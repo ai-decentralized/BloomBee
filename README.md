@@ -3,7 +3,7 @@
     Run large language models in a heterogeneous decentralized environment with offloading.<br>
     <br>
     <a href="https://pypi.org/project/bloombee/"><img src="https://img.shields.io/pypi/v/bloombee.svg?label=PyPI&color=green"></a>
-    <a href="https://github.com/yottalabsai/bloombee/actions"><img src="https://github.com/yottalabsai/BloomBee/actions/workflows/pylint.yml/badge.svg？branch=main"></a>
+    <a href="https://github.com/yottalabsai/bloombee/actions"><img src="https://img.shields.io/github/actions/workflow/status/yottalabsai/bloombee/pylint.yml?branch=main&label=Build"></a>
     <a href="https://discord.gg/Ypexx2rxt9"><img src="https://img.shields.io/discord/1267714065166241813?label=Discord&logo=discord&logoColor=white"></a>
 </p>  
 
