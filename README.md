@@ -60,21 +60,21 @@ python -m bloombee.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER 
 
 #### Inference   
 ```
-cd Bloombee/
+cd BloombBee/
 python benchmarks/benchmark_inference.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32 --seq_len 128
 ```
 
 #### Finetune 
 
 ```
-cd Bloombee/
+cd BloomBee/
 python benchmarks/benchmark_training.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32  --n_steps 20 --batch_size 32 --seq_len 128
 ```
 
 
 ## Acknowledgements  
 
-Bloombee is built upon a few popular libraries: 
+BloomBee is built upon a few popular libraries: 
 
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.  
   - [FlexLLMGen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.  
