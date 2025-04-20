@@ -4,7 +4,7 @@ import shutil
 import pytest
 from huggingface_hub import snapshot_download
 
-from petals.utils.peft import check_peft_repository, load_peft
+from bloombee.utils.peft import check_peft_repository, load_peft
 
 UNSAFE_PEFT_REPO = "artek0chumak/bloom-560m-unsafe-peft"
 SAFE_PEFT_REPO = "artek0chumak/bloom-560m-safe-peft"

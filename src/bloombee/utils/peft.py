@@ -160,7 +160,7 @@ class AdapterContextMixin:
 
     def set_adapter(self, adapter_names) -> None:
         """
-        In PEFT, this function makes the adapter trainable. However, in bloombee environment this is not possible now. Thus,
+        In PEFT, this function makes the adapter trainable. However, in BloomBee environment this is not possible now. Thus,
         this code removes this functionality.
         Link to peft code: https://github.com/huggingface/peft/blob/98f4db2c7990ef9c879a0e1da9a28a19a04701ef/src/peft/tuners/tuners_utils.py#L463
         """
@@ -210,7 +210,7 @@ def create_lora_adapter(block):
 
 
 def add_adapter_to_block(block, block_index, adapter_name, peft_config, peft_state_dict):
-    assert peft_config["peft_type"] == "LORA", "bloombee works only with LORA adapters"
+    assert peft_config["peft_type"] == "LORA", "BloomBee works only with LORA adapters"
     if peft_config["lora_dropout"] > 0:
         logger.info(f"Adapter {adapter_name} has dropout enabled, this server will disable dropout")
 

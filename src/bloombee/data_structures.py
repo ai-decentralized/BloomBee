@@ -2,7 +2,7 @@ import dataclasses
 from enum import Enum
 from typing import Any, Dict, Optional, Sequence, Tuple
 
-import pydantic.v1 as pydantic
+import pydantic
 from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
 

@@ -17,8 +17,7 @@ from bloombee.models import *
 from bloombee.utils import *
 from bloombee.utils.logging import initialize_logs as _initialize_logs
 
-# __version__ = "2.3.0.dev2"
-__version__ = "0.1.3"
+__version__ = "2.3.0.dev2"
 
 
 if not os.getenv("BLOOMBEE_IGNORE_DEPENDENCY_VERSION"):

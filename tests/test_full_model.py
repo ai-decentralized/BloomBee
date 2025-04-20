@@ -4,7 +4,7 @@ import torch
 import transformers
 from hivemind import get_logger
 
-from petals import AutoDistributedModelForCausalLM
+from bloombee import AutoDistributedModelForCausalLM
 from test_utils import *
 
 logger = get_logger(__name__)

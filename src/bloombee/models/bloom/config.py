@@ -28,7 +28,7 @@ class DistributedBloomConfig(BloomConfig, ClientConfig, PTuneConfig, LMHeadConfi
 
         loading_from_repo = model_name_or_path is not None and not os.path.isdir(model_name_or_path)
         if loading_from_repo and dht_prefix is None:
-            # We need "-bloombee" for backward compatibility with bloombee < 1.2.0
+            # We need "-bloombee" for backward compatibility with BloomBee < 1.2.0
             dht_prefix = str(model_name_or_path) + "-bloombee"
             dht_prefix = dht_prefix.replace(".", "-")
             logger.info(f"Using DHT prefix: {dht_prefix}")

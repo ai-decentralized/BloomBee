@@ -40,6 +40,28 @@ from bloombee.utils.ping import PingAggregator
 from bloombee.utils.random import sample_up_to
 from bloombee.utils.version import get_compatible_model_repo
 
+from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
+from bloombee.flexgen_utils.compression import CompressionConfig
+from bloombee.flexgen_utils.policy import Policy
+from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
+from bloombee.flexgen_utils.utils import ValueHolder, array_1d
+from pynvml import *
+
+def see_memory_usage(message, force=True):
+	logger = ''
+	logger += message
+	nvmlInit()
+ 
+	# nvidia_smi.nvmlInit()
+	handle = nvmlDeviceGetHandleByIndex(0)
+	info = nvmlDeviceGetMemoryInfo(handle)
+	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
+	
+	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
+	logger +=   'Max Memory Allocated: ' + str(
+		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
+	print(logger)
+
 logger = get_logger(__name__)
 
 
@@ -188,6 +210,7 @@ class Server:
 
         if quant_type is None:
             quant_type = QuantType.NF4 if device.type == "cuda" else QuantType.NONE
+        quant_type = QuantType.NONE ########## manually change the QuantType
         self.quant_type = quant_type
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
 
@@ -231,14 +254,40 @@ class Server:
         self.attn_cache_bytes = self._cache_bytes_per_block * num_blocks
         logger.info(f"Attention cache for all blocks will consume up to {self.attn_cache_bytes / gib:.2f} GiB")
 
+        ##############################################################
+        self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
+        self.policy = Policy(1, 1,       #  gpu_batch_size: int, num_gpu_batches: int
+                    100, 0,              # w_gpu_percent: float, w_cpu_percent: float
+                    0, 100,             # cache_gpu_percent: float, cache_cpu_percent: float
+                    0, 100,             # act_gpu_percent: float, act_cpu_percent: float
+                    overlap=False, sep_layer=True, pin_weight=True,
+                    cpu_cache_compute=False, attn_sparsity=1.0,
+                    compress_weight=False,  # 暂时禁用权重压缩，避免 compressed_device 问题
+                    comp_weight_config=CompressionConfig(
+                        num_bits=4, group_size=64,
+                        group_dim=0, symmetric=False),
+                    compress_cache=False,  # 暂时禁用缓存压缩
+                    comp_cache_config=CompressionConfig(
+                        num_bits=4, group_size=64,
+                        group_dim=2, symmetric=False))
+        self.weight_home = array_1d(self.num_blocks, ValueHolder)
+        self.path = '/tmp/data/llama_weights'
+        ##############################################################
+        
+        see_memory_usage("-----------------------------------------in server: after policy  ")
+        
         assert isinstance(throughput, float) or throughput in ["auto", "eval", "dry_run"]
         if throughput in ["auto", "eval", "dry_run"]:
             force_eval = throughput in ["eval", "dry_run"]
-            throughput_info = get_server_throughput(
+            throughput_info = get_server_throughput( # #######
                 converted_model_name_or_path,
                 self.block_config,
                 device,
                 torch_dtype,
+                self.env, #####
+                self.policy, #####
+                self.weight_home, #####
+                self.path, #####
                 num_blocks=num_blocks,
                 quant_type=quant_type,
                 tensor_parallel_devices=self.tensor_parallel_devices,
@@ -251,6 +300,7 @@ class Server:
                 sys.exit(0)
         else:
             throughput_info = {"throughput": throughput}
+        see_memory_usage("-----------------------------------------in server: after throughput calculation  ")
         self.server_info = ServerInfo(
             state=ServerState.JOINING,
             public_name=public_name,
@@ -303,7 +353,7 @@ class Server:
         block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
         total_memory_per_block = block_size + self._cache_bytes_per_block
         if self.adapters:
-            # Delay import of bloombee.utils.peft to avoid unnecessary import of bitsandbytes
+            # Delay import of petals.utils.peft to avoid unnecessary import of bitsandbytes
             from bloombee.utils.peft import estimate_adapter_memory_per_block
 
             total_memory_per_block += estimate_adapter_memory_per_block(
@@ -333,6 +383,10 @@ class Server:
                 dht_prefix=self.dht_prefix,
                 converted_model_name_or_path=self.converted_model_name_or_path,
                 block_config=self.block_config,
+                env=self.env, #####
+                policy=self.policy, #####
+                weight_home= self.weight_home, #####
+                path=self.path, ######
                 attn_cache_bytes=self.attn_cache_bytes,
                 server_info=self.server_info,
                 model_info=self.model_info,
@@ -440,6 +494,10 @@ class ModuleContainer(threading.Thread):
         dht_prefix: str,
         converted_model_name_or_path: str,
         block_config: PretrainedConfig,
+        env: ExecutionEnv, ####
+        policy: Policy,    ####
+        weight_home: array_1d, ####
+        path: str,
         attn_cache_bytes: int,
         server_info: ServerInfo,
         model_info: ModelInfo,
@@ -463,6 +521,7 @@ class ModuleContainer(threading.Thread):
         **kwargs,
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
+        print('module_uids ', module_uids)
         memory_cache = MemoryCache(attn_cache_bytes, max_alloc_timeout)
 
         server_info.state = ServerState.JOINING
@@ -481,13 +540,19 @@ class ModuleContainer(threading.Thread):
         logger.info(f"Announced that blocks {block_indices} are joining")
 
         assert len(tensor_parallel_devices) >= 1 and all(isinstance(d, torch.device) for d in tensor_parallel_devices)
-
+        
         blocks = {}
         try:
             for module_uid, block_index in zip(module_uids, block_indices):
+                print('blocks uid before load_pretrained_block() ', module_uid )
+                see_memory_usage("-----------------------------------------before petals load pretrained block ")
                 block = load_pretrained_block(
                     converted_model_name_or_path,
                     block_index,
+                    env, #######
+                    policy, #######
+                    weight_home, ######,
+                    path, ########
                     config=block_config,
                     torch_dtype=torch_dtype,
                     revision=revision,
@@ -495,8 +560,11 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
+                see_memory_usage("-----------------------------------------after petals load pretrained block ")
+                # print('block nn.module() before convert_block() ', block )
+                # print('block_config' , block_config)
                 block = convert_block(
-                    block,
+                    block,     ## block configuration
                     block_index,
                     block_config,
                     tensor_parallel_devices,
@@ -508,9 +576,10 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
+                see_memory_usage("-----------------------------------------sever: after convert_block  ")
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
-                    block,
+                    block,  ###### block instance
                     config=block_config,
                     memory_cache=memory_cache,
                     backend_dtype=torch_dtype,
@@ -737,7 +806,7 @@ class ModuleAnnouncerThread(threading.Thread):
                 break
             if not self.dht_prefix.startswith("_"):  # Not private
                 self.dht.store(
-                    key="_bloombee.models",
+                    key="_petals.models",
                     subkey=self.dht_prefix,
                     value=self.model_info.to_dict(),
                     expiration_time=get_dht_time() + self.expiration,

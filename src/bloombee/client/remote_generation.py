@@ -116,7 +116,7 @@ class RemoteGenerationMixin(_SkipTokensMixin):
             if n_prev_tokens > 0:
                 if kwargs.get("num_beams", 1) > 1:
                     logger.warning(
-                        "Beam search will not work properly in the resumed bloombee.InferenceSession "
+                        "Beam search will not work properly in the resumed petals.InferenceSession "
                         "since intermediate beam entries are lost"
                     )
 
@@ -154,7 +154,7 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         if "max_length" in kwargs and kwargs["max_length"] is None:
             del kwargs["max_length"]
 
-        # Support do_sample = {0, 1} for backward compatibility with bloombee < 2.1.0
+        # Support do_sample = {0, 1} for backward compatibility with Petals < 2.1.0
         do_sample = kwargs.get("do_sample")
         if isinstance(do_sample, int):
             kwargs["do_sample"] = bool(do_sample)

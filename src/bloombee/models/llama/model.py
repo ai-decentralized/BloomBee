@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 
 
 class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
+    # DistributedLlamaModel 类，继承自 FromPretrainedMixin、PTuneMixin 和 LlamaModel
     """LlamaModel, but all transformer layers are hosted by the swarm"""
 
     _keys_to_ignore_on_load_missing = PTuneMixin._keys_to_ignore_on_load_missing
@@ -31,7 +32,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         assert len(self.layers) == 0
         config.num_hidden_layers = n_layer
 
-        self.layers = RemoteSequential(config, dht=dht)
+        self.layers = RemoteSequential(config, dht=dht) # create RemoteSequential instance to manage distributed layers
 
         self.requires_grad_(False)  # Forbid accumulate grads for embeddings and layernorm
         self.init_prompts(config)
@@ -85,6 +86,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
             prompts = intermediate_prompts = None
 
         hidden_states = inputs_embeds
+        print('model.py llama model inputs_embeds, ', inputs_embeds)
         output_shape = input_shape + (hidden_states.size(-1),)
 
         hidden_states = self.layers(

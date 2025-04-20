@@ -6,7 +6,7 @@ import pytest
 import torch
 from hivemind.moe.server.runtime import Runtime
 
-from petals.server.task_pool import PrioritizedTaskPool
+from bloombee.server.task_pool import PrioritizedTaskPool
 
 
 def _submit_tasks(runtime_ready, pools, results_valid):

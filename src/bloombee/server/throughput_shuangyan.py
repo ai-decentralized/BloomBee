@@ -145,7 +145,7 @@ def measure_throughput_info(
             path, ####
             quant_type=quant_type,
             tensor_parallel_devices=tensor_parallel_devices,
-            n_tokens=1,
+            n_tokens=32, ########## change from 1 ---->  32
             n_steps=100,
             inference=True,
         ),
@@ -230,13 +230,9 @@ def measure_compute_rps(
         tensor_parallel_devices = (device,)
     with torch.inference_mode():
         block = get_model_block(config, env, policy, weight_home, path) #####
-
         block = block.to(dtype)
-        # hack
-        # tensor_parallel_devices = tensor_parallel_devices + (torch.device("cuda", index=1),)
-
         block = convert_block(block, 0, config, tensor_parallel_devices, device, quant_type=quant_type, freeze=True)
-        # import pdb;pdb.set_trace()
+
         cache = (DUMMY_KEY_PAST.to(dtype=dtype, device=device), DUMMY_KEY_PAST.to(dtype=dtype, device=device))
         elapsed = 0
         dummy_input = torch.randn(1, n_tokens, config.hidden_size, device=device, dtype=dtype)
@@ -245,16 +241,17 @@ def measure_compute_rps(
         print('measure_compute_rps: dummy_input.shape', dummy_input.shape)
         # Skip the 1st step to exclude the initialization time
         def step(cache_):
-            print('step cache_ block', block)
+            # import pdb; pdb.set_trace()
+            print('step block', block)
             outputs = block.forward(dummy_input, use_cache=inference, layer_past=cache_ if inference else None)
             return outputs[1] if inference else None
 
-        # cache = step(cache)
+        cache = step(cache)
         synchronize(device)
 
         start_time = time.perf_counter()
-        # for _ in range(n_steps):
-        #     cache = step(cache)
+        for _ in range(n_steps):
+            cache = step(cache)
         synchronize(device)
         elapsed = time.perf_counter() - start_time
         device_rps = n_steps * n_tokens / elapsed

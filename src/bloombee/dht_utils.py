@@ -1,7 +1,7 @@
 import warnings
 
 warnings.warn(
-    "bloombee.dht_utils has been moved to bloombee.utils.dht. This alias will be removed in bloombee 2.2.0+",
+    "bloombee.dht_utils has been moved to bloombee.utils.dht. This alias will be removed in BloomBee 2.2.0+",
     DeprecationWarning,
     stacklevel=2,
 )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import time
+from time import perf_counter
 import uuid
 from typing import AsyncIterator, List, Optional, Tuple
 
@@ -107,52 +108,61 @@ class _ServerInferenceSession:
         :prompts: optional DEEP prompts, added to a prefix of each layer's outputs,
           if specified, deep prompts should have shape [num_layers, batch_size, prefix_len, hid_size]
         """
+        step_start_time = perf_counter()
+        print('step start ..... ')
+            
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
 
-        n_input_tokens = inputs.shape[1] # get the number of token
-        print('client step() n_input_tokens', n_input_tokens)
-        if self.history is None: # if the history log is empty
-            self.history = inputs # assign the current inputs to the history log
-        elif self.history.shape[1] == self._position: # if the length of the history equals the current position
-            self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # 将当前输入的最后n_input_tokens个token拼接到历史记录中
-        assert self.history.shape[1] == self._position + n_input_tokens, ( #  确保历史记录的长度等于当前位置加上输入的token数量 
+        n_input_tokens = inputs.shape[1]
+        if self.history is None:
+            self.history = inputs
+        elif self.history.shape[1] == self._position:
+            self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1)
+        assert self.history.shape[1] == self._position + n_input_tokens, (
             f"Broken input cache: span={self.span} shape={self.history.shape} "
             f"position={self._position} n_input_tokens={n_input_tokens}"
         )
 
-        if not self.stepped: # if not exe step yet
+        if not self.stepped:
             inputs = self.history  # Pass full inputs including prefix
         else:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
         input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids)
-        print('client inference session step() input_tensors after packing ', input_tensors)
-        print('client inference session step() input_tensors after packing shape', input_tensors[0].shape)
-        print('_ServerInferenceSession  step id ', step_id)
+
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
+        # print('use server to server true/false? : ', self.config.use_server_to_server)
+        # print('stepped ', self.stepped)
+        print('self._position ', self._position)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
         if self._position is not None:
             request_metadata["start_from_position"] = self._position
-        elif self.config.use_server_to_server:
+        elif self.config.use_server_to_server: # it didn't come to this condition when it use "elif"
+            print('use server to server') 
             next_servers = self._collect_next_servers()
+            # print('next_servers', next_servers)
             if next_servers:
                 request_metadata["next_servers"] = next_servers
 
         request_metadata["args_structure"] = args_structure
-
+        # print('request_metadata ', request_metadata)
         # TODO: make possible to use different compression method for different tensors
         server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
+        # print('self.rpc_info[inference_schema] ', self.rpc_info["inference_schema"])
         compression = server_side_inference_schema[0].compression
+        # print('compression ', compression)
         inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
-
+        # print('inference_schema ', inference_schema)
         # TODO: create more explicit way to check servers schema and client's structure
         assert len(input_tensors) >= len(
             server_side_inference_schema
         ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
+        print('input tensors ',input_tensors)
+        print('input tensors[0].size() ',input_tensors[0].size())
         outputs_serialized = RemoteExpertWorker.run_coroutine(
             self._step(
                 runtime_pb2.ExpertRequest(
@@ -171,8 +181,9 @@ class _ServerInferenceSession:
         ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"
 
         self._position += n_input_tokens
-        print('server inference session self._position ', self._position)
-        print('server inference session output[0].shape ',  outputs[0].shape)
+        step_end_time = perf_counter()
+        print('step total time(sec) ',  step_end_time-step_start_time)
+        print()
         return outputs[0]
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
@@ -243,15 +254,15 @@ class InferenceSession:
     def position(self) -> int:
         return self._position
 
-    @position.setter 
-    def position(self, start_from_position: int) -> None: # 设置一个位置属性，并确保所有相关的会话对象都同步更新这个位置。
-        self._position = start_from_position # set a position attribute and ensure that all related session objects are updated to reflect this position synchronously.
+    @position.setter
+    def position(self, start_from_position: int) -> None:
+        self._position = start_from_position
         for session in self._server_sessions:
             assert isinstance(session, _ServerInferenceSession)
             session.position = start_from_position
 
     def _enter_server_sessions(self, chosen_spans: List[RemoteSpanInfo]) -> List[_ServerInferenceSession]:
-        server_sessions = [] # 创建一组服务器会话，并在发生错误时确保已创建的会话能够正确退出。
+        server_sessions = []
         try:
             for span in chosen_spans:
                 span_uids = CHAIN_DELIMITER.join(self._sequence_manager.block_uids[span.start : span.end])
@@ -285,7 +296,7 @@ class InferenceSession:
         assert not self._closed and not self._server_sessions
         return self
 
-    def step(   # 执行一次推理步骤，处理输入数据和相应的提示与假设 ID，同时在可能出现错误的情况下进行重试。
+    def step(
         self,
         inputs: torch.Tensor,
         prompts: Optional[torch.Tensor] = None,
@@ -315,7 +326,7 @@ class InferenceSession:
         inputs = inputs.cpu()
         prompts = prompts.cpu()
         hypo_ids = hypo_ids.cpu()
-        step_id = str(uuid.uuid4()) #生成一个唯一的步骤 ID。
+        step_id = str(uuid.uuid4())
 
         n_input_tokens = inputs.shape[1]
         if self._position + n_input_tokens > self._max_length:
@@ -335,14 +346,13 @@ class InferenceSession:
 
                     server_session = self._server_sessions[server_idx]
                     assert server_session.position == self.position, f"{server_session.position} and {self.position}"
-                    inputs = server_session.step( 
+                    inputs = server_session.step(
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
                         step_id=step_id,
                     )
-                    # print('inputs ', inputs)
-                    print('inputs.shape ', inputs.shape)
+
                     server_idx += 1
                     block_idx = server_session.span.end
                     self._sequence_manager.on_request_success(server_session.span.peer_id)
@@ -358,23 +368,21 @@ class InferenceSession:
                         f"Caught exception when running inference via {server_session.span if server_session is not None else None} "
                         f"(retry in {delay:.0f} sec): {repr(e)}"
                     )
-                    maybe_log_traceback(e)  
-                    time.sleep(delay) 
+                    maybe_log_traceback(e)
+                    time.sleep(delay)
 
-        self._position += n_input_tokens 
-        outputs = inputs[:, -n_input_tokens:] 
-        outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
-        print('client inference session outputs ', outputs.shape)
+        self._position += n_input_tokens
+        outputs = inputs[:, -n_input_tokens:]
+        outputs = outputs.to(device=inputs_device, dtype=inputs_dtype)
         return outputs
 
-    
     def _update_sequence(self, server_idx: int, block_idx: int, attempt_no: int) -> int:
         # If there is a failed server session, this code closes it
         self._exit_server_sessions(self._server_sessions[server_idx : server_idx + 1])
 
         n_prev_spans = len(self._server_sessions)
         update_end = self._server_sessions[server_idx].span.end if server_idx < n_prev_spans else self.num_blocks
-        if attempt_no >= 1: 
+        if attempt_no >= 1:
             logger.debug(
                 f"Due to a server failure, remote attention caches "
                 f"from block {block_idx} to {update_end} will be regenerated"
@@ -383,13 +391,11 @@ class InferenceSession:
         updated_spans = self._sequence_manager.make_sequence(
             block_idx, update_end, mode="min_latency", cache_tokens_needed=self._max_length
         )
-
         # make_sequence() could return a longer sequence
         updated_spans[-1].end = min(updated_spans[-1].end, update_end)
         updated_sessions = self._enter_server_sessions(updated_spans)
         logger.debug(f"Found path from block {block_idx} to {update_end} via {len(updated_spans)} servers")
-        
-        
+
         # If there is a failed span, this code replaces it, otherwise it just adds new ones
         if server_idx < n_prev_spans:
             updated_sessions[0].history = self._server_sessions[server_idx].history

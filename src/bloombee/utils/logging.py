@@ -4,9 +4,9 @@ from hivemind.utils import logging as hm_logging
 
 
 def initialize_logs():
-    """Initialize bloombee logging tweaks. This function is called when you import the `bloombee` module."""
+    """Initialize BloomBee logging tweaks. This function is called when you import the `bloombee` module."""
 
-    # Env var BOOMBEE_LOGGING=False prohibits bloombee do anything with logs
+    # Env var BLOOMBEE_LOGGING=False prohibits BloomBee do anything with logs
     if os.getenv("BLOOMBEE_LOGGING", "True").lower() in ("false", "0"):
         return
 

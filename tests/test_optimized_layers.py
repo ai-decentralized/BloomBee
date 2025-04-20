@@ -7,9 +7,9 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from transformers.models.falcon.modeling_falcon import FalconDecoderLayer, FalconModel, build_alibi_tensor
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaModel
 
-from petals.server.block_utils import get_model_block
-from petals.utils.auto_config import AutoDistributedConfig
-from petals.utils.convert_block import QuantType, convert_block
+from bloombee.server.block_utils import get_model_block
+from bloombee.utils.auto_config import AutoDistributedConfig
+from bloombee.utils.convert_block import QuantType, convert_block
 from test_utils import MODEL_NAME
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]

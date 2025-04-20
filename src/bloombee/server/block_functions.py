@@ -20,6 +20,16 @@ from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
 
+from time import perf_counter
+from datetime import datetime, timezone  
+def print_time_now(s):
+    # Get the current time in UTC  
+    current_utc_datetime = datetime.now(timezone.utc)  
+    # Format the datetime to the desired string format  
+    formatted_utc_time = current_utc_datetime.strftime('%Y-%m-%d %H:%M:%S.%f %Z')  
+    print('\t\t\t'+s+" UTC Time: "+ str(formatted_utc_time) )  
+    
+
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
 # TODO: Increase the NF4 threshold once bitsandbytes ships efficient NF4 kernel for parallel forward
@@ -64,7 +74,7 @@ async def run_rpc_forward(
         if not is_dummy(prompt):
             hidden_states[:, : prompt.shape[1]] += prompt
 
-        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "bloombee support only prioritized pools"
+        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "petals support only prioritized pools"
         priority = prioritizer.prioritize(
             hidden_states, points=points / len(requested_backends), backend=backend, type="forward"
         )
@@ -111,7 +121,7 @@ async def run_rpc_backward(
         if not is_dummy(prompt):
             inputs[:, : prompt.shape[1]] += prompt
         inter_inputs.append(inputs)
-        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "bloombee support only prioritized pools"
+        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "petals support only prioritized pools"
         priority = prioritizer.prioritize(
             inputs, points=points / len(requested_backends), backend=backend, type="forward_in_backward"
         )
@@ -127,7 +137,7 @@ async def run_rpc_backward(
     grad_prompts_reversed = []
     # Run a chain of requested backends
     for inp, prompt, backend in zip(*map(reversed, (inter_inputs, prompts, requested_backends))):
-        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "bloombee support only prioritized pools"
+        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "petals support only prioritized pools"
         priority = prioritizer.prioritize(
             inp, grad_outputs, points=points / len(requested_backends), backend=backend, type="backward"
         )
@@ -156,10 +166,14 @@ async def iterate_rpc_inference(
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
     assert len(cache_handles) == len(requested_backends)
 
+    start_iterate_rpc_infer_time = perf_counter() #######
+    print('start iterate rpc inference -=-=-=-')
+    #print_time_now('')
     prefix_length = 0
     point_per_piece = points / max_length if max_length > 0 else 0.0
 
     async for request, step_metadata in input_iterator:
+        print('------------------ iterate_rpc_inference step_metadata ', step_metadata)
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
             assert (
@@ -186,7 +200,8 @@ async def iterate_rpc_inference(
         else:
             prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
             prompts = [prompt if not is_dummy(prompt) else None for prompt in prompts]
-
+        print('has_prompts', has_prompts)
+        print('prompts ', prompts)
         if not (len(requested_backends) == len(prompts)):
             raise ValueError(f"Received {len(prompts)} prompts for {len(requested_backends)} backends")
 
@@ -198,6 +213,7 @@ async def iterate_rpc_inference(
 
         merge_max_tokens = MAX_NF4_SHORT_INFERENCE_TOKENS if quant_type == QuantType.NF4 else MAX_SHORT_INFERENCE_TOKENS
         can_merge_pools = batch_size * length_increment <= merge_max_tokens
+        print('-=-=-=-=-=-=-=-==-=- can merge pools : ', can_merge_pools)
         priority = prioritizer.prioritize(
             hidden_states,
             hypo_ids,
@@ -205,12 +221,18 @@ async def iterate_rpc_inference(
             requested_uids=requested_uids,
             type="inference",
         )
-
+        print('after priority = prioritizer.prioritize( )')
+        #print_time_now('')
         # A client may pass a tensor with 0 tokens. This is a special case that occurs, e.g.
         # when user wants to pre-allocate cache or check that server *can* allocate that cache.
         if hidden_states.numel() > 0:
             assert hidden_states.ndim == 3, f"hidden states must be a single 3d tensor"
+            start_compute_time = perf_counter()
+            print('before merge pools ')
+            #print_time_now('')
             if can_merge_pools:
+                print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
+                
                 inference_infos = tuple(
                     InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
                     for uid, handles in zip(requested_uids, cache_handles)
@@ -218,20 +240,38 @@ async def iterate_rpc_inference(
                 (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
                     hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                 )
+                
             else:
+                print('-=-=-=-=-=-=-=-==-=- not come into can merge pools : ', can_merge_pools)
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
-
+            # end_compute_time = perf_counter()
+            # print('the inference computing time ', end_compute_time - start_compute_time)
+            # print_time_now('')
         # serialize and send last layer outputs
         output_tensors = [
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
             for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
         ]
+        print('after serialize and send last layer outputs ', )
+        # print_time_now('')
+        # print('hidden_states ', hidden_states)
+        # print('type of hidden_states ', )
+        print('shape of hidden_states ', hidden_states.size())
+        # hidden_size_in_bytes = hidden_states.element_size() * output_tensors.numel()  
+        # print(f"Size of the hidden state in bytes: {size_in_bytes}")  
+        print()
+        
         can_push = not has_prompts
         yield output_tensors, can_push, step_metadata
-
+        # print('output_tensors ',output_tensors)
         # prepare for next step
         prefix_length += length_increment
+
+    end_iterate_rpc_infer_time = perf_counter()#######
+    # print('iterate (all steps) rpc infer time cost (sec): ', end_iterate_rpc_infer_time - start_iterate_rpc_infer_time)########
+    # #print_time_now('')
+    # print()

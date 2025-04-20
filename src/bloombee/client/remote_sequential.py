@@ -51,11 +51,15 @@ class RemoteSequential(nn.Module):
 
     def forward(self, inputs: torch.Tensor, prompts: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         assert inputs.ndim == 3, "inputs must be a tensor of shape [batch_size, seq_length, hidden_size]"
+        print('client remote sequential self.active_session ', self.active_session)
         if self.active_session is None:
             assert all(v is None for v in kwargs.values()), f"Extra kwargs are not supported in forward: {kwargs}"
             return _RemoteSequentialAutogradFunction.apply(inputs, prompts, self.sequence_manager)
-        else:
-            return self.active_session.step(inputs, prompts, **kwargs)
+        else: # model.generate(sess=session) refer in remote_generation.py
+            # self.active_session : <petals.client.inference_session.InferenceSession object at xxxxx>
+            print('start client remote sequential self.active_session .step()')
+            # print('**kwargs ', kwargs) #  {'hypo_ids': None}
+            return self.active_session.step(inputs, prompts, **kwargs) # start the model.transformer.h.inference_session
 
     @property
     def active_session(self) -> Optional[InferenceSession]:

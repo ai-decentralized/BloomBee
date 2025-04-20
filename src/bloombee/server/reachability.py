@@ -44,7 +44,7 @@ def validate_reachability(peer_id, wait_time: float = 7 * 60, retry_delay: float
         f"Server has not become reachable from the Internet:\n\n"
         f"{response['message']}\n\n"
         f"You need to fix your port forwarding and/or firewall settings. How to do that:\n\n"
-        f"    1. Choose a specific port for the bloombee server, for example, 31337.\n"
+        f"    1. Choose a specific port for the BloomBee server, for example, 31337.\n"
         f"    2. Ensure that this port is accessible from the Internet and not blocked by your firewall.\n"
         f"    3. Add these arguments to explicitly announce your IP address and port to other peers:\n"
         f"        python -m bloombee.cli.run_server ... --public_ip {response['your_ip']} --port 31337\n"
