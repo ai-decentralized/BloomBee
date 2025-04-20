@@ -1,5 +1,5 @@
 import torch
-from pynvml.smi import nvidia_smi
+# from pynvml.smi import nvidia_smi
 from pynvml import *
 from typing import Optional
 
@@ -58,6 +58,4 @@ def profile_weight_init(func):
 		print(f"PyTorch Max Allocated: {final_stats['torch_max_allocated']:.2f} GB")
 		
 		return result
-	return wrapper
-
-# input("Press Any Key To Continue ..")
+	return wrapper 

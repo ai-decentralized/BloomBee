@@ -17,11 +17,10 @@ from tqdm import tqdm
 class LlamaConfig:
     name: str="llama-7b"
     vocab_size: int=32000
-    type_vocab_size=2
-    input_dim: int=4096
+    hidden_size: int=4096
     intermediate_size: int=11008
     num_hidden_layers: int=32
-    n_head: int=32
+    num_attention_heads: int=32
     hidden_act: str="silu"
     max_position_embeddings: int=2048
     initializer_range: float=0.02
@@ -32,17 +31,17 @@ class LlamaConfig:
 
     def model_bytes(self):
         V = self.vocab_size
-        H = self.input_dim
+        H = self.hidden_size
         L = self.num_hidden_layers
         I = self.intermediate_size
         num_params = L*(4*H*H + 3*I*H + 2*H) + V*H*2 + H
         return num_params * 2    
 
     def cache_bytes(self, batch_size, seq_len):
-        return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * 2
+        return 2 * batch_size * seq_len * self.num_hidden_layers * self.hidden_size * 2
 
     def hidden_bytes(self, batch_size, seq_len):
-        return batch_size * seq_len * self.input_dim * 2
+        return batch_size * seq_len * self.hidden_size * 2
 
 def get_llama_config(name, **kwargs):
     if "/" in name:
@@ -52,13 +51,15 @@ def get_llama_config(name, **kwargs):
     arch_name = name
 
     if arch_name == "llama-7b":
-        config = LlamaConfig(name=name, input_dim=4096, n_head=32, num_hidden_layers=32, intermediate_size=11008)
+        config = LlamaConfig(name=name, hidden_size=4096, num_attention_heads=32, num_hidden_layers=32, intermediate_size=11008)
     elif arch_name == "llama-13b":
-        config = LlamaConfig(name=name, input_dim=5120, n_head=40, num_hidden_layers=40, intermediate_size=13824)
+        config = LlamaConfig(name=name, hidden_size=5120, num_attention_heads=40, num_hidden_layers=40, intermediate_size=13824)
     elif arch_name == "llama-30b":
-        config = LlamaConfig(name=name, input_dim=6656, n_head=52, num_hidden_layers=60, intermediate_size=17920)
+        config = LlamaConfig(name=name, hidden_size=6656, num_attention_heads=52, num_hidden_layers=60, intermediate_size=17920)
     elif arch_name == "llama-65b":
-        config = LlamaConfig(name=name, input_dim=8192, n_head=64, num_hidden_layers=80, intermediate_size=22016)
+        config = LlamaConfig(name=name, hidden_size=8192, num_attention_heads=64, num_hidden_layers=80, intermediate_size=22016)
+    elif arch_name == "llama-70b":
+        config = LlamaConfig(name=name, hidden_size=8192, num_attention_heads=64, num_hidden_layers=80, intermediate_size=28672)
     else:
         raise ValueError(f"Invalid model name: {name}")
     

@@ -51,7 +51,7 @@ class TorchCompressedDevice:
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
@@ -67,8 +67,8 @@ class TorchCompressedDevice:
             return  # Only CPU requires this fp32 workspace
 
         b = policy.gpu_batch_size
-        n_head = config.n_head
-        head_dim = config.input_dim // n_head
+        n_head = config.num_attention_heads
+        head_dim = config.hidden_size // n_head
         max_seq_len = task.prompt_len + task.gen_len - 1
         shape = (max_seq_len, b * n_head, head_dim)
 
@@ -357,6 +357,27 @@ def test_real_compression():
 
     print(a.flatten())
     print(b.flatten())
+
+
+def compress_cache(cache, config, task, policy):
+    if not policy.compress_cache:
+        return cache
+
+    if policy.comp_cache_config.group_size == 0:
+        return cache
+
+    k_cache, v_cache = cache
+    num_attention_heads = config.num_attention_heads
+    head_dim = config.hidden_size // num_attention_heads
+
+    if policy.comp_cache_config.group_dim == 0:
+        s_ = task.prompt_len // policy.comp_cache_config.group_size * policy.comp_cache_config.group_size
+        k_cache = k_cache[:s_]
+        v_cache = v_cache[:s_]
+
+    k_cache = policy.gpu.compressed_device.compress(k_cache, policy.comp_cache_config)
+    v_cache = policy.gpu.compressed_device.compress(v_cache, policy.comp_cache_config)
+    return k_cache, v_cache
 
 
 if __name__ == "__main__":

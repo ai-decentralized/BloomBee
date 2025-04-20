@@ -26,6 +26,7 @@ from torch import nn
 from transformers import AutoTokenizer
 from bloombee.flexgen_utils.timer import timers
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from bloombee.utils.memory_usage import see_memory_usage
 
 fix_recursive_import()
 
@@ -93,25 +94,6 @@ class Policy:
         return 100 - self.act_gpu_percent - self.act_cpu_percent
 
 from pynvml import *
-
-def see_memory_usage(message, force=True):
-	logger = ''
-	logger += message
-	nvmlInit()
- 
-	# nvidia_smi.nvmlInit()
-	handle = nvmlDeviceGetHandleByIndex(0)
-	info = nvmlDeviceGetMemoryInfo(handle)
-	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-	
-	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-	logger +=   'Max Memory Allocated: ' + str(
-		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-	print(logger)
-
-
-
-
 
 def get_choice(cur_percent, percents, choices):
     percents = np.cumsum(percents)
@@ -261,14 +243,14 @@ def load_weights_from_pytorch_model(model, policy, env, weight_home, block_index
 
 #         self.task = None
 #         self.token_type_embeddings = nn.Embedding(
-#             config.type_vocab_size, config.input_dim, device="cuda:0"
+#             config.type_vocab_size, config.hidden_size, device="cuda:0"
 #         )
 
 #     def set_task(self, task):
 #         self.task = task
 
 #     def init_weight(self, weight_home, path):
-#         v, h, dtype = (self.config.vocab_size, self.config.input_dim, self.config.dtype)
+#         v, h, dtype = (self.config.vocab_size, self.config.hidden_size, self.config.dtype)
 #         path = os.path.join(path, "")
 #         weight_specs = [
 #             ((v, h), dtype, path + "embed_tokens.weight"),
@@ -292,7 +274,7 @@ def load_weights_from_pytorch_model(model, policy, env, weight_home, block_index
 #         pass  # do nothing
 
 #     def input_act_shape_and_dtype(self, batch_size, seq_len):
-#         return (batch_size, seq_len), np.int64
+#         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
 #     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
 #                 cache_write_buf, i, k):
@@ -336,7 +318,7 @@ def load_weights_from_pytorch_model(model, policy, env, weight_home, block_index
 #         self.task = task
 
 #     def init_weight(self, weight_home, path):
-#         intermediate_size, h, dtype = (self.config.intermediate_size, self.config.input_dim, self.config.dtype)
+#         intermediate_size, h, dtype = (self.config.intermediate_size, self.config.hidden_size, self.config.dtype)
 #         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
 #         weight_specs = [
 #             # 4 weight files
@@ -374,7 +356,7 @@ def load_weights_from_pytorch_model(model, policy, env, weight_home, block_index
 #         pass  # do nothing
 
 #     def input_act_shape_and_dtype(self, batch_size, seq_len):
-#         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
+#         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
 #     def forward(self, 
 #         x,
@@ -409,8 +391,6 @@ class FLEX_LlamaAttention(LlamaAttention):
         super().__init__(config)
         self.config = config
         self.llama_config = get_llama_config('huggyllama/llama-7b')
-        # self.config.input_dim = self.config.hidden_size
-        # self.config.dtype= np.float16
         self.num_heads = config.num_attention_heads
         self.env = env
         self.layer_id = layer_id
@@ -427,7 +407,6 @@ class FLEX_LlamaAttention(LlamaAttention):
         self.task = task
 
     def init_weight(self, weight_home, path):
-        # h, dtype = (self.config.input_dim, self.config.dtype)
         h, dtype = (self.config.hidden_size, np.float16)
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
         weight_specs = [
@@ -445,7 +424,6 @@ class FLEX_LlamaAttention(LlamaAttention):
             # rotary_embed
             ((64, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
         ]
-        # print('init weights of LLamaAttention ')
         see_memory_usage("-----------------------------------------before init weights of LLamaAttention ")
         weights = init_weight_list(weight_specs, self.policy, self.env)
         see_memory_usage("-----------------------------------------after init weights of LLamaAttention ")
@@ -504,7 +482,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             dst = self.attention_compute
 
         if path == 0:  # Direct copy
-            # shape: (s, b * n_head, head_dim)
+            # shape: (s, b * num_attention_heads, head_dim)
             indices = (slice(0, self.task.prompt_len + i),
                        slice(0, k_home.shape[1]))
 
@@ -519,7 +497,7 @@ class FLEX_LlamaAttention(LlamaAttention):
                     (v_home, False),
                 ))
         elif path == 1:  # Copy to CPU temporary workspace
-            # shape: (s, b * n_head, head_dim)
+            # shape: (s, b * num_attention_heads, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
                        slice(0, k_home.shape[1]))
@@ -537,7 +515,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             gpu_k_buf = k_home.data[0][0]
             gpu_v_buf = v_home.data[0][0]
 
-            # shape: (s, b * n_head, head_dim)
+            # shape: (s, b * num_attention_heads, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
                        slice(gpu_k_buf.shape[1], k_home.shape[1]))
@@ -550,7 +528,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             raise ValueError(f"Invalid path: {path}")
 
     def store_cache(self, cache_home, cache_write_buf, i):
-        # shape: (s, b * n_head, head_dim)
+        # shape: (s, b * num_attention_heads, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
 
@@ -569,7 +547,7 @@ class FLEX_LlamaAttention(LlamaAttention):
         general_copy(v_home, indices, v_new, None)
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
-        return (batch_size, seq_len, self.config.input_dim), self.config.dtype
+        return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(
         self,
@@ -582,8 +560,8 @@ class FLEX_LlamaAttention(LlamaAttention):
         k
     ):
         
-        # n_head = self.config.n_head 
-        n_head = self.config.num_attention_heads
+        # num_attention_heads = self.config.num_attention_heads
+        num_attention_heads = self.config.num_attention_heads
         
 
         donate = [False] * 16
@@ -603,7 +581,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             see_memory_usage("-----------------------------------------before mha_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
-                                       n_head, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
+                                       num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
             see_memory_usage("-----------------------------------------after mha_llama ")
         else:
@@ -613,7 +591,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
-                w_k, w_v, w_out, n_head,
+                w_k, w_v, w_out, num_attention_heads,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 input_layernorm,
@@ -649,8 +627,6 @@ class FLEX_LlamaMLP(LlamaMLP):
         self.task = task
 
     def init_weight(self, weight_home, path):
-        # print('self.llama_config ', self.llama_config)
-        # intermediate_size, h, dtype = (self.config.intermediate_size, self.config.input_dim, self.config.dtype)
         intermediate_size, h, dtype = (self.config.intermediate_size, self.config.hidden_size, np.float16)
         print('intermediate_size, h, dtype ', intermediate_size, h, dtype)
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
@@ -692,7 +668,7 @@ class FLEX_LlamaMLP(LlamaMLP):
         pass  # do nothing
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
-        return (batch_size, seq_len, self.config.input_dim), self.config.dtype
+        return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(self, 
         hidden_states,
@@ -705,7 +681,6 @@ class FLEX_LlamaMLP(LlamaMLP):
         ):
         donate = [False] * 9
         h, donate[0] = hidden_states.val, True
-        # print('flex_llama.py MLP forward function  mlp h ,',  h)
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             ((gate, donate[1]), (down, donate[3]),
@@ -716,7 +691,6 @@ class FLEX_LlamaMLP(LlamaMLP):
 
         h = self.compute.mlp_llama(h, gate, down, up, donate, self.config, post_attention_layernorm)
         hidden_states.val = h
-        # print('flex_llama.py MLP forward function  h,',  h)
         self.temp_hidden_states.val=h
         
         return h
@@ -738,7 +712,7 @@ class FLEX_LlamaMLP(LlamaMLP):
 #         self.task = task
 
 #     def init_weight(self, weight_home, path):
-#         v, h, dtype = (self.config.vocab_size, self.config.input_dim,
+#         v, h, dtype = (self.config.vocab_size, self.config.hidden_size,
 #             self.config.dtype)
 #         path = os.path.join(path, "")
 #         weight_specs = [
@@ -770,7 +744,7 @@ class FLEX_LlamaMLP(LlamaMLP):
 #         pass  # do nothing
 
 #     def input_act_shape_and_dtype(self, batch_size, seq_len):
-#         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
+#         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
 #     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
 #                 cache_write_buf, i, k):

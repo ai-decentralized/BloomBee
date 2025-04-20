@@ -12,6 +12,7 @@ from hivemind.utils.logging import get_logger, use_hivemind_log_handler
 from tensor_parallel.slicing_configs import get_bloom_config
 from transformers import PretrainedConfig
 from pynvml import *
+from bloombee.utils.memory_usage import see_memory_usage
 
 def see_memory_usage(message, force=True):
 	logger = ''

@@ -39,6 +39,7 @@ from bloombee.utils.misc import get_size_in_bytes
 from bloombee.utils.ping import PingAggregator
 from bloombee.utils.random import sample_up_to
 from bloombee.utils.version import get_compatible_model_repo
+from bloombee.utils.memory_usage import see_memory_usage
 
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.compression import CompressionConfig

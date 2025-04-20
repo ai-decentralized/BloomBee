@@ -39,6 +39,7 @@ import os
 # sys.path.insert(0,'..')
 # sys.path.insert(0,'/flexgen_model_in_petals/src/petals/')
 # from memory_usage import see_memory_usage, nvidia_smi_usage
+from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage
 
 fix_recursive_import()
 
@@ -232,34 +233,26 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
 
 class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py return config.block_class(config)
     def __init__(self, config: LlamaConfig,layer_id: int, env: ExecutionEnv, policy: Policy, weight_home: array_1d, path: str, ):
-        see_memory_usage("-----------------------------------------OptimizedLlamaDecoderLayer  init ")
-        nn.Module.__init__(self)
-        self.hidden_size = config.hidden_size
+        nn.Module.__init__(self)  # Call nn.Module.__init__ first
         self.layer_id = layer_id
-        # print('OptimizedLlamaDecoderLayer config ', config)
         self.config = config
-        # self.devices = (device(type='cuda', index=0),)
+        self.env = env
+        self.policy = policy
         
-        self.num_heads = config.num_attention_heads
-        # self.self_attn = OptimizedLlamaAttention(config=config, layer_idx=0)
-        # self.mlp = LlamaMLP(config=config)
+        # Initialize attention and MLP layers
+        self.self_attn = OptimizedLlamaAttention(config=config, env=env, policy=policy, layer_id=self.layer_id)
+        self.mlp = FLEX_LlamaMLP(config=config, env=env, policy=policy, layer_id=self.layer_id)
+        
         ########---------------------------------------------
-        self.self_attn = OptimizedLlamaAttention(config=config, env=env, policy=policy, layer_id=self.layer_id )
-        #layer_idx only matters for KV caching, and we re-implement it in Petals
-        self.mlp = FLEX_LlamaMLP(config=config, env=env, policy=policy,layer_id=self.layer_id )
-         ########---------------------------------------------
         self.input_layernorm = FLEX_LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = FLEX_LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.pre_attn_graph = None
         self.post_attn_graph = None
         
-        
-        
-        self.llama_config = get_llama_config('huggyllama/llama-7b')
-        self.env = env
+        # Use the config passed in instead of hardcoding to llama-7b
+        self.llama_config = config
         self.path = path
-        self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
         
         layers = []
@@ -324,8 +317,11 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             
     def init_weight(self, j):
         # print('self.llama_config ', self.llama_config)
+        # Extract model name from _name_or_path
+        model_name = os.path.basename(self.llama_config._name_or_path.rstrip('/'))
+        self.llama_config.name = model_name
         expanded_path = os.path.abspath(os.path.expanduser(
-            os.path.join(self.path, f"{self.llama_config.name}-np")))
+            os.path.join(self.path, f"{model_name}-np")))
         check_path = os.path.join(expanded_path, "embed_tokens.weight")
         see_memory_usage("----------------------------------before download_llama_weights in init_weights ")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
@@ -424,7 +420,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # print('args ', args)
         # prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
         # prompt_len, gen_len, cut_gen_len = 32, 32, 32
-        tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b", padding_side="left", legacy=False)
+        tokenizer = AutoTokenizer.from_pretrained(f"huggyllama/{self.llama_config.name}", padding_side="left", legacy=False)
         tokenizer.pad_token = '[PAD]'
         # num_prompts = args.num_gpu_batches * args.gpu_batch_size
         num_prompts = 1
@@ -433,7 +429,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         prompt_len, gen_len, cut_gen_len = 1,1,1 ##########-------------------------------------
         inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
         # inputs = hidden_states.cpu()
-        print('inputs , ', inputs)
+        # print('inputs , ', inputs)
        
         task = Task(
             inputs=inputs,
@@ -476,7 +472,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # print("hidden_states,", list(hidden_states)[0])
         # print("hidden_states device,", list(hidden_states)[0].device)
         # print("hidden_states dtype,", list(hidden_states)[0].dtype)
-        # print("hidden_states shape,", hidden_states.shape) # shape [1,1,4096]
+        # print("hidden_states shape,", hidden_states.shape) # shape [1,1,hidden_size]
         
         data = hidden_states
         device = TorchDevice(data.device)
