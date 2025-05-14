@@ -136,7 +136,7 @@ class _ServerInferenceSession:
             request_metadata.update(self.session_metadata)
         if self._position is not None:
             request_metadata["start_from_position"] = self._position
-        elif self.config.use_server_to_server:
+        if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
             if next_servers:
                 request_metadata["next_servers"] = next_servers
@@ -178,7 +178,7 @@ class _ServerInferenceSession:
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
         next_servers = []
         session = self.next_session
-        while session is not None and session.stepped:
+        while session is not None :
             next_servers.append(
                 (session.span.peer_id.to_base58(), session.session_id, session.span.start, session.span.end)
             )
