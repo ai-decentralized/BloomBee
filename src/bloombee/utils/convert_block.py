@@ -14,20 +14,20 @@ from transformers import PretrainedConfig
 from pynvml import *
 from bloombee.utils.memory_usage import see_memory_usage
 
-def see_memory_usage(message, force=True):
-	logger = ''
-	logger += message
-	nvmlInit()
- 
-	# nvidia_smi.nvmlInit()
-	handle = nvmlDeviceGetHandleByIndex(0)
-	info = nvmlDeviceGetMemoryInfo(handle)
-	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-	
-	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-	logger +=   'Max Memory Allocated: ' + str(
-		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-	print(logger)
+# def see_memory_usage(message, force=True):
+# 	logger = ''
+# 	logger += message
+# 	nvmlInit()
+#  
+# 	# nvidia_smi.nvmlInit()
+# 	handle = nvmlDeviceGetHandleByIndex(0)
+# 	info = nvmlDeviceGetMemoryInfo(handle)
+# 	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
+# 	
+# 	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
+# 	logger +=   'Max Memory Allocated: ' + str(
+# 		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
+# 	print(logger)
 
 logger = get_logger(__name__)
 use_hivemind_log_handler("in_root_logger")
@@ -70,9 +70,9 @@ def convert_block(
     # print()
     # import pdb; pdb.set_trace()
     # print()
-    see_memory_usage("-----------------------------------------convert_block before make_tensor_parallel ")
+    # see_memory_usage("-----------------------------------------convert_block before make_tensor_parallel ")
     block = make_tensor_parallel(block, config, tensor_parallel_devices, output_device=output_device)
-    see_memory_usage("-----------------------------------------convert_block after make_tensor_parallel ")
+    # see_memory_usage("-----------------------------------------convert_block after make_tensor_parallel ")
     if quant_type != QuantType.NONE:
         block = quantize_module(block, quant_type=quant_type)
 

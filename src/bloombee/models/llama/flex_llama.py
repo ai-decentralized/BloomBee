@@ -424,9 +424,9 @@ class FLEX_LlamaAttention(LlamaAttention):
             # rotary_embed
             ((64, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
         ]
-        see_memory_usage("-----------------------------------------before init weights of LLamaAttention ")
+        # see_memory_usage("-----------------------------------------before init weights of LLamaAttention ")
         weights = init_weight_list(weight_specs, self.policy, self.env)
-        see_memory_usage("-----------------------------------------after init weights of LLamaAttention ")
+        # see_memory_usage("-----------------------------------------after init weights of LLamaAttention ")
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -578,15 +578,15 @@ class FLEX_LlamaAttention(LlamaAttention):
         if i == 0:
             # prefill
             # import pdb;pdb.set_trace()---------------------
-            see_memory_usage("-----------------------------------------before mha_llama ")
+            # see_memory_usage("-----------------------------------------before mha_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            see_memory_usage("-----------------------------------------after mha_llama ")
+            # see_memory_usage("-----------------------------------------after mha_llama ")
         else:
             # decoding
-            see_memory_usage("-----------------------------------------before mha_gen_llama ")
+            # see_memory_usage("-----------------------------------------before mha_gen_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
@@ -597,7 +597,7 @@ class FLEX_LlamaAttention(LlamaAttention):
                 input_layernorm,
                 rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            see_memory_usage("-----------------------------------------after mha_gen_llama ")
+            # see_memory_usage("-----------------------------------------after mha_gen_llama ")
         hidden.val = h
         
         return h
@@ -641,9 +641,9 @@ class FLEX_LlamaMLP(LlamaMLP):
             # post attention layer norm
             ((h, ), dtype, path + "post_attention_layernorm.weight"),
         ]
-        see_memory_usage("-----------------------------------------before init weights of LLamaMLP ")
+        # see_memory_usage("-----------------------------------------before init weights of LLamaMLP ")
         weights = init_weight_list(weight_specs, self.policy, self.env)
-        see_memory_usage("-----------------------------------------after init weights of LLamaMLP ")
+        # see_memory_usage("-----------------------------------------after init weights of LLamaMLP ")
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):

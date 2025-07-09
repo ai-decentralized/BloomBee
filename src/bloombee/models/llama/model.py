@@ -4,6 +4,7 @@ import hivemind
 import torch
 import torch.nn as nn
 from hivemind.utils.logging import get_logger
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama import LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel, LlamaPreTrainedModel
 
@@ -86,7 +87,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
             prompts = intermediate_prompts = None
 
         hidden_states = inputs_embeds
-        print('model.py llama model inputs_embeds, ', inputs_embeds)
+        # print('model.py llama model inputs_embeds, ', inputs_embeds)  # Temporarily commented for cleaner debug output
         output_shape = input_shape + (hidden_states.size(-1),)
 
         hidden_states = self.layers(
@@ -134,6 +135,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
 class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, LlamaForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedLlamaModel._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedLlamaModel._keys_to_ignore_on_load_unexpected
+    _supports_cache_class = True
 
     config_class = DistributedLlamaConfig
 
@@ -146,6 +148,76 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ) -> dict:
+        """
+        Prepare inputs for generation, handling incremental token generation properly.
+        This method is crucial for correct embedding updates during generation.
+        """
+        print(f"🔧 prepare_inputs_for_generation called:")
+        print(f"   input_ids.shape: {input_ids.shape if input_ids is not None else None}")
+        print(f"   past_key_values type: {type(past_key_values)}")
+        
+        if past_key_values is not None:
+            print(f"   past_key_values._seen_tokens: {past_key_values._seen_tokens}")
+        
+        # Omit tokens covered by past_key_values
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values._seen_tokens
+                max_cache_length = past_key_values.get_max_length()
+                print(f"   Cache case: cache_length={cache_length}, past_length={past_length}")
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2] if hasattr(past_key_values[0][0], 'shape') else 0
+                max_cache_length = None
+                print(f"   Non-Cache case: past_length={past_length}")
+
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+                print(f"   Attention mask case: new input_ids.shape={input_ids.shape}")
+            elif past_length < input_ids.shape[1]:
+                original_shape = input_ids.shape
+                input_ids = input_ids[:, past_length:]
+                print(f"   Past length case: {original_shape} -> {input_ids.shape}, kept tokens: {input_ids}")
+            else:
+                print(f"   No truncation needed: past_length={past_length}, input_ids.shape[1]={input_ids.shape[1]}")
+
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+            print(f"   Using inputs_embeds for first generation step")
+        else:
+            model_inputs = {"input_ids": input_ids}
+            print(f"   Using input_ids: {input_ids}")
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        print(f"   Final model_inputs keys: {list(model_inputs.keys())}")
+        return model_inputs
 
     def get_output_embeddings(self):
         return self.lm_head

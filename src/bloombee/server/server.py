@@ -48,20 +48,20 @@ from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
 from pynvml import *
 
-def see_memory_usage(message, force=True):
-	logger = ''
-	logger += message
-	nvmlInit()
- 
-	# nvidia_smi.nvmlInit()
-	handle = nvmlDeviceGetHandleByIndex(0)
-	info = nvmlDeviceGetMemoryInfo(handle)
-	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-	
-	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-	logger +=   'Max Memory Allocated: ' + str(
-		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-	print(logger)
+# def see_memory_usage(message, force=True):
+# 	logger = ''
+# 	logger += message
+# 	nvmlInit()
+#  
+# 	# nvidia_smi.nvmlInit()
+# 	handle = nvmlDeviceGetHandleByIndex(0)
+# 	info = nvmlDeviceGetMemoryInfo(handle)
+# 	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
+# 	
+# 	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
+# 	logger +=   'Max Memory Allocated: ' + str(
+# 		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
+# 	print(logger)
 
 logger = get_logger(__name__)
 
@@ -275,7 +275,7 @@ class Server:
         self.path = '/tmp/data/llama_weights'
         ##############################################################
         
-        see_memory_usage("-----------------------------------------in server: after policy  ")
+        # see_memory_usage("-----------------------------------------in server: after policy  ")
         
         assert isinstance(throughput, float) or throughput in ["auto", "eval", "dry_run"]
         if throughput in ["auto", "eval", "dry_run"]:
@@ -301,7 +301,7 @@ class Server:
                 sys.exit(0)
         else:
             throughput_info = {"throughput": throughput}
-        see_memory_usage("-----------------------------------------in server: after throughput calculation  ")
+        # see_memory_usage("-----------------------------------------in server: after throughput calculation  ")
         self.server_info = ServerInfo(
             state=ServerState.JOINING,
             public_name=public_name,
@@ -546,7 +546,7 @@ class ModuleContainer(threading.Thread):
         try:
             for module_uid, block_index in zip(module_uids, block_indices):
                 print('blocks uid before load_pretrained_block() ', module_uid )
-                see_memory_usage("-----------------------------------------before petals load pretrained block ")
+                # see_memory_usage("-----------------------------------------before petals load pretrained block ")
                 block = load_pretrained_block(
                     converted_model_name_or_path,
                     block_index,
@@ -561,7 +561,7 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                see_memory_usage("-----------------------------------------after petals load pretrained block ")
+                # see_memory_usage("-----------------------------------------after petals load pretrained block ")
                 # print('block nn.module() before convert_block() ', block )
                 # print('block_config' , block_config)
                 block = convert_block(
@@ -577,7 +577,7 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                see_memory_usage("-----------------------------------------sever: after convert_block  ")
+                # see_memory_usage("-----------------------------------------sever: after convert_block  ")
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
                     block,  ###### block instance
