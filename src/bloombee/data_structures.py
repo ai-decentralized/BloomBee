@@ -1,12 +1,14 @@
 import dataclasses
 from enum import Enum
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import pydantic
 from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
 
-from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
+# 避免循环导入，使用TYPE_CHECKING
+if TYPE_CHECKING:
+    from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
 
 ModuleUID = str
 UID_DELIMITER = "."  # delimits parts of one module uid, e.g. "bloom.transformer.h.4.self_attention"
@@ -108,6 +110,7 @@ class RemoteSpanInfo:
 
 RPCInfo = Dict[str, Any]
 
+# 定义Handle类型
 Handle = int
 
 
@@ -115,16 +118,17 @@ Handle = int
 class InferenceMetadata:
     uid: ExpertUID
     prefix_length: int
-    cache_handles: Tuple[Handle, ...]
+    cache_handles: Tuple["Handle", ...]  # 使用字符串类型注解避免循环导入
     active_adapter: Optional[str]
-    
-    
-@dataclasses.dataclass(frozen=True)
-class KVCache:
-    kvs: Sequence[torch.Tensor]
-    device: KVCacheMetadata
 
+
+@dataclasses.dataclass
+class KVCache:
+    kvs: Sequence["torch.Tensor"]  # 使用字符串类型注解
+    device: "KVCacheMetadata"  # 使用字符串类型注解
+
+
+@dataclasses.dataclass
 class KVCacheMetadata:
-    device: TorchDevice               # 存在哪个设备上
-    offloaded: bool = False             # 是否已 offload 到 CPU
-    # TODO: add more device info
+    device: "TorchDevice"  # 使用字符串类型注解，避免循环导入
+    offloaded: bool = False  # 是否已 offload 到 CPU

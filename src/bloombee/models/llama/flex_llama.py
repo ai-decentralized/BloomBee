@@ -21,13 +21,19 @@ from bloombee.flexgen_utils.utils import (GB, T, ValueHolder,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
 from bloombee.flexgen_utils.task import Task
-from bloombee.flexgen_utils.Policy import Policy
+from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from torch import nn
 from transformers import AutoTokenizer
 from bloombee.flexgen_utils.timer import timers
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from bloombee.utils.memory_usage import see_memory_usage
+
+import logging
+
+# 创建专门的offloading调试logger
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
 
 fix_recursive_import()
 
@@ -355,6 +361,15 @@ class FLEX_LlamaAttention(LlamaAttention):
                                   else self.env.gpu)
         
         self.task = None
+        
+        # 新增：支持KVCacheManager
+        self.cache_manager = None
+        self._init_cache_manager()
+
+    def _init_cache_manager(self):
+        """Initialize cache manager using shared utility"""
+        from bloombee.server.memory_cache_manager import init_cache_manager_shared
+        self.cache_manager = init_cache_manager_shared(self.policy, self.layer_id)
 
     def set_task(self, task):
         self.task = task
@@ -397,6 +412,33 @@ class FLEX_LlamaAttention(LlamaAttention):
             ))
             
     def init_cache_one_gpu_batch(self, cache_home):
+        """
+        初始化一个GPU批次的缓存
+        支持KVCacheManager的统一接口
+        """
+        if self.cache_manager is not None:
+            # 使用KVCacheManager的统一接口
+            try:
+                from bloombee.server.memory_cache import UnifiedCache
+                
+                unified_cache = self.cache_manager.init_cache_one_gpu_batch(
+                    layer_id=self.layer_id,
+                    batch_id=0,  # 这里需要根据实际情况调整batch_id
+                    config=self.config,
+                    task=self.task,
+                    policy=self.policy
+                )
+                
+                # 将UnifiedCache存储到cache_home
+                cache_home.store(unified_cache)
+                offload_logger.info(f"初始化缓存 - 层:{self.layer_id}")
+                offload_logger.info(f"   - 使用KVCacheManager")
+                return
+                
+            except Exception as e:
+                offload_logger.warning(f"⚠️ KVCacheManager init_cache失败，使用原有实现: {e}")
+        
+        # 原有的实现作为fallback
         if self.policy.cache_gpu_percent == 100:
             device = self.env.gpu
         elif self.policy.cache_cpu_percent == 100:
@@ -425,9 +467,44 @@ class FLEX_LlamaAttention(LlamaAttention):
         cache_home.store(cache)
 
     def load_cache(self, cache_home, cache_read_buf, i):
+        """
+        加载缓存
+        支持KVCacheManager的统一接口
+        """
         if i == 0:  # prefill, no cache
             return
 
+        if self.cache_manager is not None:
+            # 使用KVCacheManager的统一接口
+            try:
+                from bloombee.server.memory_cache import UnifiedCache
+                
+                # 确定目标设备
+                target_device = 'cuda:0' if not self.policy.cpu_cache_compute else 'cpu'
+                
+                unified_cache = self.cache_manager.load_cache(
+                    position=i,
+                    layer_id=self.layer_id,
+                    batch_id=0,  # 需要根据实际情况调整
+                    target_device=target_device
+                )
+                
+                if unified_cache and unified_cache.past_key_value:
+                    # 将UnifiedCache转换为cache_read_buf格式
+                    cache_read_buf.store(unified_cache.past_key_value)
+                    offload_logger.info(f"加载缓存 - 层:{self.layer_id}, 位置:{i}")
+                    offload_logger.info(f"   - 使用KVCacheManager成功")
+                else:
+                    # 处理缓存不存在的情况
+                    cache_read_buf.store(None)
+                    offload_logger.info(f" 加载缓存 - 层:{self.layer_id}, 位置:{i}")
+                    offload_logger.info(f"   - 缓存不存在，使用KVCacheManager")
+                return
+                
+            except Exception as e:
+                offload_logger.warning(f"⚠️ KVCacheManager load_cache失败，使用原有实现: {e}")
+
+        # 原有的实现作为fallback
         k_home, v_home = cache_home.val
         
         cache_nan = torch.isnan(k_home.data).any()
@@ -508,6 +585,47 @@ class FLEX_LlamaAttention(LlamaAttention):
             raise ValueError(f"Invalid path: {path}")
 
     def store_cache(self, cache_home, cache_write_buf, i):
+        """
+        存储缓存
+        支持KVCacheManager的统一接口
+        """
+        if self.cache_manager is not None:
+            # 使用KVCacheManager的统一接口
+            try:
+                from bloombee.server.memory_cache import UnifiedCache, DeviceInfo
+                
+                # 从cache_write_buf获取新的缓存数据
+                new_cache_data = cache_write_buf.pop()
+                
+                if new_cache_data is not None:
+                    # 创建UnifiedCache
+                    device_info = DeviceInfo(
+                        device_type='gpu',
+                        device_id='cuda:0',
+                        compression_config=self.policy.comp_cache_config if self.policy.compress_cache else None,
+                        offloaded=False
+                    )
+                    
+                    unified_cache = UnifiedCache(
+                        past_key_value=new_cache_data,
+                        device_info=device_info
+                    )
+                    
+                                    # 使用KVCacheManager存储
+                self.cache_manager.store_cache(
+                    unified_cache=unified_cache,
+                    position=i,
+                    layer_id=self.layer_id,
+                    batch_id=0  # 需要根据实际情况调整
+                )
+                offload_logger.info(f" 存储缓存 - 层:{self.layer_id}, 位置:{i}")
+                offload_logger.info(f"   - 使用KVCacheManager成功")
+                return
+                
+            except Exception as e:
+                offload_logger.warning(f"⚠️ KVCacheManager store_cache失败，使用原有实现: {e}")
+
+        # 原有的实现作为fallback
         # shape: (s, b * num_attention_heads, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
@@ -579,6 +697,13 @@ class FLEX_LlamaAttention(LlamaAttention):
         # num_attention_heads = self.config.num_attention_heads
         num_attention_heads = self.config.num_attention_heads
         
+        # 🔧 添加forward开始调试信息
+        offload_logger.info(f"FLEX_LlamaAttention.forward开始:")
+        offload_logger.info(f"   - layer_id: {self.layer_id}")
+        offload_logger.info(f"   - position: {i}")
+        offload_logger.info(f"   - batch: {k}")
+        offload_logger.info(f"   - cache_manager可用: {self.cache_manager is not None}")
+        offload_logger.info(f"   - 当前设备: {hidden.val.device if hasattr(hidden, 'val') else 'Unknown'}")
 
         donate = [False] * 16
         h, donate[0] = hidden.val, True
@@ -600,9 +725,24 @@ class FLEX_LlamaAttention(LlamaAttention):
             print(f"attention forward, attention_mask: {attention_mask.val}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             print(f"attention forward, mask: {mask.data}")
+            
+            # 🔧 添加prefill调试信息
+            offload_logger.info(f" Prefill阶段:")
+            offload_logger.info(f"   - 使用mha_llama")
+            offload_logger.info(f"   - mask设备: {mask.device}")
+            offload_logger.info(f"   - compute设备: {self.compute}")
+            
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
+            
+            # 🔧 添加prefill结果调试信息
+            offload_logger.info(f"Prefill完成:")
+            offload_logger.info(f"   - new_k_cache形状: {new_k_cache.shape if hasattr(new_k_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - new_v_cache形状: {new_v_cache.shape if hasattr(new_v_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - new_k_cache设备: {new_k_cache.device if hasattr(new_k_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f"   - new_v_cache设备: {new_v_cache.device if hasattr(new_v_cache, 'device') else 'Unknown'}")
+            
             # see_memory_usage("-----------------------------------------after mha_llama ")
         else:
             # decoding
@@ -610,7 +750,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             print(f"attention forward, mask: {mask.data}, ")
             k_cache, v_cache = cache_read_buf.pop()
-            see_memory_usage()
+            see_memory_usage("attention forward")
             if self.attention_compute == self.env.gpu:
                 print(f"attention_compute == gpu")
             elif self.attention_compute == self.env.cpu:
@@ -620,6 +760,17 @@ class FLEX_LlamaAttention(LlamaAttention):
             # k_cache = TorchTensor.create_from_torch(k_tensor, self.attention_compute)
             # v_cache = TorchTensor.create_from_torch(v_tensor, self.attention_compute)
             print(f"k_cache: {k_cache.shape}, self.policy.compress_cache: {self.policy.compress_cache}")
+            
+            # 🔧 添加decoding调试信息
+            offload_logger.info(f" Decoding阶段:")
+            offload_logger.info(f"   - 使用mha_gen_llama")
+            offload_logger.info(f"   - k_cache形状: {k_cache.shape if hasattr(k_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - v_cache形状: {v_cache.shape if hasattr(v_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - k_cache设备: {k_cache.device if hasattr(k_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f"   - v_cache设备: {v_cache.device if hasattr(v_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f"   - attention_compute: {self.attention_compute}")
+            offload_logger.info(f"   - compress_cache: {self.policy.compress_cache}")
+            
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
                 w_k, w_v, w_out, num_attention_heads,
@@ -629,9 +780,23 @@ class FLEX_LlamaAttention(LlamaAttention):
                 rotary_emb_inv_freq)
             print(f"attention forward, hiden state: {h}, new_k_cache: {new_k_cache}, new_v_cache: {new_v_cache}")
             cache_write_buf.store((new_k_cache, new_v_cache))
+            
+            # 🔧 添加decoding结果调试信息
+            offload_logger.info(f" Decoding完成:")
+            offload_logger.info(f"   - new_k_cache形状: {new_k_cache.shape if hasattr(new_k_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - new_v_cache形状: {new_v_cache.shape if hasattr(new_v_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - new_k_cache设备: {new_k_cache.device if hasattr(new_k_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f"   - new_v_cache设备: {new_v_cache.device if hasattr(new_v_cache, 'device') else 'Unknown'}")
+            
             # see_memory_usage("-----------------------------------------after mha_gen_llama ")
         hidden.val = h
         self.temp_hidden_states.val=h
+        
+        # 🔧 添加forward完成调试信息
+        offload_logger.info(f" FLEX_LlamaAttention.forward完成:")
+        offload_logger.info(f"   - 输出hidden_states形状: {h.shape if hasattr(h, 'shape') else 'Unknown'}")
+        offload_logger.info(f"   - 输出hidden_states设备: {h.device if hasattr(h, 'device') else 'Unknown'}")
+        
         return h
 
 class FLEX_LlamaMLP(LlamaMLP):
@@ -828,130 +993,13 @@ class LlamaDecoderLayer(nn.Module):
         if k == 0:
            weight_read_buf.store((read_buf1, read_buf2))
 
-    def init_cache_one_gpu_batch(self, cache_home):
-        self.self_attn.init_cache_one_gpu_batch(cache_home)
-
-    def load_cache(self, cache_home, cache_read_buf, i):
-        self.self_attn.load_cache(cache_home, cache_read_buf, i)
-
-    def store_cache(self, cache_home, cache_write_buf, i):
-        self.self_attn.store_cache(cache_home, cache_write_buf, i)
-
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
-        if k == self.policy.num_gpu_batches - 1:
-            read_buf1, read_buf2 = weight_read_buf.pop()
-        else:
-            read_buf1, read_buf2 = weight_read_buf.val
-        # Self Attention
-        self.self_attn.forward(
-            hidden=hidden,
-            attention_mask=attention_mask,
-            cache_read_buf=cache_read_buf,
-            cache_write_buf=cache_write_buf,
-            weight_read_buf=read_buf1,
-            i=i,
-            k=k
-        )
-        self.mlp.forward(hidden, cache_read_buf=None, cache_write_buf=None, weight_read_buf=read_buf2, i=i, k=k, attention_mask=attention_mask)
-
-class LlamaLM:
-    def __init__(self, config, env: ExecutionEnv, path: str, policy: Policy):
-        if isinstance(config, str):
-            config = get_llama_config(config)
-        self.config = config
-        self.env = env
-        self.path = path
-        self.policy = policy
-        self.num_gpu_batches = policy.num_gpu_batches
-
-        layers = []
-        layers.append(InputEmbed(config=self.config, env=self.env, policy=self.policy))
-        for i in range(self.config.num_hidden_layers):
-            if policy.sep_layer:
-                layers.append(LlamaAttention(config=self.config, env=self.env, policy=self.policy, layer_id=i))
-                layers.append(LlamaMLP(config=self.config, env=self.env, policy=self.policy, layer_id=i))
-            else:
-                layers.append(LlamaDecoderLayer(config=self.config, env=self.env, policy=self.policy, layer_id=i))
-        layers.append(OutputEmbed(config=self.config, env=self.env, policy=self.policy))
-        self.layers = layers
-        self.num_layers = len(layers)
-
-        if self.policy.act_gpu_percent == 100:
-            self.act_home = self.env.gpu
-        elif self.policy.act_cpu_percent == 100:
-            self.act_home = self.env.cpu
-        elif self.policy.act_disk_percent == 100:
-            self.act_home = self.env.disk
-        else:
-            raise NotImplementedError()
-
-        # CUDA streams
-        self.load_weight_stream = torch.cuda.Stream()
-        self.load_cache_stream = torch.cuda.Stream()
-        self.store_cache_stream = torch.cuda.Stream()
-
-        # Intermediate tensors
-        # The following buffers store values used
-        # for the i-th token, j-th layer, k-th gpu batch.
-        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
-
-        # cache[j][k]
-        self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.cache_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        # weight[j]
-        self.weight_read_buf = array_1d(num_layers, ValueHolder)
-        # attention_mask[k]
-        self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
-
-        self.task = None
-
-        # Initialize weights and apply final processing
-        self.init_all_weights()
-
-    def set_task(self, task):
-        self.task = task
-        for l in self.layers:
-            l.set_task(task)
-
-    def init_weight(self, j):
-        expanded_path = os.path.abspath(os.path.expanduser(
-            os.path.join(self.path, f"{self.config.name}-np")))
-        check_path = os.path.join(expanded_path, "embed_tokens.weight")
-        if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
-            download_llama_weights(self.config.name, self.path)
-        self.layers[j].init_weight(self.weight_home[j], expanded_path)
-
-    def load_weight(self, i, j, k, overlap=True):
-        # Handle corner cases
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
-        # Load from weight_home to weight_read_buf
-        if overlap:
-            with torch.cuda.stream(self.load_weight_stream):
-                self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
-        else:
-            self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
-
-    def delete_weight(self, j, k):
-        if k == 0:
-            for x in self.weight_home[j].pop():
-                if isinstance(x, ValueHolder):
-                    for y in x.pop():
-                        y.delete()
-                else:
-                    x.delete()
-
     def init_cache(self, j, k):
         self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
 
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
         if i == 0:  # prefill, no cache
+            offload_logger.info(f" Prefill阶段，跳过load_cache - 位置:{i}, 层:{j}, 批次:{k}")
             return
         if k == self.num_gpu_batches:
             k = 0
@@ -963,6 +1011,7 @@ class LlamaLM:
                 return
 
         # Load from cache_home to cache_read_buf
+        offload_logger.info(f"LlamaDecoderLayer.load_cache - 位置:{i}, 层:{j}, 批次:{k}")
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
                 self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
@@ -980,11 +1029,13 @@ class LlamaLM:
             if i == -1:
                 return
         if i == self.task.gen_len - 1:  # last token, no need to store cache
+            offload_logger.info(f"最后一个token，跳过store_cache - 位置:{i}, 层:{j}, 批次:{k}")
             self.cache_write_buf[j][k].pop()
             return
 
         # Store cache_write_buf to cache_home
         # Delete cache_write_buf
+        offload_logger.info(f" LlamaDecoderLayer.store_cache - 位置:{i}, 层:{j}, 批次:{k}")
         if overlap:
             with torch.cuda.stream(self.store_cache_stream):
                 self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
@@ -1058,9 +1109,19 @@ class LlamaLM:
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
+        
+
+        if i > 0:  # 只在decoding阶段调用load_cache
+            offload_logger.info(f" 调用load_cache - 位置:{i}, 层:{j}, 批次:{k}")
+            self.load_cache(i, j, k, overlap=False)
+        
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
                                self.weight_read_buf[j], self.attention_mask[k],
                                self.cache_write_buf[j][k], i, k)
+        
+
+        offload_logger.info(f" 调用store_cache - 位置:{i}, 层:{j}, 批次:{k}")
+        self.store_cache(i, j, k, overlap=False)
 
     def sync(self):
         self.env.disk.synchronize()

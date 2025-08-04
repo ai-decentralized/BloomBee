@@ -20,7 +20,8 @@ from bloombee.flexgen_utils.utils import (GB, T, cpu_mem_stats, vector_gather, t
     torch_dtype_to_num_bytes)
 from torch import nn
 from transformers.activations import ACT2FN
-from bloombee.utils.memory_usage import see_memory_usage
+# 移除循环导入，直接定义see_memory_usage函数
+# from bloombee.utils.memory_usage import see_memory_usage
 
 
 general_copy_compressed = TorchCompressedDevice = None

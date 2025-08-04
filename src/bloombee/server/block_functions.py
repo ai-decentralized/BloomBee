@@ -38,6 +38,11 @@ MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
 logger = get_logger(__name__)
 
+# 创建专门的offloading调试logger
+import logging
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
+
 
 async def run_rpc_forward(
     *flat_tensors: torch.Tensor,
@@ -230,8 +235,25 @@ async def iterate_rpc_inference(
             start_compute_time = perf_counter()
             print('before merge pools ')
             #print_time_now('')
+            
+            # 添加offloading调试信息
+            offload_logger.info(f" 推理计算开始 - 步骤{prefix_length}")
+            offload_logger.info(f"   - 批次大小: {batch_size}")
+            offload_logger.info(f"   - 长度增量: {length_increment}")
+            offload_logger.info(f"   - 前缀长度: {prefix_length}")
+            offload_logger.info(f"   - 最大长度: {max_length}")
+            
+            # 检查缓存使用情况
+            for i, (backend, handles) in enumerate(zip(requested_backends, cache_handles)):
+                cache_manager = backend.cache_manager
+                offload_logger.info(f"   - 后端{i}: {len(handles)}个缓存句柄")
+                offload_logger.info(f"     GPU缓存比例: {cache_manager.policy.cache_gpu_percent}%")
+                offload_logger.info(f"     CPU缓存比例: {cache_manager.policy.cache_cpu_percent}%")
+                offload_logger.info(f"     CPU缓存计算: {cache_manager.policy.cpu_cache_compute}")
+            
             if can_merge_pools:
                 print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
+                offload_logger.info(" 使用合并池进行推理")
                 
                 inference_infos = tuple(
                     InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
@@ -243,11 +265,18 @@ async def iterate_rpc_inference(
                 
             else:
                 print('-=-=-=-=-=-=-=-==-=- not come into can merge pools : ', can_merge_pools)
+                offload_logger.info(" 使用单独池进行推理")
+                
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
+                    offload_logger.info(f"   - 处理后端: {uid}")
+                    offload_logger.info(f"     - 缓存句柄: {len(handles)}个")
+                    
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
+            
+            offload_logger.info(f" 推理计算完成 - 步骤{prefix_length}")
             # end_compute_time = perf_counter()
             # print('the inference computing time ', end_compute_time - start_compute_time)
             # print_time_now('')

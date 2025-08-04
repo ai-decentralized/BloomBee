@@ -330,6 +330,10 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         self._cached_task = None
         self._is_initialized = False
         
+        # 🔧 添加KVCacheManager支持
+        self.cache_manager = None
+        self._init_cache_manager()
+        
         # print('before init_all_weights OptimizedLlamaDecoderLayer self.config', self.config)
         # see_memory_usage("-----------------------------------------before init_all_weights ")
         # Initialize weights and apply final processing
@@ -338,6 +342,11 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # see_memory_usage("-----------------------------------------after init_all_weights ")
         
         self.temp_hidden = ValueHolder() ######
+        
+    def _init_cache_manager(self):
+        """Initialize cache manager using shared utility"""
+        from bloombee.server.memory_cache_manager import init_cache_manager_shared
+        self.cache_manager = init_cache_manager_shared(self.policy, self.layer_id)
         
     def set_task(self, task):
         self.task = task
@@ -968,13 +977,39 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             past_key_values_length=past_key_values_length,
         )
         
+        #  添加缓存管理调用
+        import logging
+        offload_logger = logging.getLogger('bloombee.offloading')
+        
+        # 获取当前位置信息
+        current_position = position_ids[0][0].item() if position_ids is not None else 0
+        layer_id = getattr(self, 'layer_id', 0)
+        
+        offload_logger.info(f" 位置信息 - current_position:{current_position}, layer_id:{layer_id}")
+        if position_ids is not None:
+            offload_logger.info(f"   - position_ids形状: {position_ids.shape}")
+            offload_logger.info(f"   - position_ids内容: {position_ids}")
+        
+        # 调用load_cache（如果有缓存管理器）
+        if hasattr(self, 'cache_manager') and self.cache_manager is not None and current_position > 0:
+            offload_logger.info(f" WrappedLlamaBlock.load_cache - 位置:{current_position}, 层:{layer_id}")
+            try:
+                # 实际调用KVCacheManager的load_cache
+                result = self.cache_manager.load_cache(current_position, layer_id, 0)  # k=0 for single batch
+                if result is not None:
+                    offload_logger.info(f" 成功加载缓存 - 位置:{current_position}, 层:{layer_id}")
+                else:
+                    offload_logger.warning(f"⚠️ 缓存不存在 - 位置:{current_position}, 层:{layer_id}")
+            except Exception as e:
+                offload_logger.warning(f"⚠️ KVCacheManager load_cache失败: {e}")
+        
         # print(f"WrappedLlamaBlock, attention_mask: {attention_mask}")
 
         outputs = super().forward( ############
             hidden_states,
             *args,
             attention_mask=attention_mask,
-            position_ids=position_ids,  # 🔧 Pass position_ids to the parent forward method
+            position_ids=position_ids,  #  Pass position_ids to the parent forward method
             past_key_value=past_key_value,
             use_cache=use_cache,
             **kwargs,
@@ -983,6 +1018,36 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         print('block.py WrappedLlamaBlock forward : outputs ', hidden_states)
         print(f"WrappedLlamaBlock.forward, past_key_value: {past_key_value}")
         print('use_cache', use_cache)
+        
+        # 添加缓存管理调用
+        if hasattr(self, 'cache_manager') and self.cache_manager is not None:
+            offload_logger.info(f"WrappedLlamaBlock.store_cache - 位置:{current_position}, 层:{layer_id}")
+            try:
+                # 创建UnifiedCache对象
+                from bloombee.server.memory_cache import UnifiedCache, DeviceInfo
+                
+                # 从past_key_value创建UnifiedCache
+                if past_key_value is not None:
+                    device_info = DeviceInfo(
+                        device_type='gpu',
+                        device_id=str(hidden_states.device),
+                        compression_config=None,
+                        offloaded=False
+                    )
+                    
+                    unified_cache = UnifiedCache(
+                        past_key_value=past_key_value,
+                        device_info=device_info
+                    )
+                    
+                    # 实际调用KVCacheManager的store_cache
+                    self.cache_manager.store_cache(unified_cache, current_position, layer_id, 0)  # k=0 for single batch
+                    offload_logger.info(f"成功存储缓存 - 位置:{current_position}, 层:{layer_id}")
+                else:
+                    offload_logger.warning(f"⚠️ past_key_value为空，跳过store_cache")
+            except Exception as e:
+                offload_logger.warning(f"⚠️ KVCacheManager store_cache失败: {e}")
+        
         # use_cache
         # if use_cache:
         #     present_key_value = outputs[-1]

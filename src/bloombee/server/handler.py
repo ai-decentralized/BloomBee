@@ -40,6 +40,11 @@ from bloombee.utils.convert_block import QuantType
 
 logger = get_logger(__name__)
 
+# 创建专门的offloading调试logger
+import logging
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
+
 from datetime import datetime, timezone  
 # def print_time_now(s):
 #     # Get the current time in UTC  
@@ -147,6 +152,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         context: P2PContext,
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
         """Compute a single step of inference using attention cache; update attention cache accordingly."""
+        offload_logger.info("🚀 开始推理请求 - rpc_inference")
         print('come into rpc_inference ..........')
         # print_time_now('')
         async with timeout(self.session_timeout):
@@ -192,16 +198,24 @@ class TransformerConnectionHandler(ConnectionHandler):
                 # print_time_now('')
                 
                 push_time = []
+                offload_logger.info(f" 推理参数:")
+                offload_logger.info(f"   - 批次大小: {batch_size}")
+                offload_logger.info(f"   - 最大长度: {max_length}")
+                offload_logger.info(f"   - 分配超时: {alloc_timeout}")
+                offload_logger.info(f"   - 请求的UIDs: {requested_uids}")
+                
                 async with self._allocate_cache(
                     requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
                 ) as cache_handles:
                     end_cache_time = perf_counter()
+                    offload_logger.info(f" 缓存分配完成 - 时间: {end_cache_time- end_batch_size_time:.3f}s")
                     print('cache allocate time ', end_cache_time- end_batch_size_time)
                     
                     background_tasks = set()
                     step_=0
                     print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
+                    offload_logger.info(" 开始推理迭代")
                     async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
                         requested_uids=requested_uids,
                         requested_backends=requested_backends,
@@ -216,6 +230,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         quant_type=self.quant_type,
                         args_structure=args_structure,
                     ):
+                        offload_logger.info(f" 推理步骤 {step_}: can_push={can_push}")
                         print('=================================================   server rpc_inference step ',step_) ###
                         # print_time_now('')
                         step_+=1 ###
@@ -624,8 +639,27 @@ class TransformerConnectionHandler(ConnectionHandler):
         Allocate memory cache for all transformer blocks, return cache handle
         :returns: a list of {len(backends)} elements, where i-th element is a tuple of cache handles for i-th backend
         """
+        offload_logger.info(f" 分配缓存:")
+        offload_logger.info(f"   - 后端数量: {len(backends)}")
+        offload_logger.info(f"   - 批次大小: {batch_size}")
+        offload_logger.info(f"   - 最大长度: {max_length}")
+        offload_logger.info(f"   - 超时时间: {timeout}")
+        
+        # 使用KVCacheManager的offloading策略
+        cache_manager = backends[0].cache_manager
+        
+        offload_logger.info(f" 使用offloading策略:")
+        offload_logger.info(f"   - GPU缓存比例: {cache_manager.policy.cache_gpu_percent}%")
+        offload_logger.info(f"   - CPU缓存比例: {cache_manager.policy.cache_cpu_percent}%")
+        offload_logger.info(f"   - CPU缓存计算: {cache_manager.policy.cpu_cache_compute}")
+        
+        # 使用原有的缓存分配方式，但添加offloading调试信息
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
-        async with backends[0].memory_cache.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
+        offload_logger.info(f"   - 描述符数量: {len(descriptors)}")
+        
+        async with backends[0].cache_manager.cache.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
+            offload_logger.info(f" 缓存分配完成 - 句柄数量: {len(handles)}")
+            offload_logger.info(f"   - 缓存句柄: {handles}")
             yield nested_pack(handles, descriptors)
 
     def _log_request(
@@ -661,7 +695,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         result = {
             "version": bloombee.__version__,
             "dht_client_mode": self.dht.client_mode,
-            CACHE_TOKENS_AVAILABLE: backend.memory_cache.bytes_left // max(backend.cache_bytes_per_token.values()),
+            CACHE_TOKENS_AVAILABLE: backend.cache_manager.bytes_left() // max(backend.cache_bytes_per_token.values()),
         }
 
         if request.uid:

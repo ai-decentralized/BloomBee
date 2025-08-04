@@ -48,6 +48,11 @@ from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
 from pynvml import *
 
+# 创建专门的offloading调试logger
+import logging
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
+
 # def see_memory_usage(message, force=True):
 # 	logger = ''
 # 	logger += message
@@ -259,7 +264,7 @@ class Server:
         self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
         self.policy = Policy(1, 1,       #  gpu_batch_size: int, num_gpu_batches: int
                     100, 0,              # w_gpu_percent: float, w_cpu_percent: float
-                    0, 100,             # cache_gpu_percent: float, cache_cpu_percent: float
+                    50, 50,             # cache_gpu_percent: float, cache_cpu_percent: float (修改为50% GPU, 50% CPU)
                     0, 100,             # act_gpu_percent: float, act_cpu_percent: float
                     overlap=False, sep_layer=True, pin_weight=True,
                     cpu_cache_compute=False, attn_sparsity=1.0,
@@ -523,7 +528,21 @@ class ModuleContainer(threading.Thread):
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
         print('module_uids ', module_uids)
-        cache_manager = KVCacheManager(cache_size, max_alloc_timeout, self.policy)
+        
+        # 创建KVCacheManager并添加调试输出
+        offload_logger.info(" 服务器启动 - 创建KVCacheManager")
+        offload_logger.info(f" 缓存配置:")
+        offload_logger.info(f"   - 缓存大小: {attn_cache_bytes / (1024*1024*1024):.1f} GB")
+        offload_logger.info(f"   - 超时时间: {max_alloc_timeout} 秒")
+        offload_logger.info(f"   - Policy: {policy}")
+        offload_logger.info(f"   - GPU缓存: {policy.cache_gpu_percent}%")
+        offload_logger.info(f"   - CPU缓存: {policy.cache_cpu_percent}% (offloading)")
+        offload_logger.info(f"   - Disk缓存: {policy.cache_disk_percent}%")
+        offload_logger.info(f"   - 重叠计算: {policy.overlap}")
+        offload_logger.info(f"   - CPU缓存计算: {policy.cpu_cache_compute}")
+        
+        cache_manager = KVCacheManager(attn_cache_bytes, max_alloc_timeout, policy)
+        offload_logger.info(" KVCacheManager创建完成")
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(
@@ -666,7 +685,6 @@ class ModuleContainer(threading.Thread):
         ]
 
         self.runtime = RuntimeWithDeduplicatedPools(self.module_backends, device=None, **kwargs)
-        # note: We set device=None in runtime to avoid moving all modules to device 0 in runtime.run(). tensor_parallel has already moved it as needed.
 
         dht_announcer.announce(ServerState.ONLINE)
         self.dht_announcer = dht_announcer
