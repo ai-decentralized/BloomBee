@@ -1,8 +1,10 @@
 import dataclasses
+import time
 from enum import Enum
 from typing import Any, Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import pydantic
+import torch
 from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
 
@@ -132,3 +134,37 @@ class KVCache:
 class KVCacheMetadata:
     device: "TorchDevice"  # 使用字符串类型注解，避免循环导入
     offloaded: bool = False  # 是否已 offload 到 CPU
+
+
+@dataclasses.dataclass
+class DeviceInfo:
+    """设备信息，用于offloading管理"""
+    device_type: str  # 'gpu', 'cpu', 'disk', 'mixed'
+    device_id: Optional[str] = None  # 'cuda:0', 'cpu', '/tmp/disk'
+    compression_config: Optional[Any] = None
+    offloaded: bool = False
+    sync_stream: Optional[Any] = None  # 用于异步同步的CUDA stream
+    
+    def __str__(self):
+        return f"DeviceInfo(type={self.device_type}, id={self.device_id}, offloaded={self.offloaded})"
+
+
+@dataclasses.dataclass
+class UnifiedCache:
+    """统一的缓存接口，包含past_key_value和设备信息"""
+    past_key_value: Optional[Tuple[torch.Tensor, ...]]  # 模型需要的缓存数据
+    device_info: DeviceInfo  # offloading设备信息
+    cache_handles: Optional[Sequence[Handle]] = None  # MemoryCache的句柄
+    metadata: Optional[Dict[str, Any]] = None  # 元数据
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {
+                'layer_id': 0,
+                'batch_id': 0,
+                'position': 0,
+                'created_time': time.time()
+            }
+    
+    def __str__(self):
+        return f"UnifiedCache(past_key_value={self.past_key_value is not None}, device_info={self.device_info})"

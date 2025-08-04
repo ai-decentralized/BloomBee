@@ -369,6 +369,18 @@ class FLEX_LlamaAttention(LlamaAttention):
     def _init_cache_manager(self):
         """Initialize cache manager using shared utility"""
         from bloombee.server.memory_cache_manager import init_cache_manager_shared
+        from bloombee.server.cache_coordinator import get_cache_interface, create_device_info_from_policy
+        
+        # 使用缓存协调器而不是直接持有cache_manager
+        self.cache_interface = get_cache_interface()
+        if self.cache_interface is not None:
+            # 注册当前层到协调器
+            self.cache_interface.register_layer(self.layer_id, {
+                'layer_type': 'llama_attention',
+                'policy': self.policy
+            })
+        
+        # 保留原有的cache_manager用于向后兼容
         self.cache_manager = init_cache_manager_shared(self.policy, self.layer_id)
 
     def set_task(self, task):
@@ -469,13 +481,41 @@ class FLEX_LlamaAttention(LlamaAttention):
     def load_cache(self, cache_home, cache_read_buf, i):
         """
         加载缓存
-        支持KVCacheManager的统一接口
+        支持缓存协调器的统一接口
         """
         if i == 0:  # prefill, no cache
             return
 
+        # 使用缓存协调器加载缓存
+        if hasattr(self, 'cache_interface') and self.cache_interface is not None:
+            try:
+                # 确定目标设备
+                target_device = 'cuda:0' if not self.policy.cpu_cache_compute else 'cpu'
+                
+                unified_cache = self.cache_interface.load_cache(
+                    layer_id=self.layer_id,
+                    position=i,
+                    target_device=target_device,
+                    batch_id=0
+                )
+                
+                if unified_cache and unified_cache.past_key_value:
+                    # 将UnifiedCache转换为cache_read_buf格式
+                    cache_read_buf.store(unified_cache.past_key_value)
+                    offload_logger.info(f"加载缓存 - 层:{self.layer_id}, 位置:{i}")
+                    offload_logger.info(f"   - 使用缓存协调器成功")
+                else:
+                    # 处理缓存不存在的情况
+                    cache_read_buf.store(None)
+                    offload_logger.info(f" 加载缓存 - 层:{self.layer_id}, 位置:{i}")
+                    offload_logger.info(f"   - 缓存不存在，使用缓存协调器")
+                return
+                
+            except Exception as e:
+                offload_logger.warning(f"⚠️ 缓存协调器load_cache失败，使用原有实现: {e}")
+        
+        # 向后兼容：使用原有的cache_manager
         if self.cache_manager is not None:
-            # 使用KVCacheManager的统一接口
             try:
                 from bloombee.server.memory_cache import UnifiedCache
                 
@@ -492,12 +532,12 @@ class FLEX_LlamaAttention(LlamaAttention):
                 if unified_cache and unified_cache.past_key_value:
                     # 将UnifiedCache转换为cache_read_buf格式
                     cache_read_buf.store(unified_cache.past_key_value)
-                    offload_logger.info(f"加载缓存 - 层:{self.layer_id}, 位置:{i}")
+                    offload_logger.info(f"加载缓存 (fallback) - 层:{self.layer_id}, 位置:{i}")
                     offload_logger.info(f"   - 使用KVCacheManager成功")
                 else:
                     # 处理缓存不存在的情况
                     cache_read_buf.store(None)
-                    offload_logger.info(f" 加载缓存 - 层:{self.layer_id}, 位置:{i}")
+                    offload_logger.info(f" 加载缓存 (fallback) - 层:{self.layer_id}, 位置:{i}")
                     offload_logger.info(f"   - 缓存不存在，使用KVCacheManager")
                 return
                 
@@ -587,10 +627,39 @@ class FLEX_LlamaAttention(LlamaAttention):
     def store_cache(self, cache_home, cache_write_buf, i):
         """
         存储缓存
-        支持KVCacheManager的统一接口
+        支持缓存协调器的统一接口
         """
+        # 使用缓存协调器存储缓存
+        if hasattr(self, 'cache_interface') and self.cache_interface is not None:
+            try:
+                # 从cache_write_buf获取新的缓存数据
+                new_cache_data = cache_write_buf.pop()
+                
+                if new_cache_data is not None:
+                    # 通过协调器存储缓存
+                    handle = self.cache_interface.store_cache(
+                        layer_id=self.layer_id,
+                        position=i,
+                        past_key_value=new_cache_data,
+                        device=torch.device('cuda:0'),
+                        batch_id=0
+                    )
+                    
+                    if handle is not None:
+                        offload_logger.info(f" 存储缓存 - 层:{self.layer_id}, 位置:{i}, 句柄:{handle}")
+                        offload_logger.info(f"   - 使用缓存协调器成功")
+                    else:
+                        offload_logger.warning(f"⚠️ 存储缓存失败 - 层:{self.layer_id}, 位置:{i}")
+                    return
+                else:
+                    offload_logger.warning(f"⚠️ new_cache_data为空，跳过存储")
+                    return
+                    
+            except Exception as e:
+                offload_logger.warning(f"⚠️ 缓存协调器store_cache失败，使用原有实现: {e}")
+        
+        # 向后兼容：使用原有的cache_manager
         if self.cache_manager is not None:
-            # 使用KVCacheManager的统一接口
             try:
                 from bloombee.server.memory_cache import UnifiedCache, DeviceInfo
                 
@@ -599,11 +668,11 @@ class FLEX_LlamaAttention(LlamaAttention):
                 
                 if new_cache_data is not None:
                     # 创建UnifiedCache
-                    device_info = DeviceInfo(
-                        device_type='gpu',
-                        device_id='cuda:0',
-                        compression_config=self.policy.comp_cache_config if self.policy.compress_cache else None,
-                        offloaded=False
+                    # 使用统一的设备分配工具函数
+                    device_info = create_device_info_from_policy(
+                        self.policy if hasattr(self, 'policy') else None,
+                        'cuda:0',
+                        self.policy.comp_cache_config if hasattr(self, 'policy') and self.policy.compress_cache else None
                     )
                     
                     unified_cache = UnifiedCache(
@@ -611,17 +680,17 @@ class FLEX_LlamaAttention(LlamaAttention):
                         device_info=device_info
                     )
                     
-                                    # 使用KVCacheManager存储
-                self.cache_manager.store_cache(
-                    unified_cache=unified_cache,
-                    position=i,
-                    layer_id=self.layer_id,
-                    batch_id=0  # 需要根据实际情况调整
-                )
-                offload_logger.info(f" 存储缓存 - 层:{self.layer_id}, 位置:{i}")
-                offload_logger.info(f"   - 使用KVCacheManager成功")
-                return
-                
+                    # 使用KVCacheManager存储
+                    self.cache_manager.store_cache(
+                        unified_cache=unified_cache,
+                        position=i,
+                        layer_id=self.layer_id,
+                        batch_id=0  # 需要根据实际情况调整
+                    )
+                    offload_logger.info(f" 存储缓存 (fallback) - 层:{self.layer_id}, 位置:{i}, 设备:{device_info.device_type} ({device_info.device_id})")
+                    offload_logger.info(f"   - 使用KVCacheManager成功")
+                    return
+                    
             except Exception as e:
                 offload_logger.warning(f"⚠️ KVCacheManager store_cache失败，使用原有实现: {e}")
 

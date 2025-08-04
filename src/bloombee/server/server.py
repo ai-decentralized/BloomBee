@@ -30,6 +30,7 @@ from bloombee.server.block_utils import get_block_size, resolve_block_dtype
 from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.server.memory_cache_manager import KVCacheManager
+from bloombee.server.cache_coordinator import set_cache_coordinator
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
 from bloombee.utils.auto_config import AutoDistributedConfig
@@ -264,7 +265,7 @@ class Server:
         self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
         self.policy = Policy(1, 1,       #  gpu_batch_size: int, num_gpu_batches: int
                     100, 0,              # w_gpu_percent: float, w_cpu_percent: float
-                    50, 50,             # cache_gpu_percent: float, cache_cpu_percent: float (修改为50% GPU, 50% CPU)
+                    0, 100,             # cache_gpu_percent: float, cache_cpu_percent: float (修改为50% GPU, 50% CPU)
                     0, 100,             # act_gpu_percent: float, act_cpu_percent: float
                     overlap=False, sep_layer=True, pin_weight=True,
                     cpu_cache_compute=False, attn_sparsity=1.0,
@@ -543,6 +544,10 @@ class ModuleContainer(threading.Thread):
         
         cache_manager = KVCacheManager(attn_cache_bytes, max_alloc_timeout, policy)
         offload_logger.info(" KVCacheManager创建完成")
+        
+        # 初始化全局缓存协调器
+        set_cache_coordinator(cache_manager)
+        offload_logger.info(" 全局缓存协调器初始化完成")
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(

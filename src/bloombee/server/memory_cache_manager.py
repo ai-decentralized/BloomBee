@@ -10,10 +10,11 @@ import time
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
+import os # Added for os.getpid()
 
-from bloombee.data_structures import KVCache, KVCacheMetadata, Handle
+from bloombee.data_structures import KVCache, KVCacheMetadata, Handle, UnifiedCache, DeviceInfo
 from bloombee.flexgen_utils.policy import Policy
-from bloombee.server.memory_cache import MemoryCache, UnifiedCache, DeviceInfo
+from bloombee.server.memory_cache import MemoryCache
 
 # Create dedicated offloading debug logger
 offload_logger = logging.getLogger('bloombee.offloading')
@@ -164,37 +165,37 @@ class KVCacheManager:
     def load_cache(self, position: int, layer_id: int, batch_id: int, 
                   target_device: str = 'cuda:0') -> Optional[UnifiedCache]:
         """
-        Load cache from storage
-        Supports position mapping/fallback mechanism
+        Load cache from memory
+        Supports position mapping fallback for missing positions
         """
-        # First try to load from requested position
+        offload_logger.info(f"Loading cache - position:{position}, layer:{layer_id}, batch:{batch_id}")
+        
+        # Try to get handle for exact position
         handle = self._get_cache_handle(position, layer_id, batch_id)
         
-        # If not found, try position mapping (cache usually stored at position 0 during inference)
+        # If exact position not found, try position mapping fallback
         if handle is None:
             offload_logger.info(f"Position {position} not found, attempting position mapping...")
             
-            # Try to find the latest available position
-            if position > 0:
-                # Find all available positions for this layer and batch
-                available_positions = []
-                if (layer_id in self.cache_hierarchy and 
-                    batch_id in self.cache_hierarchy[layer_id]):
-                    available_positions = list(self.cache_hierarchy[layer_id][batch_id].keys())
+            # Use position tracker for more accurate fallback
+            if hasattr(self, '_position_tracker') and layer_id in self._position_tracker:
+                available_positions = list(self._position_tracker[layer_id].keys())
+                offload_logger.info(f"Available positions from tracker: {available_positions}")
                 
                 if available_positions:
-                    # Select the latest available position
-                    available_positions.sort()
-                    fallback_position = available_positions[-1]  # Select largest position (latest)
+                    # Find the closest available position
+                    fallback_position = max(available_positions)
                     offload_logger.info(f"Trying to load from position {fallback_position} (available positions: {available_positions})")
-                    handle = self._get_cache_handle(fallback_position, layer_id, batch_id)
                     
+                    handle = self._get_cache_handle(fallback_position, layer_id, batch_id)
                     if handle is not None:
                         offload_logger.info(f"Position mapping successful: {position} -> {fallback_position}")
                     else:
                         offload_logger.info(f"Position {fallback_position} also not found")
                 else:
                     offload_logger.info("No available cache positions")
+            else:
+                offload_logger.info("No position tracker available")
         
         if handle is None:
             offload_logger.warning(f"Cache handle not found - position:{position}, layer:{layer_id}, batch:{batch_id}")
@@ -203,17 +204,24 @@ class KVCacheManager:
         
         # Get UnifiedCache from MemoryCache using new storage key format
         storage_key = f"layer_{layer_id}_handle_{handle}"
-        unified_cache = self.cache._unified_caches.get(storage_key)
+        # 使用 get_unified_cache 方法而不是直接访问字典
+        unified_cache = self.cache.get_unified_cache(handle)
+        if unified_cache is None:
+            # 如果 get_unified_cache 返回 None，尝试直接访问字典（向后兼容）
+            unified_cache = self.cache._unified_caches.get(storage_key)
         if unified_cache is None:
             offload_logger.warning(f"UnifiedCache not found - storage key:{storage_key}")
             offload_logger.warning(f"Available storage keys: {list(self.cache._unified_caches.keys())}")
             return None
         
         # Sync device if needed
+        offload_logger.info(f"检查设备同步 - 当前设备: {unified_cache.device_info.device_id}, 目标设备: {target_device}")
         if unified_cache.device_info.device_id != target_device:
             offload_logger.info(f"Syncing cache from {unified_cache.device_info.device_id} to {target_device}")
             unified_cache = self.cache.sync_device_cache(unified_cache, target_device)
             self.stats['device_transfers'] += 1
+        else:
+            offload_logger.info(f"设备相同，跳过同步")
         
         # Update statistics
         cache_size = self._calculate_cache_size(unified_cache)
@@ -236,19 +244,24 @@ class KVCacheManager:
             offload_logger.warning("Cannot store cache with None past_key_value")
             return -1
         
-        # Generate global unique handle using class-level counter combined with layer_id
-        if not hasattr(KVCacheManager, '_global_handle_counter'):
-            KVCacheManager._global_handle_counter = 0
+        # Generate consistent handle using layer_id and position
+        handle = layer_id * 1000 + position  # Consistent format: layer_id * 1000 + position
         
-        base_handle = KVCacheManager._global_handle_counter
-        handle = base_handle * 1000 + layer_id  # Reserve 1000 handles per layer
-        KVCacheManager._global_handle_counter += 1
-        
-        offload_logger.info(f"Generated global handle: {handle} (base handle: {base_handle}, layer ID: {layer_id}, global counter: {KVCacheManager._global_handle_counter})")
+        offload_logger.info(f"Generated handle: {handle} (layer_id: {layer_id}, position: {position})")
         
         # Store UnifiedCache directly in MemoryCache using new storage key format
         storage_key = f"layer_{layer_id}_handle_{handle}"
         self.cache._unified_caches[storage_key] = unified_cache
+        offload_logger.info(f"存储缓存 - storage_key: {storage_key}, handle: {handle}")
+        offload_logger.info(f"当前 _unified_caches 键: {list(self.cache._unified_caches.keys())}")
+        # 添加store_unified_cache风格的调试信息
+        offload_logger.info(f"store_cache详细调试:")
+        offload_logger.info(f"   - 句柄: {handle}")
+        offload_logger.info(f"   - 设备: {unified_cache.device_info.device_id}")
+        offload_logger.info(f"   - 当前_unified_caches大小: {len(self.cache._unified_caches)}")
+        offload_logger.info(f"   - 是否覆盖现有句柄: {storage_key in self.cache._unified_caches}")
+        offload_logger.info(f"   - 进程ID: {os.getpid()}")
+        offload_logger.info(f"   - 运行时PID: {os.getpid()}")
         
         # Update hierarchy structure - use new handle format
         if layer_id not in self.cache_hierarchy:
@@ -258,6 +271,16 @@ class KVCacheManager:
         
         # Store handle - use new handle format
         self.cache_hierarchy[layer_id][batch_id][position] = handle
+        
+        # Track position state for debugging
+        if not hasattr(self, '_position_tracker'):
+            self._position_tracker = {}
+        if layer_id not in self._position_tracker:
+            self._position_tracker[layer_id] = {}
+        self._position_tracker[layer_id][position] = handle
+        
+        offload_logger.info(f"Stored cache at position {position} for layer {layer_id} with handle {handle}")
+        offload_logger.info(f"Available positions for layer {layer_id}: {list(self._position_tracker[layer_id].keys())}")
         
         # Update statistics
         cache_size = self._calculate_cache_size(unified_cache)
@@ -275,12 +298,14 @@ class KVCacheManager:
 
     def add_cache(self, kvs: KVCache, start_position: int, layer_id: int = 0, batch_id: int = 0):
         """Add new cache data"""
-        # Convert KVCache to UnifiedCache
-        device_info = DeviceInfo(
-            device_type='gpu',
-            device_id='cuda:0',
-            compression_config=self.policy.comp_cache_config if self.policy.compress_cache else None,
-            offloaded=False
+        # 在函数内部导入，避免循环导入
+        from bloombee.server.cache_coordinator import create_device_info_from_policy
+        
+        # 使用统一的设备分配工具函数
+        device_info = create_device_info_from_policy(
+            self.policy,
+            'cuda:0',
+            self.policy.comp_cache_config if self.policy.compress_cache else None
         )
         
         unified_cache = UnifiedCache(
@@ -290,7 +315,7 @@ class KVCacheManager:
         
         # Store using existing method
         handle = self.store_cache(unified_cache, start_position, layer_id, batch_id)
-        offload_logger.info(f"Added cache with handle {handle}")
+        offload_logger.info(f"Added cache with handle {handle} - device: {device_info.device_type} ({device_info.device_id})")
 
     def update_cache(self, new_kvs: KVCache, start_position: int, layer_id: int = 0, batch_id: int = 0):
         """Update existing cache data"""
@@ -339,7 +364,7 @@ class KVCacheManager:
             if handle:
                 selected_handles.append(handle)
         
-        logger.info(f"Selected {len(selected_handles)} cache handles for {len(kv_cache_position_ids)} positions at layer={layer_id}, batch={batch_id}")
+        offload_logger.info(f"Selected {len(selected_handles)} cache handles for {len(kv_cache_position_ids)} positions at layer={layer_id}, batch={batch_id}")
         return selected_handles
 
     @contextlib.contextmanager
