@@ -841,7 +841,9 @@ class FLEX_LlamaAttention(LlamaAttention):
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             print(f"attention forward, mask: {mask.data}, ")
             k_cache, v_cache = cache_read_buf.pop()
-            see_memory_usage("attention forward")
+            # Optional memory logging
+            # see_memory_usage("attention forward (decoding) before mha_gen_llama")
+
             if self.attention_compute == self.env.gpu:
                 print(f"attention_compute == gpu")
             elif self.attention_compute == self.env.cpu:

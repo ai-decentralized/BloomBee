@@ -727,7 +727,7 @@ class TorchDevice:
         
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
-                if compress_cache:
+                if compress_cache and k_cache.device.device_type == DeviceType.COMPRESSED:
                     # shape: (s, b * n_head, head_dim)
                     k = k_cache.device.decompress(k_cache)[:src_s]
                     v = v_cache.device.decompress(v_cache)[:src_s]

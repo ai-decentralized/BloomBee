@@ -655,11 +655,13 @@ class TransformerConnectionHandler(ConnectionHandler):
         
         # 使用原有的缓存分配方式，但添加offloading调试信息
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
-        offload_logger.info(f"   - 描述符数量: {len(descriptors)}")
-        
-        async with backends[0].cache_manager.cache.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
-            offload_logger.info(f" 缓存分配完成 - 句柄数量: {len(handles)}")
-            offload_logger.info(f"   - 缓存句柄: {handles}")
+
+        logger.info(
+            f"OFFLOAD: requesting KV allocation for {len(backends)} blocks, "
+            f"batch={batch_size}, max_length={max_length}"
+        )
+        async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
+            logger.info("OFFLOAD: allocation completed; entering use_cache region")
             yield nested_pack(handles, descriptors)
 
     def _log_request(

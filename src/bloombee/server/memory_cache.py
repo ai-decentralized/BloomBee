@@ -10,16 +10,28 @@ import ctypes
 import multiprocessing as mp
 import os
 import time
+
 import logging
-from typing import AsyncContextManager, Dict, Optional, Sequence, Tuple, Any
+from typing import AsyncContextManager, Dict, Optional, Sequence, Tuple, Union, Any, List
 
 import async_timeout
 import torch
+import dataclasses
 from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
 
+
 from bloombee.data_structures import Handle, UnifiedCache, DeviceInfo
+from transformers import PretrainedConfig
+
 from bloombee.utils.asyncio import shield_and_wait
 from bloombee.utils.misc import get_size_in_bytes
+from bloombee.flexgen_utils.policy import Policy
+from bloombee.flexgen_utils.task import Task
+
+from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice, DeviceType, general_copy
+from bloombee.flexgen_utils.compression import TorchCompressedDevice, general_copy_compressed
+from bloombee.flexgen_utils.utils import torch_dtype_to_np_dtype
+import numpy as np
 
 logger = get_logger(__name__)
 
@@ -31,26 +43,55 @@ offload_logger.setLevel(logging.INFO)
 class MemoryCache:
     """A shared cache for storing tensors that persist across calls. Main use case: storing past attention KVs"""
 
-    def __init__(self, max_size_bytes: Optional[int], max_alloc_timeout: Optional[float] = None):
+    def __init__(self, 
+                 max_size_bytes: Optional[int], 
+                 max_alloc_timeout: Optional[float] = None, 
+                 policy: Optional[Policy] = None, 
+                 block_config: Optional[PretrainedConfig] = None,
+                 device: Any = None):
         self.max_size_bytes = max_size_bytes if max_size_bytes is not None else (2**64 - 1)
         self.max_alloc_timeout = max_alloc_timeout
         self._lock_metadata = mp.Lock()
         self._current_size = mp.Value(ctypes.c_int64, 0, lock=False)
         self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
-        self._allocated_tensors: Dict[Handle, torch.Tensor] = {}
+        self._allocated_tensors: Dict[Handle, Any] = {}
+        self._handle_size_bytes: Dict[Handle, int] = {}
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
         self._lock_acquire_memory = mp.Lock()
         self._memory_freed_event = mp.Event()
         
-        # 统一缓存管理
-        self._unified_caches: Dict[Handle, UnifiedCache] = {}
-        self._device_sync_streams: Dict[str, torch.cuda.Stream] = {}
+
+        # flexgen' offloading depends on the task parameter, we need to mock a temp task variable for memory allocation without changing the data structure of flexgen.
+        self.mocked_task = Task(
+                inputs=None,
+                prompt_len=0,
+                gen_len=2048,
+                cut_gen_len=None,
+                do_sample=False,
+                temperature=0,
+                stop=None,
+                top_p=None,
+        )
+        self.allocation_policy = policy
+        self.block_config = block_config
+        self.device = device
+        # Initialize decompress workspace if using compressed CPU backend
+        try:
+            if isinstance(self.device, TorchCompressedDevice) and getattr(self.device, 'base_device', None) is not None:
+                if self.device.base_device.device_type == DeviceType.CPU:
+                    self.device.init_attention_compute_workspace(self.block_config, self.mocked_task, self.allocation_policy)
+        except Exception:
+            # Workspace is an optimization; proceed without if unavailable
+            pass
+        # For disk/mixed staging
+        self._underlying: Dict[Handle, Any] = {}
+        self._cpu_stage: Dict[Handle, Any] = {}
+        self._layout_meta: Dict[Handle, Tuple[bool, int, int, int, int]] = {}  # (is_key, B, H, S, D)
+        self._dtype_by_handle: Dict[Handle, torch.dtype] = {}
         
-        # 添加进程内句柄计数器
-        self._local_handle_counter = 0
 
     @property
     def current_size_bytes(self) -> int:
@@ -79,166 +120,6 @@ class MemoryCache:
     @handle_counter.setter
     def handle_counter(self, value: int):
         self._handle_counter.value = value
-
-    def get_unified_cache(self, handle: Handle) -> Optional[UnifiedCache]:
-        """
-        获取统一缓存
-        
-        Args:
-            handle: 缓存句柄
-            
-        Returns:
-            统一缓存对象，如果不存在返回None
-        """
-        offload_logger.info(f" MemoryCache.get_unified_cache被调用 - 句柄: {handle}")
-        
-        # 尝试直接通过句柄获取
-        result = self._unified_caches.get(handle)
-        if result is not None:
-            offload_logger.info(f"   - 直接通过句柄找到缓存: {result is not None}")
-            if result:
-                offload_logger.info(f"   - 缓存设备: {result.device_info.device_id}")
-            return result
-        
-        # 如果直接获取失败，尝试通过 storage_key 格式查找
-        offload_logger.info(f"   - 直接获取失败，尝试通过 storage_key 查找")
-        for key, value in self._unified_caches.items():
-            if key.endswith(f"_{handle}"):
-                offload_logger.info(f"   - 通过 storage_key 找到缓存: {key}")
-                if value:
-                    offload_logger.info(f"   - 缓存设备: {value.device_info.device_id}")
-                return value
-        
-        offload_logger.info(f"   - 未找到缓存")
-        return None
-
-    def sync_device_cache(self, unified_cache: UnifiedCache, target_device: str) -> UnifiedCache:
-        """
-        Sync cache to target device
-        Returns new UnifiedCache with updated device info
-        """
-        offload_logger.info(f" MemoryCache.sync_device_cache被调用")
-        offload_logger.info(f"   - 输入设备: {unified_cache.device_info.device_id}")
-        offload_logger.info(f"   - 目标设备: {target_device}")
-        
-        if unified_cache.past_key_value is None:
-            offload_logger.warning("Cannot sync cache with None past_key_value")
-            return unified_cache
-        
-        # Check if sync is actually needed
-        if unified_cache.device_info.device_id == target_device:
-            offload_logger.info("设备已匹配，无需同步")
-            return unified_cache
-        
-        offload_logger.info(f" MemoryCache设备同步:")
-        offload_logger.info(f"   - 源设备: {unified_cache.device_info.device_id}")
-        offload_logger.info(f"   - 目标设备: {target_device}")
-        offload_logger.info(f"   - 当前offloaded: {unified_cache.device_info.offloaded}")
-        offload_logger.info(f"   - past_key_value长度: {len(unified_cache.past_key_value)}")
-        
-        # Sync tensors to target device
-        synced_tensors = []
-        if isinstance(unified_cache.past_key_value, (tuple, list)):
-            for i, tensor in enumerate(unified_cache.past_key_value):
-                if isinstance(tensor, torch.Tensor):
-                    offload_logger.info(f"   - 同步张量{i}: {tensor.device} -> {target_device}")
-                    offload_logger.info(f"     - 张量形状: {tensor.shape}")
-                    offload_logger.info(f"     - 张量dtype: {tensor.dtype}")
-                    
-                    # 检查张量是否已经在目标设备上
-                    # 修复设备检查逻辑：比较完整的设备字符串
-                    if str(tensor.device) == target_device:
-                        offload_logger.info(f"   - 张量{i}已在目标设备上，跳过同步")
-                        synced_tensors.append(tensor)
-                    else:
-                        synced_tensor = tensor.to(target_device, non_blocking=True)
-                        synced_tensors.append(synced_tensor)
-                        offload_logger.info(f"   - 张量{i}同步完成: {tensor.device} -> {synced_tensor.device}")
-                else:
-                    synced_tensors.append(tensor)
-                    offload_logger.info(f"   - 张量{i}: 非tensor对象，跳过同步")
-            
-            # 更新设备信息
-            new_offloaded = target_device != 'cuda:0'
-            new_device_info = DeviceInfo(
-                device_type=target_device.split(':')[0] if ':' in target_device else target_device,
-                device_id=target_device,
-                compression_config=unified_cache.device_info.compression_config,
-                offloaded=new_offloaded
-            )
-            
-            offload_logger.info(f"   - 新offloaded状态: {new_offloaded}")
-            offload_logger.info(f"   - 新设备信息: {new_device_info}")
-            offload_logger.info(f" 设备同步完成")
-            
-            return UnifiedCache(
-                past_key_value=tuple(synced_tensors),
-                device_info=new_device_info,
-                cache_handles=unified_cache.cache_handles
-            )
-        
-        offload_logger.warning(f"⚠️  past_key_value不是tuple/list，跳过同步")
-        return unified_cache
-
-    def _create_handle(self) -> Handle:
-        """创建新的句柄"""
-        with self._lock_metadata:
-            # 使用进程内句柄计数器，避免多进程共享问题
-            handle = self._local_handle_counter
-            self._local_handle_counter += 1
-            # 同时更新多进程共享的计数器
-            self.handle_counter = self._local_handle_counter
-            offload_logger.info(f" 创建新句柄: {handle} (本地计数器: {self._local_handle_counter})")
-            offload_logger.info(f"   - 进程ID: {os.getpid()}")
-            offload_logger.info(f"   - 运行时PID: {self.runtime_pid}")
-            return handle
-
-    @contextlib.asynccontextmanager
-    async def allocate_cache(
-        self, *descriptors: TensorDescriptor, timeout: float
-    ) -> AsyncContextManager[Sequence[Handle]]:
-        """
-        Create a handle that is associated with buffers on unique device. If cache full, raises AllocationFailed.
-
-        :param descriptors: one or more tensors tensor of this size, dtype, etc
-        :param timeout: optional maximum time to wait for cache allocation; None (default) means no time limit
-
-        :note: if descriptors reside on different devices, it is expected that they are approximately balanced across devices;
-          if not, it will count maximum tensor allocation across devices for the purposes of size limit
-
-        :note: This function should be called by connection handlers, it can be called concurrently from multiple processes.
-        Furthermore, it can be called concurrently with at most one use_cache call in runtime.
-        """
-        assert os.getpid() != self.runtime_pid, "must be called by a ConnectionHandler, not runtime"
-        assert all(descr.device is not None for descr in descriptors), "please specify allocated devices"
-        if self.max_alloc_timeout is not None:
-            timeout = min(timeout, self.max_alloc_timeout)
-        max_alloc_size = self.get_allocation_size(*descriptors)
-
-        gib = 1024**3
-        cur_size, max_size = self.current_size_bytes, self.max_size_bytes
-        friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
-        logger.info(
-            f"rpc_inference.wait_for_alloc(size={max_alloc_size / gib:.2f} GiB), "
-            f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({cur_size / max_size * 100:.1f}%)"
-        )
-
-        alloc_task = asyncio.create_task(self._schedule_alloc(max_alloc_size, *descriptors, timeout=timeout))
-        try:
-            handles = await shield_and_wait(alloc_task)
-            logger.info(f"rpc_inference.alloc_done(size={max_alloc_size / gib:.2f} GiB)")
-            yield handles
-        finally:
-            self._free(max_alloc_size, alloc_task)
-
-    @staticmethod
-    def get_allocation_size(*descriptors: TensorDescriptor) -> int:
-        """Return the memory size (bytes) to be allocated on a device. If there are many devices, return maximum"""
-        alloc_size_by_device = {}
-        for descr in descriptors:
-            tensor_size = descr.numel() * get_size_in_bytes(descr.dtype)
-            alloc_size_by_device[descr.device] = alloc_size_by_device.get(descr.device, 0) + tensor_size
-        return max(alloc_size_by_device.values())
 
     async def _schedule_alloc(
         self, alloc_size: int, *descriptors: TensorDescriptor, timeout: Optional[float]
@@ -334,17 +215,206 @@ class MemoryCache:
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
-                    self._allocated_tensors[handle] = descr.make_zeros()
-                    assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
+                    shape = tuple(descr.shape)
+                    B, H = shape[0], shape[1]
+                    head_dim_cfg = self.block_config.hidden_size // self.block_config.num_attention_heads if self.block_config is not None else shape[-1]
+                    if shape[-2] == head_dim_cfg:
+                        is_key, D, S = True, shape[-2], shape[-1]
+                    else:
+                        is_key, S, D = False, shape[-2], shape[-1]
+
+                    nbytes = int(np.prod(shape)) * get_size_in_bytes(descr.dtype)
+                    self._handle_size_bytes[handle] = nbytes
+                    self._dtype_by_handle[handle] = descr.dtype
+
+                    if isinstance(self.device, TorchDisk):
+                        np_dtype = torch_dtype_to_np_dtype.get(descr.dtype, np.float16)
+                        underlying = self.device.allocate((S, B * H, D), np_dtype, pin_memory=False)
+                        self._underlying[handle] = underlying
+                        self._layout_meta[handle] = (is_key, B, H, S, D)
+                        self._allocated_tensors[handle] = None
+                        logger.info(
+                            f"OFFLOAD: Prepared FlexGen KV storage handle={handle} base_shape={(S, B*H, D)} from desc={shape} on {type(self.device).__name__}"
+                        )
+                    elif isinstance(self.device, TorchMixedDevice):
+                        # Mixed device requires segment lengths for split along BH dimension
+                        np_dtype = torch_dtype_to_np_dtype.get(descr.dtype, np.float16)
+                        # derive seg lengths from policy (gpu/cpu/disk split along BH)
+                        # note: BH is divisible by num_attention_heads, round segments as in init_cache_one_gpu_batch
+                        num_heads = self.block_config.num_attention_heads if self.block_config is not None else H
+                        total = B * H
+                        raw_gpu = int(total * (self.allocation_policy.cache_gpu_percent / 100.0))
+                        raw_cpu = int(total * (self.allocation_policy.cache_cpu_percent / 100.0))
+                        len_gpu = (raw_gpu // num_heads) * num_heads
+                        len_cpu = (raw_cpu // num_heads) * num_heads
+                        len_disk = max(0, total - len_gpu - len_cpu)
+                        # Guard: very small disk tail hurts stability; fold it into CPU
+                        if len_disk < num_heads and len_disk > 0:
+                            len_cpu += len_disk
+                            len_disk = 0
+                            logger.info(
+                                f"OFFLOAD: Mixed seg_lengths small disk tail folded into CPU => [gpu={len_gpu}, cpu={len_cpu}, disk={len_disk}]"
+                            )
+                        # If policy requests CPU but rounding zeroed it (small BH), prefer CPU-only over disk-only
+                        if self.allocation_policy.cache_cpu_percent > 0 and len_cpu == 0 and total >= num_heads:
+                            len_cpu = total
+                            len_gpu = 0
+                            len_disk = 0
+                            logger.info(
+                                f"OFFLOAD: Mixed seg_lengths forced CPU-only due to small BH => [gpu={len_gpu}, cpu={len_cpu}, disk={len_disk}]"
+                            )
+                        seg_lengths = [len_gpu, len_cpu, len_disk]
+                        underlying = self.device.allocate((S, B * H, D), np_dtype, seg_lengths=seg_lengths, pin_memory=False)
+                        self._underlying[handle] = underlying
+                        self._layout_meta[handle] = (is_key, B, H, S, D)
+                        self._allocated_tensors[handle] = None
+                        logger.info(
+                            f"OFFLOAD: Prepared FlexGen KV storage (mixed) handle={handle} base_shape={(S, B*H, D)} seg_lengths={seg_lengths}"
+                        )
+                    elif isinstance(self.device, TorchCompressedDevice):
+                        # Compressed offloading backend: allocate compressed underlying tensor
+                        # Compression currently requires fp16
+                        np_dtype = np.float16
+                        comp_cfg = getattr(self.allocation_policy, 'comp_cache_config', None)
+                        underlying = self.device.allocate((S, B * H, D), np_dtype, comp_config=comp_cfg, pin_memory=False)
+                        self._underlying[handle] = underlying
+                        self._layout_meta[handle] = (is_key, B, H, S, D)
+                        self._allocated_tensors[handle] = None
+                        logger.info(
+                            f"OFFLOAD: Prepared Compressed KV storage handle={handle} base_shape={(S, B*H, D)} cfg=(bits={comp_cfg.num_bits}, group={comp_cfg.group_size}, dim={comp_cfg.group_dim})"
+                        )
+                    else:
+                        is_cpu = (getattr(descr.device, 'type', str(descr.device)) == 'cpu')
+                        try:
+                            tensor = torch.empty(shape, dtype=descr.dtype, device=descr.device, pin_memory=True if is_cpu else False)
+                            tensor.zero_()
+                        except TypeError:
+                            tensor = torch.zeros(shape, dtype=descr.dtype, device=descr.device)
+                        self._allocated_tensors[handle] = tensor
+                        logger.info(
+                            f"OFFLOAD: Allocated KV tensor handle={handle} shape={shape} dtype={descr.dtype} device={descr.device}"
+                        )
+                    assert handle in self._handle_size_bytes, f"Sanity check failed: no size for handle ({handle})"
             else:  # delete tensors by handle
                 for handle in recv_handles:
                     if handle not in self._allocated_tensors:
                         logger.warning(
                             f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
                         )
+                    else:
+                        logger.info(f"OFFLOAD: Freed KV tensor handle={handle}")
                     self._allocated_tensors.pop(handle, None)
-        yield tuple(self._allocated_tensors[handle] for handle in handles)
+                    self._handle_size_bytes.pop(handle, None)
+                    self._underlying.pop(handle, None)
+                    self._layout_meta.pop(handle, None)
+                    self._cpu_stage.pop(handle, None)
+                    self._dtype_by_handle.pop(handle, None)
+        # Materialize CPU tensors for FlexGen-backed handles
+        materialized: List[torch.Tensor] = []
+        for handle in handles:
+            if handle in self._underlying:
+                is_key, B, H, S, D = self._layout_meta[handle]
+                BH = B * H
+                # Stage always in fp16 for compressed; otherwise follow original dtype
+                if isinstance(self.device, TorchCompressedDevice):
+                    stage_np_dtype = np.float16
+                else:
+                    torch_dtype = self._dtype_by_handle.get(handle, torch.float16)
+                    stage_np_dtype = torch_dtype_to_np_dtype.get(torch_dtype, np.float16)
+                cpu_stage = TorchDevice("cpu").allocate((S, BH, D), stage_np_dtype, pin_memory=True)
+                try:
+                    if isinstance(self.device, TorchCompressedDevice):
+                        comp_cfg = getattr(self.allocation_policy, 'comp_cache_config', None)
+                        # If compressed base is CPU, decompress directly; if DISK, stage via CPU compressed device
+                        if self.device.base_device.device_type == DeviceType.CPU:
+                            decompressed = self.device.decompress(self._underlying[handle])
+                            cpu_stage.data.copy_(decompressed)
+                            logger.info(f"OFFLOAD: COMPRESS copy-in (decompress, base=CPU) handle={handle} -> CPU stage")
+                        else:
+                            cpu_comp = TorchDevice("cpu").compressed_device
+                            tmp_comp = cpu_comp.allocate((S, BH, D), np.float16, comp_config=comp_cfg, pin_memory=True)
+                            general_copy_compressed(tmp_comp, None, self._underlying[handle], None)
+                            decompressed = cpu_comp.decompress(tmp_comp)
+                            cpu_stage.data.copy_(decompressed)
+                            logger.info(f"OFFLOAD: COMPRESS copy-in (decompress via CPU) handle={handle} -> CPU stage")
+                    else:
+                        general_copy(cpu_stage, None, self._underlying[handle], None)
+                except Exception as e:
+                    logger.warning(f"OFFLOAD: copy-in failed for handle={handle}: {e}. Filling zeros.")
+                    cpu_stage.data.zero_()
+                if is_key:
+                    # View-only transform to [B, H, D, S]; keep it as a view so in-place writes update cpu_stage
+                    tensor = cpu_stage.data.view(S, B, H, D).permute(1, 2, 3, 0)
+                else:
+                    # View-only transform to [B, H, S, D]
+                    tensor = cpu_stage.data.view(S, B, H, D).permute(1, 2, 0, 3)
+                self._cpu_stage[handle] = cpu_stage
+                self._allocated_tensors[handle] = tensor
+                materialized.append(tensor)
+            else:
+                # It is possible that this handle was created for underlying only
+                # Ensure presence; otherwise initialize a zero CPU tensor as a fallback
+                tensor = self._allocated_tensors.get(handle)
+                if tensor is None:
+                    # Fallback zero tensor based on recorded layout
+                    is_key, B, H, S, D = self._layout_meta[handle]
+                    if is_key:
+                        tensor = torch.zeros((B, H, D, S), dtype=self._dtype_by_handle.get(handle, torch.float16), device='cpu', pin_memory=True)
+                    else:
+                        tensor = torch.zeros((B, H, S, D), dtype=self._dtype_by_handle.get(handle, torch.float16), device='cpu', pin_memory=True)
+                    self._allocated_tensors[handle] = tensor
+                materialized.append(tensor)
+
+        try:
+            yield tuple(materialized)
+        finally:
+            for handle in handles:
+                if handle in self._underlying and handle in self._cpu_stage:
+                    try:
+                        if isinstance(self.device, TorchCompressedDevice):
+                            comp_cfg = getattr(self.allocation_policy, 'comp_cache_config', None)
+                            cpu_comp = TorchDevice("cpu").compressed_device
+                            compressed = cpu_comp.compress(self._cpu_stage[handle].data, comp_cfg)
+                            general_copy_compressed(self._underlying[handle], None, compressed, None)
+                            logger.info(f"OFFLOAD: Synced COMPRESSED KV handle={handle} back to {type(self.device.base_device).__name__}")
+                        else:
+                            general_copy(self._underlying[handle], None, self._cpu_stage[handle], None)
+                            logger.info(f"OFFLOAD: Synced KV handle={handle} back to {type(self.device).__name__}")
+                    except Exception as e:
+                        logger.warning(f"OFFLOAD: copy-out failed for handle={handle}: {e}. Skipping sync.")
+
+    def force_free(self, *handles: Handle):
+        """Force free handles immediately (outside of allocate context). Adjust size counters and wake waiters."""
+        with self._lock_metadata:
+            freed_bytes = 0
+            for handle in handles:
+                tensor = self._allocated_tensors.pop(handle, None)
+                size_bytes = self._handle_size_bytes.pop(handle, 0)
+                if tensor is not None:
+                    freed_bytes += size_bytes
+                    logger.info(f"OFFLOAD: Force free KV tensor handle={handle}, bytes={size_bytes}")
+                if handle in self._underlying:
+                    self._underlying.pop(handle, None)
+                    self._layout_meta.pop(handle, None)
+                    self._cpu_stage.pop(handle, None)
+                    self._dtype_by_handle.pop(handle, None)
+            if freed_bytes:
+                self.current_size_bytes = max(0, self.current_size_bytes - freed_bytes)
+                self._memory_freed_event.set()
 
 
 class AllocationFailed(Exception):
     pass
+
+class KVCacheMetadata:
+    device: Any               # 存在哪个设备上
+    offloaded: bool = False             # 是否已 offload 到 CPU
+    # TODO: add more device info
+
+
+@dataclasses.dataclass(frozen=True)
+class AdaptedKVCache:
+    kvs: Sequence[torch.Tensor]
+    device: KVCacheMetadata
+
+

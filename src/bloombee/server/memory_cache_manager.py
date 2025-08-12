@@ -1,508 +1,220 @@
-"""
-Memory cache manager for KV cache offloading
-Supports unified cache interface and device synchronization
-"""
 
+from dataclasses import dataclass
 import contextlib
-import logging
-import multiprocessing as mp
-import time
-from typing import Any, Dict, List, Optional, Sequence
-
+import asyncio
 import torch
-import os # Added for os.getpid()
+import os
+from typing import Optional, Tuple, AsyncContextManager, Sequence
 
-from bloombee.data_structures import KVCache, KVCacheMetadata, Handle, UnifiedCache, DeviceInfo
+from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata
+from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.policy import Policy
-from bloombee.server.memory_cache import MemoryCache
+from bloombee.flexgen_utils.pytorch_backend import DeviceType
 
-# Create dedicated offloading debug logger
-offload_logger = logging.getLogger('bloombee.offloading')
-offload_logger.setLevel(logging.INFO)
+from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
+
+from bloombee.data_structures import Handle
+from bloombee.utils.asyncio import shield_and_wait
+from bloombee.utils.misc import get_size_in_bytes
+
+from transformers import PretrainedConfig
 
 
-def init_cache_manager_shared(policy, layer_id):
-    """
-    Shared function to initialize KVCacheManager
-    Used by both flex_llama.py and block.py to eliminate code duplication
-    
-    Args:
-        policy: Policy object containing cache configuration
-        layer_id: Layer ID for logging purposes
-        
-    Returns:
-        KVCacheManager instance or None if initialization fails
-    """
-    try:
-        # Get cache size from policy, use default if not available
-        cache_size = getattr(policy, 'cache_size', 1024 * 1024 * 1024)  # 1GB default
-        max_alloc_timeout = getattr(policy, 'max_alloc_timeout', 30)
-        
-        cache_manager = KVCacheManager(cache_size, max_alloc_timeout, policy)
-        # offload_logger.info(f" Initialized KVCacheManager - layer:{layer_id}")
-        
-        return cache_manager
-        
-    except ImportError as e:
-        print(f"Warning: Could not import KVCacheManager: {e}")
-        return None
-    except Exception as e:
-        print(f"Warning: Failed to initialize KVCacheManager: {e}")
-        return None
+logger = get_logger(__name__)
 
 
 class KVCacheManager:
-    """
-    Basic KV cache manager supporting offloading functionality
-    Supports layered optimization by model layer and GPU batch
-    Supports unified UnifiedCache interface
-    """
-    
-    # Singleton pattern implementation
-    _instance = None
-    _initialized = False
-    
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-    
-    def __init__(self, cache_size: int, max_alloc_timeout: int, policy: Policy):
-        # Avoid duplicate initialization
-        if self._initialized:
-            return
-        self._initialized = True
-        
-        self.cache_size = cache_size
+    def __init__(self, cache_max_size: int, 
+                 max_alloc_timeout: int, 
+                 policy: Policy, 
+                 env: ExecutionEnv,
+                 block_config: PretrainedConfig):
+        # 初始化为二维数组结构
+        self.env = env
+        self.runtime_pid = os.getpid()
+        self.cache = MemoryCache(cache_max_size, max_alloc_timeout, policy, block_config, self.get_cache_device(policy))
+        self.offloading_policy = policy
+        self.attention_compute = (self.env.cpu if policy.cpu_cache_compute
+                                  else self.env.gpu)
+        self.block_config = block_config
         self.max_alloc_timeout = max_alloc_timeout
-        self.policy = policy
+        self._active_cache_tensors_stack = []
         
-        # Initialize memory cache
-        self.cache = MemoryCache(cache_size, max_alloc_timeout)
         
-        # Initialize device allocation strategy
-        self.device_allocation = self._init_device_allocation()
-        
-        # Cache hierarchy: cache_hierarchy[layer_id][batch_id][position] = UnifiedCache handle
-        self.cache_hierarchy: Dict[int, Dict[int, Dict[int, Handle]]] = {}
-        
-        # Statistics tracking
-        self.stats = {
-            'total_stores': 0,
-            'total_loads': 0,
-            'total_bytes_stored': 0,
-            'total_bytes_loaded': 0,
-            'device_transfers': 0
-        }
-        
-        offload_logger.info("Initializing KVCacheManager - starting offloading system")
-        offload_logger.info(f"Cache size: {cache_size / (1024*1024*1024):.2f} GB")
-        offload_logger.info(f"Max alloc timeout: {max_alloc_timeout} seconds")
-        offload_logger.info(f"Policy: GPU={self.policy.cache_gpu_percent}%, CPU={self.policy.cache_cpu_percent}%, Disk={self.policy.cache_disk_percent}%")
-        offload_logger.info("KVCacheManager initialization completed")
+    def get_cache_device(self, policy):
+        if policy.cache_gpu_percent == 100:
+            device = self.env.gpu
+        elif policy.cache_cpu_percent == 100:
+            device = self.env.cpu
+        elif policy.cache_disk_percent == 100:
+            device = self.env.disk
+        else:
+            device = self.env.mixed
 
-    def _init_device_allocation(self) -> Dict[str, float]:
-        """Initialize device allocation strategy based on policy"""
-        return {
-            'gpu': self.policy.cache_gpu_percent / 100.0,
-            'cpu': self.policy.cache_cpu_percent / 100.0,
-            'disk': self.policy.cache_disk_percent / 100.0
-        }
+        if policy.compress_cache:
+            assert device.device_type != DeviceType.MIXED
+            device = device.compressed_device
+        return device
 
     def clear(self):
-        """Clear all cached data"""
-        self.cache_hierarchy.clear()
-        self.stats = {
-            'total_stores': 0,
-            'total_loads': 0,
-            'total_bytes_stored': 0,
-            'total_bytes_loaded': 0,
-            'device_transfers': 0
-        }
-        offload_logger.info("KVCacheManager cache cleared")
+        # for b in range(self.max_batch_size):
+        #     for l in range(self.num_layers):
+        #         self.cache[b][l] = None
+        # No-op for now; handles are freed by context manager or force_free
+        return
+    
+    @contextlib.asynccontextmanager
+    async def allocate_cache(
+        self, *descriptors: TensorDescriptor, timeout: float
+    ) -> AsyncContextManager[Sequence[Handle]]:
+        """
+        Create a handle that is associated with buffers on unique device. If cache full, raises AllocationFailed.
 
-    def init_cache_one_gpu_batch(self, layer_id: int, batch_id: int, 
-                                config, task, policy) -> UnifiedCache:
-        """
-        Initialize cache for one GPU batch
-        Creates UnifiedCache with appropriate device allocation
-        """
-        # Determine target device based on policy
-        if self.policy.cache_gpu_percent == 100:
-            device_type = 'gpu'
-            device_id = 'cuda:0'
-        elif self.policy.cache_cpu_percent == 100:
-            device_type = 'cpu'
-            device_id = 'cpu'
-        elif self.policy.cache_disk_percent == 100:
-            device_type = 'disk'
-            device_id = '/tmp/disk_cache'
-        else:
-            # Mixed allocation - use GPU as primary
-            device_type = 'gpu'
-            device_id = 'cuda:0'
-        
-        # Create device info
-        device_info = DeviceInfo(
-            device_type=device_type,
-            device_id=device_id,
-            compression_config=self.policy.comp_cache_config if self.policy.compress_cache else None,
-            offloaded=(device_type != 'gpu')
-        )
-        
-        # Create empty UnifiedCache
-        unified_cache = UnifiedCache(
-            past_key_value=None,  # Will be populated during inference
-            device_info=device_info
-        )
-        
-        offload_logger.info(f"Initialized cache for layer {layer_id}, batch {batch_id}")
-        offload_logger.info(f"Device: {device_type} ({device_id})")
-        offload_logger.info(f"Compression: {self.policy.compress_cache}")
-        
-        return unified_cache
+        :param descriptors: one or more tensors tensor of this size, dtype, etc
+        :param timeout: optional maximum time to wait for cache allocation; None (default) means no time limit
 
-    def load_cache(self, position: int, layer_id: int, batch_id: int, 
-                  target_device: str = 'cuda:0') -> Optional[UnifiedCache]:
+        :note: if descriptors reside on different devices, it is expected that they are approximately balanced across devices;
+          if not, it will count maximum tensor allocation across devices for the purposes of size limit
+
+        :note: This function should be called by connection handlers, it can be called concurrently from multiple processes.
+        Furthermore, it can be called concurrently with at most one use_cache call in runtime.
         """
-        Load cache from memory
-        Supports position mapping fallback for missing positions
-        """
-        offload_logger.info(f"Loading cache - position:{position}, layer:{layer_id}, batch:{batch_id}")
-        
-        # Try to get handle for exact position
-        handle = self._get_cache_handle(position, layer_id, batch_id)
-        
-        # If exact position not found, try position mapping fallback
-        if handle is None:
-            offload_logger.info(f"Position {position} not found, attempting position mapping...")
+        assert os.getpid() != self.runtime_pid, "must be called by a ConnectionHandler, not runtime"
+        assert all(descr.device is not None for descr in descriptors), "please specify allocated devices"
+        if self.max_alloc_timeout is not None and timeout is not None:
+            timeout = min(timeout, self.max_alloc_timeout)
+
+        max_alloc_size = self.get_allocation_size(*descriptors)
+
+        gib = 1024**3
+        cur_size, max_size = self.current_size_bytes, self.max_size_bytes
+        friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
+        used_pct = (cur_size / max_size * 100.0) if max_size != 0 and max_size != 2**64 - 1 else 0.0
+        logger.info(
+            f"rpc_inference.wait_for_alloc(size={max_alloc_size / gib:.2f} GiB), "
+            f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({used_pct:.1f}%)"
+        )
+
+        alloc_task = asyncio.create_task(self.cache._schedule_alloc(max_alloc_size, *descriptors, timeout=timeout))
+        try:
+            handles = await shield_and_wait(alloc_task)
+            logger.info(f"rpc_inference.alloc_done(size={max_alloc_size / gib:.2f} GiB)")
+            yield handles
+        finally:
+            self.cache._free(max_alloc_size, alloc_task)
             
-            # Use position tracker for more accurate fallback
-            if hasattr(self, '_position_tracker') and layer_id in self._position_tracker:
-                available_positions = list(self._position_tracker[layer_id].keys())
-                offload_logger.info(f"Available positions from tracker: {available_positions}")
+            
+    @staticmethod
+    def get_allocation_size(*descriptors: TensorDescriptor) -> int:
+        """Return the memory size (bytes) to be allocated on a device. If there are many devices, return maximum"""
+        alloc_size_by_device = {}
+        for descr in descriptors:
+            tensor_size = descr.numel() * get_size_in_bytes(descr.dtype)
+            alloc_size_by_device[descr.device] = alloc_size_by_device.get(descr.device, 0) + tensor_size
+        return max(alloc_size_by_device.values())
+        
+    
+    def add_cache(self, kvs: AdaptedKVCache, start_position: int):
+        self._write_kvs(kvs, start_position)
                 
-                if available_positions:
-                    # Find the closest available position
-                    fallback_position = max(available_positions)
-                    offload_logger.info(f"Trying to load from position {fallback_position} (available positions: {available_positions})")
-                    
-                    handle = self._get_cache_handle(fallback_position, layer_id, batch_id)
-                    if handle is not None:
-                        offload_logger.info(f"Position mapping successful: {position} -> {fallback_position}")
-                    else:
-                        offload_logger.info(f"Position {fallback_position} also not found")
-                else:
-                    offload_logger.info("No available cache positions")
-            else:
-                offload_logger.info("No position tracker available")
-        
-        if handle is None:
-            offload_logger.warning(f"Cache handle not found - position:{position}, layer:{layer_id}, batch:{batch_id}")
-            offload_logger.warning("Position mapping failed")
-            return None
-        
-        # Get UnifiedCache from MemoryCache using new storage key format
-        storage_key = f"layer_{layer_id}_handle_{handle}"
-        # 使用 get_unified_cache 方法而不是直接访问字典
-        unified_cache = self.cache.get_unified_cache(handle)
-        if unified_cache is None:
-            # 如果 get_unified_cache 返回 None，尝试直接访问字典（向后兼容）
-            unified_cache = self.cache._unified_caches.get(storage_key)
-        if unified_cache is None:
-            offload_logger.warning(f"UnifiedCache not found - storage key:{storage_key}")
-            offload_logger.warning(f"Available storage keys: {list(self.cache._unified_caches.keys())}")
-            return None
-        
-        # Sync device if needed
-        offload_logger.info(f"检查设备同步 - 当前设备: {unified_cache.device_info.device_id}, 目标设备: {target_device}")
-        if unified_cache.device_info.device_id != target_device:
-            offload_logger.info(f"Syncing cache from {unified_cache.device_info.device_id} to {target_device}")
-            unified_cache = self.cache.sync_device_cache(unified_cache, target_device)
-            self.stats['device_transfers'] += 1
-        else:
-            offload_logger.info(f"设备相同，跳过同步")
-        
-        # Update statistics
-        cache_size = self._calculate_cache_size(unified_cache)
-        self.stats['total_loads'] += 1
-        self.stats['total_bytes_loaded'] += cache_size
-        
-        offload_logger.info(f"Successfully loaded cache - position:{position}, layer:{layer_id}")
-        offload_logger.info(f"Cache size: {cache_size / 1024:.1f} KB")
-        offload_logger.info(f"Device: {unified_cache.device_info.device_id}")
-        
-        return unified_cache
-
-    def store_cache(self, unified_cache: UnifiedCache, position: int, 
-                   layer_id: int, batch_id: int) -> Handle:
-        """
-        Store cache to memory
-        Generates unique handles per layer within inference step
-        """
-        if unified_cache.past_key_value is None:
-            offload_logger.warning("Cannot store cache with None past_key_value")
-            return -1
-        
-        # Generate consistent handle using layer_id and position
-        handle = layer_id * 1000 + position  # Consistent format: layer_id * 1000 + position
-        
-        offload_logger.info(f"Generated handle: {handle} (layer_id: {layer_id}, position: {position})")
-        
-        # Store UnifiedCache directly in MemoryCache using new storage key format
-        storage_key = f"layer_{layer_id}_handle_{handle}"
-        self.cache._unified_caches[storage_key] = unified_cache
-        offload_logger.info(f"存储缓存 - storage_key: {storage_key}, handle: {handle}")
-        offload_logger.info(f"当前 _unified_caches 键: {list(self.cache._unified_caches.keys())}")
-        # 添加store_unified_cache风格的调试信息
-        offload_logger.info(f"store_cache详细调试:")
-        offload_logger.info(f"   - 句柄: {handle}")
-        offload_logger.info(f"   - 设备: {unified_cache.device_info.device_id}")
-        offload_logger.info(f"   - 当前_unified_caches大小: {len(self.cache._unified_caches)}")
-        offload_logger.info(f"   - 是否覆盖现有句柄: {storage_key in self.cache._unified_caches}")
-        offload_logger.info(f"   - 进程ID: {os.getpid()}")
-        offload_logger.info(f"   - 运行时PID: {os.getpid()}")
-        
-        # Update hierarchy structure - use new handle format
-        if layer_id not in self.cache_hierarchy:
-            self.cache_hierarchy[layer_id] = {}
-        if batch_id not in self.cache_hierarchy[layer_id]:
-            self.cache_hierarchy[layer_id][batch_id] = {}
-        
-        # Store handle - use new handle format
-        self.cache_hierarchy[layer_id][batch_id][position] = handle
-        
-        # Track position state for debugging
-        if not hasattr(self, '_position_tracker'):
-            self._position_tracker = {}
-        if layer_id not in self._position_tracker:
-            self._position_tracker[layer_id] = {}
-        self._position_tracker[layer_id][position] = handle
-        
-        offload_logger.info(f"Stored cache at position {position} for layer {layer_id} with handle {handle}")
-        offload_logger.info(f"Available positions for layer {layer_id}: {list(self._position_tracker[layer_id].keys())}")
-        
-        # Update statistics
-        cache_size = self._calculate_cache_size(unified_cache)
-        self.stats['total_stores'] += 1
-        self.stats['total_bytes_stored'] += cache_size
-        
-        offload_logger.info(f"Successfully stored cache - position:{position}, layer:{layer_id}")
-        offload_logger.info(f"Handle: {handle}")
-        offload_logger.info(f"Device: {unified_cache.device_info}")
-        offload_logger.info(f"Cache size: {cache_size / 1024:.1f} KB")
-        offload_logger.info(f"Total memory used: {self.cache.current_size_bytes / (1024*1024):.1f} MB")
-        offload_logger.info(f"Remaining memory: {self.cache.bytes_left / (1024*1024*1024):.1f} GB")
-        
-        return handle
-
-    def add_cache(self, kvs: KVCache, start_position: int, layer_id: int = 0, batch_id: int = 0):
-        """Add new cache data"""
-        # 在函数内部导入，避免循环导入
-        from bloombee.server.cache_coordinator import create_device_info_from_policy
-        
-        # 使用统一的设备分配工具函数
-        device_info = create_device_info_from_policy(
-            self.policy,
-            'cuda:0',
-            self.policy.comp_cache_config if self.policy.compress_cache else None
-        )
-        
-        unified_cache = UnifiedCache(
-            past_key_value=kvs.kvs,
-            device_info=device_info
-        )
-        
-        # Store using existing method
-        handle = self.store_cache(unified_cache, start_position, layer_id, batch_id)
-        offload_logger.info(f"Added cache with handle {handle} - device: {device_info.device_type} ({device_info.device_id})")
-
-    def update_cache(self, new_kvs: KVCache, start_position: int, layer_id: int = 0, batch_id: int = 0):
-        """Update existing cache data"""
-        # Get existing cache
-        existing_cache = self.load_cache(start_position, layer_id, batch_id)
-        
-        if existing_cache is None:
-            # If no existing cache, add new one
-            self.add_cache(new_kvs, start_position, layer_id, batch_id)
-            return
-        
-        # Merge new KV tensors with existing ones
-        if existing_cache.past_key_value and new_kvs.kvs:
-            merged_kvs = []
-            for existing, new in zip(existing_cache.past_key_value, new_kvs.kvs):
-                if isinstance(existing, torch.Tensor) and isinstance(new, torch.Tensor):
-                    merged = torch.cat([existing, new], dim=0)
-                    merged_kvs.append(merged)
-                else:
-                    merged_kvs.append(new)
-            
-            # Create updated UnifiedCache
-            updated_cache = UnifiedCache(
-                past_key_value=tuple(merged_kvs),
-                device_info=existing_cache.device_info,
-                cache_handles=existing_cache.cache_handles
-            )
-            
-            # Store updated cache
-            handle = self.store_cache(updated_cache, start_position, layer_id, batch_id)
-            offload_logger.info(f"Updated cache with handle {handle}")
-
+    def update_cache(
+        self, new_kvs: AdaptedKVCache, start_position: int
+    ):
+        self._write_kvs(new_kvs, start_position)
+    
     def bytes_left(self) -> int:
-        """Get remaining cache capacity in bytes"""
         return self.cache.bytes_left
 
-    def select_cache(self, kv_cache_position_ids: Optional[torch.Tensor] = None, 
-                    layer_id: int = 0, batch_id: int = 0):
-        """Select cache handles for given positions"""
-        if kv_cache_position_ids is None:
-            return self._get_all_cache_handles(layer_id, batch_id)
-        
-        selected_handles = []
-        for position in kv_cache_position_ids:
-            handle = self._get_cache_handle(position, layer_id, batch_id)
-            if handle:
-                selected_handles.append(handle)
-        
-        offload_logger.info(f"Selected {len(selected_handles)} cache handles for {len(kv_cache_position_ids)} positions at layer={layer_id}, batch={batch_id}")
-        return selected_handles
+    @property
+    def current_size_bytes(self) -> int:
+        return self.cache.current_size_bytes
 
+    @property
+    def max_size_bytes(self) -> int:
+        return self.cache.max_size_bytes
+    
+    def select_cache(
+        self,
+        prefix_length: int,
+        hypo_ids: Optional[torch.Tensor] = None,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return aggregated past_key_value (K_all, V_all) for current active cache.
+
+        - Aggregates over shards along head dimension
+        - Optionally reorders batch by hypo_ids
+        - Slices to prefix_length along sequence dimension
+
+        Returns None if prefix_length <= 0
+        """
+        assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
+        if prefix_length <= 0:
+            return None
+
+        cache_tensors = self._active_cache_tensors_stack[-1]
+        keys_per_shard = []
+        values_per_shard = []
+
+        for key_shard, value_shard in zip(cache_tensors[0::2], cache_tensors[1::2]):
+            # key_shard: [B, H, D, Lmax] -> slice & permute -> [B, H, Lp, D]
+            # value_shard: [B, H, Lmax, D] -> slice -> [B, H, Lp, D]
+            k = key_shard[:, :, :, :prefix_length].permute(0, 1, 3, 2)
+            v = value_shard[:, :, :prefix_length, :]
+            if hypo_ids is not None and isinstance(hypo_ids, torch.Tensor) and hypo_ids.numel() > 0:
+                index = hypo_ids.to(k.device)
+                k = k.index_select(0, index)
+                v = v.index_select(0, index)
+            keys_per_shard.append(k)
+            values_per_shard.append(v)
+
+        if len(keys_per_shard) == 1:
+            return keys_per_shard[0], values_per_shard[0]
+
+        key_all = torch.cat(keys_per_shard, dim=1)
+        value_all = torch.cat(values_per_shard, dim=1)
+        return key_all, value_all
+    
     @contextlib.contextmanager
-    def use_cache(self, *handles: Handle):
-        """
-        Context manager for using cache handles
-        Yields cache tensors for given handles
-        """
-        if not handles:
-            yield []
-            return
-        
-        offload_logger.info(f"Using cache handles: {handles}")
-        offload_logger.info(f"Number of handles: {len(handles)}")
-        
+    def use_cache(self, *handles: Handle) -> Sequence[torch.Tensor]:
         with self.cache.use_cache(*handles) as cache_tensors:
-            offload_logger.info(f"Cache tensors retrieved: {len(cache_tensors)} tensors")
-            yield cache_tensors
+            # Keep underlying tensors in the stack for centralized writes,
+            # but yield clones to callers to prevent accidental in-place edits
+            self._active_cache_tensors_stack.append(cache_tensors)
+            try:
+                safe_views = tuple(t.detach().clone() for t in cache_tensors)
+                yield safe_views
+            finally:
+                self._active_cache_tensors_stack.pop()
 
-    def get_cache_info(self) -> Dict[str, Any]:
-        """Get cache statistics and information"""
-        return {
-            'cache_size_bytes': self.cache_size,
-            'current_size_bytes': self.cache.current_size_bytes,
-            'bytes_left': self.cache.bytes_left,
-            'stats': self.stats.copy(),
-            'hierarchy_layers': len(self.cache_hierarchy),
-            'total_handles': len(self.cache._unified_caches)
-        }
-
-    def _calculate_cache_size(self, unified_cache: UnifiedCache) -> int:
-        """Calculate size of UnifiedCache in bytes"""
-        if unified_cache.past_key_value is None:
-            return 0
-        
-        total_size = 0
-        for tensor in unified_cache.past_key_value:
-            if isinstance(tensor, torch.Tensor):
-                total_size += tensor.numel() * tensor.element_size()
-        
-        return total_size
-
-    def _get_cache_handle(self, position: int, layer_id: int, batch_id: int) -> Optional[Handle]:
-        """Get cache handle for specific position, layer, and batch"""
-        offload_logger.info(f"Looking for cache handle - position:{position}, layer:{layer_id}, batch:{batch_id}")
-        
-        if layer_id in self.cache_hierarchy:
-            if batch_id in self.cache_hierarchy[layer_id]:
-                if position in self.cache_hierarchy[layer_id][batch_id]:
-                    handle = self.cache_hierarchy[layer_id][batch_id][position]
-                    offload_logger.info(f"Found handle: {handle}")
-                    return handle
-                else:
-                    # Show all available positions for this layer and batch
-                    available_positions = list(self.cache_hierarchy[layer_id][batch_id].keys())
-                    offload_logger.info(f"Position {position} not found, available positions: {available_positions}")
-            else:
-                # Show all available batches for this layer
-                available_batches = list(self.cache_hierarchy[layer_id].keys())
-                offload_logger.info(f"Batch {batch_id} not found, available batches: {available_batches}")
-        else:
-            # Show all available layers
-            available_layers = list(self.cache_hierarchy.keys())
-            offload_logger.info(f"Layer {layer_id} not found, available layers: {available_layers}")
-        
-        offload_logger.warning("Cache handle not found")
-        return None
-
-    def _get_all_cache_handles(self, layer_id: int, batch_id: int) -> List[Handle]:
-        """Get all cache handles for a specific layer and batch"""
-        all_handles = []
-        if (layer_id in self.cache_hierarchy and 
-            batch_id in self.cache_hierarchy[layer_id]):
-            for handle in self.cache_hierarchy[layer_id][batch_id].values():
-                all_handles.append(handle)
-        return all_handles
-
-    def _update_cache_stats(self, cache_size: int, layer_id: int, device_info: DeviceInfo):
-        """Update cache statistics"""
-        self.stats['total_bytes_stored'] += cache_size
-        offload_logger.info(f"Updated cache stats - size: {cache_size / 1024:.1f} KB, layer: {layer_id}, device: {device_info.device_id}")
-
-
-class BlockCacheAdapter:
-    """
-    Adapter class for connecting block.py cache management with KVCacheManager
-    Provides conversion between block cache format and KVCache format
-    """
+    def delete_cache(self, *handles: Handle):
+        """Explicitly delete cache handles to free space early."""
+        try:
+            self.cache.force_free(*handles)
+        except Exception as e:
+            logger.warning(f"OFFLOAD: delete_cache failed for handles={handles}: {e}")
     
-    def __init__(self, cache_manager: KVCacheManager):
-        self.cache_manager = cache_manager
-    
-    def register_block_cache(self, layer_id: int, batch_id: int, 
-                           cache_home, cache_read_buf, cache_write_buf):
-        """Register block cache with KVCacheManager"""
-        # This is a placeholder for future implementation
-        offload_logger.info(f"Registered block cache for layer {layer_id}, batch {batch_id}")
-    
-    def sync_block_cache_to_manager(self, layer_id: int, batch_id: int, position: int):
-        """Sync block cache to KVCacheManager"""
-        # Convert block cache to KVCache format
-        block_cache = None  # Get from block system
-        if block_cache:
-            kvs = self._convert_block_cache_to_kvs(block_cache)
-            self.cache_manager.add_cache(kvs, position, layer_id, batch_id)
-    
-    def sync_manager_cache_to_block(self, layer_id: int, batch_id: int, position: int):
-        """Sync KVCacheManager cache to block"""
-        # Load from KVCacheManager
-        unified_cache = self.cache_manager.load_cache(position, layer_id, batch_id)
-        if unified_cache:
-            # Convert to block cache format
-            block_cache = self._convert_kvs_to_block_cache(unified_cache.past_key_value)
-            # Store in block system
-            offload_logger.info(f"Synced manager cache to block for layer {layer_id}, position {position}")
-    
-    def _convert_block_cache_to_kvs(self, block_cache) -> KVCache:
-        """Convert block cache to KVCache format"""
-        # Placeholder implementation
-        # TODO: Implement actual conversion logic
-        return KVCache(
-            kvs=block_cache,
-            device=KVCacheMetadata(
-                device=None,  # Will be set by caller
-                offloaded=False
-            )
-        )
-    
-    def _convert_kvs_to_block_cache(self, cache_tensors) -> tuple:
-        """Convert KVCache format to block cache format"""
-        # Placeholder implementation
-        # TODO: Implement actual conversion logic
-        return cache_tensors
+    def _write_kvs(self, kvs: AdaptedKVCache, start_position: int) -> None:
+        assert self._active_cache_tensors_stack, "KV write called outside of use_cache context"
+        cache_tensors = self._active_cache_tensors_stack[-1]
+        new_kvs = kvs.kvs if hasattr(kvs, "kvs") else kvs  # type: ignore
+        assert len(cache_tensors) % 2 == 0 and len(new_kvs) % 2 == 0, "KV lists must be K/V pairs"
+        bh, head_dim, new_len = new_kvs[0].shape
+        logger.info(f"OFFLOAD: KV write start={start_position}, new_len={new_len}, bh={bh}, d={head_dim}")
 
+        # Keys: cache_key [B,H,D,Lmax], new_key [B*H, D, new_len]
+        for cache_key, new_key in zip(cache_tensors[0::2], new_kvs[0::2]):
+            B, H, D, Lmax = cache_key.shape
+            assert D == head_dim and start_position + new_len <= Lmax
+            reshaped = new_key.view(B, H, head_dim, new_len)
+            cache_key[:, :, :, start_position:start_position + new_len] = reshaped
 
+        # Values: cache_value [B,H,Lmax,D], new_value [B*H, new_len, D]
+        for cache_value, new_value in zip(cache_tensors[1::2], new_kvs[1::2]):
+            B, H, Lmax, D = cache_value.shape
+            assert D == head_dim and start_position + new_len <= Lmax
+            reshaped = new_value.view(B, H, new_len, head_dim)
+            cache_value[:, :, start_position:start_position + new_len, :] = reshaped
 
+        logger.info("OFFLOAD: KV write finished")
 
-if __name__ == "__main__":
-    test_kv_cache_manager()
         
         
