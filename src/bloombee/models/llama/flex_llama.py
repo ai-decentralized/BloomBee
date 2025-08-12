@@ -54,6 +54,28 @@ DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 from pynvml import *
 
+class FLEX_LlamaRMSNorm(LlamaRMSNorm): #put in fex_llama
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__(hidden_size, eps=1e-6)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+    
+    
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
 def get_choice(cur_percent, percents, choices):
     percents = np.cumsum(percents)
     assert np.abs(percents[-1] - 100) < 1e-5

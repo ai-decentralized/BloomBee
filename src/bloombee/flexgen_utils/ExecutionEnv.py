@@ -1,7 +1,6 @@
 import argparse
 import dataclasses
-from attr import define, field
-from attr.setters import frozen
+
 import functools
 import gc
 import math
