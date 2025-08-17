@@ -357,6 +357,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
 
                             past_key, past_value = past_key_value
                             # Normalize past shapes into [B, H, S, D]
+                            # logger.info(f"before format past_key: {past_key.shape}")
                             if past_key.dim() == 3:
                                 # from backend packed: [B*H, D, S] or [B*H, S, D]
                                 bh, x1, x2 = past_key.shape
@@ -373,9 +374,10 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                                 past_value = v_bhsd.view(b, h, s, d)
                             # Transform to FlexGen expected (s, b*h, d)
                             b, h, s, d = past_key.shape
-
+                            # logger.info(f"after format past_key: {past_key.shape}")
                             past_k_new = past_key.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
                             past_v_new = past_value.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
+                            # logger.info(f"past_key: {past_k_new.shape}")
                             self.cache_read_buf[0][0].store((past_k_new, past_v_new))
 
                         layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num)

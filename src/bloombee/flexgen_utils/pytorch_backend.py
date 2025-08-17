@@ -230,7 +230,16 @@ class TorchTensor:
 
     def smart_copy(self, dst, src_indices=None):
         if self.device == dst:
+            if src_indices is not None:
+                # 假设 self.data 是一个 torch.Tensor
+                sliced_data = self.data[src_indices]
+                # 创建一个新的 wrapper 对象（类型和 self 一样）
+                new_obj = self.create_from_torch(
+                    sliced_data, device=self.device, name=self.name
+                )
+                return new_obj, True
             return self, False
+
         return self.copy(dst, src_indices=src_indices), True
 
     def move(self, dst):
