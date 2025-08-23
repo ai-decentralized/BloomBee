@@ -29,7 +29,11 @@ from bloombee.flexgen_utils.timer import timers
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from bloombee.utils.memory_usage import see_memory_usage
 
+from hivemind.utils import get_logger
+
 fix_recursive_import()
+
+logger = get_logger(__name__)
 
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
@@ -478,15 +482,12 @@ class FLEX_LlamaAttention(LlamaAttention):
         else:
             ((w_q, _), (w_k, _),  (w_v, _), (w_out, _), (input_layernorm, _), (rotary_emb_inv_freq, _)) = weight_read_buf.val
 
-        print(f"attention forward, i: {i}, self.task.prompt_len: {self.task.prompt_len}, hiden states: {h}")
         
         if i == 0:
             # prefill
             # import pdb;pdb.set_trace()---------------------
             # see_memory_usage("-----------------------------------------before mha_llama ")
-            print(f"attention forward, attention_mask: {attention_mask.val}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            print(f"attention forward, mask: {mask.data}")
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
@@ -495,19 +496,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # decoding
             # see_memory_usage("-----------------------------------------before mha_gen_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            print(f"attention forward, mask: {mask.data}, ")
             k_cache, v_cache = cache_read_buf.pop()
-            # Optional memory logging
-            # see_memory_usage("attention forward (decoding) before mha_gen_llama")
-            if self.attention_compute == self.env.gpu:
-                print(f"attention_compute == gpu")
-            elif self.attention_compute == self.env.cpu:
-                print(f"attention_compute == cpu")
-            else:
-                print(f"attention_compute == {self.attention_compute}")
-            # k_cache = TorchTensor.create_from_torch(k_tensor, self.attention_compute)
-            # v_cache = TorchTensor.create_from_torch(v_tensor, self.attention_compute)
-            print(f"k_cache: {k_cache.shape}, self.policy.compress_cache: {self.policy.compress_cache}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
                 w_k, w_v, w_out, num_attention_heads,
@@ -515,7 +504,6 @@ class FLEX_LlamaAttention(LlamaAttention):
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 input_layernorm,
                 rotary_emb_inv_freq)
-            print(f"attention forward, hiden state: {h}, new_k_cache: {new_k_cache}, new_v_cache: {new_v_cache}")
             cache_write_buf.store((new_k_cache, new_v_cache))
             # see_memory_usage("-----------------------------------------after mha_gen_llama ")
         hidden.val = h

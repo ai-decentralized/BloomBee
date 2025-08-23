@@ -68,7 +68,7 @@ class MemoryCache:
         self.mocked_task = Task(
                 inputs=None,
                 prompt_len=0,
-                gen_len=128,
+                gen_len=256,
                 cut_gen_len=None,
                 do_sample=False,
                 temperature=0,

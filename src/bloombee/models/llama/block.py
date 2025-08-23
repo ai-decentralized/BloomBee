@@ -336,7 +336,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                     if i == 0:
                         mask_length = hidden_states.shape[1]
                     else:
-                        mask_length = i
+                        mask_length = i + 1
                     self.update_attention_mask(0, k, mask_length)
 
                 for j in range(self.num_layers):
@@ -583,7 +583,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         if position_ids is not None:
             print(f'🔧 WrappedLlamaBlock.forward: position_ids shape={position_ids.shape}, content={position_ids}')
 
-        print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}, past_key_value: {past_key_value}")
+        # print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}, past_key_value: {past_key_value}")
         if attention_mask is None:
             attention_mask = torch.ones(
                 (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device

@@ -20,9 +20,6 @@ from bloombee.flexgen_utils.utils import (GB, T, cpu_mem_stats, vector_gather, t
     torch_dtype_to_num_bytes)
 from torch import nn
 from transformers.activations import ACT2FN
-# 移除循环导入，直接定义see_memory_usage函数
-# from bloombee.utils.memory_usage import see_memory_usage
-
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -64,12 +61,27 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    B, S, H, D = xq.shape
+    half = D // 2
+
+    q1, q2 = xq[..., :half].float(), xq[..., half:].float()
+    k1, k2 = xk[..., :half].float(), xk[..., half:].float()
+    qz = torch.complex(q1, q2)  # (B,S,H,half)
+    kz = torch.complex(k1, k2)
+
+    if freqs_cis.ndim == 2:            # (S, half)
+        freqs_bc = freqs_cis.view(1, S, 1, half)
+    elif freqs_cis.ndim == 3:          # (B, S, half)
+        freqs_bc = freqs_cis.view(B, S, 1, half)
+    else:
+        raise ValueError(f"unexpected freqs_cis shape: {freqs_cis.shape}")
+
+    qz = qz * freqs_bc
+    kz = kz * freqs_bc
+
+    q_out = torch.cat([qz.real, qz.imag], dim=-1).type_as(xq)
+    k_out = torch.cat([kz.real, kz.imag], dim=-1).type_as(xk)
+    return q_out, k_out
 
 def precompute_freqs_cis(dim: int, end: int, inv_freq, theta= 10000.0):
     # freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -82,12 +94,13 @@ def precompute_freqs_cis(dim: int, end: int, inv_freq, theta= 10000.0):
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
-def rms_norm(hidden_states, weight, variance_epsilon=1e-5):
+def rms_norm(hidden_states, weight, variance_epsilon=1e-6):  # 改 eps=1e-6
     input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
-    return weight * hidden_states.to(input_dtype)
+    x = hidden_states.to(torch.float32)
+    w = weight.to(torch.float32)
+    var = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(var + variance_epsilon)
+    return (x * w).to(input_dtype)  # 乘法在 fp32，最后再 cast
 
 def sample_top_p(probs, p):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -531,7 +544,7 @@ class TorchDevice:
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
         # shape: (b, 1, h)
-        q = F.linear(hidden, w_q.data) * scaling
+        q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
         # shape: (b, 1, num_attention_heads, head_dim)
@@ -616,63 +629,52 @@ class TorchDevice:
         return TorchTensor.create_from_torch(value, self), k_new, v_new
     
 
-    def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out, num_attention_heads, donate, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq):
+    def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out,
+              num_attention_heads, donate, compress_cache, comp_config,
+              input_layernorm, rotary_emb_inv_freq):
         """Multi-head attention (prefill phase)."""
-        # decompress weight
+        
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
             w_k = w_k.device.decompress(w_k)
             w_v = w_v.device.decompress(w_v)
             w_out = w_out.device.decompress(w_out)
-        
-        bsz,q_len,h = hidden_states.shape   # hidden_states.shape should be   torch.Size([1, 1, hidden_size])
-        # 1 is the length of inputs.ids
-        # if the length of inputs is 8, the hidden_states.shape should be torch.Size([1, 8, hidden_size])
-        # q_len = 8 ##########################################################################
+
+        bsz, q_len, h = hidden_states.shape
         head_dim = h // num_attention_heads
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
-        scaling = head_dim ** -0.5
-        # import pdb; pdb.set_trace()
         hidden = rms_norm(hidden_states.data, input_layernorm.data)
-        # hidden = F.layer_norm(hidden_states.data, (h,), weight=input_layernorm.data)
-        
-        q = F.linear(hidden, w_q.data) * scaling
+
+        q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
-
+        
         q = q.view(bsz, q_len, num_attention_heads, head_dim)
         k = k.view(bsz, q_len, num_attention_heads, head_dim)
         v = v.view(bsz, q_len, num_attention_heads, head_dim)
-
+        
         q, k = apply_rotary_emb(q, k, freqs_cis=freq_cis[:q_len])
 
-        # shape: (b * num_attention_heads, s, head_dim)
+        # (b * n_head, s, d), (b * n_head, d, s), (b * n_head, s, d)
         q = q.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
-        # shape: (b * num_attention_heads, head_dim, s)
         k = k.permute(0, 2, 3, 1).reshape(bsz * num_attention_heads, head_dim, q_len)
-        # shape: (b * num_attention_heads, s, head_dim)
         v = v.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
 
-        attn_weights = torch.bmm(q, k)
+        attn_weights = torch.bmm(q, k) / math.sqrt(head_dim)
 
         idx = torch.arange(q_len, device=self.dev)
-        causal_mask = (idx <= idx.view(q_len, 1)).view(1, 1, q_len, q_len) 
-        # causal_mask.shape should be torch.Size([1, 1, 1, 1])
-        # 1 is the length of inputs.ids
-        # if the length of inputs is 8, the causal_mask.shape should be torch.Size([1, 1, 8, 8])
-        # import pdb; pdb.set_trace()
-        mask = attention_mask.data.view(bsz, 1, 1, q_len) & causal_mask # shape [1,1]
-        # mask.shape should be torch.Size([1, 1, 1, 1])
-        
-        # shape: (b, n_head, s, s)
+        causal_mask = (idx <= idx.view(q_len, 1)).view(1, 1, q_len, q_len)
+        mask = attention_mask.data.view(bsz, 1, 1, q_len) & causal_mask
+
         attn_weights = attn_weights.view(bsz, num_attention_heads, q_len, q_len)
         attn_weights = torch.where(mask, attn_weights, -1e4)
         attn_weights = attn_weights.view(bsz * num_attention_heads, q_len, q_len)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        # shape: (b, n_head, s, head_dim)
+
+        attn_weights = F.softmax(attn_weights.to(torch.float32), dim=2).to(q.dtype)
+
         value = torch.bmm(attn_weights, v).view(bsz, num_attention_heads, q_len, head_dim)
-        # shape: (b, s, h)
         value = value.transpose(1, 2).reshape(bsz, q_len, h)
+
         value = F.linear(value, w_out.data)
 
         value.add_(hidden_states.data)
@@ -680,20 +682,17 @@ class TorchDevice:
         if donate[0]: hidden_states.delete()
         if donate[1]: attention_mask.delete()
 
-        # (s, b * n_head, head_dim)
+        # (s, b * n_head, head_dim) / (b * n_head, s, head_dim)
         k = k.permute(2, 0, 1)
         v = v.permute(1, 0, 2)
 
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
             v = self.compressed_device.compress(v, comp_config)
-        else:
+       else:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
-        ## k.shape (32,32,128)
-        ## v.shape (32,32,128)
         return TorchTensor.create_from_torch(value, self), k, v
-    
     
     def mha_gen_llama(self, inputs, attention_mask, w_q, w_k, w_v,
                 w_out, n_head, k_cache, v_cache, donate,
@@ -713,17 +712,19 @@ class TorchDevice:
         scaling = head_dim ** -0.5
 
         hidden = rms_norm(inputs.data, input_layernorm.data)
-        # hidden = F.layer_norm(inputs.data, (h,), weight=input_layernorm.data)
 
         # shape: (b, 1, h)
-        q = F.linear(hidden, w_q.data) * scaling
+        q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
+        
         # shape: (b, 1, n_head, head_dim)
         q = q.view(b, tgt_s, n_head, head_dim)
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
-        q, k = apply_rotary_emb(q, k, freqs_cis=freq_cis[src_s: src_s + tgt_s])
+        
+        q, k = apply_rotary_emb(q, k, freqs_cis=freq_cis[src - tgt_s: src])
+        
          # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
         # shape: (1, b * n_head, head_dim)
@@ -738,14 +739,14 @@ class TorchDevice:
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache and k_cache.device.device_type == DeviceType.COMPRESSED:
                     # shape: (s, b * n_head, head_dim)
-                    k = k_cache.device.decompress(k_cache)[:src_s]
-                    v = v_cache.device.decompress(v_cache)[:src_s]
+                    k = k_cache.device.decompress(k_cache)
+                    v = v_cache.device.decompress(v_cache)
                 else:
                     # shape: (s, b * n_head, head_dim)
-                    k = k_cache.data[:src_s]
-                    v = v_cache.data[:src_s]
-                k[src_s:src_s + 1] = k_new
-                v[src_s:src_s + 1] = v_new
+                    k = k_cache.data
+                    v = v_cache.data
+                k = torch.cat([k, k_new], dim=0)   # shape → (hist_len + tgt_s, ...)
+                v = torch.cat([v, v_new], dim=0)
                 # shape: (b * n_head, head_dim, s)
                 k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
                 # shape: (b * n_head, s, head_dim)
@@ -783,6 +784,7 @@ class TorchDevice:
 
         # shape: (b, 1, h)
         value = value.transpose(1, 2).view(b, tgt_s, h)
+        
         value = F.linear(value, w_out.data)
 
         value.add_(inputs.data)
@@ -804,9 +806,10 @@ class TorchDevice:
         return TorchTensor.create_from_torch(value, self), k_new, v_new
 
 
-    def _attention_weights(self, q, k, mask, b, src_s, n_head):
+    def _attention_weights(self, q, k, mask, b, src_s, n_head, head_dim):
         # shape: (b * n_head, 1, s)
-        attn_weights = torch.bmm(q, k)
+        attn_weights = torch.bmm(q, k) / math.sqrt(head_dim)
+
         # shape: (b, 1, 1, s)
         mask = mask.view(b, 1, 1, src_s)
         
@@ -820,14 +823,14 @@ class TorchDevice:
 
     def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
         # shape: (b * n_head, 1, s)
-        attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
+        attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head, head_dim)
         # shape: (b, n_head, 1, head_dim)
         return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 
     def _sparse_attention_value(self, q, k, v_new, v_cache, mask, b,
                                 src_s, tgt_s, n_head, head_dim, attn_sparsity):
         # shape: (b * n_head, 1, s)
-        attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
+        attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head, head_dim)
         topk = int(attn_sparsity * (attn_weights.shape[2] - 1))
         topk_weights, topk_indices = attn_weights[:, :, :-1].topk(
             topk, dim=2, sorted=False)

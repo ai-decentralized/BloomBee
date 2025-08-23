@@ -226,7 +226,6 @@ class KVCacheManager:
         #     # hypo_ids: shape (B,)
         #     k_pkv = k_pkv.index_select(0, hypo_ids)
         #     v_pkv = v_pkv.index_select(0, hypo_ids)
-        logger.info(f"k_pkv: {k_pkv.shape}, prefix_length: {prefix_length}")
         return k_pkv, v_pkv
 
 
@@ -315,6 +314,8 @@ class KVCacheManager:
         # 这样 general_copy 能统一处理各类设备/压缩/分段
         k_src_tt = TorchTensor.create_from_torch(k_write, self.attention_compute)
         v_src_tt = TorchTensor.create_from_torch(v_write, self.attention_compute)
+
+        logger.info(f"_write_kvs, dst_idx: {dst_idx}")
 
         # 真正写入（兼容 COMPRESSED / MIXED / DISK 等）
         general_copy(k_cache, dst_idx, k_src_tt, None)

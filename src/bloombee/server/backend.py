@@ -191,6 +191,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             offload_logger.info(f"   - prefix_length: {inference_info.prefix_length}")
             offload_logger.info(f"   - cache_handles数量: {len(inference_info.cache_handles)}")
             offload_logger.info(f"   - 当前设备: {hidden_states.device}")
+            logger.info(f"inference_step, input hidden_states: {hidden_states}")
             
             # see_memory_usage("transformer backend inference step : seq_len")
             
@@ -291,6 +292,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
 
+                logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
 

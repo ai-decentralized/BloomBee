@@ -71,10 +71,12 @@ def benchmark_inference(process_idx, args, result_pipe):
             logger.info(f"🔍 [Process {process_idx}] Step {step} - Before generation:")
             logger.info(f"🔍 [Process {process_idx}] Current result length: {len(result)}")
             logger.info(f"🔍 [Process {process_idx}] Current result text: {repr(result)}")
-            if (step == 0):
-                outputs = model.generate(input_ids, max_new_tokens=1, session=sess)
-            else:
-                outputs = model.generate(max_new_tokens=1, session=sess)
+            # if (step == 0):
+            #     outputs = model.generate(input_ids, max_new_tokens=1, session=sess)
+            # else:
+            #     outputs = model.generate(max_new_tokens=1, session=sess)
+                
+            outputs = model.generate(max_new_tokens=1, session=sess)    
                 
             logger.info(f"🔍 [Process {process_idx}] Step {step} - After generation:")
             logger.info(f"🔍 [Process {process_idx}] Generated outputs shape: {outputs.shape}")
