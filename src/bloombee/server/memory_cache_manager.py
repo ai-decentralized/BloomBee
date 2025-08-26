@@ -67,18 +67,6 @@ class KVCacheManager:
     async def allocate_cache(
         self, *descriptors: TensorDescriptor, timeout: float
     ) -> AsyncContextManager[Sequence[Handle]]:
-        """
-        Create a handle that is associated with buffers on unique device. If cache full, raises AllocationFailed.
-
-        :param descriptors: one or more tensors tensor of this size, dtype, etc
-        :param timeout: optional maximum time to wait for cache allocation; None (default) means no time limit
-
-        :note: if descriptors reside on different devices, it is expected that they are approximately balanced across devices;
-          if not, it will count maximum tensor allocation across devices for the purposes of size limit
-
-        :note: This function should be called by connection handlers, it can be called concurrently from multiple processes.
-        Furthermore, it can be called concurrently with at most one use_cache call in runtime.
-        """
         assert os.getpid() != self.runtime_pid, "must be called by a ConnectionHandler, not runtime"
         assert all(descr.device is not None for descr in descriptors), "please specify allocated devices"
         if self.max_alloc_timeout is not None and timeout is not None:
