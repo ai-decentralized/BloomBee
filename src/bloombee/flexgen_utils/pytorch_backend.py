@@ -94,7 +94,7 @@ def precompute_freqs_cis(dim: int, end: int, inv_freq, theta= 10000.0):
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
-def rms_norm(hidden_states, weight, variance_epsilon=1e-6):  # 改 eps=1e-6
+def rms_norm(hidden_states, weight, variance_epsilon=1e-6):  # 改 eps=1e-6 from 1e-5
     input_dtype = hidden_states.dtype
     x = hidden_states.to(torch.float32)
     w = weight.to(torch.float32)
@@ -689,7 +689,7 @@ class TorchDevice:
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
             v = self.compressed_device.compress(v, comp_config)
-       else:
+        else:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
         return TorchTensor.create_from_torch(value, self), k, v

@@ -258,13 +258,6 @@ class Server:
             num_blocks = len(block_indices)
         self.strict_block_indices, self.num_blocks = block_indices, num_blocks
 
-        gib = 1024**3
-        self.attn_cache_bytes = self._cache_bytes_per_block * num_blocks
-        logger.info(
-            f"OFFLOAD: cache budget tokens={attn_cache_tokens}, max_batch={self.max_batch_size}, "
-            f"blocks={num_blocks}, total={self.attn_cache_bytes / gib:.2f} GiB"
-        )
-
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
 
@@ -403,7 +396,6 @@ class Server:
                 policy=self.policy, #####
                 weight_home= self.weight_home, #####
                 path=self.path, ######
-                attn_cache_bytes=self.attn_cache_bytes,
                 server_info=self.server_info,
                 model_info=self.model_info,
                 block_indices=block_indices,
@@ -514,7 +506,6 @@ class ModuleContainer(threading.Thread):
         policy: Policy,    ####
         weight_home: array_1d, ####
         path: str,
-        attn_cache_bytes: int,
         server_info: ServerInfo,
         model_info: ModelInfo,
         block_indices: List[int],
@@ -522,6 +513,7 @@ class ModuleContainer(threading.Thread):
         max_batch_size: int,
         max_chunk_size_bytes: int,
         max_alloc_timeout: float,
+        inference_max_length: int,
         torch_dtype: torch.dtype,
         cache_dir: str,
         max_disk_space: int,
@@ -539,8 +531,7 @@ class ModuleContainer(threading.Thread):
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
         print('module_uids ', module_uids)
 
-        cache_manager = KVCacheManager(attn_cache_bytes, max_alloc_timeout, policy, env, block_config)
-
+        cache_manager = KVCacheManager(inference_max_length, max_alloc_timeout, policy, env, block_config)
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(
@@ -634,6 +625,7 @@ class ModuleContainer(threading.Thread):
             dht,
             dht_prefix,
             blocks,
+            inference_max_length=inference_max_length,
             dht_announcer=dht_announcer,
             server_info=server_info,
             update_period=update_period,
@@ -804,7 +796,7 @@ class ModuleAnnouncerThread(threading.Thread):
         while True:
             start_time = time.perf_counter()
 
-            self.server_info.cache_tokens_left = self.cache_manager.bytes_left() // self.bytes_per_token
+            self.server_info.cache_tokens_left = self.cache_manager.tokens_left()
             if self.server_info.state != ServerState.OFFLINE:
                 self._ping_next_servers()
                 self.server_info.next_pings = {

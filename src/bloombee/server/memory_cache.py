@@ -44,16 +44,17 @@ class MemoryCache:
     """A shared cache for storing tensors that persist across calls. Main use case: storing past attention KVs"""
 
     def __init__(self, 
-                 max_size_bytes: Optional[int], 
+                 max_size_tokens: Optional[int], 
                  max_alloc_timeout: Optional[float] = None, 
                  policy: Optional[Policy] = None, 
                  block_config: Optional[PretrainedConfig] = None,
                  device: Any = None):
-        self.max_size_bytes = max_size_bytes if max_size_bytes is not None else (2**64 - 1)
+        logger.info(f"max_size_tokens: {max_size_tokens}")
+        self.max_size_tokens = max_size_tokens if max_size_tokens is not None else (2048)
         self.max_alloc_timeout = max_alloc_timeout
         self._lock_metadata = mp.Lock()
-        self._current_size = mp.Value(ctypes.c_int64, 0, lock=False)
-        self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
+        self._current_tokens = mp.Value(ctypes.c_int64, 0, lock=False)
+        self._enqueued_tokens = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
         self._allocated_tensors: Dict[Handle, Any] = {}
         self._handle_size_bytes: Dict[Handle, int] = {}
@@ -65,40 +66,30 @@ class MemoryCache:
         
 
         # flexgen' offloading depends on the task parameter, we need to mock a temp task variable for memory allocation without changing the data structure of flexgen.
-        self.mocked_task = Task(
-                inputs=None,
-                prompt_len=0,
-                gen_len=256,
-                cut_gen_len=None,
-                do_sample=False,
-                temperature=0,
-                stop=None,
-                top_p=None,
-        )
         self.allocation_policy = policy
         self.block_config = block_config
         self.device = device
         
 
     @property
-    def current_size_bytes(self) -> int:
-        return self._current_size.value
+    def current_size_tokens(self) -> int:
+        return self._current_tokens.value
 
-    @current_size_bytes.setter
-    def current_size_bytes(self, value: int):
-        self._current_size.value = value
-
-    @property
-    def enqueued_size_bytes(self) -> int:
-        return self._enqueued_size.value
-
-    @enqueued_size_bytes.setter
-    def enqueued_size_bytes(self, value: int):
-        self._enqueued_size.value = value
+    @current_size_tokens.setter
+    def current_size_tokens(self, value: int):
+        self._current_tokens.value = value
 
     @property
-    def bytes_left(self) -> int:
-        return self.max_size_bytes - self.current_size_bytes
+    def enqueued_size_tokens(self) -> int:
+        return self._enqueued_tokens.value
+
+    @enqueued_size_tokens.setter
+    def enqueued_size_tokens(self, value: int):
+        self._enqueued_tokens.value = value
+
+    @property
+    def tokens_left(self) -> int:
+        return self.max_size_tokens - self.current_size_tokens
 
     @property
     def handle_counter(self) -> int:
@@ -109,79 +100,79 @@ class MemoryCache:
         self._handle_counter.value = value
 
     async def _schedule_alloc(
-        self, alloc_size: int, *descriptors: TensorDescriptor, timeout: Optional[float]
+        self, alloc_tokens_num: int, *descriptors: TensorDescriptor, timeout: Optional[float]
     ) -> Sequence[Handle]:
         """
         This method should be called inside asyncio.shield() because:
             - hivemind.utils.enter_asynchronously() does not always release the lock on cancellation
         """
         try:
-            async with self._wait_for_free_memory(alloc_size, timeout):
+            async with self._wait_for_free_memory(alloc_tokens_num, timeout):
                 with self._lock_metadata:
                     handles = tuple(int(self.handle_counter) + i for i in range(len(descriptors)))
-                    self.current_size_bytes += alloc_size
+                    self.current_size_tokens += alloc_tokens_num
                     self.handle_counter += len(handles)  # note: this will eventually overflow and it is okay
                     self._pipe_send.send((handles, descriptors))
                     return handles
         except TimeoutError:
-            raise AllocationFailed(f"Could not allocate {alloc_size} (timeout={timeout})")
+            raise AllocationFailed(f"Could not allocate {alloc_tokens_num} (timeout={timeout})")
 
     @contextlib.asynccontextmanager
-    async def _wait_for_free_memory(self, alloc_size: int, timeout: Optional[float]):
+    async def _wait_for_free_memory(self, alloc_tokens_num: int, timeout: Optional[float]):
         start_time = time.perf_counter()
         loop = asyncio.get_event_loop()
 
-        with self._enqueued_size.get_lock():
-            self._enqueued_size.value += alloc_size
+        with self._enqueued_tokens.get_lock():
+            self._enqueued_tokens.value += alloc_tokens_num
         allocated = False
         try:
             context_manager = async_timeout.timeout(timeout) if timeout != 0 else contextlib.AsyncExitStack()
             # contextlib.AsyncExitStack() is used as a null context here
             async with context_manager:
-                if timeout == 0 and self.current_size_bytes + self.enqueued_size_bytes > self.max_size_bytes:
-                    raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
+                if timeout == 0 and self.current_size_tokens + self.enqueued_size_tokens > self.max_size_tokens:
+                    raise AllocationFailed(f"Could not allocate {alloc_tokens_num} tokens cache immediately: out of memory")
                 async with enter_asynchronously(self._lock_acquire_memory):
-                    if self.current_size_bytes + alloc_size > self.max_size_bytes:
+                    if self.current_size_tokens + alloc_tokens_num > self.max_size_tokens:
                         if timeout == 0:
-                            raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
+                            raise AllocationFailed(f"Could not allocate {alloc_tokens_num} tokens cache immediately: out of memory")
                         elapsed_time = time.perf_counter() - start_time
                         remaining_timeout = max(0.0, timeout - elapsed_time) if timeout is not None else None
-                        await loop.run_in_executor(None, self._wait_until_available, alloc_size, remaining_timeout)
+                        await loop.run_in_executor(None, self._wait_until_available, alloc_tokens_num, remaining_timeout)
 
                 allocated = True
-                with self._enqueued_size.get_lock():
-                    self._enqueued_size.value -= alloc_size
+                with self._enqueued_tokens.get_lock():
+                    self._enqueued_tokens.value -= alloc_tokens_num
                 yield
         except asyncio.TimeoutError:
-            raise AllocationFailed(f"Could not allocate {alloc_size} within {timeout} seconds")
+            raise AllocationFailed(f"Could not allocate {alloc_tokens_num} within {timeout} seconds")
         finally:
             if not allocated:
-                with self._enqueued_size.get_lock():
-                    self._enqueued_size.value -= alloc_size
+                with self._enqueued_tokens.get_lock():
+                    self._enqueued_tokens.value -= alloc_tokens_num
 
-    def _free(self, alloc_size: int, alloc_task: asyncio.Task):
+    def _free(self, alloc_tokens_num: int, alloc_task: asyncio.Task):
         if alloc_task.exception() is not None:
             return
         handles = alloc_task.result()
 
         with self._lock_metadata:
             self._pipe_send.send((handles, None))  # signal runtime to free these handles
-            self.current_size_bytes -= alloc_size
+            self.current_size_tokens -= alloc_tokens_num
         self._memory_freed_event.set()
 
-    def _wait_until_available(self, allocated_size: int, timeout: Optional[float] = None):
+    def _wait_until_available(self, alloc_tokens_num: int, timeout: Optional[float] = None):
         # note: this function should only be called inside _lock_acquire_memory!
-        if allocated_size > self.max_size_bytes:
+        if alloc_tokens_num > self.max_size_tokens:
             raise AllocationFailed(
-                f"Could not allocate {allocated_size} bytes, max cache size = {self.max_size_bytes} bytes"
+                f"Could not allocate {alloc_tokens_num} tokens cache, max cache size = {self.max_size_tokens} tokens"
             )
         timeout = timeout if timeout != float("inf") else None
         deadline = None if timeout is None else time.perf_counter() + timeout
-        while self.current_size_bytes + allocated_size > self.max_size_bytes:
+        while self.current_size_tokens + alloc_tokens_num > self.max_size_tokens:
             remaining_time = None if timeout is None else deadline - time.perf_counter()
             if not self._memory_freed_event.wait(remaining_time):
                 raise AllocationFailed(
-                    f"Server's attention cache is full, failed to allocate {allocated_size} bytes in {timeout} seconds"
+                    f"Server's attention cache is full, failed to allocate {alloc_tokens_num} tokens cache in {timeout} seconds"
                 )
             self._memory_freed_event.clear()
 
@@ -202,6 +193,16 @@ class MemoryCache:
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
+                    self.mocked_task = Task(
+                        inputs=None,
+                        prompt_len=0,
+                        gen_len=descr.shape[-1],
+                        cut_gen_len=None,
+                        do_sample=False,
+                        temperature=0,
+                        stop=None,
+                        top_p=None,
+                    )
                     self._allocated_tensors[handle] = self.device.init_cache_one_gpu_batch(self.block_config, self.mocked_task, self.allocation_policy)
                     assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
             else:  # delete tensors by handle

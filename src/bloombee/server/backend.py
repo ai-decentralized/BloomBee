@@ -295,14 +295,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
-
-                print('backend.py output_hidden_states.shape ', output_hidden_states.shape)
-                
-                # 🔧 添加最终结果调试信息
-                offload_logger.info(f" inference_step完成:")
-                offload_logger.info(f"   - output_hidden_states形状: {output_hidden_states.shape}")
-                offload_logger.info(f"   - output_hidden_states设备: {output_hidden_states.device}")
-                offload_logger.info(f"   - 剩余内存: {self.cache_manager.bytes_left() / (1024*1024*1024):.2f} GB")
                 
                 return (output_hidden_states,) # Return output hidden states
                 

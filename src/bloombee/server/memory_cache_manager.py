@@ -10,7 +10,6 @@ from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMet
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import DeviceType, TorchDisk, TorchMixedDevice, TorchTensor, general_copy
-
 from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
 
 from bloombee.data_structures import Handle
@@ -23,7 +22,7 @@ logger = get_logger(__name__)
 
 
 class KVCacheManager:
-    def __init__(self, cache_max_size: int, 
+    def __init__(self, cache_max_size_tokens: int, 
                  max_alloc_timeout: int, 
                  policy: Policy, 
                  env: ExecutionEnv,
@@ -32,7 +31,7 @@ class KVCacheManager:
         self.env = env
         self.runtime_pid = os.getpid()
         self.device = self.get_cache_device(policy)
-        self.cache = MemoryCache(cache_max_size, max_alloc_timeout, policy, block_config, self.device)
+        self.cache = MemoryCache(cache_max_size_tokens, max_alloc_timeout, policy, block_config, self.device)
         self.offloading_policy = policy
         self.attention_compute = (self.env.cpu if policy.cpu_cache_compute
                                   else self.env.gpu)
@@ -72,34 +71,35 @@ class KVCacheManager:
         if self.max_alloc_timeout is not None and timeout is not None:
             timeout = min(timeout, self.max_alloc_timeout)
 
-        max_alloc_size = self.get_allocation_size(*descriptors)
+        allocation_tokens = self.get_allocation_size_tokens(*descriptors)
+        allocation_size = allocation_tokens * self.size_per_token()
 
         gib = 1024**3
-        cur_size, max_size = self.current_size_bytes, self.max_size_bytes
+        cur_tokens, max_tokens = self.current_size_tokens, self.max_size_tokens
+        max_size = max_tokens * self.size_per_token()
+        cur_size = cur_tokens * self.size_per_token()
         friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
         used_pct = (cur_size / max_size * 100.0) if max_size != 0 and max_size != 2**64 - 1 else 0.0
         logger.info(
-            f"rpc_inference.wait_for_alloc(size={max_alloc_size / gib:.2f} GiB), "
+            f"rpc_inference.wait_for_alloc(size={allocation_size / gib:.2f} GiB), "
             f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({used_pct:.1f}%)"
         )
 
-        alloc_task = asyncio.create_task(self.cache._schedule_alloc(max_alloc_size, *descriptors, timeout=timeout))
+        alloc_task = asyncio.create_task(self.cache._schedule_alloc(allocation_tokens, *descriptors, timeout=timeout))
         try:
             handles = await shield_and_wait(alloc_task)
-            logger.info(f"rpc_inference.alloc_done(size={max_alloc_size / gib:.2f} GiB)")
+            logger.info(f"rpc_inference.alloc_done(size={allocation_size / gib:.2f} GiB)")
             yield handles
         finally:
-            self.cache._free(max_alloc_size, alloc_task)
+            self.cache._free(allocation_tokens, alloc_task)
             
             
     @staticmethod
-    def get_allocation_size(*descriptors: TensorDescriptor) -> int:
-        """Return the memory size (bytes) to be allocated on a device. If there are many devices, return maximum"""
-        alloc_size_by_device = {}
+    def get_allocation_size_tokens(*descriptors: TensorDescriptor) -> int:
+        allocation_tokens_num = 0
         for descr in descriptors:
-            tensor_size = descr.numel() * get_size_in_bytes(descr.dtype)
-            alloc_size_by_device[descr.device] = alloc_size_by_device.get(descr.device, 0) + tensor_size
-        return max(alloc_size_by_device.values())
+            allocation_tokens_num = max(descr.shape[-1], allocation_tokens_num) 
+        return allocation_tokens_num
         
     
     def add_cache(self, kvs: AdaptedKVCache, start_position: int):
@@ -110,16 +110,21 @@ class KVCacheManager:
     ):
         self._write_kvs(new_kvs, start_position)
     
-    def bytes_left(self) -> int:
-        return self.cache.bytes_left
+    def tokens_left(self) -> int:
+        return self.cache.tokens_left
 
     @property
-    def current_size_bytes(self) -> int:
-        return self.cache.current_size_bytes
+    def current_size_tokens(self) -> int:
+        return self.cache.current_size_tokens
 
     @property
-    def max_size_bytes(self) -> int:
-        return self.cache.max_size_bytes
+    def max_size_tokens(self) -> int:
+        return self.cache.max_size_tokens
+    
+    def size_per_token(self) -> int:
+        cache_values_per_block = 2 * self.block_config.hidden_size
+        cache_values_per_block //= self.block_config.num_key_value_groups
+        return cache_values_per_block * get_size_in_bytes(torch.float16)
     
     def select_cache(
         self,
