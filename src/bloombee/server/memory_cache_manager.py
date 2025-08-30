@@ -72,12 +72,13 @@ class KVCacheManager:
             timeout = min(timeout, self.max_alloc_timeout)
 
         allocation_tokens = self.get_allocation_size_tokens(*descriptors)
-        allocation_size = allocation_tokens * self.size_per_token()
+        allocation_size = allocation_tokens * self.size_per_token() * len(descriptors)
 
         gib = 1024**3
         cur_tokens, max_tokens = self.current_size_tokens, self.max_size_tokens
-        max_size = max_tokens * self.size_per_token()
-        cur_size = cur_tokens * self.size_per_token()
+        max_size = max_tokens * self.size_per_token() * len(descriptors)
+        cur_size = cur_tokens * self.size_per_token() * len(descriptors)
+        logger.info(f"size_per_token: {self.size_per_token()}")
         friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
         used_pct = (cur_size / max_size * 100.0) if max_size != 0 and max_size != 2**64 - 1 else 0.0
         logger.info(
