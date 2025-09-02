@@ -2,6 +2,7 @@ import dataclasses
 from enum import Enum
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+import torch
 import pydantic
 from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
@@ -115,3 +116,5 @@ class InferenceMetadata:
     prefix_length: int
     cache_handles: Tuple[Handle, ...]
     active_adapter: Optional[str]
+    tree_attention_mask: Optional[torch.Tensor] = None
+    kv_cache_position_ids: Optional[torch.Tensor] = None

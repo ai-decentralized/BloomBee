@@ -555,6 +555,7 @@ class FLEX_LlamaAttention(LlamaAttention):
         cache_read_buf,
         weight_read_buf,
         attention_mask,
+        rotary_position_ids,
         cache_write_buf,
         i,
         k
@@ -581,7 +582,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # see_memory_usage("-----------------------------------------before mha_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
-                                       num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
+                                       num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids)
             cache_write_buf.store((new_k_cache, new_v_cache))
             # see_memory_usage("-----------------------------------------after mha_llama ")
         else:
@@ -595,7 +596,8 @@ class FLEX_LlamaAttention(LlamaAttention):
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 input_layernorm,
-                rotary_emb_inv_freq)
+                rotary_emb_inv_freq,
+                rotary_position_ids)
             cache_write_buf.store((new_k_cache, new_v_cache))
             # see_memory_usage("-----------------------------------------after mha_gen_llama ")
         hidden.val = h
@@ -677,6 +679,7 @@ class FLEX_LlamaMLP(LlamaMLP):
         attention_mask,
         cache_write_buf,
         position_ids,
+        rotary_position_ids,
         k: int = 0
         ):
         donate = [False] * 9

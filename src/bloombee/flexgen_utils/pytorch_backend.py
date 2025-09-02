@@ -70,15 +70,19 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-def precompute_freqs_cis(dim: int, end: int, inv_freq, theta= 10000.0):
-    # freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    # freqs = freqs.cuda()
-    # inv_freq = 1.0 / (theta ** (torch.arange(0, dims_per_head, 2).float() / dims_per_head))
-    # freqs = inv_freq[: (dim // 2)]
-    freqs = inv_freq
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+def precompute_freqs_cis(
+    dim: int, 
+    end: int, 
+    inv_freq: torch.Tensor, 
+    theta: float = 10000.0,
+    position_ids: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    if position_ids is None:
+        t = torch.arange(end, device=inv_freq.device)
+    else:
+        t = position_ids.float().to(inv_freq.device)
+    freqs = torch.outer(t, inv_freq).float()
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
 def rms_norm(hidden_states, weight, variance_epsilon=1e-5):
@@ -606,7 +610,7 @@ class TorchDevice:
         return TorchTensor.create_from_torch(value, self), k_new, v_new
     
 
-    def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out, num_attention_heads, donate, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq):
+    def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out, num_attention_heads, donate, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids):
         """Multi-head attention (prefill phase)."""
         # decompress weight
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -620,7 +624,7 @@ class TorchDevice:
         # if the length of inputs is 8, the hidden_states.shape should be torch.Size([1, 8, hidden_size])
         # q_len = 8 ##########################################################################
         head_dim = h // num_attention_heads
-        freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
+        freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
         # import pdb; pdb.set_trace()
         hidden = rms_norm(hidden_states.data, input_layernorm.data)
@@ -687,12 +691,12 @@ class TorchDevice:
     def mha_gen_llama(self, h, mask, w_q, w_k, w_v, w_out, num_attention_heads,
                 k_cache, v_cache, donate, attn_sparsity,
                 compress_cache, comp_cache_config,
-                input_layernorm, rotary_emb_inv_freq):
+                input_layernorm, rotary_emb_inv_freq, rotary_position_ids):
         """Multi-head attention (generation phase)."""
         # Fused optimization for attention mechanism
         b, tgt_s, hidden_size = h.shape
         head_dim = hidden_size // num_attention_heads
-        freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
+        freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
 
         hidden = rms_norm(h.data, input_layernorm.data)

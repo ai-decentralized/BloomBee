@@ -24,6 +24,7 @@ class RemotePastKeyValues(Cache):
         super().__init__()
         self._seen_tokens = 0
         self.hypo_ids: Optional[torch.LongTensor] = None
+        self.kv_cache_position_ids: Optional[torch.LongTensor] = None
 
     def __getitem__(self, _index: int) -> List[torch.Tensor]:
         return [DUMMY]  # For compatibility with BloomForCausalLM.prepare_inputs_for_generation()
@@ -39,6 +40,9 @@ class RemotePastKeyValues(Cache):
 
     def reorder_cache(self, beam_idx):
         raise NotImplementedError("Beam search reordering is not implemented yet")
+    
+    def set_kv_cache(self, position_ids: Optional[torch.LongTensor]):
+        self.kv_cache_position_ids = position_ids
 
 
 _skipped_tokens = ContextVar("skipped_tokens", default=0)

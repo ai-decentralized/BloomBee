@@ -131,6 +131,7 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
 	    k: Optional[int]= 0, ########################################
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
@@ -182,7 +183,7 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         
         print(f'🔧 Extracted start_position: {start_position}')
         
-        super(OptimizedLlamaAttention, self).forward(hidden_states,cache_read_buf, weight_read_buf,attention_mask,cache_write_buf,start_position,k)
+        super(OptimizedLlamaAttention, self).forward(hidden_states,cache_read_buf, weight_read_buf,attention_mask, rotary_position_ids, cache_write_buf,start_position,k)
         # see_memory_usage("-----------------------------------------after OptimizedLlamaAttention forward ")
         # print('hidden_states ', hidden_states.val)
         self.temp_hidden_states.val = hidden_states.val
@@ -420,6 +421,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # k: int, ######## the num_gpu_batches 
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
@@ -585,7 +587,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                          
                         #  Performance optimization: Reduce debug output, only enable when needed
                         #  Pass the correct position_ids from the forward method parameter
-                        hidden_states = self.compute_layer(i, j, k, position_ids=position_ids).data.clone()  
+                        hidden_states = self.compute_layer(i, j, k, position_ids=position_ids, rotary_position_ids=rotary_position_ids).data.clone()  
                         # self.temp_hidden.val = self.compute_layer(i, j, k).data.clone()
                         # see_memory_usage('-----------------------------------------after compute_layer '+ str(i)+ '' + str(j)+' '+str(k))
                         # print('self.temp_hidden ', self.temp_hidden.val.data)
@@ -793,7 +795,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             if x.val:  # x may already be moved due to overlapping
                 x.val = x.val.move(self.act_home)
                 
-    def compute_layer(self, i, j, k, position_ids=None):
+    def compute_layer(self, i, j, k, position_ids=None, rotary_position_ids=None):
         # print('block.py compute_layer')
         # Update the hidden in place
         # Clear the weight_read_buf if it is the last gpu batch
@@ -825,7 +827,8 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                                cache_write_buf=self.cache_write_buf[j][k],
                                k=k, 
                                attention_mask=self.attention_mask[k], 
-                               position_ids=position_ids)
+                               position_ids=position_ids,
+                               rotary_position_ids=rotary_position_ids)
                                
         # Profile memory after forward pass
         # see_memory_usage(f"-----------------------------------------after compute_layer {j} forward pass for token {i}")
@@ -843,6 +846,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         *args,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
         **kwargs,
@@ -868,18 +872,24 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             attention_mask = torch.ones(
                 (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
             )
-        attention_mask = _prepare_4d_causal_attention_mask(
-            attention_mask=attention_mask,
-            input_shape=(batch_size, seq_length),
-            inputs_embeds=hidden_states,
-            past_key_values_length=past_key_values_length,
-        )
+        if attention_mask.dim() == 3:
+            attention_mask = attention_mask.unsqueeze(1)
+        elif attention_mask.dim() == 4:
+            pass
+        else:
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask=attention_mask,
+                input_shape=(batch_size, seq_length),
+                inputs_embeds=hidden_states,
+                past_key_values_length=past_key_values_length,
+            )
 
         outputs = super().forward( ############
             hidden_states,
             *args,
             attention_mask=attention_mask,
             position_ids=position_ids,  # 🔧 Pass position_ids to the parent forward method
+            rotary_position_ids=rotary_position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
             **kwargs,
