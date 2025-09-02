@@ -99,6 +99,8 @@ class _ServerInferenceSession:
         inputs: torch.Tensor,
         prompts: torch.Tensor,
         hypo_ids: torch.LongTensor,
+        tree_attention_mask: Optional[torch.Tensor] = None,
+        kv_cache_position_ids: Optional[torch.Tensor] = None,
         *,
         step_id: str,
     ) -> torch.Tensor:
@@ -127,10 +129,12 @@ class _ServerInferenceSession:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids)
-        # print('client inference session step() input_tensors after packing ', input_tensors)
-        # print('client inference session step() input_tensors after packing shape', input_tensors[0].shape)
-        # print('_ServerInferenceSession  step id ', step_id)
+        combined_mask = self._pack_kv_into_tree_mask(tree_attention_mask, kv_cache_position_ids) if kv_cache_position_ids is not None else None
+
+        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, combined_mask)
+        print('client inference session step() input_tensors after packing ', input_tensors)
+        print('client inference session step() input_tensors after packing shape', input_tensors[0].shape)
+        print('_ServerInferenceSession  step id ', step_id)
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
@@ -149,9 +153,9 @@ class _ServerInferenceSession:
         inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
 
         # TODO: create more explicit way to check servers schema and client's structure
-        assert len(input_tensors) >= len(
-            server_side_inference_schema
-        ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
+        # assert len(input_tensors) >= len(
+        #     server_side_inference_schema
+        # ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
         # Serialize and send data (debug output removed for performance)
         serialized_tensors = [
@@ -179,6 +183,32 @@ class _ServerInferenceSession:
         # print('server inference session self._position ', self._position)
         # print('server inference session output[0].shape ',  outputs[0].shape)
         return outputs[0]
+    
+    def _pack_kv_into_tree_mask(self, tree_attention_mask, kv_cache_position_ids):
+        """
+        pack KV cache information with tree mask so that we can get these in sever successfully.
+        TODO: modify inference schema to make it separate instead of packing together 
+        """
+        original_shape = tree_attention_mask.shape
+        original_dtype = tree_attention_mask.dtype
+
+        extra_row_shape = (original_shape[0], 1) + original_shape[2:]
+        extra_row = torch.full(extra_row_shape, 254, dtype=original_dtype, device=tree_attention_mask.device)
+
+        if kv_cache_position_ids is not None:
+            kv_flat = kv_cache_position_ids.flatten()
+            available_space = extra_row.numel() - 1
+            actual_len = min(len(kv_flat), available_space)
+
+            extra_flat = extra_row.view(-1)
+            extra_flat[:actual_len] = kv_flat[:actual_len].to(original_dtype)
+            extra_flat[-1] = actual_len
+            extra_row = extra_flat.view(extra_row_shape)
+        else:
+            extra_row.view(-1)[-1] = 255
+
+        combined_mask = torch.cat([tree_attention_mask, extra_row], dim=1)
+        return combined_mask
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
         next_servers = []
@@ -295,6 +325,8 @@ class InferenceSession:
         inputs: torch.Tensor,
         prompts: Optional[torch.Tensor] = None,
         hypo_ids: Optional[torch.Tensor] = None,
+        tree_attention_mask: Optional[torch.Tensor] = None,
+        kv_cache_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -321,8 +353,9 @@ class InferenceSession:
         inputs = inputs.cpu()
         prompts = prompts.cpu()
         hypo_ids = hypo_ids.cpu()
-        
-        step_id = str(uuid.uuid4())  # Generate a unique step ID.
+        tree_attention_mask = tree_attention_mask.cpu() if tree_attention_mask is not None else None
+        kv_cache_position_ids = kv_cache_position_ids.cpu() if kv_cache_position_ids is not None else None
+        step_id = str(uuid.uuid4()) #生成一个唯一的步骤 ID。
 
         n_input_tokens = inputs.shape[1]
         if self._position + n_input_tokens > self._max_length:
@@ -347,6 +380,8 @@ class InferenceSession:
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
+                        tree_attention_mask,
+                        kv_cache_position_ids,
                         step_id=step_id,
                     )
                     # print('inputs ', inputs)

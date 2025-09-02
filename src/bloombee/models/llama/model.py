@@ -3,6 +3,7 @@ from typing import Optional
 import hivemind
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from hivemind.utils.logging import get_logger
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -62,9 +63,6 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         # The causal mask will be added on the server-side
-        assert (
-            attention_mask is None or (attention_mask == 1).all()
-        ), f"Custom attention masks are not supported, {attention_mask=}"
         if cache_position is not None:
             assert position_ids is not None and torch.all(torch.eq(cache_position, position_ids)).item()
         assert (
@@ -96,6 +94,8 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
             hidden_states,
             prompts=intermediate_prompts,
             hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
+            tree_attention_mask=attention_mask,
+            kv_cache_position_ids=past_key_values.kv_cache_position_ids if past_key_values is not None else None,
         )
 
         if past_key_values is None:

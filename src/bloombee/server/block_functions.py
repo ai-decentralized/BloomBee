@@ -191,7 +191,38 @@ async def iterate_rpc_inference(
             # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
-        hidden_states, prompts, hypo_ids, *_ = flat_tensors
+        hidden_states, prompts, hypo_ids, combined_mask, *_ = flat_tensors
+        
+        if combined_mask is not None:
+            tree_attention_mask = combined_mask[:, :-1, :, :]
+            extra_row = combined_mask[:, -1:, :, :]
+
+            # 检查最后一行是否是我们添加的（通过检查padding值）
+            extra_flat = extra_row.view(-1)
+
+            # 检查是否包含我们的特殊padding值254
+            if torch.any(extra_flat == 254):
+                # 获取长度标记（最后一个元素）
+                length_marker = extra_flat[-1].item()
+
+                if length_marker == 255:
+                    # 255表示原始kv_cache_position_ids为None
+                    kv_cache_position_ids = None
+                elif length_marker > 0 and length_marker < 255:
+                    # 提取实际的kv值
+                    kv_values = extra_flat[:length_marker].long()
+                    kv_cache_position_ids = kv_values
+                else:
+                    kv_cache_position_ids = None
+            else:
+                # 如果没有特殊padding值，说明这不是我们打包的数据
+                # 可能是旧版本，直接返回原始mask
+                tree_attention_mask = combined_mask
+                kv_cache_position_ids = None
+        else:
+            tree_attention_mask = None
+            kv_cache_position_ids = None
+        
         batch_size, length_increment, _ = hidden_states.shape
 
         # Cast inputs to backend dtype
@@ -256,7 +287,7 @@ async def iterate_rpc_inference(
                 # offload_logger.info(" Using merged pool for inference")
                 
                 inference_infos = tuple(
-                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
+                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids)
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
                 (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
@@ -269,10 +300,7 @@ async def iterate_rpc_inference(
                 # offload_logger.info(" Using separate pools for inference")
                 
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
-                    # offload_logger.info(f"   - Processing backend: {uid}")
-                    # offload_logger.info(f"     - Cache handles: {len(handles)}")
-                    
-                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
+                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
