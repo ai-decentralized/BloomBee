@@ -78,18 +78,18 @@ class KVCacheManager:
         cur_tokens, max_tokens = self.current_size_tokens, self.max_size_tokens
         max_size = max_tokens * self.size_per_token() * len(descriptors)
         cur_size = cur_tokens * self.size_per_token() * len(descriptors)
-        logger.info(f"size_per_token: {self.size_per_token()}")
+        # logger.info(f"size_per_token: {self.size_per_token()}")
         friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
         used_pct = (cur_size / max_size * 100.0) if max_size != 0 and max_size != 2**64 - 1 else 0.0
-        logger.info(
-            f"rpc_inference.wait_for_alloc(size={allocation_size / gib:.2f} GiB), "
-            f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({used_pct:.1f}%)"
-        )
+        # logger.info(
+        #     f"rpc_inference.wait_for_alloc(size={allocation_size / gib:.2f} GiB), "
+        #     f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({used_pct:.1f}%)"
+        # )
 
         alloc_task = asyncio.create_task(self.cache._schedule_alloc(allocation_tokens, *descriptors, timeout=timeout))
         try:
             handles = await shield_and_wait(alloc_task)
-            logger.info(f"rpc_inference.alloc_done(size={allocation_size / gib:.2f} GiB)")
+            # logger.info(f"rpc_inference.alloc_done(size={allocation_size / gib:.2f} GiB)")
             yield handles
         finally:
             self.cache._free(allocation_tokens, alloc_task)
@@ -173,7 +173,7 @@ class KVCacheManager:
             v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
             k_sbh = _as_torch(k_sel)
             v_sbh = _as_torch(v_sel)
-            logger.info(f"k_cache: {k_cache.shape}, k_sbh: {k_sbh.shape}")
+            # logger.info(f"k_cache: {k_cache.shape}, k_sbh: {k_sbh.shape}")
 
         elif path == 1:
             # 使用 compute_dst 的 workspace 承载 (S, BH, D)
@@ -229,7 +229,7 @@ class KVCacheManager:
         with self.cache.use_cache(*handles) as cache_tensors:
             # Keep underlying tensors in the stack for centralized writes,
             # but yield clones to callers to prevent accidental in-place edits
-            logger.info(f"use cache, cache_tensors: {cache_tensors}, len={len(cache_tensors)}")
+            # logger.info(f"use cache, cache_tensors: {cache_tensors}, len={len(cache_tensors)}")
             self._active_cache_tensors_stack.append(cache_tensors)
             try:
                 # safe_views = tuple(t.detach().clone() for t in cache_tensors)
@@ -256,7 +256,7 @@ class KVCacheManager:
         assert self._active_cache_tensors_stack, "KV write called outside of use_cache context"
         cache_tensors = self._active_cache_tensors_stack[-1]  # TorchTensor
         (k_cache, v_cache), = cache_tensors
-        logger.info(f"_active_cache_tensors_stack, k_cache: {k_cache}")
+        # logger.info(f"_active_cache_tensors_stack, k_cache: {k_cache}")
         S_total, BH_dst, D_dst = k_cache.shape
 
         # 取出 (key, value)
@@ -288,8 +288,14 @@ class KVCacheManager:
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
 
         end_position = start_position + s_new
-        assert 0 <= start_position < S_total and end_position <= S_total, \
-            f"write range [{start_position}, {end_position}) out of bounds (S_total={S_total})"
+        if not (0 <= start_position < S_total and end_position <= S_total):
+            # Out of bounds: use overwrite-tail policy to avoid overlapping in-place copies
+                key_t = key_t[:, :, -S_total:]
+                value_t = value_t[:, -S_total:, :]
+                s_new = S_total
+                start_position = 0
+                end_position = S_total
+
 
         # 可选：对齐 dtype（以目标 cache 为准）
         if key_t.dtype != k_cache.dtype:
@@ -309,7 +315,7 @@ class KVCacheManager:
         k_src_tt = TorchTensor.create_from_torch(k_write, self.attention_compute)
         v_src_tt = TorchTensor.create_from_torch(v_write, self.attention_compute)
 
-        logger.info(f"_write_kvs, dst_idx: {dst_idx}")
+        # logger.info(f"_write_kvs, dst_idx: {dst_idx}")
 
         # 真正写入（兼容 COMPRESSED / MIXED / DISK 等）
         general_copy(k_cache, dst_idx, k_src_tt, None)

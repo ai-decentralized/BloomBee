@@ -152,7 +152,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         context: P2PContext,
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
         """Compute a single step of inference using attention cache; update attention cache accordingly."""
-        offload_logger.info("🚀 开始推理请求 - rpc_inference")
+        # offload_logger.info("🚀 开始推理请求 - rpc_inference")
         print('come into rpc_inference ..........')
         # print_time_now('')
         async with timeout(self.session_timeout):
@@ -198,24 +198,24 @@ class TransformerConnectionHandler(ConnectionHandler):
                 # print_time_now('')
                 
                 push_time = []
-                offload_logger.info(f" 推理参数:")
-                offload_logger.info(f"   - 批次大小: {batch_size}")
-                offload_logger.info(f"   - 最大长度: {max_length}")
-                offload_logger.info(f"   - 分配超时: {alloc_timeout}")
-                offload_logger.info(f"   - 请求的UIDs: {requested_uids}")
+                # offload_logger.info(f" 推理参数:")
+                # offload_logger.info(f"   - 批次大小: {batch_size}")
+                # offload_logger.info(f"   - 最大长度: {max_length}")
+                # offload_logger.info(f"   - 分配超时: {alloc_timeout}")
+                # offload_logger.info(f"   - 请求的UIDs: {requested_uids}")
                 
                 async with self._allocate_cache(
                     requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
                 ) as cache_handles:
                     end_cache_time = perf_counter()
-                    offload_logger.info(f" 缓存分配完成 - 时间: {end_cache_time- end_batch_size_time:.3f}s")
-                    print('cache allocate time ', end_cache_time- end_batch_size_time)
+                    # offload_logger.info(f" 缓存分配完成 - 时间: {end_cache_time- end_batch_size_time:.3f}s")
+                    # print('cache allocate time ', end_cache_time- end_batch_size_time)
                     
                     background_tasks = set()
                     step_=0
-                    print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
+                    # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
-                    offload_logger.info(" 开始推理迭代")
+                    # offload_logger.info(" 开始推理迭代")
                     async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
                         requested_uids=requested_uids,
                         requested_backends=requested_backends,
@@ -230,8 +230,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                         quant_type=self.quant_type,
                         args_structure=args_structure,
                     ):
-                        offload_logger.info(f" 推理步骤 {step_}: can_push={can_push}")
-                        print('=================================================   server rpc_inference step ',step_) ###
+                        # offload_logger.info(f" 推理步骤 {step_}: can_push={can_push}")
+                        # print('=================================================   server rpc_inference step ',step_) ###
                         # print_time_now('')
                         step_+=1 ###
                         
@@ -262,7 +262,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             finally:
                 self._log_request("rpc_inference.close", requested_uids, context)
                 # print_time_now('')
-                print('end of  rpc_inference ..........')  ###
+                # print('end of  rpc_inference ..........')  ###
                 end_time_rpc_infer = perf_counter() ###
                 # print('rpc_inference total time(sec) ', end_time_rpc_infer - start_time) ###
             
@@ -378,17 +378,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                     #The purpose of this above code is to ensure that there are tasks running while handling asynchronous requests, 
                     # and to be able to promptly respond to requests coming from different sources.
                     end_push_time = perf_counter()
-                    print('async requests handling time ', end_push_time - end_meta_push_time)
+                    # print('async requests handling time ', end_push_time - end_meta_push_time)
                     # print_time_now('')
                     if anext_task in done:
                         request = await anext_task
                         anext_task = None
-                        print(f'----------------------anext_task done first')
+                        # print(f'----------------------anext_task done first')
                         # print_time_now('')
                     elif get_push_task in done:
                         request = await get_push_task
                         get_push_task = None
-                        print(f'get_push_task done first')
+                        # print(f'get_push_task done first')
                         # print_time_now('')
                     else:
                         self._log_request("rpc_inference.step", requested_uids, context, warning="timed out")
@@ -399,7 +399,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             # print('infer step  time ', end_iterate_inference_steps_time-start_iterate_inference_steps_time)
             # print_time_now('')
         except Exception:
-            logger.warning("rpc_inference._iterate_inference_steps() exception:", exc_info=True)
+            # logger.warning("rpc_inference._iterate_inference_steps() exception:", exc_info=True)
             raise
 
     async def rpc_push(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
@@ -418,7 +418,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         # print('_push_outputs metadata ', metadata)
         try:
             next_servers = metadata.get("next_servers")
-            print('---------------------------------------function _push_outputs: next_servers ', next_servers)
+            # print('---------------------------------------function _push_outputs: next_servers ', next_servers)
             if not next_servers:
                 return
 
@@ -639,21 +639,21 @@ class TransformerConnectionHandler(ConnectionHandler):
         Allocate memory cache for all transformer blocks, return cache handle
         :returns: a list of {len(backends)} elements, where i-th element is a tuple of cache handles for i-th backend
         """
-        offload_logger.info(f" 分配缓存:")
-        offload_logger.info(f"   - 后端数量: {len(backends)}")
-        offload_logger.info(f"   - 批次大小: {batch_size}")
-        offload_logger.info(f"   - 最大长度: {max_length}")
-        offload_logger.info(f"   - 超时时间: {timeout}")
+        # offload_logger.info(f" 分配缓存:")
+        # offload_logger.info(f"   - 后端数量: {len(backends)}")
+        # offload_logger.info(f"   - 批次大小: {batch_size}")
+        # offload_logger.info(f"   - 最大长度: {max_length}")
+        # offload_logger.info(f"   - 超时时间: {timeout}")
         
         # 使用KVCacheManager的offloading策略
         cache_manager = backends[0].cache_manager
         
-        offload_logger.info(f" 使用offloading策略:")
-        offload_logger.info(f"   - GPU缓存比例: {cache_manager.offloading_policy.cache_gpu_percent}%")
-        offload_logger.info(f"   - CPU缓存比例: {cache_manager.offloading_policy.cache_cpu_percent}%")
-        offload_logger.info(f"   - CPU缓存计算: {cache_manager.offloading_policy.cpu_cache_compute}")
+        offload_logger.info(f" Using offloading strategy:")
+        offload_logger.info(f"   - GPU cache ratio: {cache_manager.offloading_policy.cache_gpu_percent}%")
+        offload_logger.info(f"   - CPU cache ratio: {cache_manager.offloading_policy.cache_cpu_percent}%")
+        offload_logger.info(f"   - CPU cache compute: {cache_manager.offloading_policy.cpu_cache_compute}")
         
-        # 使用原有的缓存分配方式，但添加offloading调试信息
+        # Use the original cache allocation method, but add offloading debug information
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
 
         logger.info(

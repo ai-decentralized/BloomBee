@@ -12,7 +12,7 @@ from hivemind.utils.logging import get_logger, use_hivemind_log_handler
 from tensor_parallel.slicing_configs import get_bloom_config
 from transformers import PretrainedConfig
 from pynvml import *
-from bloombee.utils.memory_usage import see_memory_usage
+from bloombee.utils.memory_usage import see_memory_usage, log_mem
 
 # def see_memory_usage(message, force=True):
 # 	logger = ''
@@ -67,35 +67,56 @@ def convert_block(
     """
     if freeze:
         block.requires_grad_(False)
-    # print()
-    # import pdb; pdb.set_trace()
-    # print()
-    # see_memory_usage("-----------------------------------------convert_block before make_tensor_parallel ")
-    block = make_tensor_parallel(block, config, tensor_parallel_devices, output_device=output_device)
-    # see_memory_usage("-----------------------------------------convert_block after make_tensor_parallel ")
+    # Skip tensor parallelism for FlexGen blocks - they manage their own weights and devices
+    log_prefix = f"[convert_block:{block_index}]"
+    # log_mem(f"{log_prefix} skipping tensor parallelism - FlexGen manages weights directly")
+    
+    # Only apply quantization if needed
     if quant_type != QuantType.NONE:
         block = quantize_module(block, quant_type=quant_type)
-
-    # for shard, device in zip(block.module_shards, block.devices):
-    #     shard.to(device)
-    # for shard, device in zip(block.modules, block.devices):
-    #     shard.to(device)
+        # log_mem(f"{log_prefix} after quantization")
+    else:
+        # log_mem(f"{log_prefix} no quantization applied")
+        pass
+    
+    # Create a simple wrapper that provides TensorParallel interface for pipeline parallelism
+    # but uses FlexGen's forward method directly
+    class PipelineParallelWrapper:
+        def __init__(self, module, devices, output_device):
+            self._module = module
+            self.devices = devices
+            self.output_device_index = 0  # Single device in pipeline parallelism
+            self.module_shards = [module]  # Single shard per pipeline stage
+            
+        def forward(self, *args, **kwargs):
+            # Use FlexGen's forward method directly
+            return self._module.forward(*args, **kwargs)
+            
+        def named_parameters(self, *args, **kwargs):
+            return self._module.named_parameters(*args, **kwargs)
+            
+        def named_buffers(self, *args, **kwargs):
+            return self._module.named_buffers(*args, **kwargs)
+    
+    tp_block = PipelineParallelWrapper(block, tensor_parallel_devices, output_device)
+    # log_mem(f"{log_prefix} created PipelineParallel wrapper")
+    
     print('quant_type ', quant_type)
     print('adapters ', adapters )
     if adapters:
         
         from bloombee.utils.peft import add_adapter_to_block, create_lora_adapter, load_peft
 
-        create_lora_adapter(block)
+        create_lora_adapter(tp_block)
         for adapter_name in adapters:
             adapter_config, adapter_state_dict = load_peft(
                 adapter_name,
                 block_idx=block_index,
                 **kwargs,
             )
-            add_adapter_to_block(block, block_index, adapter_name, adapter_config, adapter_state_dict)
+            add_adapter_to_block(tp_block, block_index, adapter_name, adapter_config, adapter_state_dict)
 
-    return block
+    return tp_block
 
 
 def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:

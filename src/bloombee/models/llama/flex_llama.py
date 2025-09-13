@@ -27,7 +27,7 @@ from torch import nn
 from transformers import AutoTokenizer
 from bloombee.flexgen_utils.timer import timers
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from bloombee.utils.memory_usage import see_memory_usage
+from bloombee.utils.memory_usage import see_memory_usage, log_mem
 
 from hivemind.utils import get_logger
 
@@ -89,6 +89,7 @@ def init_weight_list(weight_specs, policy, env):
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
     ret = []
+    # log_mem("[FlexGen] init_weight_list(start)")
     for i in range(len(weight_specs)):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         # print('mid_percent ', mid_percent)
@@ -152,6 +153,7 @@ def init_weight_list(weight_specs, policy, env):
         # print('weight.data ', weight.data)
         ret.append(weight)
         
+    # log_mem("[FlexGen] init_weight_list(end)")
     return ret
 
 # 添加一个新函数，用于从 PyTorch 模型加载权重到 FlexGen 格式
@@ -400,9 +402,9 @@ class FLEX_LlamaAttention(LlamaAttention):
             # rotary_embed
             ((64, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
         ]
-        # see_memory_usage("-----------------------------------------before init weights of LLamaAttention ")
+        # log_mem(f"[FlexGen.Attn:{self.layer_id}] init_weight(start)")
         weights = init_weight_list(weight_specs, self.policy, self.env)
-        # see_memory_usage("-----------------------------------------after init weights of LLamaAttention ")
+        # log_mem(f"[FlexGen.Attn:{self.layer_id}] init_weight(end)")
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -410,6 +412,7 @@ class FLEX_LlamaAttention(LlamaAttention):
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] load_weight(k={k})")
             weight_read_buf.store((
                 w_q.smart_copy(dst1),
                 w_k.smart_copy(dst1),
@@ -486,15 +489,15 @@ class FLEX_LlamaAttention(LlamaAttention):
         if i == 0:
             # prefill
             # import pdb;pdb.set_trace()---------------------
-            # see_memory_usage("-----------------------------------------before mha_llama ")
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start prefill) i={i} k={k}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            # see_memory_usage("-----------------------------------------after mha_llama ")
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(end prefill) i={i} k={k}")
         else:
             # decoding
-            # see_memory_usage("-----------------------------------------before mha_gen_llama ")
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start decode) i={i} k={k}")
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             k_cache, v_cache = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
@@ -505,7 +508,7 @@ class FLEX_LlamaAttention(LlamaAttention):
                 input_layernorm,
                 rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            # see_memory_usage("-----------------------------------------after mha_gen_llama ")
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(end decode) i={i} k={k}")
         hidden.val = h
         self.temp_hidden_states.val=h
         return h
@@ -549,9 +552,9 @@ class FLEX_LlamaMLP(LlamaMLP):
             # post attention layer norm
             ((h, ), dtype, path + "post_attention_layernorm.weight"),
         ]
-        # see_memory_usage("-----------------------------------------before init weights of LLamaMLP ")
+        # log_mem(f"[FlexGen.MLP:{self.layer_id}] init_weight(start)")
         weights = init_weight_list(weight_specs, self.policy, self.env)
-        # see_memory_usage("-----------------------------------------after init weights of LLamaMLP ")
+        # log_mem(f"[FlexGen.MLP:{self.layer_id}] init_weight(end)")
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -598,7 +601,9 @@ class FLEX_LlamaMLP(LlamaMLP):
             ((gate, _), (down, _),
              (up, _), (post_attention_layernorm, _)) = weight_read_buf.val
 
+        # log_mem(f"[FlexGen.MLP:{self.layer_id}] forward(start) k={k}")
         h = self.compute.mlp_llama(h, gate, down, up, donate, self.config, post_attention_layernorm)
+        # log_mem(f"[FlexGen.MLP:{self.layer_id}] forward(end) k={k}")
         hidden_states.val = h
         self.temp_hidden_states.val=h
         

@@ -1,3 +1,4 @@
+import os
 import torch
 # from pynvml.smi import nvidia_smi
 from pynvml import *
@@ -33,6 +34,17 @@ def see_memory_usage(message: str, force: bool = True):
 	logger += f"Memory Allocated: {stats['torch_allocated']:.2f} GB\n"
 	logger += f"Max Memory Allocated: {stats['torch_max_allocated']:.2f} GB\n"
 	print(logger)
+
+def memlog_enabled() -> bool:
+	"""Return True if memory logging is enabled via env var BB_MEMLOG."""
+	val = os.environ.get("BB_MEMLOG", "0")
+	return str(val).lower() in ("1", "true", "yes", "on")
+
+def log_mem(message: str):
+    """Conditionally log memory usage when BB_MEMLOG is enabled."""
+    # if memlog_enabled():
+    #     see_memory_usage(message)
+    pass
 
 def profile_weight_init(func):
 	"""Decorator to profile memory usage during weight initialization."""

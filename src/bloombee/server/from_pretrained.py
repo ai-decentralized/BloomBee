@@ -39,6 +39,8 @@ import numpy as np
 # import pdb
 
 from bloombee.models.llama.flex_llama import load_weights_from_pytorch_model
+from bloombee.utils.memory_usage import log_mem
+import os
 
 
 
@@ -75,21 +77,9 @@ def load_pretrained_block(
         print('load_pretrained_block : init_empty_weights() ') 
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
     
-    block_prefix = f"{config.block_prefix}.{block_index}."
-    state_dict = _load_state_dict_from_repo(
-        model_name,
-        block_prefix,
-        revision=revision,
-        token=token,
-        cache_dir=cache_dir,
-        max_disk_space=max_disk_space,
-    )
-    
-    # 将权重加载到模型中
-    for param_name, param in state_dict.items():
-        if not str(param.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
-            param = param.to(torch_dtype)
-        set_module_tensor_to_device(block, param_name, "cpu", value=param, dtype=param.dtype)
+    # Skip HuggingFace weight loading - use FlexGen weight management only
+    # This prevents duplicate weight allocation (HF + FlexGen)
+    # log_mem(f"[FlexGen] skipping HF weight loading for block={block_index} - using FlexGen weights only")
     
     # # 使用 FlexGen 的权重加载方式
     # try:

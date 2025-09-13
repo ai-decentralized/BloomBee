@@ -61,7 +61,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self._peft_module = _peft_module
 
         super().__init__(*args, **kwargs)
-        assert isinstance(self.module, TensorParallel)
+        # Accept both TensorParallel and our PipelineParallelWrapper
+        assert (isinstance(self.module, TensorParallel) or 
+                hasattr(self.module, 'devices') and hasattr(self.module, 'module_shards'))
         self.config = config
         self.cache_manager = cache_manager
         self.max_chunk_size_bytes = max_chunk_size_bytes
@@ -182,16 +184,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         try:
             assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]" # Ensure hidden states are 3-dimensional
             batch_size, seq_len, hidden_size = hidden_states.shape
-            print("transformer backend inference step : seq_len", seq_len)
-            print(f"🔧 Backend inference_step: batch_size={batch_size}, seq_len={seq_len}, prefix_length={inference_info.prefix_length}")
+            # print("transformer backend inference step : seq_len", seq_len)
+            # print(f"🔧 Backend inference_step: batch_size={batch_size}, seq_len={seq_len}, prefix_length={inference_info.prefix_length}")
             
             # 🔧 添加offloading调试信息
-            offload_logger.info(f"   - batch_size: {batch_size}")
-            offload_logger.info(f"   - seq_len: {seq_len}")
-            offload_logger.info(f"   - prefix_length: {inference_info.prefix_length}")
-            offload_logger.info(f"   - cache_handles数量: {len(inference_info.cache_handles)}")
-            offload_logger.info(f"   - 当前设备: {hidden_states.device}")
-            logger.info(f"inference_step, input hidden_states: {hidden_states}")
+            # offload_logger.info(f"   - batch_size: {batch_size}")
+            # offload_logger.info(f"   - seq_len: {seq_len}")
+            # offload_logger.info(f"   - prefix_length: {inference_info.prefix_length}")
+            # offload_logger.info(f"   - cache_handles数量: {len(inference_info.cache_handles)}")
+            # offload_logger.info(f"   - 当前设备: {hidden_states.device}")
+            # logger.info(f"inference_step, input hidden_states: {hidden_states}")
             
             # see_memory_usage("transformer backend inference step : seq_len")
             
@@ -219,17 +221,17 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 layer_past = selected
                 
                 # 🔧 添加layer_past调试信息
-                offload_logger.info(f"选择layer_past:")
-                offload_logger.info(f"   - layer_past类型: {type(layer_past)}")
-                offload_logger.info(f"   - layer_past长度: {len(layer_past) if layer_past else 0}")
-                if layer_past and len(layer_past) > 0:
-                    offload_logger.info(f"   - 第一个tensor形状: {layer_past[0].shape}")
-                    offload_logger.info(f"   - 第一个tensor设备: {layer_past[0].device}")
+                # offload_logger.info(f"选择layer_past:")
+                # offload_logger.info(f"   - layer_past类型: {type(layer_past)}")
+                # offload_logger.info(f"   - layer_past长度: {len(layer_past) if layer_past else 0}")
+                # if layer_past and len(layer_past) > 0:
+                #     offload_logger.info(f"   - 第一个tensor形状: {layer_past[0].shape}")
+                #     offload_logger.info(f"   - 第一个tensor设备: {layer_past[0].device}")
                 
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
-                    print('transformer backend inference step() offset ', offset )
-                    print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
+                    # print('transformer backend inference step() offset ', offset )
+                    # print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
                     
                     #  Generate correct position_ids for this chunk
                     chunk_length = min(max_chunk_length, seq_len - offset)
@@ -241,42 +243,42 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         dtype=torch.long
                     ).unsqueeze(0).expand(batch_size, -1)
                     
-                    print(f' Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}')
+                    # print(f' Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}')
                     
                     # 🔧 添加chunk处理调试信息
-                    offload_logger.info(f" 处理chunk {offset//max_chunk_length + 1}:")
-                    offload_logger.info(f"   - chunk_length: {chunk_length}")
-                    offload_logger.info(f"   - hidden_states_chunk设备: {hidden_states_chunk.device}")
-                    offload_logger.info(f"   - position_ids范围: {position_ids.min().item()}-{position_ids.max().item()}")
+                    # offload_logger.info(f" 处理chunk {offset//max_chunk_length + 1}:")
+                    # offload_logger.info(f"   - chunk_length: {chunk_length}")
+                    # offload_logger.info(f"   - hidden_states_chunk设备: {hidden_states_chunk.device}")
+                    # offload_logger.info(f"   - position_ids范围: {position_ids.min().item()}-{position_ids.max().item()}")
                     
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
-                        print(f' About to call module.forward with position_ids...')
+                        # print(f' About to call module.forward with position_ids...')
                         forward_result = self.module.forward(
                             hidden_states_chunk, 
                             layer_past=layer_past, 
                             use_cache=True,  #  Keep use_cache=True to get cache tensors
                             position_ids=position_ids  #  Pass the generated position_ids
                         )
-                        print(f' module.forward returned: {type(forward_result)}, length: {len(forward_result) if forward_result else "None"}')
+                        # print(f' module.forward returned: {type(forward_result)}, length: {len(forward_result) if forward_result else "None"}')
                         
                         if forward_result is None:
-                            print(f' ERROR: module.forward returned None!')
+                            # print(f' ERROR: module.forward returned None!')
                             return (hidden_states,)  # Return original input as fallback
                         
                         output_hidden_states_chunk, new_kvs = forward_result
-                        print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
+                        # print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
                         
                         # 🔧 添加forward结果调试信息
-                        offload_logger.info(f" module.forward完成:")
-                        offload_logger.info(f"   - output_hidden_states_chunk形状: {output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}")
-                        offload_logger.info(f"   - new_kvs长度: {len(new_kvs) if new_kvs else 0}")
-                        if new_kvs and len(new_kvs) > 0:
-                            offload_logger.info(f"   - new_kvs[0]形状: {new_kvs[0].shape}")
-                            offload_logger.info(f"   - new_kvs[0]设备: {new_kvs[0].device}")
+                        # offload_logger.info(f" module.forward完成:")
+                        # offload_logger.info(f"   - output_hidden_states_chunk形状: {output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}")
+                        # offload_logger.info(f"   - new_kvs长度: {len(new_kvs) if new_kvs else 0}")
+                        # if new_kvs and len(new_kvs) > 0:
+                        #     offload_logger.info(f"   - new_kvs[0]形状: {new_kvs[0].shape}")
+                        #     offload_logger.info(f"   - new_kvs[0]设备: {new_kvs[0].device}")
                         
                     except Exception as e:
-                        print(f' ERROR in module.forward: {type(e).__name__}: {e}')
+                        # print(f' ERROR in module.forward: {type(e).__name__}: {e}')
                         import traceback
                         traceback.print_exc()
                         return (hidden_states,)  # Return original input as fallback
@@ -292,14 +294,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
 
-                logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
+                # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
                 
                 return (output_hidden_states,) # Return output hidden states
                 
         except Exception as e:
-            print(f' CRITICAL ERROR in inference_step: {type(e).__name__}: {e}')
+            # print(f' CRITICAL ERROR in inference_step: {type(e).__name__}: {e}')
             import traceback
             traceback.print_exc()
             return (hidden_states,)  # Return original input as fallback
@@ -371,11 +373,11 @@ class _MergedInferenceStep:
         assert len(inference_infos) == len(
             optional_prompts
         ), f"found {len(inference_infos)} blocks but {len(optional_prompts)} prompts"
-        print('............... come into the _MergedInferenceStep __call__' )
+        # print('............... come into the _MergedInferenceStep __call__' )
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:
                 hidden_states[:, : optional_prompt.shape[1]] += optional_prompt
-            print('............... come into the _MergedInferenceStep __call__ inference_info.uid ', inference_info.uid)
+            # print('............... come into the _MergedInferenceStep __call__ inference_info.uid ', inference_info.uid)
             (hidden_states,) = self.backends[inference_info.uid].inference_step(hidden_states, hypo_ids, inference_info)
         # import pdb; pdb.set_trace()
         return (hidden_states,)
