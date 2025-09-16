@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import random
 import sys
+import tempfile
 import threading
 import time
 from typing import Dict, List, Optional, Sequence, Union
@@ -280,7 +281,7 @@ class Server:
         )
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
-        self.path = '/tmp/data/llama_weights'
+        self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
         ##############################################################
         
         # see_memory_usage("-----------------------------------------in server: after policy  ")
