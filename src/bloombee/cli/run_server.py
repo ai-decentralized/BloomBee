@@ -173,6 +173,8 @@ def main():
     host_maddrs = args.pop("host_maddrs")
     port = args.pop("port")
     if port is not None:
+        if not (0 <= port <= 65535):
+            parser.error(f"Port must be between 0 and 65535, got {port}")
         assert host_maddrs is None, "You can't use --port and --host_maddrs at the same time"
     else:
         port = 0
