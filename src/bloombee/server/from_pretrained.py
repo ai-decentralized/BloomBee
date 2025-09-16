@@ -72,7 +72,7 @@ def load_pretrained_block(
     torch_dtype = resolve_block_dtype(config, torch_dtype)
     
     with init_empty_weights():
-        print('load_pretrained_block : init_empty_weights() ') 
+        logger.debug('load_pretrained_block: init_empty_weights()')
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
     
     block_prefix = f"{config.block_prefix}.{block_index}."
