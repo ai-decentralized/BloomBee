@@ -35,7 +35,7 @@ import numpy as np
 
 logger = get_logger(__name__)
 
-# 创建专门的offloading调试logger
+# Create dedicated offloading debug logger
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
 
@@ -219,8 +219,8 @@ class AllocationFailed(Exception):
     pass
 
 class KVCacheMetadata:
-    device: Any               # 存在哪个设备上
-    offloaded: bool = False             # 是否已 offload 到 CPU
+    device: Any               # On which device
+    offloaded: bool = False             # Whether offloaded to CPU
     # TODO: add more device info
 
 

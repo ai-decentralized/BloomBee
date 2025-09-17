@@ -48,7 +48,7 @@ from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
 from pynvml import *
 
-# 创建专门的offloading调试logger
+# Create dedicated offloading debug logger
 import logging
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
@@ -261,8 +261,8 @@ class Server:
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
 
-        # Policy: weights on GPU, KV cache on DISK (100%), activations在CPU
-        # 如需切到混合，将 cache_cpu_percent 改为 >0（其余自动归于 disk）
+        # Policy: weights on GPU, KV cache on DISK (100%), activations on CPU
+        # If you want to switch to mixed, change cache_cpu_percent to >0 (the rest will automatically be assigned to disk)
         # Enable KV cache compression. Start with CPU-only cache for stability.
         # You can switch to Disk-only by setting cache_cpu_percent=0 and cache_gpu_percent=0, and using disk 100% in env.
         # Default to GPU-only, no offloading, no compression

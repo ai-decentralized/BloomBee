@@ -111,7 +111,7 @@ class _ServerInferenceSession:
             raise Exception("Session is closed, cannot perform step")
 
         n_input_tokens = inputs.shape[1] # get the number of token
-        print('client step() n_input_tokens', n_input_tokens)
+        # print('client step() n_input_tokens', n_input_tokens)
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
@@ -128,9 +128,9 @@ class _ServerInferenceSession:
 
         # serialize inputs and put them into the queue
         input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids)
-        print('client inference session step() input_tensors after packing ', input_tensors)
-        print('client inference session step() input_tensors after packing shape', input_tensors[0].shape)
-        print('_ServerInferenceSession  step id ', step_id)
+        # print('client inference session step() input_tensors after packing ', input_tensors)
+        # print('client inference session step() input_tensors after packing shape', input_tensors[0].shape)
+        # print('_ServerInferenceSession  step id ', step_id)
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
@@ -171,8 +171,8 @@ class _ServerInferenceSession:
         ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"
 
         self._position += n_input_tokens
-        print('server inference session self._position ', self._position)
-        print('server inference session output[0].shape ',  outputs[0].shape)
+        # print('server inference session self._position ', self._position)
+        # print('server inference session output[0].shape ',  outputs[0].shape)
         return outputs[0]
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
@@ -342,7 +342,7 @@ class InferenceSession:
                         step_id=step_id,
                     )
                     # print('inputs ', inputs)
-                    print('inputs.shape ', inputs.shape)
+                    # print('inputs.shape ', inputs.shape)
                     server_idx += 1
                     block_idx = server_session.span.end
                     self._sequence_manager.on_request_success(server_session.span.peer_id)
@@ -362,10 +362,10 @@ class InferenceSession:
                     time.sleep(delay) 
 
         self._position += n_input_tokens 
-        print(f"lient inference session outputs, inputs: {inputs}")
+        # print(f"lient inference session outputs, inputs: {inputs}")
         outputs = inputs 
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
-        print('client inference session outputs ', outputs.shape)
+        # print('client inference session outputs ', outputs.shape)
         return outputs
 
     

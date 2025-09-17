@@ -81,7 +81,7 @@ def load_pretrained_block(
     # This prevents duplicate weight allocation (HF + FlexGen)
     # log_mem(f"[FlexGen] skipping HF weight loading for block={block_index} - using FlexGen weights only")
     
-    # # 使用 FlexGen 的权重加载方式
+    # # Use FlexGen weight loading方式
     # try:
     #     load_weights_from_pytorch_model(block, policy, env, weight_home, block_index)
     #     logger.info(f"Loaded {model_name} block {block_index} with FlexGen weight management")

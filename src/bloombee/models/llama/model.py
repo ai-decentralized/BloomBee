@@ -90,7 +90,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         # print('model.py llama model inputs_embeds, ', inputs_embeds)  # Temporarily commented for cleaner debug output
         output_shape = input_shape + (hidden_states.size(-1),)
         
-        logger.info(f"hidden_states: {hidden_states}")
+        # logger.info(f"hidden_states: {hidden_states}")
 
         hidden_states = self.layers(
             hidden_states,
@@ -158,12 +158,12 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
         Prepare inputs for generation, handling incremental token generation properly.
         This method is crucial for correct embedding updates during generation.
         """
-        print(f"🔧 prepare_inputs_for_generation called:")
-        print(f"   input_ids.shape: {input_ids.shape if input_ids is not None else None}")
-        print(f"   past_key_values type: {type(past_key_values)}")
+        # print(f"🔧 prepare_inputs_for_generation called:")
+        # print(f"   input_ids.shape: {input_ids.shape if input_ids is not None else None}")
+        # print(f"   past_key_values type: {type(past_key_values)}")
         
-        if past_key_values is not None:
-            print(f"   past_key_values._seen_tokens: {past_key_values._seen_tokens}")
+        # if past_key_values is not None:
+        #     print(f"   past_key_values._seen_tokens: {past_key_values._seen_tokens}")
         
         # Omit tokens covered by past_key_values
         if past_key_values is not None:
@@ -171,19 +171,19 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
                 cache_length = past_key_values.get_seq_length()
                 past_length = past_key_values._seen_tokens
                 max_cache_length = past_key_values.get_max_length()
-                print(f"   Cache case: cache_length={cache_length}, past_length={past_length}")
+                # print(f"   Cache case: cache_length={cache_length}, past_length={past_length}")
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2] if hasattr(past_key_values[0][0], 'shape') else 0
                 max_cache_length = None
-                print(f"   Non-Cache case: past_length={past_length}")
+                # print(f"   Non-Cache case: past_length={past_length}")
 
             if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
                 input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-                print(f"   Attention mask case: new input_ids.shape={input_ids.shape}")
+                # print(f"   Attention mask case: new input_ids.shape={input_ids.shape}")
             elif past_length < input_ids.shape[1]:
                 original_shape = input_ids.shape
                 input_ids = input_ids[:, past_length:]
-                print(f"   Past length case: {original_shape} -> {input_ids.shape}, kept tokens: {input_ids}")
+                # print(f"   Past length case: {original_shape} -> {input_ids.shape}, kept tokens: {input_ids}")
             else:
                 print(f"   No truncation needed: past_length={past_length}, input_ids.shape[1]={input_ids.shape[1]}")
 
@@ -208,7 +208,7 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
             print(f"   Using inputs_embeds for first generation step")
         else:
             model_inputs = {"input_ids": input_ids}
-            print(f"   Using input_ids: {input_ids}")
+            # print(f"   Using input_ids: {input_ids}")
 
         model_inputs.update(
             {
@@ -218,7 +218,7 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
                 "attention_mask": attention_mask,
             }
         )
-        print(f"   Final model_inputs keys: {list(model_inputs.keys())}")
+        # print(f"   Final model_inputs keys: {list(model_inputs.keys())}")
         return model_inputs
 
     def get_output_embeddings(self):

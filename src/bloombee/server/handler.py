@@ -40,7 +40,7 @@ from bloombee.utils.convert_block import QuantType
 
 logger = get_logger(__name__)
 
-# 创建专门的offloading调试logger
+# Create dedicated offloading debug logger
 import logging
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
@@ -152,7 +152,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         context: P2PContext,
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
         """Compute a single step of inference using attention cache; update attention cache accordingly."""
-        # offload_logger.info("🚀 开始推理请求 - rpc_inference")
+        # offload_logger.info("🚀 Start inference request - rpc_inference")
         print('come into rpc_inference ..........')
         # print_time_now('')
         async with timeout(self.session_timeout):
@@ -198,24 +198,24 @@ class TransformerConnectionHandler(ConnectionHandler):
                 # print_time_now('')
                 
                 push_time = []
-                # offload_logger.info(f" 推理参数:")
-                # offload_logger.info(f"   - 批次大小: {batch_size}")
-                # offload_logger.info(f"   - 最大长度: {max_length}")
-                # offload_logger.info(f"   - 分配超时: {alloc_timeout}")
-                # offload_logger.info(f"   - 请求的UIDs: {requested_uids}")
+                # offload_logger.info(f" Inference parameters:")
+                # offload_logger.info(f"   - batch size: {batch_size}")
+                # offload_logger.info(f"   - max length: {max_length}")
+                # offload_logger.info(f"   - allocation timeout: {alloc_timeout}")
+                # offload_logger.info(f"   - requested UIDs: {requested_uids}")
                 
                 async with self._allocate_cache(
                     requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
                 ) as cache_handles:
                     end_cache_time = perf_counter()
-                    # offload_logger.info(f" 缓存分配完成 - 时间: {end_cache_time- end_batch_size_time:.3f}s")
+                    # offload_logger.info(f" Cache allocation completed - time: {end_cache_time- end_batch_size_time:.3f}s")
                     # print('cache allocate time ', end_cache_time- end_batch_size_time)
                     
                     background_tasks = set()
                     step_=0
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
-                    # offload_logger.info(" 开始推理迭代")
+                    # offload_logger.info(" Start inference iteration")
                     async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
                         requested_uids=requested_uids,
                         requested_backends=requested_backends,
@@ -230,7 +230,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         quant_type=self.quant_type,
                         args_structure=args_structure,
                     ):
-                        # offload_logger.info(f" 推理步骤 {step_}: can_push={can_push}")
+                        # offload_logger.info(f" Inference step {step_}: can_push={can_push}")
                         # print('=================================================   server rpc_inference step ',step_) ###
                         # print_time_now('')
                         step_+=1 ###
@@ -639,13 +639,13 @@ class TransformerConnectionHandler(ConnectionHandler):
         Allocate memory cache for all transformer blocks, return cache handle
         :returns: a list of {len(backends)} elements, where i-th element is a tuple of cache handles for i-th backend
         """
-        # offload_logger.info(f" 分配缓存:")
-        # offload_logger.info(f"   - 后端数量: {len(backends)}")
-        # offload_logger.info(f"   - 批次大小: {batch_size}")
-        # offload_logger.info(f"   - 最大长度: {max_length}")
-        # offload_logger.info(f"   - 超时时间: {timeout}")
+        # offload_logger.info(f" Allocating cache:")
+        # offload_logger.info(f"   - Number of backends: {len(backends)}")
+        # offload_logger.info(f"   - Batch size: {batch_size}")
+        # offload_logger.info(f"   - Max length: {max_length}")
+        # offload_logger.info(f"   - Timeout: {timeout}")
         
-        # 使用KVCacheManager的offloading策略
+        # Use KVCacheManager's offloading strategy
         cache_manager = backends[0].cache_manager
         
         offload_logger.info(f" Using offloading strategy:")

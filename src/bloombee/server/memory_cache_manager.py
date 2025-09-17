@@ -27,7 +27,7 @@ class KVCacheManager:
                  policy: Policy, 
                  env: ExecutionEnv,
                  block_config: PretrainedConfig):
-        # 初始化为二维数组结构
+        # Initialize as 2D array structure
         self.env = env
         self.runtime_pid = os.getpid()
         self.device = self.get_cache_device(policy)
@@ -133,11 +133,11 @@ class KVCacheManager:
         hypo_ids: Optional[torch.Tensor] = None,
     ):
         """
-        返回用于计算的标准 KV
-        K, V: torch.Tensor, 形状均为 (B, H, S, D)，位于 compute_dst（CPU或GPU）上
-        约定：
-        - 内部缓存沿维度 (S, B*H, D) 存储
-        - 若为混合设备(MIXED)则会在 compute_dst 上合并段并返回
+        Return standard KV for computation
+        K, V: torch.Tensor, both with shape (B, H, S, D), located on compute_dst (CPU or GPU)
+        Convention:
+        - Internal cache is stored along dimension (S, B*H, D)
+        - If mixed device (MIXED), segments will be merged on compute_dst and returned
         """
         assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
         if prefix_length <= 0:
@@ -148,10 +148,10 @@ class KVCacheManager:
         S_full, BH, D = k_cache.shape
         assert prefix_length <= S_full, f"prefix_length={prefix_length} > seq_len={S_full}"
 
-        # 计算发生的目标设备（CPU/GPU）
+        # Target device for computation (CPU/GPU)
         compute_dst = self.attention_compute  # 统一在计算设备上物化
 
-        # 路径判定（是否 MIXED）
+        # Path determination (whether MIXED)
         if self.offloading_policy.cpu_cache_compute and (
             self.device.device_type == DeviceType.MIXED and getattr(k_cache.data[0][0], "shape", None) is not None
         ):
@@ -159,16 +159,16 @@ class KVCacheManager:
         else:
             path = 0 if not self.offloading_policy.cpu_cache_compute else 1
 
-        # 需要的切片
+        # Required slice
         idx_all = (slice(0, prefix_length), slice(0, BH))
 
-        # 工具：拿到底层 torch.Tensor
+        # Utility: get underlying torch.Tensor
         def _as_torch(x):
             return x.data if hasattr(x, "data") else x
 
-        # 1) 物化到 (S, BH, D) 的 torch.Tensor（位于 compute_dst）
+        # 1) Materialize to (S, BH, D) torch.Tensor (located on compute_dst)
         if path == 0:
-            # 直接在 compute_dst 上切前缀（同设备为视图，跨设备为复制/解压）
+            # Directly slice prefix on compute_dst (view for same device, copy/decompress for cross-device)
             k_sel, _ = k_cache.smart_copy(compute_dst, idx_all)
             v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
             k_sbh = _as_torch(k_sel)
@@ -176,25 +176,25 @@ class KVCacheManager:
             # logger.info(f"k_cache: {k_cache.shape}, k_sbh: {k_sbh.shape}")
 
         elif path == 1:
-            # 使用 compute_dst 的 workspace 承载 (S, BH, D)
+            # Use compute_dst workspace to carry (S, BH, D)
             k_buf, v_buf = compute_dst.next_attention_compute_workspace()
             general_copy(k_buf, idx_all, k_cache, idx_all)
             general_copy(v_buf, idx_all, v_cache, idx_all)
             k_sbh, v_sbh = _as_torch(k_buf), _as_torch(v_buf)
 
-        else:  # path == 2, MIXED: GPU 段 + 其他段合并到 compute_dst
+        else:  # path == 2, MIXED: GPU segment + other segments merged to compute_dst
             gpu_k_part = k_cache.data[0][0][:prefix_length]  # (S, BH_gpu, D)
             gpu_v_part = v_cache.data[0][0][:prefix_length]
             BH_gpu = int(gpu_k_part.shape[1])
 
-            # 其余段复制到 compute_dst 的 workspace
+            # Copy remaining segments to compute_dst workspace
             k_rest, v_rest = compute_dst.next_attention_compute_workspace()
             idx_rest = (slice(0, prefix_length), slice(BH_gpu, BH))
             general_copy(k_rest, idx_rest, k_cache, idx_rest)
             general_copy(v_rest, idx_rest, v_cache, idx_rest)
             k_rest_t, v_rest_t = _as_torch(k_rest), _as_torch(v_rest)
 
-            # 若 compute_dst 不在 GPU，需要把 GPU 段搬到 compute_dst 再拼
+            # If compute_dst is not on GPU, need to move GPU segment to compute_dst then concatenate
             if gpu_k_part.device != k_rest_t.device:
                 gpu_k_part = gpu_k_part.to(k_rest_t.device, non_blocking=True)
                 gpu_v_part = gpu_v_part.to(v_rest_t.device, non_blocking=True)
@@ -202,7 +202,7 @@ class KVCacheManager:
             k_sbh = torch.cat([gpu_k_part, k_rest_t[:, BH_gpu:BH, :]], dim=1)
             v_sbh = torch.cat([gpu_v_part, v_rest_t[:, BH_gpu:BH, :]], dim=1)
 
-        # 2) (S, BH, D) -> (B, H, S, D) 的标准 PKV 视图（零拷贝）
+        # 2) (S, BH, D) -> (B, H, S, D) standard PKV view (zero-copy)
         H = getattr(self.block_config, "num_attention_heads", None)
         assert H is not None, "block_config.num_attention_heads is required"
         assert (k_sbh.shape[1] % H) == 0, f"BH={k_sbh.shape[1]} not divisible by H={H}"
@@ -215,7 +215,7 @@ class KVCacheManager:
         k_pkv = _to_pkv(k_sbh)
         v_pkv = _to_pkv(v_sbh)
 
-        # 可选：按 hypo_ids 重排 batch
+        # Optional: reorder batch by hypo_ids
         # if hypo_ids is not None:
         #     # hypo_ids: shape (B,)
         #     k_pkv = k_pkv.index_select(0, hypo_ids)
@@ -246,10 +246,10 @@ class KVCacheManager:
     
     def _write_kvs(self, kvs, start_position: int) -> None:
         """
-        将 new_kvs 写入当前活跃 cache：
-        - 目标 cache_tensors：k_cache, v_cache，形状均为 (S_total, B*H, D)
-        - 写入起点：start_position（沿 sequence 维）
-        - 源 new_kvs：
+        Write new_kvs to current active cache:
+        - Target cache_tensors: k_cache, v_cache, both with shape (S_total, B*H, D)
+        - Write start position: start_position (along sequence dimension)
+        - Source new_kvs:
             key:   (B*H, D, s_new)
             value: (B*H, s_new, D)
         """
@@ -259,11 +259,11 @@ class KVCacheManager:
         # logger.info(f"_active_cache_tensors_stack, k_cache: {k_cache}")
         S_total, BH_dst, D_dst = k_cache.shape
 
-        # 取出 (key, value)
+        # Extract (key, value)
         new_kvs = kvs.kvs if hasattr(kvs, "kvs") else kvs
         key, value = new_kvs
 
-        # 若可能是 FlexGen 的封装/压缩，转成 torch.Tensor（与你给的 to_torch_tensor 一致的逻辑）
+        # If possibly FlexGen wrapper/compression, convert to torch.Tensor (consistent to_torch_tensor logic)
         try:
             from bloombee.flexgen_utils.pytorch_backend import DeviceType
             def _to_torch(x):
@@ -271,8 +271,8 @@ class KVCacheManager:
                     getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
                     or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
                 ):
-                    return x.device.decompress(x)  # 解压到 torch.Tensor
-                return getattr(x, 'data', x)      # TorchTensor -> torch.Tensor, 否则原样返回
+                    return x.device.decompress(x)  # Decompress to torch.Tensor
+                return getattr(x, 'data', x)      # TorchTensor -> torch.Tensor, otherwise return as-is
         except Exception:
             def _to_torch(x):
                 return getattr(x, 'data', x)
@@ -280,7 +280,7 @@ class KVCacheManager:
         key_t = _to_torch(key)       # (BH, D, s_new)
         value_t = _to_torch(value)   # (BH, s_new, D)
 
-        # 形状与范围校验
+        # Shape and range validation
         assert key_t.ndim == 3 and value_t.ndim == 3, f"new_kvs dims invalid: key {key_t.shape}, value {value_t.shape}"
         BH_src, D_src, s_new = key_t.shape
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
@@ -297,27 +297,27 @@ class KVCacheManager:
                 end_position = S_total
 
 
-        # 可选：对齐 dtype（以目标 cache 为准）
+        # Optional: align dtype (based on target cache)
         if key_t.dtype != k_cache.dtype:
             key_t = key_t.to(dtype=k_cache.dtype)
         if value_t.dtype != v_cache.dtype:
             value_t = value_t.to(dtype=v_cache.dtype)
 
-        # 仅做视图变换到内部布局 (s_new, BH, D)；不产生新内存
+        # Only view transformation to internal layout (s_new, BH, D); no new memory allocation
         k_write = key_t.permute(2, 0, 1)   # (s_new, BH, D)
         v_write = value_t.permute(1, 0, 2) # (s_new, BH, D)
 
-        # 目标切片
+        # Target slice
         dst_idx = (slice(start_position, start_position + s_new), slice(0, BH_src), slice(0, D_src))
 
-        # 将源 torch.Tensor 包装成 TorchTensor（device 用 compute 设备即可；底层断言已关，允许不一致）
-        # 这样 general_copy 能统一处理各类设备/压缩/分段
+        # Wrap source torch.Tensor into TorchTensor (device can use compute device; underlying assertions disabled, allowing inconsistency)
+        # This way general_copy can uniformly handle various devices/compression/segmentation
         k_src_tt = TorchTensor.create_from_torch(k_write, self.attention_compute)
         v_src_tt = TorchTensor.create_from_torch(v_write, self.attention_compute)
 
         # logger.info(f"_write_kvs, dst_idx: {dst_idx}")
 
-        # 真正写入（兼容 COMPRESSED / MIXED / DISK 等）
+        # Actual write (compatible with COMPRESSED / MIXED / DISK etc.)
         general_copy(k_cache, dst_idx, k_src_tt, None)
         general_copy(v_cache, dst_idx, v_src_tt, None)
 

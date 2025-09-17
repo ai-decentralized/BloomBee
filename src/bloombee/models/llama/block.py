@@ -354,7 +354,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                 for k in range(self.num_gpu_batches):
                     for j in range(self.num_layers):
 
-                        # 加载当前层的缓存
+                        # Load current layer cache
                         # self.load_cache(i, j, k, overlap=False)
                         # self.load_hidden(i, j, k)
                         if j == 0 and past_key_value is not None:
