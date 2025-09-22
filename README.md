@@ -24,8 +24,20 @@ pip install bloombee
 #### From Source
 ```bash  
 git clone https://github.com/ai-decentralized/BloomBee.git  
-cd BloomBee  
-pip install .
+cd BloomBee
+python3 -m venv bloombee-venv
+source bloombee-venv/bin/activate
+pip install -e .
+
+pip install pynvml
+pip install attrs
+```
+If you are using Hivemind (required for BloomBee setup), please install this as well:
+```
+git clone https://github.com/learning-at-home/hivemind
+cd hivemind
+pip install -e .
+
 ```
 ## How to use BloomBee(<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
 #### 1. Start the main server 
@@ -47,6 +59,26 @@ Here is the BloomBee Server location:
 export BBSERVER=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ  
 
 ```
+To setup the workers, connect to the GPUs being used (If using remote SSH to instance):
+```
+chmod 400 ~/.ssh/<YOURKEYPAIR>.pem
+ssh -i ~/.ssh/<YOURKEYPAIR.pem cc@<FLOATING IP>
+```
+Next, make sure that the workers are fully set up in the BloomBee environment.
+```
+git clone https://github.com/ai-decentralized/BloomBee.git
+cd BloomBee
+python3 -m venv bloombee-venv
+source bloombee-venv/bin/activate
+pip install -e .
+
+pip install pynvml
+pip install attrs
+
+git clone https://github.com/learning-at-home/hivemind
+cd hivemind
+pip install -e .  
+```
 Start one worker to hold 16 blocks (16 tranformer layers)
 ```
 python -m bloombee.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
@@ -55,6 +87,16 @@ Start second worker to hold another 16 blocks (16 tranformer layers)
 ```
 python -m bloombee.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 ```
+In case your workers do not run do to IP connection resets, please configure the config files containing the workers' IPs. 
+
+If a bitsandbytes error comes up, please use this fix: 
+```
+cd ~/BloomBee
+rm -rf bitsandbytes
+git clone https://github.com/TimDettmers/bitsandbytes.git
+cd bitsandbytes
+```
+Make sure to set CUDA versions to the correct library paths if necessary.
 
 #### 3. Run inference or finetune jobs
 
