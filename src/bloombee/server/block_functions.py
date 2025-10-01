@@ -172,13 +172,13 @@ async def iterate_rpc_inference(
     assert len(cache_handles) == len(requested_backends)
 
     start_iterate_rpc_infer_time = perf_counter() #######
-    print('start iterate rpc inference -=-=-=-')
+    # print('start iterate rpc inference -=-=-=-')
     #print_time_now('')
     prefix_length = 0
     point_per_piece = points / max_length if max_length > 0 else 0.0
 
     async for request, step_metadata in input_iterator:
-        print('------------------ iterate_rpc_inference step_metadata ', step_metadata)
+        # print('------------------ iterate_rpc_inference step_metadata ', step_metadata)
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
             assert (
@@ -205,8 +205,8 @@ async def iterate_rpc_inference(
         else:
             prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
             prompts = [prompt if not is_dummy(prompt) else None for prompt in prompts]
-        print('has_prompts', has_prompts)
-        print('prompts ', prompts)
+        # print('has_prompts', has_prompts)
+        # print('prompts ', prompts)
         if not (len(requested_backends) == len(prompts)):
             raise ValueError(f"Received {len(prompts)} prompts for {len(requested_backends)} backends")
 
@@ -218,7 +218,7 @@ async def iterate_rpc_inference(
 
         merge_max_tokens = MAX_NF4_SHORT_INFERENCE_TOKENS if quant_type == QuantType.NF4 else MAX_SHORT_INFERENCE_TOKENS
         can_merge_pools = batch_size * length_increment <= merge_max_tokens
-        print('-=-=-=-=-=-=-=-==-=- can merge pools : ', can_merge_pools)
+        # print('-=-=-=-=-=-=-=-==-=- can merge pools : ', can_merge_pools)
         priority = prioritizer.prioritize(
             hidden_states,
             hypo_ids,
@@ -226,34 +226,34 @@ async def iterate_rpc_inference(
             requested_uids=requested_uids,
             type="inference",
         )
-        print('after priority = prioritizer.prioritize( )')
+        # print('after priority = prioritizer.prioritize( )')
         #print_time_now('')
         # A client may pass a tensor with 0 tokens. This is a special case that occurs, e.g.
         # when user wants to pre-allocate cache or check that server *can* allocate that cache.
         if hidden_states.numel() > 0:
             assert hidden_states.ndim == 3, f"hidden states must be a single 3d tensor"
             start_compute_time = perf_counter()
-            print('before merge pools ')
+            # print('before merge pools ')
             #print_time_now('')
             
             # Add offloading debug information
-            offload_logger.info(f" Inference computation started - step {prefix_length}")
-            offload_logger.info(f"   - Batch size: {batch_size}")
-            offload_logger.info(f"   - Length increment: {length_increment}")
-            offload_logger.info(f"   - Prefix length: {prefix_length}")
-            offload_logger.info(f"   - Max length: {max_length}")
+            # offload_logger.info(f" Inference computation started - step {prefix_length}")
+            # offload_logger.info(f"   - Batch size: {batch_size}")
+            # offload_logger.info(f"   - Length increment: {length_increment}")
+            # offload_logger.info(f"   - Prefix length: {prefix_length}")
+            # offload_logger.info(f"   - Max length: {max_length}")
             
-            # Check cache usage
-            for i, (backend, handles) in enumerate(zip(requested_backends, cache_handles)):
-                cache_manager = backend.cache_manager
-                offload_logger.info(f"   - Backend {i}: {len(handles)} cache handles")
-                offload_logger.info(f"     GPU cache ratio: {cache_manager.offloading_policy.cache_gpu_percent}%")
-                offload_logger.info(f"     CPU cache ratio: {cache_manager.offloading_policy.cache_cpu_percent}%")
-                offload_logger.info(f"     CPU cache compute: {cache_manager.offloading_policy.cpu_cache_compute}")
+            # # Check cache usage
+            # for i, (backend, handles) in enumerate(zip(requested_backends, cache_handles)):
+            #     cache_manager = backend.cache_manager
+            #     offload_logger.info(f"   - Backend {i}: {len(handles)} cache handles")
+            #     offload_logger.info(f"     GPU cache ratio: {cache_manager.offloading_policy.cache_gpu_percent}%")
+            #     offload_logger.info(f"     CPU cache ratio: {cache_manager.offloading_policy.cache_cpu_percent}%")
+            #     offload_logger.info(f"     CPU cache compute: {cache_manager.offloading_policy.cpu_cache_compute}")
             
             if can_merge_pools:
-                print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
-                offload_logger.info(" Using merged pool for inference")
+                # print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
+                # offload_logger.info(" Using merged pool for inference")
                 
                 inference_infos = tuple(
                     InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
@@ -264,12 +264,13 @@ async def iterate_rpc_inference(
                 )
                 
             else:
-                print('-=-=-=-=-=-=-=-==-=- not come into can merge pools : ', can_merge_pools)
-                offload_logger.info(" Using separate pools for inference")
+                pass
+                # print('-=-=-=-=-=-=-=-==-=- not come into can merge pools : ', can_merge_pools)
+                # offload_logger.info(" Using separate pools for inference")
                 
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
-                    offload_logger.info(f"   - Processing backend: {uid}")
-                    offload_logger.info(f"     - Cache handles: {len(handles)}")
+                    # offload_logger.info(f"   - Processing backend: {uid}")
+                    # offload_logger.info(f"     - Cache handles: {len(handles)}")
                     
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
@@ -285,14 +286,14 @@ async def iterate_rpc_inference(
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
             for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
         ]
-        print('after serialize and send last layer outputs ', )
+        # print('after serialize and send last layer outputs ', )
         # print_time_now('')
         # print('hidden_states ', hidden_states)
         # print('type of hidden_states ', )
-        print('shape of hidden_states ', hidden_states.size())
-        # hidden_size_in_bytes = hidden_states.element_size() * output_tensors.numel()  
-        # print(f"Size of the hidden state in bytes: {size_in_bytes}")  
-        print()
+        # print('shape of hidden_states ', hidden_states.size())
+        # # hidden_size_in_bytes = hidden_states.element_size() * output_tensors.numel()  
+        # # print(f"Size of the hidden state in bytes: {size_in_bytes}")  
+        # print()
         
         can_push = not has_prompts
         yield output_tensors, can_push, step_metadata

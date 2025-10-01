@@ -51,60 +51,26 @@ def benchmark_inference(process_idx, args, result_pipe):
     ) 
     logger.info(f"Created model: {process_idx=} {model.device=}")
 
-    result = ""
-    step_times = []
-    
-    logger.info(f"[Process {process_idx}] BOS token id: {tokenizer.bos_token_id}")
-    logger.info(f"[Process {process_idx}] Starting inference session...")
-    # test_prompt = "Simply put, the theory of relativity states that"
-    test_prompt =""
-    result = ""
+    test_prompt = ""
     input_ids = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=True)
     temp_result_tokens = input_ids
     
+    step_times = []
+    
     with model.transformer.h.inference_session(max_length=args.seq_len) as sess:
-        
-
         for step in range(args.seq_len):
             start_time = perf_counter()
-
-            logger.info(f"[Process {process_idx}] Step {step} - Before generation:")
-            logger.info(f"[Process {process_idx}] Current result length: {len(result)}")
-            logger.info(f"[Process {process_idx}] Current result text: {repr(result)}")
-            # if (step == 0):
-            #     outputs = model.generate(input_ids, max_new_tokens=1, session=sess)
-            # else:
-            #     outputs = model.generate(max_new_tokens=1, session=sess)
-                
+            
             outputs = model.generate(max_new_tokens=1, session=sess)    
-                
-            # logger.info(f"🔍 [Process {process_idx}] Step {step} - After generation:")
-            # logger.info(f"🔍 [Process {process_idx}] Generated outputs shape: {outputs.shape}")
-            # logger.info(f"🔍 [Process {process_idx}] Generated outputs: {outputs}")
-            # logger.info(f"🔍 [Process {process_idx}] Full sequence: {outputs[0]}")
-            
-   
             new_token_id = outputs[0][-1].item()  
-            logger.info(f"[Process {process_idx}] New token id: {new_token_id}")
-            
-
             new_token_text = tokenizer.decode([new_token_id])
-            logger.info(f"[Process {process_idx}] New token text: {repr(new_token_text)}")
-            
-
             temp_result_tokens = torch.cat([temp_result_tokens, outputs[:, -1:]], dim=1)
-            full_decoded = tokenizer.decode(temp_result_tokens[0])
-            logger.info(f"[Process {process_idx}] temp_result: {repr(full_decoded)}")
 
             if step >= args.warmup_steps:
                 step_times.append(perf_counter() - start_time)
                 speed = 1 / np.mean(step_times)
                 logger.info(f"{process_idx=} {step=} {speed=:.2f}")
-                
-            logger.info(f"[Process {process_idx}] Step {step} completed\n" + "="*50)
-            
-    logger.info(f"Generated text (process {process_idx}): {repr(result)}")
-    logger.info(f"Generated text length: {len(result)} characters")
+    
     result_pipe.send(speed)
 
 

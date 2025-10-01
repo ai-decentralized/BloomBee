@@ -153,7 +153,7 @@ class TransformerConnectionHandler(ConnectionHandler):
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
         """Compute a single step of inference using attention cache; update attention cache accordingly."""
         # offload_logger.info("🚀 Start inference request - rpc_inference")
-        print('come into rpc_inference ..........')
+        # Debug output removed
         # print_time_now('')
         async with timeout(self.session_timeout):
             
@@ -163,6 +163,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                 self._log_request("rpc_inference.open", None, context, warning="timed out")
                 return
 
+            # RPC Debug: Log received request size
+            request_tensor_sizes = [len(tensor.buffer) for tensor in request.tensors]
+            request_metadata_size = len(request.metadata) if request.metadata else 0
+            total_request_size = sum(request_tensor_sizes) + request_metadata_size
+            
+            # RPC debug output removed
+
             requested_uids = self._check_uids(request.uid)
             self._log_request("rpc_inference.open", requested_uids, context)
             try:
@@ -170,7 +177,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 
                 metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
                 end_msg_serial_time = perf_counter()
-                print('msg_Serializer time ', end_msg_serial_time-start_time)
+                # Debug output removed
                 # print_time_now('')
                 
                 requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
@@ -194,7 +201,7 @@ class TransformerConnectionHandler(ConnectionHandler):
 
                 batch_size = request.tensors[0].size[0] if request.tensors else 1
                 end_batch_size_time = perf_counter()
-                print('prepare time ', end_batch_size_time-end_msg_serial_time)
+                # Debug output removed
                 # print_time_now('')
                 
                 push_time = []
@@ -252,7 +259,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         end_ExpertResponse_time=perf_counter() ###
                         # print('runtime_pb2.ExpertResponse push outputs respond time', end_ExpertResponse_time-start_ExpertResponse_time) ###
                         # print_time_now('')
-                        print() ###
+                        # Debug output removed
                         
                     end_iterate_rpc_inference_time=perf_counter() ###
                     # print('mean push time ', np.mean(push_time[4:])) ###
@@ -648,10 +655,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         # Use KVCacheManager's offloading strategy
         cache_manager = backends[0].cache_manager
         
-        offload_logger.info(f" Using offloading strategy:")
-        offload_logger.info(f"   - GPU cache ratio: {cache_manager.offloading_policy.cache_gpu_percent}%")
-        offload_logger.info(f"   - CPU cache ratio: {cache_manager.offloading_policy.cache_cpu_percent}%")
-        offload_logger.info(f"   - CPU cache compute: {cache_manager.offloading_policy.cpu_cache_compute}")
+        # Offloading debug output removed
         
         # Use the original cache allocation method, but add offloading debug information
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]

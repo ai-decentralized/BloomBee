@@ -136,7 +136,7 @@ class _ServerInferenceSession:
             request_metadata.update(self.session_metadata)
         if self._position is not None:
             request_metadata["start_from_position"] = self._position
-        if self.config.use_server_to_server:
+        elif self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
             if next_servers:
                 request_metadata["next_servers"] = next_servers
@@ -153,18 +153,23 @@ class _ServerInferenceSession:
             server_side_inference_schema
         ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
+        # Serialize and send data (debug output removed for performance)
+        serialized_tensors = [
+            serialize_torch_tensor(tensor.to(proto.dtype), proto.compression)
+            for tensor, proto in zip(input_tensors, inference_schema)
+        ]
+        serialized_metadata = MSGPackSerializer.dumps(request_metadata)
+        
         outputs_serialized = RemoteExpertWorker.run_coroutine(
             self._step(
                 runtime_pb2.ExpertRequest(
                     uid=self.uid,
-                    tensors=[
-                        serialize_torch_tensor(tensor.to(proto.dtype), proto.compression)
-                        for tensor, proto in zip(input_tensors, inference_schema)
-                    ],
-                    metadata=MSGPackSerializer.dumps(request_metadata),
+                    tensors=serialized_tensors,
+                    metadata=serialized_metadata,
                 )
             )
         )
+        
         outputs = list(map(deserialize_torch_tensor, outputs_serialized.tensors))
         assert (
             outputs[0].shape == inputs.shape
@@ -178,7 +183,7 @@ class _ServerInferenceSession:
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
         next_servers = []
         session = self.next_session
-        while session is not None :
+        while session is not None and session.stepped: 
             next_servers.append(
                 (session.span.peer_id.to_base58(), session.session_id, session.span.start, session.span.end)
             )
@@ -312,10 +317,12 @@ class InferenceSession:
 
         inputs_device = inputs.device
         inputs_dtype = inputs.dtype
+        
         inputs = inputs.cpu()
         prompts = prompts.cpu()
         hypo_ids = hypo_ids.cpu()
-        step_id = str(uuid.uuid4()) #生成一个唯一的步骤 ID。
+        
+        step_id = str(uuid.uuid4())  # Generate a unique step ID.
 
         n_input_tokens = inputs.shape[1]
         if self._position + n_input_tokens > self._max_length:
@@ -335,6 +342,7 @@ class InferenceSession:
 
                     server_session = self._server_sessions[server_idx]
                     assert server_session.position == self.position, f"{server_session.position} and {self.position}"
+                    
                     inputs = server_session.step( 
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
@@ -358,12 +366,13 @@ class InferenceSession:
                         f"Caught exception when running inference via {server_session.span if server_session is not None else None} "
                         f"(retry in {delay:.0f} sec): {repr(e)}"
                     )
-                    maybe_log_traceback(e)  
+                    maybe_log_traceback(e)
                     time.sleep(delay) 
 
         self._position += n_input_tokens 
         # print(f"lient inference session outputs, inputs: {inputs}")
         outputs = inputs 
+        
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         # print('client inference session outputs ', outputs.shape)
         return outputs

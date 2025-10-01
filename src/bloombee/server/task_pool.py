@@ -125,7 +125,7 @@ class PrioritizedTaskPool(threading.Thread):
     ) -> Tuple[Any, List[torch.Tensor]]:
         """receive next batch of arrays"""
         device = device if device is not None else self.device  # If device not specified, use default device 
-        print('-=-==-=-=-=-=- task pool: load_batch_to_runtime(): device ', device)
+        # print('-=-==-=-=-=-=- task pool: load_batch_to_runtime(): device ', device)
         task = self._ordered_tasks.get(block=True, timeout=timeout)  # Get next task from ordered task queue, may block until timeout 
         batch_inputs = [_move_to_device_if_tensor(arg, device, share_memory=False) for arg in task.args]  # Move task arguments to specified device 
         self._dispatched_tasks[task.uid] = task  # Mark task as dispatched 

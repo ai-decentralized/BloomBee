@@ -467,9 +467,13 @@ class Server:
         if self.strict_block_indices is not None:
             return self.strict_block_indices
 
-        # If multiple servers (e.g., launched on the same machine by a script) get to this line at the same time,
-        # this delay decreases the probability of a race condition while choosing the best blocks to serve.
-        time.sleep(random.random() * 2 * self.mean_block_selection_delay)
+        # 优化：减少不必要的随机延迟，提升启动速度
+        # 原始延迟：time.sleep(random.random() * 2 * self.mean_block_selection_delay)
+        # 使用更小的延迟或在单机部署时完全移除
+        if hasattr(self, '_single_machine_mode') and self._single_machine_mode:
+            pass  # 单机模式下不需要延迟
+        else:
+            time.sleep(min(0.1, random.random() * self.mean_block_selection_delay))  # 最大100ms延迟
         module_infos = get_remote_module_infos(self.dht, self.module_uids, latest=True)
         return block_selection.choose_best_blocks(self.num_blocks, module_infos)
 
@@ -530,7 +534,7 @@ class ModuleContainer(threading.Thread):
         **kwargs,
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
-        print('module_uids ', module_uids)
+        # Debug output removed
 
         cache_manager = KVCacheManager(inference_max_length, max_alloc_timeout, policy, env, block_config)
 
@@ -554,7 +558,7 @@ class ModuleContainer(threading.Thread):
         blocks = {}
         try:
             for module_uid, block_index in zip(module_uids, block_indices):
-                print('blocks uid before load_pretrained_block() ', module_uid )
+                # Debug output removed
                 # see_memory_usage("-----------------------------------------before petals load pretrained block ")
                 block = load_pretrained_block(
                     converted_model_name_or_path,
