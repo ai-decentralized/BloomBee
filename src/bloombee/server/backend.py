@@ -31,18 +31,18 @@ offload_logger.setLevel(logging.INFO)
 
 
 def compute_tensor_hash(tensor):
-    """Compute SHA256 hash of tensor for debugging - 优化CPU转换"""
+    """Compute SHA256 hash of tensor for debugging - optimized CPU conversion"""
     if tensor is None:
         return "None"
     try:
-        # 优化：只在debug时才进行CPU转换，避免不必要的性能开销
+        # Optimization: Only perform CPU conversion in debug mode to avoid unnecessary performance overhead
         if not getattr(compute_tensor_hash, '_debug_enabled', False):
-            return "hash_disabled"  # 在生产环境中禁用hash计算
+            return "hash_disabled"  # Disable hash computation in production environment
         return hashlib.sha256(tensor.detach().cpu().numpy().tobytes()).hexdigest()[:16]
     except:
         return "error"
-        
-# 可以通过设置这个标志来启用/禁用hash计算
+
+# This flag can be set to enable/disable hash computation
 compute_tensor_hash._debug_enabled = False
 
 # def see_memory_usage(message, force=True):
@@ -176,7 +176,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
     def _ensure_model_on_device(self):
         """Ensure model is on correct device, load from CPU to GPU if needed"""
-        # 🚀 Optimized: Add fast-path check to avoid repeated device comparison
+        # Optimized: Add fast-path check to avoid repeated device comparison
         if getattr(self, '_device_already_set', False):
             return
         
@@ -248,7 +248,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     
                     #  Generate correct position_ids for this chunk
                     chunk_length = min(max_chunk_length, seq_len - offset)
-                    # 🚀 Optimized: Reuse cached position_ids base tensor
+                    # Optimized: Reuse cached position_ids base tensor
                     cache_key = (chunk_length, batch_size, hidden_states.device)
                     if cache_key not in self._position_ids_cache:
                         # Create base position_ids (0 to chunk_length-1)
@@ -260,7 +260,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     
                     # print(f' Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}')
                     
-                    # 🔧 Add chunk processing debug information
+                    # Add chunk processing debug information
                     # offload_logger.info(f" Processing chunk {offset//max_chunk_length + 1}:")
                     # offload_logger.info(f"   - chunk_length: {chunk_length}")
                     # offload_logger.info(f"   - hidden_states_chunk device: {hidden_states_chunk.device}")
@@ -284,7 +284,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         output_hidden_states_chunk, new_kvs = forward_result
                         # print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
                         
-                        # 🔧 Add forward result debug information
+                        # Add forward result debug information
                         # offload_logger.info(f" module.forward completed:")
                         # offload_logger.info(f"   - output_hidden_states_chunk shape: {output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}")
                         # offload_logger.info(f"   - new_kvs length: {len(new_kvs) if new_kvs else 0}")
@@ -304,7 +304,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         output_hidden_states = output_hidden_states_chunk  # saves one memcopy # Copy memory only once
                     # layer_past = new_kvs # Update cache state
 
-                # 🔧 Fixed: Restore cache update logic  
+                # Fixed: Restore cache update logic  
                 past_key_values_length = 0
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
@@ -362,7 +362,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend]):
     """Replace each backend's rpc_inference pools with a combined pool runs multiple blocks in one call"""
     assert len(backends) != 0 and all(isinstance(b, TransformerBackend) for b in backends.values())
-    # Debug output removed
+    # print('............... come into the merge_inference_pools_inplace() ' )
     first_pool = next(iter(backends.values())).inference_pool
     merged_pool = PrioritizedTaskPool(
         _MergedInferenceStep(backends),
