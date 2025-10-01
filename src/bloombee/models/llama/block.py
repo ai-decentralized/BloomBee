@@ -32,12 +32,12 @@ from transformers import AutoTokenizer
 import os
 from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage, log_mem
 
-# 全局tokenizer单例 - 避免每个layer重复创建
+# Global tokenizer singleton - avoid creating duplicate tokenizers for each layer
 _global_tokenizer = None
 _tokenizer_lock = threading.Lock() if 'threading' in sys.modules else None
 
 def get_global_tokenizer(model_name='llama-7b-hf'):
-    """获取全局共享的tokenizer，只初始化一次"""
+    """Get globally shared tokenizer, initialize only once"""
     global _global_tokenizer
     if _global_tokenizer is None:
         try:
@@ -107,7 +107,7 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
 
         # print('🔧 Final position_ids before processing:', position_ids)
 
-        # 🚀 Optimized: Avoid .item() CPU-GPU sync by using direct indexing
+        #   Optimized: Avoid .item() CPU-GPU sync by using direct indexing
         # Most common case: 2D tensor [batch_size, seq_len]
         if position_ids.dim() == 2:
             start_position = position_ids[0, 0]  # Keep as tensor, no .item() sync!
@@ -178,26 +178,26 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
 
         self.task = None
 
-        # 优化1: 使用全局共享tokenizer，避免每个layer重复创建
+        # Use globally shared tokenizer to avoid creating duplicate tokenizers for each layer
         self._cached_tokenizer = None
-        # 不在__init__中初始化tokenizer，避免每个layer都创建
+        # Don't initialize tokenizer in __init__ to avoid creating one for each layer
         
-        # 优化2: 改进Task管理
+        # Improved Task management
         self._cached_task = None
         self._is_initialized = False
-        self._test_inputs_cache = {}  # 优化3: 缓存test_inputs结果
+        self._test_inputs_cache = {}  # Optimization 3: cache test_inputs results
         
-        # 优化4: 缓存常用计算结果
+        # Cache frequently used calculation results
         self._last_prompt_len = None
         self._last_gen_len = None
         
-        # FlexGen优化: 对象复用和缓存策略
+        # Object reuse and caching strategy
         self._cached_torch_device = None
         self._cached_hidden_array = None
         self._last_gen_len_for_hidden = None
         self._cache_cleared = False
         
-        # FlexGen优化: GPU流管理优化
+        # GPU stream management optimization
         self._streams_initialized = False
 
         # log_mem(f"[LlamaDecoderLayer:{self.layer_id}] before init_all_weights")
@@ -206,18 +206,18 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
 
         self.temp_hidden = ValueHolder()
         
-        # FlexGen优化8: 延迟初始化GPU流
+        # Lazy initialization of GPU streams
         self._init_gpu_streams_if_needed()
 
     def _get_tokenizer(self):
-        """优化：使用全局共享tokenizer，避免重复创建"""
+        """Optimization: use globally shared tokenizer to avoid duplicate creation"""
         if self._cached_tokenizer is None:
             model_name = getattr(self.llama_config, 'name', 'llama-7b-hf')
             self._cached_tokenizer = get_global_tokenizer(model_name)
         return self._cached_tokenizer
 
     def _get_cached_test_inputs(self, prompt_len, num_prompts):
-        """优化：缓存test_inputs结果，避免重复计算"""
+        """Optimization: cache test_inputs results to avoid duplicate calculations"""
         cache_key = (prompt_len, num_prompts)
         if cache_key not in self._test_inputs_cache:
             tokenizer = self._get_tokenizer()
@@ -226,16 +226,16 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                     prompt_len, num_prompts, tokenizer
                 )
             else:
-                # 如果tokenizer不可用，使用简单的默认值
+                # If tokenizer is unavailable, use simple default values
                 self._test_inputs_cache[cache_key] = ([0],) * num_prompts
         return self._test_inputs_cache[cache_key]
 
     def _should_rebuild_task(self, max_new_tokens, actual_prompt_len):
-        """优化：简化Task重建逻辑，减少重复检查"""
+        """Optimization: simplify Task rebuild logic, reduce duplicate checks"""
         if self._cached_task is None:
             return True
         
-        # 只有真正变化时才重建
+        # Only rebuild when there are actual changes
         if (self._cached_task.gen_len != max_new_tokens or 
             self._cached_task.prompt_len != actual_prompt_len):
             return True
@@ -243,14 +243,14 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         return False
     
     def _should_force_cache_clear(self):
-        """判断是否需要强制清理缓存"""
-        # 只在真正必要时清理缓存，比如Task变化
+        """Determine if cache needs to be force cleared"""
+        # Only clear cache when truly necessary
         return (self._cached_task is None or 
                 self._last_prompt_len != self._cached_task.prompt_len or
                 self._last_gen_len != self._cached_task.gen_len)
 
     def _init_gpu_streams_if_needed(self):
-        """FlexGen优化8: 延迟初始化GPU流，避免重复创建"""
+        """Lazy initialization of GPU streams to avoid duplicate creation"""
         if not self._streams_initialized:
             if not hasattr(self, 'load_weight_stream'):
                 self.load_weight_stream = torch.cuda.Stream()
@@ -336,8 +336,8 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         residual = hidden_states
         # log_mem(f"[Layer:{self.layer_id}] forward(start) batch={hidden_states.shape[0]} seq={hidden_states.shape[1]}")
 
-        # 优化：使用全局共享tokenizer，避免重复创建
-        # tokenizer只在真正需要时获取
+        # Use globally shared tokenizer to avoid duplicate creation
+        # Only get tokenizer when truly needed
         # if self._cached_tokenizer is None:
         #     self._cached_tokenizer = self._get_tokenizer()
 
@@ -345,12 +345,12 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         actual_prompt_len = hidden_states.shape[1] if hidden_states.shape[1] > 0 else 1
         prompt_len, gen_len, cut_gen_len = actual_prompt_len, max_new_tokens, max_new_tokens
 
-        # 优化：使用简化的Task重建逻辑，并添加性能监控
+        # Use simplified Task rebuild logic and add performance monitoring
         task_rebuild_start = None
         if self._should_rebuild_task(max_new_tokens, actual_prompt_len):
             task_rebuild_start = time.time()
             
-            # 优化：使用缓存的test_inputs
+            # Use cached test_inputs
             inputs = self._get_cached_test_inputs(prompt_len, num_prompts)
 
             self._cached_task = Task(
@@ -364,14 +364,14 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                 top_p=top_p
             )
             
-            # 缓存参数以便下次比较
+            # Cache parameters for next comparison
             self._last_prompt_len = actual_prompt_len
             self._last_gen_len = max_new_tokens
             
             if not self._is_initialized:
                 self._is_initialized = True
                 
-            # 性能监控：记录Task重建时间
+            # Performance monitoring: record Task rebuild time
             if task_rebuild_start is not None:
                 task_rebuild_time = (time.time() - task_rebuild_start) * 1000
                 if task_rebuild_time > 1.0:  # 只记录超过1ms的情况
@@ -389,7 +389,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         self.output_ids = np.ones((num_prompts, prompt_len + gen_len), dtype=np.int64)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
 
-        # FlexGen优化1: 智能缓存清理 - 避免每次都清理
+        # Smart cache clearing - avoid clearing every time
         cache_clear_start = time.time()
         if not self._cache_cleared or self._should_force_cache_clear():
             num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
@@ -407,7 +407,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         if cache_clear_time > 2.0:
             print(f"[FLEXGEN_PERF] Layer {self.layer_id} Cache clear took: {cache_clear_time:.3f}ms")
 
-        # FlexGen优化2: 智能hidden数组复用
+        # Smart hidden array reuse
         hidden_alloc_start = time.time()
         if (self._cached_hidden_array is None or 
             self._last_gen_len_for_hidden != gen_len):
@@ -421,7 +421,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         if hidden_alloc_time > 2.0:
             print(f"[FLEXGEN_PERF] Layer {self.layer_id} Hidden array alloc took: {hidden_alloc_time:.3f}ms")
 
-        # FlexGen优化3: TorchDevice对象复用
+        # TorchDevice object reuse
         device_wrap_start = time.time()
         data = hidden_states
         if (self._cached_torch_device is None or 
@@ -440,7 +440,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         # print(f"input batch size: {hidden_states.shape[0]}")
         # print(f"gpu_batch_size: {self.policy.gpu_batch_size}")
 
-        # FlexGen优化4: CPU缓存计算工作空间初始化优化
+        # CPU cache compute workspace initialization optimization
         cpu_workspace_start = time.time()
         self.task = task
         self.set_task(task)
@@ -456,7 +456,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         if debug_mode is None:
             if not overlap:
                 if position_ids is not None and position_ids.numel() > 0:
-                    # 🚀 Optimized: Avoid .item() sync
+                    #   Optimized: Avoid .item() sync
                     current_position = position_ids.flatten()[0]
                     # print(f'🔧 Using actual position from position_ids: {current_position}')
                 else:
@@ -472,7 +472,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                         mask_length = i + 1
                     self.update_attention_mask(0, k, mask_length)
 
-                # FlexGen优化5: 权重加载性能监控和优化
+                # Weight loading performance monitoring and optimization
                 weight_load_start = time.time()
                 for j in range(self.num_layers):
                     for k in range(self.num_gpu_batches):
@@ -484,7 +484,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                 final_outputs = []
                 generated_tokens_num = 0
                 if position_ids is not None and position_ids.numel() > 0:
-                    # 🚀 Optimized: Avoid .item() sync - keep as tensor for faster ops
+                    #   Optimized: Avoid .item() sync - keep as tensor for faster ops
                     generated_tokens_num = position_ids.flatten()[-1] - self.task.prompt_len + 1
                 for k in range(self.num_gpu_batches):
                     for j in range(self.num_layers):
@@ -514,7 +514,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                             # Transform to FlexGen expected (s, b*h, d)
                             b, h, s, d = past_key.shape
                             # logger.info(f"after format past_key: {past_key.shape}")
-                            # 🚀 Optimized: Use reshape instead of permute+contiguous+view
+                            #   Optimized: Use reshape instead of permute+contiguous+view
                             # reshape() will avoid copy when possible
                             past_k_new = past_key.permute(2, 0, 1, 3).reshape(s, b * h, d)
                             past_v_new = past_value.permute(2, 0, 1, 3).reshape(s, b * h, d)
@@ -557,7 +557,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                             self.cache_write_buf[0][0].store((k_new, v_new))
 
                     # print(f"forward, layer_output: {layer_output}")
-                    # 🚀 Optimized: Avoid clone if not necessary
+                    #   Optimized: Avoid clone if not necessary
                     # Only clone if tensor has grad or is a view that might be modified
                     if layer_output.data.requires_grad or layer_output.data._base is not None:
                         final_outputs.append(layer_output.data.clone())
@@ -574,12 +574,12 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
 
         outputs = (hidden_states, past_key_value)
         # log_mem(f"[Layer:{self.layer_id}] forward(end) out_shape={hidden_states.shape}")
-        # 优化：移除每次forward的empty_cache调用，减少GPU开销
+        # Remove empty_cache call from each forward to reduce GPU overhead
         # torch.cuda.empty_cache()  # 这会导致性能问题
         return outputs
 
     def load_weight(self, i, j, k, overlap=True):
-        # FlexGen优化6: 权重加载细粒度监控
+        # Fine-grained weight loading monitoring
         individual_weight_start = time.time()
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
@@ -607,7 +607,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         if i == 0:
             return
 
-        # FlexGen优化7: 缓存加载监控
+                # Cache loading monitoring
         cache_load_start = time.time()
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
@@ -633,7 +633,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         if overlap:
             with torch.cuda.stream(self.store_cache_stream):
                 self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
-            # 优化：移除不必要的同步，减少GPU阻塞
+            # Remove unnecessary synchronization to reduce GPU blocking
             # torch.cuda.synchronize()  # 这会造成性能瓶颈
         else:
             self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
@@ -722,7 +722,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
 class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # 🚀 Performance optimization: Pre-allocate attention_mask cache
+        #   Performance optimization: Pre-allocate attention_mask cache
         self._attention_mask_cache = {}
     
     def forward(
@@ -752,7 +752,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             # print(f'🔧 WrappedLlamaBlock.forward: position_ids shape={position_ids.shape}, content={position_ids}')
 
         # print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}, past_key_value: {past_key_value}")
-        # 🚀 Optimized: Reuse cached attention_mask
+        #   Optimized: Reuse cached attention_mask
         if attention_mask is None:
             cache_key = (batch_size, seq_length, past_key_values_length, hidden_states.device, hidden_states.dtype)
             if cache_key not in self._attention_mask_cache:
@@ -807,7 +807,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
                 key_bhsd = key_states
             elif d1 == self.self_attn.head_dim and d2 == seq_length:
                 # currently [B*H, D, S] — permute
-                # 🚀 Optimized: contiguous() only if needed by subsequent ops
+                #   Optimized: contiguous() only if needed by subsequent ops
                 key_bhsd = key_states.permute(0, 2, 1)
             else:
                 # Fallback: assume second dim is sequence
@@ -817,7 +817,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             if value_states.shape[1] == seq_length:
                 val_bhsd = value_states
             else:
-                # 🚀 Optimized: contiguous() only if needed
+                #   Optimized: contiguous() only if needed
                 val_bhsd = value_states.permute(0, 2, 1)
 
             # Reshape into [B, H, S, D]
@@ -842,13 +842,13 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
 
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
-    """优化：简化test_inputs生成，减少tokenizer调用开销"""
-    # 直接创建简单的input_ids，避免tokenizer处理
-    # 使用pad_token_id作为默认值
+    """Simplify test_inputs generation to reduce tokenizer call overhead"""
+    # Directly create simple input_ids to avoid tokenizer processing
+    # Use pad_token_id as default value
     pad_token_id = getattr(tokenizer, 'pad_token_id', 0)
     if pad_token_id is None:
         pad_token_id = 0
     
-    # 创建简单的input_ids列表，长度为1（最小有效长度）
+    # Create simple input_ids list with length 1 (minimum valid length)
     simple_input_ids = [pad_token_id]
     return (simple_input_ids,) * num_prompts
