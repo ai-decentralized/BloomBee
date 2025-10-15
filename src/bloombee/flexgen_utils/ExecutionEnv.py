@@ -20,12 +20,8 @@ class ExecutionEnv:
     mixed: Any = None
 
     @classmethod
-    def create(cls, offload_dir, device="cuda:0"):
-        # Use the provided device instead of hardcoded CUDA
-        if device == "cpu":
-            gpu = TorchDevice("cpu")  # Use CPU as "gpu" for compatibility
-        else:
-            gpu = TorchDevice(device)
+    def create(cls, offload_dir):
+        gpu = TorchDevice("cuda:0")
         print('ExecutionEnv: gpu ', gpu)
         cpu = TorchDevice("cpu")
         disk = TorchDisk(offload_dir)

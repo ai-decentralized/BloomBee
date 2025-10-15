@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import random
 import sys
+import tempfile
 import threading
 import time
 from typing import Dict, List, Optional, Sequence, Union
@@ -29,7 +30,7 @@ from bloombee.server.backend import TransformerBackend, merge_inference_pools_in
 from bloombee.server.block_utils import get_block_size, resolve_block_dtype
 from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.server.handler import TransformerConnectionHandler
-from bloombee.server.memory_cache import MemoryCache
+from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
 from bloombee.utils.auto_config import AutoDistributedConfig
@@ -47,6 +48,11 @@ from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
 from pynvml import *
+
+# Create dedicated offloading debug logger
+import logging
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
 
 # def see_memory_usage(message, force=True):
 # 	logger = ''
@@ -131,20 +137,11 @@ class Server:
         if custom_module_path is not None:
             add_custom_models_from_file(custom_module_path)
 
-        # Force TinyLlama models to use TinyLlama-specific config
-        if "tinyllama" in converted_model_name_or_path.lower():
-            from bloombee.models.tinyllama.config import DistributedLlamaConfig
-            self.block_config = DistributedLlamaConfig.from_pretrained(
-                converted_model_name_or_path,
-                use_auth_token=token,
-                revision=revision,
-            )
-        else:
-            self.block_config = AutoDistributedConfig.from_pretrained(
-                converted_model_name_or_path,
-                use_auth_token=token,
-                revision=revision,
-            )
+        self.block_config = AutoDistributedConfig.from_pretrained(
+            converted_model_name_or_path,
+            use_auth_token=token,
+            revision=revision,
+        )
 
         if dht_prefix is None:
             dht_prefix = self.block_config.dht_prefix
@@ -235,8 +232,10 @@ class Server:
         self.max_alloc_timeout = max_alloc_timeout
 
         # For attention cache in GPU or RAM
+        # Align cache token budget with inference_max_length by default to fit requested allocations
         if attn_cache_tokens is None:
-            attn_cache_tokens = 16384 if is_multiquery_attn else 4096
+            attn_cache_tokens = self.inference_max_length
+        # Per-token KV values per block (K and V), accounting for multi-query heads
         cache_values_per_block = 2 * self.block_config.hidden_size * attn_cache_tokens
         cache_values_per_block //= self.block_config.num_key_value_groups
         self._cache_bytes_per_block = cache_values_per_block * get_size_in_bytes(self.torch_dtype)
@@ -260,28 +259,29 @@ class Server:
             num_blocks = len(block_indices)
         self.strict_block_indices, self.num_blocks = block_indices, num_blocks
 
-        gib = 1024**3
-        self.attn_cache_bytes = self._cache_bytes_per_block * num_blocks
-        logger.info(f"Attention cache for all blocks will consume up to {self.attn_cache_bytes / gib:.2f} GiB")
-
         ##############################################################
-        self.env = ExecutionEnv.create("~./flexgen_offload_dir", str(self.device)) ##########
-        self.policy = Policy(1, 1,       #  gpu_batch_size: int, num_gpu_batches: int
-                    100, 0,              # w_gpu_percent: float, w_cpu_percent: float
-                    0, 100,             # cache_gpu_percent: float, cache_cpu_percent: float
-                    0, 100,             # act_gpu_percent: float, act_cpu_percent: float
-                    overlap=False, sep_layer=True, pin_weight=True,
-                    cpu_cache_compute=False, attn_sparsity=1.0,
-                    compress_weight=False,  # 暂时禁用权重压缩，避免 compressed_device 问题
-                    comp_weight_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=0, symmetric=False),
-                    compress_cache=False,  # 暂时禁用缓存压缩
-                    comp_cache_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=2, symmetric=False))
+        self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
+
+        # Policy: weights on GPU, KV cache on DISK (100%), activations on CPU
+        # If you want to switch to mixed, change cache_cpu_percent to >0 (the rest will automatically be assigned to disk)
+        # Enable KV cache compression. Start with CPU-only cache for stability.
+        # You can switch to Disk-only by setting cache_cpu_percent=0 and cache_gpu_percent=0, and using disk 100% in env.
+        # Default to GPU-only, no offloading, no compression
+        self.policy = Policy(
+            1, 1,            # gpu_batch_size, num_gpu_batches
+            100, 0,          # w_gpu_percent, w_cpu_percent
+            100, 0,          # cache_gpu_percent, cache_cpu_percent (KV on GPU)
+            100, 0,          # act_gpu_percent, act_cpu_percent (activations on GPU)
+            overlap=False, sep_layer=True, pin_weight=True,
+            cpu_cache_compute=False, attn_sparsity=1.0,
+            compress_weight=False,
+            comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
+            compress_cache=False,
+            comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
+        )
+
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
-        self.path = '/tmp/data/llama_weights'
+        self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
         ##############################################################
         
         # see_memory_usage("-----------------------------------------in server: after policy  ")
@@ -397,7 +397,6 @@ class Server:
                 policy=self.policy, #####
                 weight_home= self.weight_home, #####
                 path=self.path, ######
-                attn_cache_bytes=self.attn_cache_bytes,
                 server_info=self.server_info,
                 model_info=self.model_info,
                 block_indices=block_indices,
@@ -468,9 +467,13 @@ class Server:
         if self.strict_block_indices is not None:
             return self.strict_block_indices
 
-        # If multiple servers (e.g., launched on the same machine by a script) get to this line at the same time,
-        # this delay decreases the probability of a race condition while choosing the best blocks to serve.
-        time.sleep(random.random() * 2 * self.mean_block_selection_delay)
+        # Optimization: reduce unnecessary random delay to speed up startup
+        # Original delay: time.sleep(random.random() * 2 * self.mean_block_selection_delay)
+        # Use a smaller delay or remove it entirely in single-machine deployment
+        if hasattr(self, '_single_machine_mode') and self._single_machine_mode:
+            pass  # No delay needed in single-machine mode
+        else:
+            time.sleep(min(0.1, random.random() * self.mean_block_selection_delay))  # Maximum 100ms delay
         module_infos = get_remote_module_infos(self.dht, self.module_uids, latest=True)
         return block_selection.choose_best_blocks(self.num_blocks, module_infos)
 
@@ -508,7 +511,6 @@ class ModuleContainer(threading.Thread):
         policy: Policy,    ####
         weight_home: array_1d, ####
         path: str,
-        attn_cache_bytes: int,
         server_info: ServerInfo,
         model_info: ModelInfo,
         block_indices: List[int],
@@ -516,6 +518,7 @@ class ModuleContainer(threading.Thread):
         max_batch_size: int,
         max_chunk_size_bytes: int,
         max_alloc_timeout: float,
+        inference_max_length: int,
         torch_dtype: torch.dtype,
         cache_dir: str,
         max_disk_space: int,
@@ -531,8 +534,8 @@ class ModuleContainer(threading.Thread):
         **kwargs,
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
-        print('module_uids ', module_uids)
-        memory_cache = MemoryCache(attn_cache_bytes, max_alloc_timeout)
+
+        cache_manager = KVCacheManager(inference_max_length, max_alloc_timeout, policy, env, block_config)
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(
@@ -541,7 +544,7 @@ class ModuleContainer(threading.Thread):
             server_info,
             model_info,
             block_config=block_config,
-            memory_cache=memory_cache,
+            cache_manager=cache_manager,
             update_period=update_period,
             expiration=expiration,
             daemon=True,
@@ -554,7 +557,6 @@ class ModuleContainer(threading.Thread):
         blocks = {}
         try:
             for module_uid, block_index in zip(module_uids, block_indices):
-                print('blocks uid before load_pretrained_block() ', module_uid )
                 # see_memory_usage("-----------------------------------------before petals load pretrained block ")
                 block = load_pretrained_block(
                     converted_model_name_or_path,
@@ -591,7 +593,7 @@ class ModuleContainer(threading.Thread):
                     module_uid,
                     block,  ###### block instance
                     config=block_config,
-                    memory_cache=memory_cache,
+                    cache_manager=cache_manager,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
                     args_schema=(
@@ -626,6 +628,7 @@ class ModuleContainer(threading.Thread):
             dht,
             dht_prefix,
             blocks,
+            inference_max_length=inference_max_length,
             dht_announcer=dht_announcer,
             server_info=server_info,
             update_period=update_period,
@@ -675,7 +678,6 @@ class ModuleContainer(threading.Thread):
         ]
 
         self.runtime = RuntimeWithDeduplicatedPools(self.module_backends, device=None, **kwargs)
-        # note: We set device=None in runtime to avoid moving all modules to device 0 in runtime.run(). tensor_parallel has already moved it as needed.
 
         dht_announcer.announce(ServerState.ONLINE)
         self.dht_announcer = dht_announcer
@@ -761,7 +763,7 @@ class ModuleAnnouncerThread(threading.Thread):
         model_info: ModelInfo,
         *,
         block_config: PretrainedConfig,
-        memory_cache: MemoryCache,
+        cache_manager: KVCacheManager,
         update_period: float,
         expiration: float,
         max_pinged: int = 5,
@@ -772,7 +774,7 @@ class ModuleAnnouncerThread(threading.Thread):
         self.dht = dht
         self.server_info = server_info
         self.model_info = model_info
-        self.memory_cache = memory_cache
+        self.cache_manager = cache_manager
 
         self.bytes_per_token = block_config.hidden_size * get_size_in_bytes(DTYPE_MAP[server_info.torch_dtype])
         self.bytes_per_token //= block_config.num_key_value_groups
@@ -797,7 +799,7 @@ class ModuleAnnouncerThread(threading.Thread):
         while True:
             start_time = time.perf_counter()
 
-            self.server_info.cache_tokens_left = self.memory_cache.tokens_left
+            self.server_info.cache_tokens_left = self.cache_manager.tokens_left()
             if self.server_info.state != ServerState.OFFLINE:
                 self._ping_next_servers()
                 self.server_info.next_pings = {

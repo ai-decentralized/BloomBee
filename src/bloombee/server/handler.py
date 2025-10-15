@@ -695,7 +695,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         result = {
             "version": bloombee.__version__,
             "dht_client_mode": self.dht.client_mode,
-            CACHE_TOKENS_AVAILABLE: backend.memory_cache.tokens_left,
+            CACHE_TOKENS_AVAILABLE: backend.cache_manager.tokens_left(),
         }
 
         if request.uid:

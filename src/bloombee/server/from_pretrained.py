@@ -29,7 +29,7 @@ from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.disk_cache import DEFAULT_CACHE_DIR, allow_cache_reads, allow_cache_writes, free_disk_space_for
 from bloombee.utils.hf_auth import always_needs_auth
 
-# Dynamic import based on model type - will be imported when needed
+from bloombee.flexgen_utils.llama_config import LlamaConfig, get_llama_config, download_llama_weights
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
@@ -39,6 +39,8 @@ import numpy as np
 # import pdb
 
 from bloombee.models.llama.flex_llama import load_weights_from_pytorch_model
+from bloombee.utils.memory_usage import log_mem
+import os
 
 
 
@@ -64,49 +66,22 @@ def load_pretrained_block(
     max_disk_space: Optional[int] = None,
 ) -> nn.Module:
     if config is None:
-        # Force TinyLlama models to use TinyLlama-specific config
-        if "tinyllama" in model_name.lower():
-            print(f"DEBUG: Loading TinyLlama config for {model_name}")
-            from bloombee.models.tinyllama.config import DistributedLlamaConfig
-            config = DistributedLlamaConfig.from_pretrained(model_name, use_auth_token=token)
-            print(f"DEBUG: TinyLlama config loaded: {config}")
-        else:
-            print(f"DEBUG: Loading regular config for {model_name}")
-            config = AutoDistributedConfig.from_pretrained(model_name, use_auth_token=token)
+        config = AutoDistributedConfig.from_pretrained(model_name, use_auth_token=token)
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
-    
-    # Ensure the config has the model name for weight downloading
-    # Always override _name_or_path with the actual model_name to avoid local path issues
-    config._name_or_path = model_name
     
     assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
     torch_dtype = resolve_block_dtype(config, torch_dtype)
     
     with init_empty_weights():
-        print('load_pretrained_block : init_empty_weights() ') 
-        print(f'DEBUG: config.model_type = {config.model_type}')
-        print(f'DEBUG: config.block_class = {config.block_class}')
-        print(f'DEBUG: config.hidden_size = {config.hidden_size}')
+        logger.debug('load_pretrained_block: init_empty_weights()')
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
     
-    block_prefix = f"{config.block_prefix}.{block_index}."
-    state_dict = _load_state_dict_from_repo(
-        model_name,
-        block_prefix,
-        revision=revision,
-        token=token,
-        cache_dir=cache_dir,
-        max_disk_space=max_disk_space,
-    )
+    # Skip HuggingFace weight loading - use FlexGen weight management only
+    # This prevents duplicate weight allocation (HF + FlexGen)
+    # log_mem(f"[FlexGen] skipping HF weight loading for block={block_index} - using FlexGen weights only")
     
-    # 将权重加载到模型中
-    for param_name, param in state_dict.items():
-        if not str(param.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
-            param = param.to(torch_dtype)
-        set_module_tensor_to_device(block, param_name, "cpu", value=param, dtype=param.dtype)
-    
-    # # 使用 FlexGen 的权重加载方式
+    # # Use FlexGen weight loading方式
     # try:
     #     load_weights_from_pytorch_model(block, policy, env, weight_home, block_index)
     #     logger.info(f"Loaded {model_name} block {block_index} with FlexGen weight management")
@@ -452,12 +427,7 @@ def set_module_tensor_to_device(
         if "xpu" in str(device) and not is_xpu_available():
             raise ValueError(f'{device} is not available, you should use device="cpu" instead')
         if value is None:
-            # Handle meta tensor conversion properly
-            if old_value.device == torch.device("meta") and device not in ["meta", torch.device("meta")]:
-                # Use to_empty() for meta tensor conversion
-                new_value = old_value.to_empty(device=device)
-            else:
-                new_value = old_value.to(device)
+            new_value = old_value.to(device)
             if dtype is not None and device in ["meta", torch.device("meta")]:
                 if not str(old_value.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
                     new_value = new_value.to(dtype)

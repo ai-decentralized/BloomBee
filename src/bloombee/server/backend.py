@@ -14,13 +14,36 @@ from tensor_parallel.tensor_parallel import PerDeviceTensors
 from transformers import PretrainedConfig
 
 from bloombee.data_structures import InferenceMetadata
-from bloombee.server.memory_cache import MemoryCache
+from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
 from pynvml import *
+import logging
+import hashlib
+import time
 
 logger = get_logger(__name__)
+
+# Create dedicated offloading debug logger
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
+
+
+def compute_tensor_hash(tensor):
+    """Compute SHA256 hash of tensor for debugging - optimized CPU conversion"""
+    if tensor is None:
+        return "None"
+    try:
+        # Optimization: Only perform CPU conversion in debug mode to avoid unnecessary performance overhead
+        if not getattr(compute_tensor_hash, '_debug_enabled', False):
+            return "hash_disabled"  # Disable hash computation in production environment
+        return hashlib.sha256(tensor.detach().cpu().numpy().tobytes()).hexdigest()[:16]
+    except:
+        return "error"
+
+# This flag can be set to enable/disable hash computation
+compute_tensor_hash._debug_enabled = False
 
 # def see_memory_usage(message, force=True):
 # 	logger = ''
@@ -46,7 +69,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self,
         *args,
         config: PretrainedConfig,
-        memory_cache: MemoryCache,
+        cache_manager: KVCacheManager,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
         **kwargs,
@@ -56,51 +79,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self._peft_module = _peft_module
 
         super().__init__(*args, **kwargs)
-        assert isinstance(self.module, TensorParallel)
+        # Accept both TensorParallel and our PipelineParallelWrapper
+        assert (isinstance(self.module, TensorParallel) or 
+                hasattr(self.module, 'devices') and hasattr(self.module, 'module_shards'))
         self.config = config
-        self.memory_cache = memory_cache
+        self.cache_manager = cache_manager
         self.max_chunk_size_bytes = max_chunk_size_bytes
-        
-        # Create KVCacheManager for proper cache management
-        from bloombee.server.memory_cache_manager import KVCacheManager
-        from bloombee.flexgen_utils.policy import Policy
-        from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
-        
-        # Create a default policy and environment for KVCacheManager
-        # These should ideally be passed from the server, but we'll create defaults for now
-        from bloombee.flexgen_utils.compression import CompressionConfig
-        
-        policy = Policy(
-            gpu_batch_size=1,
-            num_gpu_batches=1,
-            w_gpu_percent=100,
-            w_cpu_percent=0,
-            cache_gpu_percent=100,  # Use GPU for cache by default
-            cache_cpu_percent=0,
-            act_gpu_percent=100,
-            act_cpu_percent=0,
-            overlap=False,
-            sep_layer=False,
-            pin_weight=False,
-            cpu_cache_compute=False,
-            attn_sparsity=1.0,
-            compress_weight=False,
-            comp_weight_config=CompressionConfig(num_bits=8, group_size=64, group_dim=0, symmetric=True),
-            compress_cache=False,
-            comp_cache_config=CompressionConfig(num_bits=8, group_size=64, group_dim=0, symmetric=True)
-        )
-        
-        # Create ExecutionEnv - this should match the server's env
-        env = ExecutionEnv.create("~./flexgen_offload_dir", "cpu")
-        
-        # Create KVCacheManager
-        self.cache_manager = KVCacheManager(
-            cache_max_size_tokens=memory_cache.max_size_tokens,
-            max_alloc_timeout=memory_cache.max_alloc_timeout or 600,
-            policy=policy,
-            env=env,
-            block_config=config
-        )
 
         for name, param in self.module.named_parameters():
             assert not param.requires_grad, f"Block parameters must not accumulate gradients, but {name} does"
@@ -139,44 +123,32 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         )
 
         self.cache_bytes_per_token: Dict[torch.device, int] = Counter()
-        for descr in self.get_inference_cache_descriptors(batch_size=1, max_length=256):
+        for descr in self.get_inference_cache_descriptors(batch_size=1, max_length=1):
             self.cache_bytes_per_token[descr.device] += descr.numel() * get_size_in_bytes(descr.dtype)
+        
+        # 🚀 Performance optimization: Pre-allocate position_ids cache
+        self._position_ids_cache = {}
 
-        # Create CPU device list
-        num_cpus = 1  # Can be adjusted as needed
-        cpus = [torch.device('cpu') for _ in range(num_cpus)]
-        
-        # Set TensorParallel module to use CPU devices
-        self.module.devices = cpus
-        
-        # If module has module_shards, move them to CPU
-        if hasattr(self.module, 'module_shards'):
-            for shard in self.module.module_shards:
-                # Handle meta tensor conversion properly
-                if any(param.device.type == 'meta' for param in shard.parameters()):
-                    shard.to_empty(device='cpu')
-                else:
-                    shard.to('cpu')
-        
-        # Set output device to CPU
-        if hasattr(self.module, 'output_device_index'):
-            self.module.output_device_index = 0  # Use first CPU as output device
-        
-        # Mark for delayed initialization
-        self.module.need_delayed_init = True
-        
-        # Record original devices for restoration when needed
+        # Decide device placement policy for module based on offloading policy
+        offload_policy = cache_manager.offloading_policy
+        is_offloading_mode = (
+            offload_policy.cache_gpu_percent < 100
+            or offload_policy.cache_cpu_percent > 0
+            or offload_policy.cache_disk_percent > 0
+            or offload_policy.compress_cache
+        )
+
+        # 🔧 Note: For offloading mode, we keep the model on GPU
+        # The KVCacheManager will handle cache offloading separately
+        # Moving model to CPU here causes issues with meta tensors
+        # The cache offloading is managed by memory_cache_manager.py
+
+        # Record original devices for restoration when needed (after potential override)
         self.original_devices = self.module.devices
-        self.original_output_device_index = self.module.output_device_index
+        self.original_output_device_index = getattr(self.module, 'output_device_index', 0)
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""
-        print(f"[DEBUG] Server: get_inference_cache_descriptors called with batch_size={batch_size}, max_length={max_length}")
-        
-        # Remove hardcoded cap - let the system handle larger sequences
-        # max_length = min(max_length, 256)  # REMOVED: This was preventing proper sequence expansion
-        print(f"[DEBUG] Server: max_length set to {max_length} (no hardcoded cap)")
-        
         head_dim = self.config.hidden_size // self.config.num_attention_heads
         cache_tensors = []
         for device, num_heads in zip(self.module.devices, self.shard_num_heads):
@@ -184,8 +156,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             if hasattr(self.config, "num_key_value_heads"):
                 num_heads = self.config.num_key_value_heads
             keys = TensorDescriptor((batch_size, num_heads, head_dim, max_length), dtype=self.dtype, device=device)
-            values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
-            cache_tensors.extend((keys, values))
+            # values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
+            cache_tensors.append(keys)
         return cache_tensors
 
     def forward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
@@ -204,6 +176,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
     def _ensure_model_on_device(self):
         """Ensure model is on correct device, load from CPU to GPU if needed"""
+        # Optimized: Add fast-path check to avoid repeated device comparison
+        if getattr(self, '_device_already_set', False):
+            return
+        
         # Check if current device differs from original device
         if self.module.devices != self.original_devices:
             # Move model to original devices
@@ -217,6 +193,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             
             # Mark for delayed initialization
             self.module.need_delayed_init = True
+        
+        # Mark as already set to skip future checks
+        self._device_already_set = True
 
     @torch.inference_mode() # Enter inference mode, no gradient computation to save memory
     def inference_step( # Each block will execute once
@@ -226,86 +205,122 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         inference_info: InferenceMetadata,  # Inference-related metadata
     ) -> Tuple[torch.Tensor, ...]:
         try:
+            step_start_time = time.perf_counter()
             assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]" # Ensure hidden states are 3-dimensional
             batch_size, seq_len, hidden_size = hidden_states.shape
-            print("transformer backend inference step : seq_len", seq_len)
-            print(f"Backend inference_step: batch_size={batch_size}, seq_len={seq_len}, prefix_length={inference_info.prefix_length}")
-            # see_memory_usage("transformer backend inference step : seq_len")
             
+            # Block-level debug output removed
             
             self._ensure_model_on_device()
             
-            with self.memory_cache.use_cache(
+            with self.cache_manager.use_cache(
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
-                self._reorder_cache_inplace(cache_tensors, hypo_ids) # Reorder cache based on hypothesis IDs
+
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
                 # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
                 # is at least 4-6x less than `autograd_memory`.
                 max_chunk_length = self._estimate_max_chunk_length(hidden_states, inference_info) # Estimate maximum chunk length
-                print("transformer backend inference step() : max_chunk_length", max_chunk_length)
+                # Debug output removed
                 # see_memory_usage("transformer backend inference step : seq_len")
                 output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # Initialize output states
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
-                layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length) # Select previous layer's cache state
+                # Centralized select: aggregate + reorder + slice
+                selected = self.cache_manager.select_cache(
+                    prefix_length=inference_info.prefix_length,
+                    hypo_ids=hypo_ids,
+                )
+                layer_past = selected
+                
+                # 🔧 Add layer_past debug information
+                # offload_logger.info(f"Select layer_past:")
+                # offload_logger.info(f"   - layer_past type: {type(layer_past)}")
+                # offload_logger.info(f"   - layer_past length: {len(layer_past) if layer_past else 0}")
+                # if layer_past and len(layer_past) > 0:
+                #     offload_logger.info(f"   - first tensor shape: {layer_past[0].shape}")
+                #     offload_logger.info(f"   - first tensor device: {layer_past[0].device}")
                 
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
-                    print('transformer backend inference step() offset ', offset )
-                    print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
+                    # print('transformer backend inference step() offset ', offset )
+                    # print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
                     
                     #  Generate correct position_ids for this chunk
                     chunk_length = min(max_chunk_length, seq_len - offset)
-                    # Create position_ids starting from prefix_length + offset
-                    position_ids = torch.arange(
-                        inference_info.prefix_length + offset,
-                        inference_info.prefix_length + offset + chunk_length,
-                        device=hidden_states.device,
-                        dtype=torch.long
-                    ).unsqueeze(0).expand(batch_size, -1)
+                    # Optimized: Reuse cached position_ids base tensor
+                    cache_key = (chunk_length, batch_size, hidden_states.device)
+                    if cache_key not in self._position_ids_cache:
+                        # Create base position_ids (0 to chunk_length-1)
+                        base_ids = torch.arange(0, chunk_length, device=hidden_states.device, dtype=torch.long)
+                        self._position_ids_cache[cache_key] = base_ids.unsqueeze(0).expand(batch_size, -1)
                     
-                    print(f' Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}')
+                    # Add offset to cached base tensor (avoids creating new tensor)
+                    position_ids = self._position_ids_cache[cache_key] + (inference_info.prefix_length + offset)
+                    
+                    # print(f' Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}')
+                    
+                    # Add chunk processing debug information
+                    # offload_logger.info(f" Processing chunk {offset//max_chunk_length + 1}:")
+                    # offload_logger.info(f"   - chunk_length: {chunk_length}")
+                    # offload_logger.info(f"   - hidden_states_chunk device: {hidden_states_chunk.device}")
+                    # offload_logger.info(f"   - position_ids range: {position_ids.min().item()}-{position_ids.max().item()}")
                     
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
-                        print(f' About to call module.forward with position_ids...')
+                        # print(f' About to call module.forward with position_ids...')
                         forward_result = self.module.forward(
                             hidden_states_chunk, 
                             layer_past=layer_past, 
                             use_cache=True,  #  Keep use_cache=True to get cache tensors
                             position_ids=position_ids  #  Pass the generated position_ids
                         )
-                        print(f' module.forward returned: {type(forward_result)}, length: {len(forward_result) if forward_result else "None"}')
+                        # print(f' module.forward returned: {type(forward_result)}, length: {len(forward_result) if forward_result else "None"}')
                         
                         if forward_result is None:
-                            print(f' ERROR: module.forward returned None!')
+                            # print(f' ERROR: module.forward returned None!')
                             return (hidden_states,)  # Return original input as fallback
                         
                         output_hidden_states_chunk, new_kvs = forward_result
-                        print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
+                        # print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
+                        
+                        # Add forward result debug information
+                        # offload_logger.info(f" module.forward completed:")
+                        # offload_logger.info(f"   - output_hidden_states_chunk shape: {output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}")
+                        # offload_logger.info(f"   - new_kvs length: {len(new_kvs) if new_kvs else 0}")
+                        # if new_kvs and len(new_kvs) > 0:
+                        #     offload_logger.info(f"   - new_kvs[0] shape: {new_kvs[0].shape}")
+                        #     offload_logger.info(f"   - new_kvs[0] device: {new_kvs[0].device}")
                         
                     except Exception as e:
-                        print(f' ERROR in module.forward: {type(e).__name__}: {e}')
-                        import traceback
-                        traceback.print_exc()
+                        # print(f' ERROR in module.forward: {type(e).__name__}: {e}')
+                        # import traceback
+                        # traceback.print_exc()
                         return (hidden_states,)  # Return original input as fallback
                     
                     if seq_len > max_chunk_length:
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk # Store output
                     else:
                         output_hidden_states = output_hidden_states_chunk  # saves one memcopy # Copy memory only once
-                    layer_past = new_kvs # Update cache state
+                    # layer_past = new_kvs # Update cache state
 
                 # Fixed: Restore cache update logic  
-                self._update_cache_inplace(cache_tensors, new_kvs, inference_info.prefix_length) # Update cache
-                print('backend.py output_hidden_states.shape ', output_hidden_states.shape)
+                past_key_values_length = 0
+                if layer_past is not None and len(layer_past) > 0:
+                    past_key_values_length = layer_past[0].shape[2]
+
+                # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
+                # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
+                self.cache_manager.update_cache(new_kvs, past_key_values_length)
+                
+                # Block-level output debug removed
+                
                 return (output_hidden_states,) # Return output hidden states
                 
         except Exception as e:
-            print(f' CRITICAL ERROR in inference_step: {type(e).__name__}: {e}')
-            import traceback
-            traceback.print_exc()
+            # print(f' CRITICAL ERROR in inference_step: {type(e).__name__}: {e}')
+            # import traceback
+            # traceback.print_exc()
             return (hidden_states,)  # Return original input as fallback
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:
@@ -314,28 +329,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         batch_size, seq_length, hidden_size = hidden_states.shape
         worst_case_length = inference_info.prefix_length + seq_length
         attn_bytes_per_token = max(self.shard_num_heads) * batch_size * self.dtype_bytes * worst_case_length
-        
-        # Calculate chunk length based on available memory
-        chunk_length = max(1, self.max_chunk_size_bytes // attn_bytes_per_token)
-
-        # Add much more aggressive limits for batch processing to prevent OOM
-        if batch_size > 1:
-            # For batch processing, be extremely conservative with chunk size
-            # This prevents system crashes and improves performance
-            max_reasonable_chunk = min(32, 256 // batch_size)  # Much smaller chunks for batches
-        else:
-            max_reasonable_chunk = 256  # Reduced from 512 for single sequence too
-
-        chunk_length = min(chunk_length, max_reasonable_chunk)
-
-        # Debug print for memory allocation
-        print(f"[DEBUG] _estimate_max_chunk_length: batch_size={batch_size}, max_allocation_bytes={self.max_chunk_size_bytes}, attn_bytes_per_token={attn_bytes_per_token}, chunk_length={chunk_length}, max_reasonable_chunk={max_reasonable_chunk}")
-
-        # Debug logging for memory allocation
-        if batch_size > 1:
-            logger.warning(f"Memory allocation debug - batch_size: {batch_size}, max_allocation_bytes: {self.max_chunk_size_bytes}, attn_bytes_per_token: {attn_bytes_per_token}, chunk_length: {chunk_length}, max_reasonable_chunk: {max_reasonable_chunk}")
-            
-        return chunk_length
+        return max(1, self.max_chunk_size_bytes // attn_bytes_per_token)
 
     def _reorder_cache_inplace(self, cache_tensors: torch.Tensor, hypo_ids: torch.Tensor):
         """If hypo_ids is specified, reorder elements of each cache tensor in-place by taking indices from hypo_ids"""
@@ -343,28 +337,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             for cache_tensor in cache_tensors:
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
 
-    def _select_layer_past(self, cache_tensors: Sequence[torch.Tensor], prefix_length: int) -> Sequence[torch.Tensor]:
-        """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
-        key_cache, value_cache = list(cache_tensors[0::2]), list(cache_tensors[1::2])
-        for i in range(len(key_cache)):
-            key_cache[i] = key_cache[i].flatten(0, 1)[:, :, :prefix_length]
-            # shape: [batch * num_kv_heads, head_dim, kv_length]
-            value_cache[i] = value_cache[i].flatten(0, 1)[:, :prefix_length]
-            # shape: [batch * num_kv_heads, kv_length, head_dim]
-        layer_past = tuple(chain(*zip(key_cache, value_cache)))
-        return PerDeviceTensors(*layer_past) if len(self.module.module_shards) > 1 else layer_past
+    # Selection is centralized in KVCacheManager.select_cache()
 
-    def _update_cache_inplace(
-        self, cache_tensors: Sequence[torch.Tensor], new_kvs: Sequence[torch.Tensor], prefix_length: int
-    ):
-        """Writes new key/value tensors back into cache, works in-place"""
-        _batch_size_times_num_kv_heads, head_dim, new_length = new_kvs[0].shape
-        for cache_key, new_key in zip(cache_tensors[0::2], new_kvs[0::2]):
-            new_key = new_key.view(*cache_key.shape[:3], new_length)
-            cache_key[:, :, :, prefix_length:new_length] = new_key[:, :, :, prefix_length:new_length]
-        for cache_value, new_value in zip(cache_tensors[1::2], new_kvs[1::2]):
-            new_value = new_value.view(*cache_value.shape[:2], new_length, head_dim)
-            cache_value[:, :, prefix_length:new_length, :] = new_value[:, :, prefix_length:new_length, :]
+    # Cache writing is centralized in KVCacheManager.update_cache()
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
         return self.forward_pool, self.backward_pool, self.inference_pool
@@ -387,7 +362,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend]):
     """Replace each backend's rpc_inference pools with a combined pool runs multiple blocks in one call"""
     assert len(backends) != 0 and all(isinstance(b, TransformerBackend) for b in backends.values())
-    print('............... come into the merge_inference_pools_inplace() ' )
+    # print('............... come into the merge_inference_pools_inplace() ' )
     first_pool = next(iter(backends.values())).inference_pool
     merged_pool = PrioritizedTaskPool(
         _MergedInferenceStep(backends),
@@ -415,11 +390,11 @@ class _MergedInferenceStep:
         assert len(inference_infos) == len(
             optional_prompts
         ), f"found {len(inference_infos)} blocks but {len(optional_prompts)} prompts"
-        print('............... come into the _MergedInferenceStep __call__' )
+        # print('............... come into the _MergedInferenceStep __call__' )
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:
                 hidden_states[:, : optional_prompt.shape[1]] += optional_prompt
-            print('............... come into the _MergedInferenceStep __call__ inference_info.uid ', inference_info.uid)
+            # print('............... come into the _MergedInferenceStep __call__ inference_info.uid ', inference_info.uid)
             (hidden_states,) = self.backends[inference_info.uid].inference_step(hidden_states, hypo_ids, inference_info)
         # import pdb; pdb.set_trace()
         return (hidden_states,)

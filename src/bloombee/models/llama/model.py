@@ -50,7 +50,6 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        batch_mode: bool = False,  # NEW: Enable batch mode
     ) -> BaseModelOutputWithPast:
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -88,8 +87,10 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
             prompts = intermediate_prompts = None
 
         hidden_states = inputs_embeds
-        print('model.py llama model inputs_embeds, ', inputs_embeds)
+        # print('model.py llama model inputs_embeds, ', inputs_embeds)  # Temporarily commented for cleaner debug output
         output_shape = input_shape + (hidden_states.size(-1),)
+        
+        # logger.info(f"hidden_states: {hidden_states}")
 
         hidden_states = self.layers(
             hidden_states,
@@ -157,12 +158,12 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
         Prepare inputs for generation, handling incremental token generation properly.
         This method is crucial for correct embedding updates during generation.
         """
-        print(f"prepare_inputs_for_generation called:")
-        print(f"   input_ids.shape: {input_ids.shape if input_ids is not None else None}")
-        print(f"   past_key_values type: {type(past_key_values)}")
+        # print(f"🔧 prepare_inputs_for_generation called:")
+        # print(f"   input_ids.shape: {input_ids.shape if input_ids is not None else None}")
+        # print(f"   past_key_values type: {type(past_key_values)}")
         
-        if past_key_values is not None:
-            print(f"   past_key_values._seen_tokens: {past_key_values._seen_tokens}")
+        # if past_key_values is not None:
+        #     print(f"   past_key_values._seen_tokens: {past_key_values._seen_tokens}")
         
         # Omit tokens covered by past_key_values
         if past_key_values is not None:
@@ -170,19 +171,19 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
                 cache_length = past_key_values.get_seq_length()
                 past_length = past_key_values._seen_tokens
                 max_cache_length = past_key_values.get_max_length()
-                print(f"   Cache case: cache_length={cache_length}, past_length={past_length}")
+                # print(f"   Cache case: cache_length={cache_length}, past_length={past_length}")
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2] if hasattr(past_key_values[0][0], 'shape') else 0
                 max_cache_length = None
-                print(f"   Non-Cache case: past_length={past_length}")
+                # print(f"   Non-Cache case: past_length={past_length}")
 
             if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
                 input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-                print(f"   Attention mask case: new input_ids.shape={input_ids.shape}")
+                # print(f"   Attention mask case: new input_ids.shape={input_ids.shape}")
             elif past_length < input_ids.shape[1]:
                 original_shape = input_ids.shape
                 input_ids = input_ids[:, past_length:]
-                print(f"   Past length case: {original_shape} -> {input_ids.shape}, kept tokens: {input_ids}")
+                # print(f"   Past length case: {original_shape} -> {input_ids.shape}, kept tokens: {input_ids}")
             else:
                 print(f"   No truncation needed: past_length={past_length}, input_ids.shape[1]={input_ids.shape[1]}")
 
@@ -207,7 +208,7 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
             print(f"   Using inputs_embeds for first generation step")
         else:
             model_inputs = {"input_ids": input_ids}
-            print(f"   Using input_ids: {input_ids}")
+            # print(f"   Using input_ids: {input_ids}")
 
         model_inputs.update(
             {
@@ -217,7 +218,7 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
                 "attention_mask": attention_mask,
             }
         )
-        print(f"   Final model_inputs keys: {list(model_inputs.keys())}")
+        # print(f"   Final model_inputs keys: {list(model_inputs.keys())}")
         return model_inputs
 
     def get_output_embeddings(self):
@@ -226,98 +227,6 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
     @property
     def transformer(self) -> DistributedLlamaModel:  # For compatibility with RemoteGenerationMixin
         return self.model
-
-    def generate_batch_prompts(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        num_prompts: int = 1,
-        max_new_tokens: int = 50,
-        temperature: float = 1.0,
-        do_sample: bool = True,
-        pad_token_id: Optional[int] = None,
-        **kwargs
-    ) -> torch.LongTensor:
-        """
-        Generate text for multiple identical prompts using BloomBee's 4D tensor architecture.
-        
-        This method leverages BloomBee's built-in 4D tensor support to process multiple
-        copies of the same prompt in parallel through the distributed layers.
-        
-        Args:
-            input_ids: Input token IDs [1, seq_length] (single prompt)
-            num_prompts: Number of identical prompts to process in parallel
-            max_new_tokens: Maximum number of new tokens to generate
-            temperature: Sampling temperature for generation
-            do_sample: Whether to use sampling or greedy decoding
-            pad_token_id: Padding token ID (defaults to EOS token)
-            
-        Returns:
-            Generated token IDs [num_prompts, final_seq_length]
-        """
-        if input_ids is None:
-            raise ValueError("input_ids must be provided")
-        
-        if num_prompts <= 1:
-            # Use standard generation for single prompt
-            return self.generate(
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-                pad_token_id=pad_token_id,
-                **kwargs
-            )
-        
-        if pad_token_id is None:
-            pad_token_id = self.config.eos_token_id
-        
-        # Create 4D tensor: [num_prompts, batch_size=1, seq_length]
-        batch_size = 1  # BloomBee's batch_size dim in 4D tensor
-        seq_length = input_ids.shape[1]
-        
-        # Expand input to 4D: [1, seq_length] → [num_prompts, 1, seq_length]
-        current_ids = input_ids.unsqueeze(0).expand(num_prompts, batch_size, seq_length)
-        
-        # Manual autoregressive generation loop
-        for step in range(max_new_tokens):
-            # Create 4D embeddings: [num_prompts, batch_size, current_seq_len, hidden_size]
-            with torch.no_grad():
-                inputs_embeds = self.model.embed_tokens(current_ids)
-                
-                # Forward pass with 4D tensors and batch_prompts=True
-                outputs = self.model(
-                    inputs_embeds=inputs_embeds,
-                    batch_prompts=True,  # Enable 4D tensor processing
-                )
-                
-                # Get logits: [num_prompts, batch_size, seq_len, vocab_size]
-                logits = self.lm_head(outputs.last_hidden_state)
-                
-                # Generate next tokens from last position
-                next_token_logits = logits[:, :, -1, :]  # [num_prompts, batch_size, vocab_size]
-                
-                if do_sample:
-                    # Apply temperature and sample
-                    next_token_logits = next_token_logits / temperature
-                    probs = torch.softmax(next_token_logits, dim=-1)
-                    # Sample for each prompt independently
-                    next_tokens = torch.multinomial(
-                        probs.view(-1, probs.shape[-1]), 
-                        num_samples=1
-                    ).view(num_prompts, batch_size, 1)
-                else:
-                    # Greedy decoding
-                    next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-                
-                # Concatenate new tokens: [num_prompts, batch_size, seq_len + 1]
-                current_ids = torch.cat([current_ids, next_tokens], dim=-1)
-                
-                # Optional: Check for EOS tokens
-                # if pad_token_id is not None and (next_tokens == pad_token_id).all():
-                #     break
-        
-        # Return as [num_prompts, final_seq_length] (remove batch_size=1 dimension)
-        return current_ids.squeeze(1)
 
 
 class DistributedLlamaForSequenceClassification(FromPretrainedMixin, LlamaForSequenceClassification):
