@@ -96,6 +96,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
             hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
             tree_attention_mask=attention_mask,
             kv_cache_position_ids=past_key_values.kv_cache_position_ids if past_key_values is not None else None,
+            draft_tokens = input_ids,
         )
 
         if past_key_values is None:

@@ -8,8 +8,8 @@ import torch
 from hivemind.utils.logging import get_logger
 from transformers import AutoTokenizer
 
-from petals import AutoDistributedSpeculativeModel
-from petals.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
+from bloombee import AutoDistributedSpeculativeModel
+from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 

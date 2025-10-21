@@ -19,6 +19,7 @@ from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
+from bloombee.server.SpeculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 
 from time import perf_counter
 from datetime import datetime, timezone  
@@ -194,34 +195,73 @@ async def iterate_rpc_inference(
         hidden_states, prompts, hypo_ids, combined_mask, *_ = flat_tensors
         
         if combined_mask is not None:
-            tree_attention_mask = combined_mask[:, :-1, :, :]
-            extra_row = combined_mask[:, -1:, :, :]
-
-            # 检查最后一行是否是我们添加的（通过检查padding值）
-            extra_flat = extra_row.view(-1)
-
-            # 检查是否包含我们的特殊padding值254
-            if torch.any(extra_flat == 254):
-                # 获取长度标记（最后一个元素）
-                length_marker = extra_flat[-1].item()
-
-                if length_marker == 255:
-                    # 255表示原始kv_cache_position_ids为None
-                    kv_cache_position_ids = None
-                elif length_marker > 0 and length_marker < 255:
-                    # 提取实际的kv值
-                    kv_values = extra_flat[:length_marker].long()
-                    kv_cache_position_ids = kv_values
+        # 检查是否包含我们打包的额外行
+            # 通过检查倒数第二行和最后一行的padding值
+            if combined_mask.shape[1] >= 2:
+                second_last_row = combined_mask[:, -2:-1, :, :]
+                last_row = combined_mask[:, -1:, :, :]
+                
+                second_last_flat = second_last_row.view(-1)
+                last_flat = last_row.view(-1)
+                
+                # 检查是否同时包含两个额外行（新版本：kv和draft）
+                has_kv_row = torch.any(second_last_flat == 254)
+                has_draft_row = torch.any(last_flat == 253)
+                
+                if has_kv_row and has_draft_row:
+                    # 新版本：包含两个额外行
+                    tree_attention_mask = combined_mask[:, :-2, :, :]
+                    
+                    # 解析kv_cache_position_ids（倒数第二行）
+                    kv_length_marker = second_last_flat[-1].item()
+                    if kv_length_marker == 255:
+                        kv_cache_position_ids = None
+                    elif 0 < kv_length_marker < 255:
+                        kv_values = second_last_flat[:kv_length_marker].long()
+                        kv_cache_position_ids = kv_values
+                    else:
+                        kv_cache_position_ids = None
+                    
+                    # 解析draft_tokens（最后一行）
+                    draft_length_marker = last_flat[-1].item()
+                    if draft_length_marker == 255:
+                        draft_tokens = None
+                    elif 0 < draft_length_marker < 255:
+                        draft_values = last_flat[:draft_length_marker].long()
+                        draft_tokens = draft_values
+                    else:
+                        draft_tokens = None
+                        
+                elif torch.any(last_flat == 254):
+                    # 旧版本：只有一个额外行（仅kv）
+                    tree_attention_mask = combined_mask[:, :-1, :, :]
+                    
+                    # 解析kv_cache_position_ids
+                    kv_length_marker = last_flat[-1].item()
+                    if kv_length_marker == 255:
+                        kv_cache_position_ids = None
+                    elif 0 < kv_length_marker < 255:
+                        kv_values = last_flat[:kv_length_marker].long()
+                        kv_cache_position_ids = kv_values
+                    else:
+                        kv_cache_position_ids = None
+                    
+                    # 旧版本没有draft_tokens
+                    draft_tokens = None
                 else:
+                    # 没有我们打包的数据
+                    tree_attention_mask = combined_mask
                     kv_cache_position_ids = None
+                    draft_tokens = None
             else:
-                # 如果没有特殊padding值，说明这不是我们打包的数据
-                # 可能是旧版本，直接返回原始mask
+                # mask行数不足，无法包含额外行
                 tree_attention_mask = combined_mask
                 kv_cache_position_ids = None
+                draft_tokens = None
         else:
             tree_attention_mask = None
             kv_cache_position_ids = None
+            draft_tokens = None
         
         batch_size, length_increment, _ = hidden_states.shape
 
@@ -310,9 +350,11 @@ async def iterate_rpc_inference(
             # print('the inference computing time ', end_compute_time - start_compute_time)
             # print_time_now('')
         # serialize and send last layer outputs
+        hidden_states, keep_indices = _prune_draft_tree(hidden_states, draft_tokens, tree_attention_mask)
+        
         output_tensors = [
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-            for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
+            for result, proto in zip((hidden_states, keep_indices), nested_flatten(requested_backends[-1].outputs_schema))
         ]
         # print('after serialize and send last layer outputs ', )
         # print_time_now('')
@@ -333,3 +375,34 @@ async def iterate_rpc_inference(
     # print('iterate (all steps) rpc infer time cost (sec): ', end_iterate_rpc_infer_time - start_iterate_rpc_infer_time)########
     # #print_time_now('')
     # print()
+    
+def _prune_draft_tree(hidden_states: torch.Tensor, draft_tokens: torch.Tensor, tree_attention_mask):
+        hidden_size = 4096
+        vocab_size = 32000
+        
+        # Create configuration
+        config = PruningConfig(
+            method=PruningMethod.SIMPLE_PROBABILITY,
+            neural_threshold=0.5,
+            simple_threshold=0.3
+        )
+        
+        # Create manager
+        manager = BloombeePrunerManager(
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            config=config
+        )
+        results = manager.prune_speculation_tree(
+            hidden_states,
+            draft_tokens,
+            tree_attention_mask
+        )
+        
+        keep_indices = results['keep_indices']
+        new_hidden_states = hidden_states[keep_indices]
+        return new_hidden_states, keep_indices
+        
+        
+        
+        

@@ -125,3 +125,4 @@ class InferenceMetadata:
     active_adapter: Optional[str]
     tree_attention_mask: Optional[torch.Tensor] = None
     kv_cache_position_ids: Optional[torch.Tensor] = None
+    draft_tokens: Optional[torch.Tensor] = None

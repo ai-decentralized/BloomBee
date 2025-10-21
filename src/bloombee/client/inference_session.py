@@ -101,6 +101,7 @@ class _ServerInferenceSession:
         hypo_ids: torch.LongTensor,
         tree_attention_mask: Optional[torch.Tensor] = None,
         kv_cache_position_ids: Optional[torch.Tensor] = None,
+        draft_tokens: Optional[torch.Tensor] = None,
         *,
         step_id: str,
     ) -> torch.Tensor:
@@ -129,7 +130,7 @@ class _ServerInferenceSession:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        combined_mask = self._pack_kv_into_tree_mask(tree_attention_mask, kv_cache_position_ids) if kv_cache_position_ids is not None else None
+        combined_mask = self._pack_kv_into_tree_mask(tree_attention_mask, kv_cache_position_ids, draft_tokens) if kv_cache_position_ids is not None else None
 
         input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, combined_mask)
         print('client inference session step() input_tensors after packing ', input_tensors)
@@ -180,34 +181,53 @@ class _ServerInferenceSession:
         ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"
 
         self._position += n_input_tokens
-        # print('server inference session self._position ', self._position)
-        # print('server inference session output[0].shape ',  outputs[0].shape)
-        return outputs[0]
+        print('server inference session self._position ', self._position)
+        print('server inference session output[0].shape ',  outputs[0].shape)
+        return outputs
     
-    def _pack_kv_into_tree_mask(self, tree_attention_mask, kv_cache_position_ids):
+    def _pack_kv_into_tree_mask(self, tree_attention_mask, kv_cache_position_ids, draft_tokens):
         """
-        pack KV cache information with tree mask so that we can get these in sever successfully.
+        pack KV cache information and draft tokens with tree mask so that we can get these in server successfully.
         TODO: modify inference schema to make it separate instead of packing together 
         """
         original_shape = tree_attention_mask.shape
         original_dtype = tree_attention_mask.dtype
 
+        # Create first extra row for kv_cache_position_ids
         extra_row_shape = (original_shape[0], 1) + original_shape[2:]
-        extra_row = torch.full(extra_row_shape, 254, dtype=original_dtype, device=tree_attention_mask.device)
+        kv_extra_row = torch.full(extra_row_shape, 254, dtype=original_dtype, device=tree_attention_mask.device)
 
+        # Pack kv_cache_position_ids
         if kv_cache_position_ids is not None:
             kv_flat = kv_cache_position_ids.flatten()
-            available_space = extra_row.numel() - 1
+            available_space = kv_extra_row.numel() - 1
             actual_len = min(len(kv_flat), available_space)
 
-            extra_flat = extra_row.view(-1)
-            extra_flat[:actual_len] = kv_flat[:actual_len].to(original_dtype)
-            extra_flat[-1] = actual_len
-            extra_row = extra_flat.view(extra_row_shape)
+            kv_extra_flat = kv_extra_row.view(-1)
+            kv_extra_flat[:actual_len] = kv_flat[:actual_len].to(original_dtype)
+            kv_extra_flat[-1] = actual_len
+            kv_extra_row = kv_extra_flat.view(extra_row_shape)
         else:
-            extra_row.view(-1)[-1] = 255
+            kv_extra_row.view(-1)[-1] = 255
 
-        combined_mask = torch.cat([tree_attention_mask, extra_row], dim=1)
+        # Create second extra row for draft_tokens
+        draft_extra_row = torch.full(extra_row_shape, 253, dtype=original_dtype, device=tree_attention_mask.device)
+        
+        # Pack draft_tokens
+        if draft_tokens is not None:
+            draft_flat = draft_tokens.flatten()
+            available_space = draft_extra_row.numel() - 1
+            actual_len = min(len(draft_flat), available_space)
+            
+            draft_extra_flat = draft_extra_row.view(-1)
+            draft_extra_flat[:actual_len] = draft_flat[:actual_len].to(original_dtype)
+            draft_extra_flat[-1] = actual_len
+            draft_extra_row = draft_extra_flat.view(extra_row_shape)
+        else:
+            draft_extra_row.view(-1)[-1] = 255
+
+        # Combine all: original mask + kv_row + draft_row
+        combined_mask = torch.cat([tree_attention_mask, kv_extra_row, draft_extra_row], dim=1)
         return combined_mask
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
@@ -269,6 +289,7 @@ class InferenceSession:
         self._max_length = max_length
         self.output_ids = None
         self.past_key_values = None
+        self.keep_indices = None
 
     @property
     def num_blocks(self) -> int:
@@ -327,6 +348,7 @@ class InferenceSession:
         hypo_ids: Optional[torch.Tensor] = None,
         tree_attention_mask: Optional[torch.Tensor] = None,
         kv_cache_position_ids: Optional[torch.Tensor] = None,
+        draft_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -355,6 +377,7 @@ class InferenceSession:
         hypo_ids = hypo_ids.cpu()
         tree_attention_mask = tree_attention_mask.cpu() if tree_attention_mask is not None else None
         kv_cache_position_ids = kv_cache_position_ids.cpu() if kv_cache_position_ids is not None else None
+        draft_tokens = draft_tokens.cpu() if draft_tokens is not None else None
         step_id = str(uuid.uuid4()) #生成一个唯一的步骤 ID。
 
         n_input_tokens = inputs.shape[1]
@@ -365,6 +388,7 @@ class InferenceSession:
 
         server_idx = 0
         block_idx = 0
+        print("draft_tokens: ", draft_tokens)
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
                 logger.debug(f"Inference: block {block_idx}, attempt {attempt_no}")
@@ -375,15 +399,19 @@ class InferenceSession:
 
                     server_session = self._server_sessions[server_idx]
                     assert server_session.position == self.position, f"{server_session.position} and {self.position}"
-                    
-                    inputs = server_session.step( 
+
+                    inputs, keep_indices = server_session.step(
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
                         tree_attention_mask,
                         kv_cache_position_ids,
+                        draft_tokens,
                         step_id=step_id,
                     )
+                    kv_cache_position_ids = self._update_kv_cache_position_ids(kv_cache_position_ids, self.keep_indices)
+                    self.keep_indices = keep_indices
+                    tree_attention_mask = tree_attention_mask[keep_indices]
                     # print('inputs ', inputs)
                     # print('inputs.shape ', inputs.shape)
                     server_idx += 1
@@ -406,11 +434,54 @@ class InferenceSession:
 
         self._position += n_input_tokens 
         # print(f"lient inference session outputs, inputs: {inputs}")
+        inputs = self._recover_hidden_states(inputs, self.keep_indices, len(draft_tokens))
         outputs = inputs 
         
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         # print('client inference session outputs ', outputs.shape)
         return outputs
+    
+    def _recover_hidden_states(self, hidden_states, keep_indices, original_length):
+        if not torch.is_tensor(keep_indices):
+            keep_indices = torch.tensor(keep_indices, device=hidden_states.device, dtype=torch.long)
+
+        # 判断是否有 batch 维度
+        if hidden_states.dim() == 2:
+            # [S_kept, H]
+            recovered = hidden_states.new_zeros((original_length, hidden_states.size(-1)))
+            recovered[keep_indices] = hidden_states
+
+        elif hidden_states.dim() == 3:
+            # [B, S_kept, H]
+            B, _, H = hidden_states.shape
+            recovered = hidden_states.new_zeros((B, original_length, H))
+            recovered[:, keep_indices, :] = hidden_states
+
+        else:
+            raise ValueError(f"Unexpected hidden_states dim {hidden_states.dim()}, expected 2 or 3")
+
+        # 保存 mask 方便后续屏蔽 logits
+        mask = torch.ones(original_length, dtype=torch.bool, device=hidden_states.device)
+        mask[keep_indices] = False
+        self._last_padded_mask = mask
+
+        return recovered
+    
+    def _update_kv_cache_position_ids(self, kv_cache_position_ids, keep_indices):
+        if not torch.is_tensor(keep_indices):
+            keep_indices = torch.tensor(keep_indices, device=kv_cache_position_ids.device)
+
+        # 建立映射表：原始 id → 新位置
+        # 例如 keep_indices = [2,4,7] → map: {2:0, 4:1, 7:2}
+        mapping = {int(k.item()): i for i, k in enumerate(keep_indices)}
+
+        # 生成新 ids：查表
+        new_ids = torch.tensor(
+            [mapping.get(int(x.item()), -1) for x in kv_cache_position_ids],
+            device=kv_cache_position_ids.device
+        )
+
+        return new_ids
 
     
     def _update_sequence(self, server_idx: int, block_idx: int, attempt_no: int) -> int:
