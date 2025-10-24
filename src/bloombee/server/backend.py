@@ -209,7 +209,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]" # Ensure hidden states are 3-dimensional
             batch_size, seq_len, hidden_size = hidden_states.shape
             
-            # Block-level debug output removed
+            # 🔍 GPU Processing Debug: Log block processing start with batch size analysis
+            logger.info(f"[GPU_BLOCK_START] Block={self.name} | Batch={batch_size} | Seq={seq_len}")
+            logger.info(f"[BATCH_SIZE_ANALYSIS] Actual Batch Size: {batch_size} | "
+                       f"Hidden Size: {hidden_size} | "
+                       f"Sequence Length: {seq_len} | "
+                       f"Total Tokens: {batch_size * seq_len}")
             
             self._ensure_model_on_device()
             
@@ -313,7 +318,15 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
                 
-                # Block-level output debug removed
+                # 🔍 GPU Processing Debug: Log block processing end with batch size performance
+                step_end_time = time.perf_counter()
+                step_duration = (step_end_time - step_start_time) * 1000  # Convert to ms
+                tokens_per_second = (batch_size * seq_len) / (step_duration / 1000) if step_duration > 0 else 0
+                logger.info(f"[GPU_BLOCK_END] Block={self.name} | Duration={step_duration:.2f}ms | Seq={seq_len}")
+                logger.info(f"[BATCH_PERFORMANCE] Batch Size: {batch_size} | "
+                           f"Tokens/sec: {tokens_per_second:.1f} | "
+                           f"Duration: {step_duration:.2f}ms | "
+                           f"Efficiency: {tokens_per_second / batch_size:.1f} tokens/sec/batch")
                 
                 return (output_hidden_states,) # Return output hidden states
                 

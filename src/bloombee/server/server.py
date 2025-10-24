@@ -271,7 +271,7 @@ class Server:
             act_gpu_percent, act_cpu_percent = 0, 100
         else:
             # GPU mode: all resources on GPU (default)
-            w_gpu_percent, w_cpu_percent = 100, 0
+            w_gpu_percent, w_cpu_percent = 83, 17
             cache_gpu_percent, cache_cpu_percent = 100, 0
             act_gpu_percent, act_cpu_percent = 100, 0
 
@@ -287,6 +287,16 @@ class Server:
             compress_cache=False,
             comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
         )
+        
+        # 🔍 Batch Size Debug: Log batch size configuration
+        logger.info(f"[BATCH_SIZE_CONFIG] GPU Batch Size: {batch_size}")
+        logger.info(f"[BATCH_SIZE_CONFIG] Min Batch Size: {min_batch_size}")
+        logger.info(f"[BATCH_SIZE_CONFIG] Max Batch Size: {max_batch_size}")
+        logger.info(f"[BATCH_SIZE_CONFIG] Policy GPU Batch Size: {self.policy.gpu_batch_size}")
+        logger.info(f"[BATCH_SIZE_CONFIG] Policy Num GPU Batches: {self.policy.num_gpu_batches}")
+        
+        # Log detailed policy strategy
+        self.policy.log_batch_size_strategy()
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
@@ -339,6 +349,15 @@ class Server:
 
         self.module_container = None
         self.stop = threading.Event()
+        
+        # 🔍 Batch Size Performance Tracking
+        self.batch_size_stats = {
+            'total_requests': 0,
+            'total_tokens': 0,
+            'total_time': 0.0,
+            'batch_sizes': [],
+            'throughput_history': []
+        }
 
     def _choose_num_blocks(self) -> int:
         assert self.device.type in ("cuda", "mps"), (
@@ -449,6 +468,9 @@ class Server:
                     if self._should_choose_other_blocks():
                         logger.info("Swarm is imbalanced, server will load other blocks")
                         break  # Stop serving this set of modules
+                    
+                    # 🔍 Batch Size Debug: Log performance statistics periodically
+                    self.log_batch_size_performance()
             finally:
                 self.module_container.shutdown()
 
@@ -491,6 +513,28 @@ class Server:
 
         module_infos = get_remote_module_infos(self.dht, self.module_uids, latest=True)
         return block_selection.should_choose_other_blocks(self.dht.peer_id, module_infos, self.balance_quality)
+    
+    def log_batch_size_performance(self):
+        """Log batch size performance statistics for debugging"""
+        if self.batch_size_stats['total_requests'] > 0:
+            avg_batch_size = sum(self.batch_size_stats['batch_sizes']) / len(self.batch_size_stats['batch_sizes'])
+            avg_throughput = self.batch_size_stats['total_tokens'] / self.batch_size_stats['total_time'] if self.batch_size_stats['total_time'] > 0 else 0
+            
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Requests: {self.batch_size_stats['total_requests']}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Average Batch Size: {avg_batch_size:.2f}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Average Throughput: {avg_throughput:.1f} tokens/sec")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Tokens: {self.batch_size_stats['total_tokens']}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Time: {self.batch_size_stats['total_time']:.2f}s")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Batch Size Range: {min(self.batch_size_stats['batch_sizes'])}-{max(self.batch_size_stats['batch_sizes'])}")
+            
+            # Analyze batch size efficiency
+            if len(self.batch_size_stats['throughput_history']) > 1:
+                throughput_trend = self.batch_size_stats['throughput_history'][-1] - self.batch_size_stats['throughput_history'][0]
+                logger.info(f"[BATCH_SIZE_TREND] Throughput Trend: {throughput_trend:.1f} tokens/sec change")
+                if throughput_trend < 0:
+                    logger.warning(f"[BATCH_SIZE_WARNING] Throughput is decreasing! Consider adjusting batch size.")
+                else:
+                    logger.info(f"[BATCH_SIZE_SUCCESS] Throughput is improving with current batch size.")
 
     def shutdown(self, timeout: Optional[float] = 5):
         self.stop.set()

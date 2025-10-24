@@ -36,18 +36,22 @@ from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage, log_
 _global_tokenizer = None
 _tokenizer_lock = threading.Lock() if 'threading' in sys.modules else None
 
-def get_global_tokenizer(model_name='llama-7b-hf'):
+def get_global_tokenizer(model_name='llama-7b'):
     """Get globally shared tokenizer, initialize only once"""
     global _global_tokenizer
     if _global_tokenizer is None:
         try:
+            # Remove -hf suffix if present, as huggyllama repos don't use it
+            clean_model_name = model_name.replace('-hf', '') if model_name.endswith('-hf') else model_name
+            hf_model_name = f"huggyllama/{clean_model_name}"
+            
             _global_tokenizer = AutoTokenizer.from_pretrained(
-                f"huggyllama/{model_name}", 
+                hf_model_name, 
                 padding_side="left", 
                 legacy=False
             )
             _global_tokenizer.pad_token = '[PAD]'
-            print(f"[TOKENIZER_INIT] Global tokenizer initialized for {model_name}")
+            print(f"[TOKENIZER_INIT] Global tokenizer initialized for {hf_model_name}")
         except Exception as e:
             print(f"[TOKENIZER_INIT] Failed to initialize global tokenizer: {e}")
             _global_tokenizer = None
@@ -219,8 +223,10 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
     def _get_tokenizer(self):
         """Optimization: use globally shared tokenizer to avoid duplicate creation"""
         if self._cached_tokenizer is None:
-            model_name = getattr(self.llama_config, 'name', 'llama-7b-hf')
-            self._cached_tokenizer = get_global_tokenizer(model_name)
+            model_name = getattr(self.llama_config, 'name', 'llama-7b')
+            # Remove -hf suffix if present, as huggyllama repos don't use it
+            clean_model_name = model_name.replace('-hf', '') if model_name.endswith('-hf') else model_name
+            self._cached_tokenizer = get_global_tokenizer(clean_model_name)
         return self._cached_tokenizer
 
     def _get_cached_test_inputs(self, prompt_len, num_prompts):
@@ -287,7 +293,23 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self.init_weight(j)
 
     def init_weight(self, j):
-        model_name = os.path.basename(self.llama_config._name_or_path.rstrip('/'))
+        # Get model name from llama_config.name if available, otherwise use a default
+        if hasattr(self.llama_config, 'name') and self.llama_config.name:
+            model_name = self.llama_config.name
+        elif hasattr(self.llama_config, '_name_or_path') and self.llama_config._name_or_path:
+            model_name = os.path.basename(self.llama_config._name_or_path.rstrip('/'))
+        else:
+            # Fallback to a default model name - use correct Hugging Face identifier
+            model_name = "llama-30b"  # Remove -hf suffix as huggyllama repos don't use it
+        
+        # Ensure model_name is not empty and remove -hf suffix if present
+        if not model_name or model_name == '.':
+            model_name = "llama-30b"
+        
+        # Remove -hf suffix if present, as huggyllama repos don't use it
+        if model_name.endswith('-hf'):
+            model_name = model_name[:-3]
+            
         self.llama_config.name = model_name
         expanded_path = os.path.abspath(os.path.expanduser(
             os.path.join(self.path, f"{model_name}-np")))

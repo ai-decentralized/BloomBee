@@ -418,15 +418,20 @@ class TransformerConnectionHandler(ConnectionHandler):
         self, request: runtime_pb2.ExpertRequest, serialized_outputs: runtime_pb2.Tensor, metadata: dict
     ) -> None:
         # print('_push_outputs metadata ', metadata)
+        push_start_time = perf_counter()
         try:
             next_servers = metadata.get("next_servers")
-            # print('---------------------------------------function _push_outputs: next_servers ', next_servers)
+            print(f"[DEBUG] _push_outputs: next_servers={next_servers}")
             if not next_servers:
+                print(f"[DEBUG] _push_outputs: No next_servers, returning early")
                 return
 
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]
             next_peer_id = PeerID.from_base58(next_peer_id)
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
+
+            # Log cross-GPU transfer start
+            logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
             # Sending hidden states serialized with output_schema to avoid double serialization
             next_tensors = [serialized_outputs] + request.tensors[1:]
@@ -434,6 +439,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
 
             stub = self.get_stub(self._p2p, next_peer_id)
+            transfer_start = perf_counter()
             await stub.rpc_push(
                 runtime_pb2.ExpertRequest(
                     uid=next_uid,
@@ -442,6 +448,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                 ),
                 timeout=self.request_timeout,
             )
+            transfer_end = perf_counter()
+            transfer_time = (transfer_end - transfer_start) * 1000  # ms
+            total_push_time = (transfer_end - push_start_time) * 1000  # ms
+            
+            # Log cross-GPU transfer end
+            logger.info(f"[CROSS_GPU_TRANSFER_END] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} | TransferTime={transfer_time:.2f}ms | TotalPushTime={total_push_time:.2f}ms")
         except Exception:
             logger.debug(
                 f"Failed to push outputs to peer_id={next_peer_id}, session_id={next_session_id}, blocks={next_start}:{next_end}:",
@@ -450,6 +462,9 @@ class TransformerConnectionHandler(ConnectionHandler):
 
     async def rpc_forward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
         async with timeout(self.request_timeout):
+            # Start timing for server processing latency
+            server_start_time = perf_counter()
+            
             # Parse request and prepare backends
             flat_inputs = [deserialize_torch_tensor(tensor) for tensor in request.tensors]
             requested_uids = self._check_uids(request.uid)
@@ -464,6 +479,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points, (float, int)
             ), f"rpc_forward should have number of points as number or None, got {points}"
 
+            # Log server processing start
+            logger.info(f"[SERVER_PROCESSING_START] Server processing request with {len(requested_uids)} backends")
+            
+            # Measure network transfer time for S1->S2 communication
+            network_start_time = perf_counter()
             hidden_states = await run_rpc_forward(
                 *flat_inputs,
                 requested_backends=requested_backends,
@@ -472,6 +492,20 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points=points,
                 args_structure=args_structure,
             )
+            network_end_time = perf_counter()
+            network_transfer_time = (network_end_time - network_start_time) * 1000
+            
+            # Calculate server processing latency
+            server_end_time = perf_counter()
+            server_processing_latency = (server_end_time - server_start_time) * 1000
+            
+            logger.info(f"[NETWORK_TRANSFER_LATENCY] S1->S2 Transfer: {network_transfer_time:.2f}ms | "
+                       f"Backends: {len(requested_backends)} | "
+                       f"Output Shape: {hidden_states.shape}")
+            logger.info(f"[SERVER_PROCESSING_LATENCY] Total: {server_processing_latency:.2f}ms | "
+                       f"Backends: {len(requested_backends)} | "
+                       f"Output Shape: {hidden_states.shape}")
+            
             return runtime_pb2.ExpertResponse(
                 tensors=self._serialize_outputs(hidden_states, requested_backends, metadata)
             )
