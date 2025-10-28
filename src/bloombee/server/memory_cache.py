@@ -188,23 +188,30 @@ class MemoryCache:
         # note: this specific function is not concurrent, so you can safely allocate/offload/defragment data here
 
         # read creation/deletion requests from connection handlers
-        while self._pipe_recv.poll():
-            recv_handles, recv_data = self._pipe_recv.recv()
+        def _process_message(recv_handles, recv_data):
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
+                    seq_len = descr.shape[-1] if descr.shape else 0
+                    logger.info(
+                        "[CACHE_CREATE] handle=%s seq_len=%s shape=%s",
+                        handle,
+                        seq_len,
+                        descr.shape if descr.shape is not None else None,
+                    )
                     self.mocked_task = Task(
                         inputs=None,
-                        prompt_len=0,
-                        gen_len=descr.shape[-1],
+                        prompt_len=1,
+                        gen_len=max(1, seq_len),
                         cut_gen_len=None,
                         do_sample=False,
                         temperature=0,
                         stop=None,
                         top_p=None,
                     )
-                    self._allocated_tensors[handle] = self.device.init_cache_one_gpu_batch(self.block_config, self.mocked_task, self.allocation_policy)
-                    assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
+                    self._allocated_tensors[handle] = self.device.init_cache_one_gpu_batch(
+                        self.block_config, self.mocked_task, self.allocation_policy
+                    )
             else:  # delete tensors by handle
                 for handle in recv_handles:
                     if handle not in self._allocated_tensors:
@@ -212,6 +219,22 @@ class MemoryCache:
                             f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
                         )
                     self._allocated_tensors.pop(handle, None)
+
+        while self._pipe_recv.poll():
+            _process_message(*self._pipe_recv.recv())
+
+        # Ensure all requested handles are materialized; wait synchronously if needed
+        missing_handles = [handle for handle in handles if handle not in self._allocated_tensors]
+        while missing_handles:
+            logger.info("[CACHE_WAIT] handles_missing=%s", missing_handles)
+            _process_message(*self._pipe_recv.recv())
+            missing_handles = [handle for handle in handles if handle not in self._allocated_tensors]
+
+        logger.info(
+            "[CACHE_READY] handles=%s devices=%s",
+            handles,
+            [self._allocated_tensors[h].device if hasattr(self._allocated_tensors[h], "device") else None for h in handles],
+        )
         yield tuple(self._allocated_tensors[handle] for handle in handles)
         
 
@@ -228,5 +251,3 @@ class KVCacheMetadata:
 class AdaptedKVCache:
     kvs: Sequence[torch.Tensor]
     device: KVCacheMetadata
-
-

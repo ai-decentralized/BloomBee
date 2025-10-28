@@ -271,7 +271,7 @@ class Server:
             act_gpu_percent, act_cpu_percent = 0, 100
         else:
             # GPU mode: all resources on GPU (default)
-            w_gpu_percent, w_cpu_percent = 83, 17
+            w_gpu_percent, w_cpu_percent = 100, 0
             cache_gpu_percent, cache_cpu_percent = 100, 0
             act_gpu_percent, act_cpu_percent = 100, 0
 

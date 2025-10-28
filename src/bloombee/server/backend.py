@@ -331,9 +331,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 return (output_hidden_states,) # Return output hidden states
                 
         except Exception as e:
-            # print(f' CRITICAL ERROR in inference_step: {type(e).__name__}: {e}')
-            # import traceback
-            # traceback.print_exc()
+            logger.exception(
+                "inference_step failed for block %s (batch=%s, seq=%s, prefix=%s): %s",
+                self.name,
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                inference_info.prefix_length if 'inference_info' in locals() else None,
+                e,
+            )
             return (hidden_states,)  # Return original input as fallback
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:

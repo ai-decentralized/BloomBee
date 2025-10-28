@@ -146,7 +146,14 @@ class KVCacheManager:
         cache_tensors = self._active_cache_tensors_stack[-1]
         (k_cache, v_cache), = cache_tensors
         S_full, BH, D = k_cache.shape
-        assert prefix_length <= S_full, f"prefix_length={prefix_length} > seq_len={S_full}"
+        if prefix_length > S_full:
+            logger.warning(
+                "Requested prefix_length=%s exceeds allocated cache %s; clamping to maximum. "
+                "This usually indicates the client requested more tokens than declared.",
+                prefix_length,
+                S_full,
+            )
+            prefix_length = S_full
 
         # Target device for computation (CPU/GPU)
         compute_dst = self.attention_compute  # 统一在计算设备上物化

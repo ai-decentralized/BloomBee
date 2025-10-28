@@ -201,6 +201,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                 # print_time_now('')
                 
                 push_time = []
+                logger.info(
+                    "[BATCH_REQUEST] handler=%s batch=%d max_length=%d session=%s",
+                    self._handler_index,
+                    batch_size,
+                    max_length,
+                    session_id,
+                )
                 # offload_logger.info(f" Inference parameters:")
                 # offload_logger.info(f"   - batch size: {batch_size}")
                 # offload_logger.info(f"   - max length: {max_length}")
@@ -683,8 +690,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         
         # Use KVCacheManager's offloading strategy
         cache_manager = backends[0].cache_manager
-        
-        
+
+        # Enforce server-side batch capacity to avoid silent cache corruption
+        policy = cache_manager.offloading_policy
+        max_supported_batch = policy.gpu_batch_size
+        if batch_size > max_supported_batch:
+            raise AllocationFailed(
+                f"Requested batch size {batch_size} exceeds server capacity "
+                f"{max_supported_batch}. Reduce client batch size or restart the "
+                f"server with a larger --batch_size value."
+            )
+
         # Use the original cache allocation method, but add offloading debug information
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
 
@@ -692,9 +708,22 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"OFFLOAD: requesting KV allocation for {len(backends)} blocks, "
             f"batch={batch_size}, max_length={max_length}"
         )
-        async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
+        async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as raw_handles:
             logger.info("OFFLOAD: allocation completed; entering use_cache region")
-            yield nested_pack(handles, descriptors)
+            packed_handles = nested_pack(raw_handles, descriptors)
+            def _handle_size(item):
+                if isinstance(item, (list, tuple)):
+                    return len(item)
+                return 1
+            logger.info(
+                "[CACHE_HANDLES] handler=%s batch=%d max_length=%d total_handles=%d per_backend=%s",
+                self._handler_index,
+                batch_size,
+                max_length,
+                len(raw_handles),
+                [_handle_size(h) for h in packed_handles],
+            )
+            yield packed_handles
 
     def _log_request(
         self,
