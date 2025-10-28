@@ -201,13 +201,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 # print_time_now('')
                 
                 push_time = []
-                logger.info(
-                    "[BATCH_REQUEST] handler=%s batch=%d max_length=%d session=%s",
-                    self._handler_index,
-                    batch_size,
-                    max_length,
-                    session_id,
-                )
                 # offload_logger.info(f" Inference parameters:")
                 # offload_logger.info(f"   - batch size: {batch_size}")
                 # offload_logger.info(f"   - max length: {max_length}")
@@ -710,20 +703,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as raw_handles:
             logger.info("OFFLOAD: allocation completed; entering use_cache region")
-            packed_handles = nested_pack(raw_handles, descriptors)
-            def _handle_size(item):
-                if isinstance(item, (list, tuple)):
-                    return len(item)
-                return 1
-            logger.info(
-                "[CACHE_HANDLES] handler=%s batch=%d max_length=%d total_handles=%d per_backend=%s",
-                self._handler_index,
-                batch_size,
-                max_length,
-                len(raw_handles),
-                [_handle_size(h) for h in packed_handles],
-            )
-            yield packed_handles
+            yield nested_pack(raw_handles, descriptors)
 
     def _log_request(
         self,

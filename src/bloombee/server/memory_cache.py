@@ -193,12 +193,6 @@ class MemoryCache:
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
                     seq_len = descr.shape[-1] if descr.shape else 0
-                    logger.info(
-                        "[CACHE_CREATE] handle=%s seq_len=%s shape=%s",
-                        handle,
-                        seq_len,
-                        descr.shape if descr.shape is not None else None,
-                    )
                     self.mocked_task = Task(
                         inputs=None,
                         prompt_len=1,
@@ -226,15 +220,9 @@ class MemoryCache:
         # Ensure all requested handles are materialized; wait synchronously if needed
         missing_handles = [handle for handle in handles if handle not in self._allocated_tensors]
         while missing_handles:
-            logger.info("[CACHE_WAIT] handles_missing=%s", missing_handles)
             _process_message(*self._pipe_recv.recv())
             missing_handles = [handle for handle in handles if handle not in self._allocated_tensors]
 
-        logger.info(
-            "[CACHE_READY] handles=%s devices=%s",
-            handles,
-            [self._allocated_tensors[h].device if hasattr(self._allocated_tensors[h], "device") else None for h in handles],
-        )
         yield tuple(self._allocated_tensors[handle] for handle in handles)
         
 
