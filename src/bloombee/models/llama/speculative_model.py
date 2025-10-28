@@ -248,21 +248,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         return verified_tokens, verified_tokens_positions, new_past_key_values, llm_generated_token
     
     def pack_bool_mask_to_int64(self, mask_bool: torch.Tensor) -> torch.Tensor:
-        batch_size, n, m = mask_bool.shape
-        assert n == m, "Must be square matrix"
-        mask_np = mask_bool.cpu().numpy().astype(np.uint8)
-        packed = np.packbits(mask_np, axis=-1)
-        bytes_per_row = packed.shape[-1]
-        padded_bytes = ((bytes_per_row + 7) // 8) * 8
-        
-        if padded_bytes > bytes_per_row:
-            pad_width = [(0, 0), (0, 0), (0, padded_bytes - bytes_per_row)]
-            packed = np.pad(packed, pad_width, constant_values=0)
-        
-        num_int64 = padded_bytes // 8
-        packed = packed.reshape(batch_size, n, num_int64, 8)
-        
-        return torch.from_numpy(packed).to(mask_bool.device)
+        assert mask_bool.dtype == torch.bool, "Input must be a bool tensor"
+        return mask_bool.to(dtype=torch.int64)
     
     def _fallback_generation_with_forward(
         self, 

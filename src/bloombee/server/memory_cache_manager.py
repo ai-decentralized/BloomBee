@@ -131,6 +131,7 @@ class KVCacheManager:
         self,
         prefix_length: int,
         hypo_ids: Optional[torch.Tensor] = None,
+        kv_cache_position_ids: Optional[torch.Tensor] = None,
     ):
         """
         Return standard KV for computation
@@ -160,7 +161,16 @@ class KVCacheManager:
             path = 0 if not self.offloading_policy.cpu_cache_compute else 1
 
         # Required slice
-        idx_all = (slice(0, prefix_length), slice(0, BH))
+        need_reorder = False
+        if kv_cache_position_ids is None:
+            idx_all = (slice(0, prefix_length), slice(0, BH))
+        else:
+            root_position = kv_cache_position_ids[0]
+            prefix_positions = list(range(root_position))  # [0, 1, 2, ..., root-1]
+            idx_all = prefix_positions + kv_cache_position_ids  # 完整序列
+            expected_continuous = list(range(len(idx_all)))
+            need_reorder = False if (idx_all == expected_continuous) else True
+        
 
         # Utility: get underlying torch.Tensor
         def _as_torch(x):

@@ -194,67 +194,61 @@ async def iterate_rpc_inference(
 
         hidden_states, prompts, hypo_ids, combined_mask, *_ = flat_tensors
         
+        logger.info(f"combined_mask shape: {combined_mask.shape}, combined_mask: {combined_mask}")
+        
+        # combined_mask: [B, H, W] 例如 [1, 33, 30]
+        # 约定：[-3] 行为 KV，[-2]、[-1] 行为 Draft，其它行为 tree_attention_mask
+        # 每行最后一个位置（索引 -1）为长度标记，前面的位置存放数据
+
         if combined_mask is not None:
-        # 检查是否包含我们打包的额外行
-            # 通过检查倒数第二行和最后一行的padding值
-            if combined_mask.shape[1] >= 2:
-                second_last_row = combined_mask[:, -2:-1, :, :]
-                last_row = combined_mask[:, -1:, :, :]
-                
-                second_last_flat = second_last_row.view(-1)
-                last_flat = last_row.view(-1)
-                
-                # 检查是否同时包含两个额外行（新版本：kv和draft）
-                has_kv_row = torch.any(second_last_flat == 254)
-                has_draft_row = torch.any(last_flat == 253)
-                
-                if has_kv_row and has_draft_row:
-                    # 新版本：包含两个额外行
-                    tree_attention_mask = combined_mask[:, :-2, :, :]
-                    
-                    # 解析kv_cache_position_ids（倒数第二行）
-                    kv_length_marker = second_last_flat[-1].item()
-                    if kv_length_marker == 255:
-                        kv_cache_position_ids = None
-                    elif 0 < kv_length_marker < 255:
-                        kv_values = second_last_flat[:kv_length_marker].long()
-                        kv_cache_position_ids = kv_values
+            B, H, W = combined_mask.shape
+
+            if H >= 3 and W >= 1:
+                # ---- 取出三行 ----
+                kv_row     = combined_mask[:, -3, :]    # [B, W]
+                draft_rows = combined_mask[:, -2:, :]   # [B, 2, W]
+
+                # ---- 解析 KV（倒数第3行）----
+                kv_len = kv_row[:, -1].to(torch.long)                 # [B]
+                # 合法长度：1..W-1
+                kv_len = torch.clamp(kv_len, min=0, max=W-1)
+
+                kv_cache_position_ids_list = []
+                for b in range(B):
+                    L = int(kv_len[b].item())
+                    if L > 0:
+                        kv_cache_position_ids_list.append(kv_row[b, :L].to(torch.long))
                     else:
-                        kv_cache_position_ids = None
-                    
-                    # 解析draft_tokens（最后一行）
-                    draft_length_marker = last_flat[-1].item()
-                    if draft_length_marker == 255:
-                        draft_tokens = None
-                    elif 0 < draft_length_marker < 255:
-                        draft_values = last_flat[:draft_length_marker].long()
-                        draft_tokens = draft_values
-                    else:
-                        draft_tokens = None
-                        
-                elif torch.any(last_flat == 254):
-                    # 旧版本：只有一个额外行（仅kv）
-                    tree_attention_mask = combined_mask[:, :-1, :, :]
-                    
-                    # 解析kv_cache_position_ids
-                    kv_length_marker = last_flat[-1].item()
-                    if kv_length_marker == 255:
-                        kv_cache_position_ids = None
-                    elif 0 < kv_length_marker < 255:
-                        kv_values = last_flat[:kv_length_marker].long()
-                        kv_cache_position_ids = kv_values
-                    else:
-                        kv_cache_position_ids = None
-                    
-                    # 旧版本没有draft_tokens
-                    draft_tokens = None
-                else:
-                    # 没有我们打包的数据
-                    tree_attention_mask = combined_mask
-                    kv_cache_position_ids = None
-                    draft_tokens = None
+                        kv_cache_position_ids_list.append(None)
+
+                # B==1 时返回单个张量或 None；否则按 batch 返回列表
+                kv_cache_position_ids = (
+                    kv_cache_position_ids_list[0] if B == 1 else kv_cache_position_ids_list
+                )
+
+                # ---- 解析 Draft tokens（最后两行）----
+                draft_tokens_all_batches = []
+                for b in range(B):
+                    tokens = []
+                    for i in range(2):  # 两行：-2 与 -1
+                        row = draft_rows[b, i, :]              # [W]
+                        L = int(row[-1].item())
+                        if 0 < L <= W - 1:
+                            tokens.extend(row[:L].to(torch.long).tolist())
+                    draft_tokens_all_batches.append(
+                        (torch.tensor(tokens, dtype=torch.long, device=combined_mask.device)
+                        if len(tokens) > 0 else None)
+                    )
+
+                draft_tokens = (
+                    draft_tokens_all_batches[0] if B == 1 else draft_tokens_all_batches
+                )
+
+                # ---- tree_attention_mask（去掉最后3行）----
+                tree_attention_mask = combined_mask[:, :-3, :]
+
             else:
-                # mask行数不足，无法包含额外行
+                # 行数不足3或宽度为0，无法拆出 KV / Draft
                 tree_attention_mask = combined_mask
                 kv_cache_position_ids = None
                 draft_tokens = None
@@ -262,6 +256,7 @@ async def iterate_rpc_inference(
             tree_attention_mask = None
             kv_cache_position_ids = None
             draft_tokens = None
+
         
         batch_size, length_increment, _ = hidden_states.shape
 
@@ -330,7 +325,7 @@ async def iterate_rpc_inference(
                     InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids)
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
-                (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
+                (hidden_states, full_mask) = await requested_backends[0].inference_pool.submit_task(
                     hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                 )
                 
@@ -341,7 +336,7 @@ async def iterate_rpc_inference(
                 
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids),)
-                    (hidden_states,) = await backend.inference_pool.submit_task(
+                    (hidden_states, full_mask) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
             
@@ -350,12 +345,20 @@ async def iterate_rpc_inference(
             # print('the inference computing time ', end_compute_time - start_compute_time)
             # print_time_now('')
         # serialize and send last layer outputs
-        hidden_states, keep_indices = _prune_draft_tree(hidden_states, draft_tokens, tree_attention_mask)
+        logger.info(f"before _prune_draft_tree, hidden_states shape: {hidden_states.shape}, full_mask: {full_mask}")
+        hidden_states, keep_indices = _prune_draft_tree(hidden_states, draft_tokens, full_mask)
+        logger.info(f"after _prune_draft_tree, hidden_states shape: {hidden_states.shape}")
+        logger.info(f"keep_indices: {keep_indices}")
+        logger.info(f"outputs_schema: {requested_backends[-1].outputs_schema}")
+        
+        keep_indices = torch.tensor(keep_indices, dtype=torch.int64, device=hidden_states.device)
         
         output_tensors = [
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
             for result, proto in zip((hidden_states, keep_indices), nested_flatten(requested_backends[-1].outputs_schema))
         ]
+        
+        # logger.info(f"output_tensors: {output_tensors}")
         # print('after serialize and send last layer outputs ', )
         # print_time_now('')
         # print('hidden_states ', hidden_states)
@@ -400,7 +403,8 @@ def _prune_draft_tree(hidden_states: torch.Tensor, draft_tokens: torch.Tensor, t
         )
         
         keep_indices = results['keep_indices']
-        new_hidden_states = hidden_states[keep_indices]
+        logger.info(f"keep_indices: {keep_indices}")
+        new_hidden_states = hidden_states[:, keep_indices, :]
         return new_hidden_states, keep_indices
         
         

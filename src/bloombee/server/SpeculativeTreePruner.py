@@ -47,7 +47,7 @@ class PruningConfig:
     # Simple probability method config
     simple_threshold: float = 0.3
     simple_top_k: int = 5
-    simple_use_entropy: bool = True
+    simple_use_entropy: bool = False
     
     # Adaptive neural method config
     neural_threshold: float = 0.5
@@ -118,6 +118,8 @@ class SimpleProbabilityPruner(PrunerInterface):
             self.lm_head = tie_weights
         else:
             self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            self.lm_head.requires_grad_(False)
+            self.lm_head.to(dtype=torch.float16)
         
         # Statistics
         self.total_branches = 0
@@ -147,8 +149,12 @@ class SimpleProbabilityPruner(PrunerInterface):
         seq_len = len(draft_tokens)
         
         # Get middle layer logits and probabilities
+        logger.info(f"middle_hidden_states: {middle_hidden_states}")
         middle_logits = self.lm_head(middle_hidden_states)
+        logger.info(f"middle_logits: {middle_logits}")
         probs = F.softmax(middle_logits, dim=-1)
+        logger.info(f"probs: {probs}")
+        logger.info(f"tree_attention_mask : {tree_attention_mask}")
         
         # Initialize keep mask (all True initially)
         keep_mask = torch.ones(seq_len, dtype=torch.bool)
@@ -167,8 +173,12 @@ class SimpleProbabilityPruner(PrunerInterface):
                 scores[i] = 0.0  # Set score to 0 for discarded nodes
                 continue
             
+            logger.info(f"draft_tokens[i]: {draft_tokens[i]}")
+            
             # Get token probability
-            token_prob = probs[i, draft_tokens[i]]
+            token_prob = probs[0, i, draft_tokens[i]]
+            
+            logger.info(f"probs shape : {probs.shape}, tree_attention_mask shape: {tree_attention_mask.shape}")
             
             # Calculate score with optional adjustments
             score = token_prob
@@ -183,6 +193,8 @@ class SimpleProbabilityPruner(PrunerInterface):
             # depth = torch.sum(tree_attention_mask[i, :i]).item()
             # depth_factor = 1.0 - (depth * 0.1)
             # score = score * max(depth_factor, 0.5)
+                
+            logger.info(f"current node score: {score}")
             
             scores[i] = score
             
@@ -194,46 +206,46 @@ class SimpleProbabilityPruner(PrunerInterface):
                 # Mark all descendants as discarded
                 # Descendants are nodes j > i where j can attend to i
                 for j in range(i + 1, seq_len):
-                    if tree_attention_mask[j, i] == 1:
+                    if tree_attention_mask[0, j, i] == 1:
                         discarded[j] = True
                         keep_mask[j] = False
         
         # Ensure minimum branches are kept
-        # kept_count = keep_mask.sum().item()
-        # if kept_count < self.config.min_keep_branches:
-        #     # Find leaf nodes (nodes with no children)
-        #     leaf_nodes = []
-        #     for i in range(seq_len):
-        #         is_leaf = True
-        #         for j in range(i + 1, seq_len):
-        #             if tree_attention_mask[j, i] == 1:  # j is child of i
-        #                 is_leaf = False
-        #                 break
-        #         if is_leaf:
-        #             leaf_nodes.append(i)
+        kept_count = keep_mask.sum().item()
+        if kept_count < self.config.min_keep_branches:
+            # Find leaf nodes (nodes with no children)
+            leaf_nodes = []
+            for i in range(seq_len):
+                is_leaf = True
+                for j in range(i + 1, seq_len):
+                    if tree_attention_mask[0, j, i] == 1:  # j is child of i
+                        is_leaf = False
+                        break
+                if is_leaf:
+                    leaf_nodes.append(i)
             
-        #     # Sort leaf nodes by their scores
-        #     leaf_scores = [(scores[i].item(), i) for i in leaf_nodes]
-        #     leaf_scores.sort(reverse=True)
+            # Sort leaf nodes by their scores
+            leaf_scores = [(scores[i].item(), i) for i in leaf_nodes]
+            leaf_scores.sort(reverse=True)
             
-        #     # Keep top branches (complete paths from root to leaf)
-        #     keep_mask = torch.zeros(seq_len, dtype=torch.bool)
-        #     branches_kept = 0
+            # Keep top branches (complete paths from root to leaf)
+            keep_mask = torch.zeros(seq_len, dtype=torch.bool)
+            branches_kept = 0
             
-        #     for score, leaf_idx in leaf_scores:
-        #         if branches_kept >= self.config.min_keep_branches:
-        #             break
+            for score, leaf_idx in leaf_scores:
+                if branches_kept >= self.config.min_keep_branches:
+                    break
                 
-        #         # Keep this leaf and all its ancestors
-        #         current = leaf_idx
-        #         keep_mask[current] = True
+                # Keep this leaf and all its ancestors
+                current = leaf_idx
+                keep_mask[current] = True
                 
-        #         # Trace back to root and keep all ancestors
-        #         for j in range(leaf_idx):
-        #             if tree_attention_mask[leaf_idx, j] == 1:
-        #                 keep_mask[j] = True
+                # Trace back to root and keep all ancestors
+                for j in range(leaf_idx):
+                    if tree_attention_mask[0, leaf_idx, j] == 1:
+                        keep_mask[j] = True
                 
-        #         branches_kept += 1
+                branches_kept += 1
         
         # # Limit maximum branches
         # kept_count = keep_mask.sum().item()
@@ -262,21 +274,21 @@ class SimpleProbabilityPruner(PrunerInterface):
         self.pruned_branches += len(prune_indices)
         
         # Create new attention mask for kept nodes
-        new_attention_mask = self._create_pruned_attention_mask(
-            tree_attention_mask, keep_indices
-        )
+        # new_attention_mask = self._create_pruned_attention_mask(
+        #     tree_attention_mask, keep_indices
+        # )
         
         return {
             'keep_indices': keep_indices,
             'prune_indices': prune_indices,
             'keep_probs': scores.tolist(),
             'keep_mask': keep_mask,
-            'new_attention_mask': new_attention_mask,
+            # 'new_attention_mask': new_attention_mask,
             'metadata': {
                 'middle_logits': middle_logits,
                 'threshold_used': self.config.simple_threshold,
                 'avg_score': scores[keep_mask].mean().item() if keep_mask.any() else 0.0,
-                'depth_distribution': self._get_depth_distribution(tree_attention_mask, keep_mask)
+                # 'depth_distribution': self._get_depth_distribution(tree_attention_mask, keep_mask)
             }
         }
     

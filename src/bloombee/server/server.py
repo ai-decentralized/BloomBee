@@ -606,6 +606,11 @@ class ModuleContainer(threading.Thread):
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression
                         ),
+                        BatchTensorDescriptor(
+                            1, 64,                             # keep_indices_padded: [B, 64]
+                            dtype=torch.int64,
+                            compression=compression
+                        ),
                     ),
                     min_batch_size=min_batch_size,
                     max_batch_size=max_batch_size,

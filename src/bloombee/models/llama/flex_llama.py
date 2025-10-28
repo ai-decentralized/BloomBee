@@ -485,6 +485,8 @@ class FLEX_LlamaAttention(LlamaAttention):
                 = weight_read_buf.pop()
         else:
             ((w_q, _), (w_k, _),  (w_v, _), (w_out, _), (input_layernorm, _), (rotary_emb_inv_freq, _)) = weight_read_buf.val
+            
+        logger.info(f"forward rotary_position_ids: {rotary_position_ids}")
 
         
         if i == 0:
