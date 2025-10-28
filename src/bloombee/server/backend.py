@@ -233,6 +233,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 selected = self.cache_manager.select_cache(
                     prefix_length=inference_info.prefix_length,
                     hypo_ids=hypo_ids,
+                    kv_cache_position_ids=inference_info.kv_cache_position_ids
                 )
                 layer_past = selected
                 
@@ -240,13 +241,18 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
                     
+                logger.info(f"past_key_values_length: {past_key_values_length}")
+                    
                 full_mask = self._create_attention_mask(
                     tree_attention_mask=inference_info.tree_attention_mask,
                     src_len=seq_len + past_key_values_length,
                     past_key_values_length=past_key_values_length,
                     device=hidden_states.device,
                 )
-                attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                
+                logger.info(f"full_mask: {full_mask.shape}")
+                # attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                attention_mask = full_mask
                 
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
@@ -263,9 +269,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         self._position_ids_cache[cache_key] = base_ids.unsqueeze(0).expand(batch_size, -1)
                     
                     # Add offset to cached base tensor (avoids creating new tensor)
-                    position_ids = self._position_ids_cache[cache_key] + (inference_info.prefix_length + offset)
+                    position_ids = self._position_ids_cache[cache_key] + (past_key_values_length + offset)
 
-                    print(f' Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}')
+                    logger.info(f"Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}")
                     rotary_position_ids = self._create_tree_position_ids(2, 4, past_key_values_length, device='cuda:0') if inference_info.tree_attention_mask is not None else None
                     
                     logger.info(f"rotary_position_ids: {rotary_position_ids}, hidden_states_chunk: {hidden_states_chunk.shape}")

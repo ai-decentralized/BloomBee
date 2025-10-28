@@ -31,10 +31,13 @@ from bloombee.flexgen_utils.task import Task
 from transformers import AutoTokenizer
 import os
 from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage, log_mem
+from hivemind.utils import get_logger
 
 # Global tokenizer singleton - avoid creating duplicate tokenizers for each layer
 _global_tokenizer = None
 _tokenizer_lock = threading.Lock() if 'threading' in sys.modules else None
+
+logger = get_logger(__name__)
 
 def get_global_tokenizer(model_name='llama-7b-hf'):
     """Get globally shared tokenizer, initialize only once"""
@@ -473,6 +476,9 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                     else:
                         mask_length = i + 1
                     self.update_attention_mask(0, k, mask_length)
+                    attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
+                             else self.env.gpu)
+                    self.attention_mask[k].store(TorchTensor.create_from_torch(attention_mask, attention_compute))
 
                 # Weight loading performance monitoring and optimization
                 weight_load_start = time.time()
@@ -790,6 +796,8 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
                 inputs_embeds=hidden_states,
                 past_key_values_length=past_key_values_length,
             )
+            
+        logger.info(f"block, attention_mask: {attention_mask.shape}")
 
         outputs = super().forward(
             hidden_states,

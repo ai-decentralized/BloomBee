@@ -20,10 +20,14 @@ from bloombee.flexgen_utils.utils import (GB, T, cpu_mem_stats, vector_gather, t
     torch_dtype_to_num_bytes)
 from torch import nn
 from transformers.activations import ACT2FN
+import logging
+from hivemind.utils import get_logger
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
+
+logger = get_logger(__name__)
 
 
 def fix_recursive_import():
@@ -670,7 +674,7 @@ class TorchDevice:
 
         idx = torch.arange(q_len, device=self.dev)
         causal_mask = (idx <= idx.view(q_len, 1)).view(1, 1, q_len, q_len)
-        mask = attention_mask.data.view(bsz, 1, 1, q_len) & causal_mask
+        mask = attention_mask.data.view(bsz, 1, q_len, q_len).to(torch.bool) & causal_mask
 
         attn_weights = attn_weights.view(bsz, num_attention_heads, q_len, q_len)
         attn_weights = torch.where(mask, attn_weights, -1e4)
@@ -712,7 +716,7 @@ class TorchDevice:
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
-        src_s = attention_mask.shape[1]
+        src_s = attention_mask.shape[-1]
         head_dim = h // n_head
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
@@ -729,7 +733,14 @@ class TorchDevice:
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
         
-        q, k = apply_rotary_emb(q, k, freqs_cis=freq_cis[src_s - tgt_s: src_s])
+        logger.info(f"attention_mask: {attention_mask.shape}")
+        logger.info(f"inputs: {inputs.shape}")
+        logger.info(f"freq_cis: {freq_cis.shape}")
+        logger.info(f"src_s: {src_s}")
+        logger.info(f"tgt_s: {tgt_s}")
+        freqs_slice = freq_cis[-tgt_s:]
+        
+        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
         
          # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
@@ -789,7 +800,7 @@ class TorchDevice:
                 n_head, head_dim)
 
         # shape: (b, 1, h)
-        value = value.transpose(1, 2).view(b, tgt_s, h)
+        value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, h)
         
         value = F.linear(value, w_out.data)
 
@@ -812,31 +823,31 @@ class TorchDevice:
         return TorchTensor.create_from_torch(value, self), k_new, v_new
 
 
-    def _attention_weights(self, q, k, mask, b, src_s, n_head, head_dim):
+    def _attention_weights(self, q, k, mask, b, src_s, tgt_s, n_head, head_dim):
         # shape: (b * n_head, 1, s)
         attn_weights = torch.bmm(q, k) / math.sqrt(head_dim)
 
         # shape: (b, 1, 1, s)
-        mask = mask.view(b, 1, 1, src_s)
+        mask = mask.view(b, 1, tgt_s, src_s).to(torch.bool)
         
         mask = mask.to(attn_weights.device)
         # shape: (b * n_head, 1, s)
-        attn_weights = attn_weights.view(b, n_head, 1, src_s)
+        attn_weights = attn_weights.view(b, n_head, tgt_s, src_s)
         attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, 1, src_s)
+        attn_weights = attn_weights.view(b * n_head, tgt_s, src_s)
         attn_weights = F.softmax(attn_weights, dim=2)
         return attn_weights
 
     def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
         # shape: (b * n_head, 1, s)
-        attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head, head_dim)
+        attn_weights = self._attention_weights(q, k, mask, b, src_s, tgt_s, n_head, head_dim)
         # shape: (b, n_head, 1, head_dim)
         return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 
     def _sparse_attention_value(self, q, k, v_new, v_cache, mask, b,
                                 src_s, tgt_s, n_head, head_dim, attn_sparsity):
         # shape: (b * n_head, 1, s)
-        attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head, head_dim)
+        attn_weights = self._attention_weights(q, k, mask, b, src_s, tgt_s, n_head, head_dim)
         topk = int(attn_sparsity * (attn_weights.shape[2] - 1))
         topk_weights, topk_indices = attn_weights[:, :, :-1].topk(
             topk, dim=2, sorted=False)

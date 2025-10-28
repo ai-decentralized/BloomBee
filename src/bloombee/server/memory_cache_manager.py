@@ -167,10 +167,10 @@ class KVCacheManager:
         else:
             root_position = kv_cache_position_ids[0]
             prefix_positions = list(range(root_position))  # [0, 1, 2, ..., root-1]
-            idx_all = prefix_positions + kv_cache_position_ids  # 完整序列
+            idx_all = prefix_positions + kv_cache_position_ids.tolist()  # 完整序列
             expected_continuous = list(range(len(idx_all)))
             need_reorder = False if (idx_all == expected_continuous) else True
-        
+            prefix_length = len(idx_all)
 
         # Utility: get underlying torch.Tensor
         def _as_torch(x):

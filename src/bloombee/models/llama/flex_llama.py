@@ -494,6 +494,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # import pdb;pdb.set_trace()---------------------
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start prefill) i={i} k={k}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+            logger.info(f"flex llama, attention_mask: {mask}")
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids)
             cache_write_buf.store((new_k_cache, new_v_cache))
@@ -501,7 +502,9 @@ class FLEX_LlamaAttention(LlamaAttention):
         else:
             # decoding
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start decode) i={i} k={k}")
+            
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
+            logger.info(f"flex llama, attention_mask: {mask}")
             k_cache, v_cache = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
