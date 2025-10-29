@@ -34,6 +34,7 @@ from hivemind.utils.streaming import split_for_streaming
 import bloombee
 from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, ModuleUID
 from bloombee.server.backend import TransformerBackend
+from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
