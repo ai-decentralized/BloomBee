@@ -136,7 +136,8 @@ class _ServerInferenceSession:
             request_metadata.update(self.session_metadata)
         if self._position is not None:
             request_metadata["start_from_position"] = self._position
-        elif self.config.use_server_to_server:
+        # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
+        if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
             if next_servers:
                 request_metadata["next_servers"] = next_servers
@@ -372,7 +373,6 @@ class InferenceSession:
         self._position += n_input_tokens 
         # print(f"lient inference session outputs, inputs: {inputs}")
         outputs = inputs 
-        
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         # print('client inference session outputs ', outputs.shape)
         return outputs

@@ -71,6 +71,9 @@ def main():
     parser.add_argument('--inference_max_length', type=int, default=None,
                         help='Maximum total sequence length permitted per inference, defaults to 16384 tokens. '
                              'Default: 8192 for models with multi-query attention (based on Llama 2, Falcon), 2048 for others')
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Number of sequences to process in parallel (GPU batch size). '
+                             'Default: 1 (no batching). Higher values improve throughput but use more memory.')
     parser.add_argument('--min_batch_size', type=int, default=1,
                         help='Minimum required batch size for all operations (in total tokens)')
     parser.add_argument('--max_batch_size', type=int, default=None,

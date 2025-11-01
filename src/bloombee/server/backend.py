@@ -21,7 +21,6 @@ from bloombee.utils.memory_usage import see_memory_usage
 from pynvml import *
 import logging
 import hashlib
-import time
 
 logger = get_logger(__name__)
 
@@ -205,11 +204,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         inference_info: InferenceMetadata,  # Inference-related metadata
     ) -> Tuple[torch.Tensor, ...]:
         try:
-            step_start_time = time.perf_counter()
             assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]" # Ensure hidden states are 3-dimensional
             batch_size, seq_len, hidden_size = hidden_states.shape
-            
-            # Block-level debug output removed
             
             self._ensure_model_on_device()
             
@@ -313,14 +309,17 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
                 
-                # Block-level output debug removed
-                
                 return (output_hidden_states,) # Return output hidden states
                 
         except Exception as e:
-            # print(f' CRITICAL ERROR in inference_step: {type(e).__name__}: {e}')
-            # import traceback
-            # traceback.print_exc()
+            logger.exception(
+                "inference_step failed for block %s (batch=%s, seq=%s, prefix=%s): %s",
+                self.name,
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                inference_info.prefix_length if 'inference_info' in locals() else None,
+                e,
+            )
             return (hidden_states,)  # Return original input as fallback
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:

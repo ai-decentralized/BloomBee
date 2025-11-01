@@ -75,7 +75,7 @@ async def run_rpc_forward(
         prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
 
     # Run a chain of requested backends
-    for backend, prompt in zip(requested_backends, prompts):
+    for i, (backend, prompt) in enumerate(zip(requested_backends, prompts)):
         if not is_dummy(prompt):
             hidden_states[:, : prompt.shape[1]] += prompt
 
@@ -83,11 +83,13 @@ async def run_rpc_forward(
         priority = prioritizer.prioritize(
             hidden_states, points=points / len(requested_backends), backend=backend, type="forward"
         )
+        
         (hidden_states,) = await backend.forward_pool.submit_task(
             hidden_states,
             active_adapter,
             priority=priority,
         )
+        
         assert isinstance(hidden_states, torch.Tensor)
         assert (
             hidden_states.ndim == 3
@@ -197,6 +199,8 @@ async def iterate_rpc_inference(
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
+        
+        step_num = step_metadata.get("step", 0)
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
@@ -232,7 +236,6 @@ async def iterate_rpc_inference(
         # when user wants to pre-allocate cache or check that server *can* allocate that cache.
         if hidden_states.numel() > 0:
             assert hidden_states.ndim == 3, f"hidden states must be a single 3d tensor"
-            start_compute_time = perf_counter()
             # print('before merge pools ')
             #print_time_now('')
             
@@ -268,17 +271,17 @@ async def iterate_rpc_inference(
                 # print('-=-=-=-=-=-=-=-==-=- not come into can merge pools : ', can_merge_pools)
                 # offload_logger.info(" Using separate pools for inference")
                 
-                for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
+                for i, (backend, uid, handles, prompt) in enumerate(zip(requested_backends, requested_uids, cache_handles, prompts)):
                     # offload_logger.info(f"   - Processing backend: {uid}")
                     # offload_logger.info(f"     - Cache handles: {len(handles)}")
                     
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
+                    
                     (hidden_states,) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
             
             # offload_logger.info(f" Inference computation completed - step {prefix_length}")
-            # end_compute_time = perf_counter()
             # print('the inference computing time ', end_compute_time - start_compute_time)
             # print_time_now('')
         # serialize and send last layer outputs
@@ -296,6 +299,8 @@ async def iterate_rpc_inference(
         # print()
         
         can_push = not has_prompts
+        
+        
         yield output_tensors, can_push, step_metadata
         # print('output_tensors ',output_tensors)
         # prepare for next step

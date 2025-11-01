@@ -148,7 +148,11 @@ def download_llama_weights(model_name, path):
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
     if "llama" in model_name:
-        hf_model_name = "huggyllama/" + model_name
+        # Remove -hf suffix if present, as huggyllama repos don't use it
+        clean_name = model_name.replace("-hf", "")
+        hf_model_name = "huggyllama/" + clean_name
+    else:
+        raise ValueError(f"Invalid model name: {model_name}. Only llama models are supported.")
 
     folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
     bin_files = glob.glob(os.path.join(folder, "*.bin"))

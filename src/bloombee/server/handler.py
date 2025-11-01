@@ -34,6 +34,7 @@ from hivemind.utils.streaming import split_for_streaming
 import bloombee
 from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, ModuleUID
 from bloombee.server.backend import TransformerBackend
+from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
@@ -420,8 +421,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         # print('_push_outputs metadata ', metadata)
         try:
             next_servers = metadata.get("next_servers")
-            # print('---------------------------------------function _push_outputs: next_servers ', next_servers)
+            print(f"[DEBUG] _push_outputs: next_servers={next_servers}")
             if not next_servers:
+                print(f"[DEBUG] _push_outputs: No next_servers, returning early")
                 return
 
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]
@@ -649,8 +651,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         
         # Use KVCacheManager's offloading strategy
         cache_manager = backends[0].cache_manager
-        
-        
+
+        # Enforce server-side batch capacity to avoid silent cache corruption
+        policy = cache_manager.offloading_policy
+        max_supported_batch = policy.gpu_batch_size
+        if batch_size > max_supported_batch:
+            raise AllocationFailed(
+                f"Requested batch size {batch_size} exceeds server capacity "
+                f"{max_supported_batch}. Reduce client batch size or restart the "
+                f"server with a larger --batch_size value."
+            )
+
         # Use the original cache allocation method, but add offloading debug information
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
 
@@ -658,9 +669,9 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"OFFLOAD: requesting KV allocation for {len(backends)} blocks, "
             f"batch={batch_size}, max_length={max_length}"
         )
-        async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
+        async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as raw_handles:
             logger.info("OFFLOAD: allocation completed; entering use_cache region")
-            yield nested_pack(handles, descriptors)
+            yield nested_pack(raw_handles, descriptors)
 
     def _log_request(
         self,

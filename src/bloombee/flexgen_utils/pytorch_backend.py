@@ -299,7 +299,12 @@ class TorchDevice:
 
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         if self.device_type == DeviceType.CPU:
-            pin_memory = True if pin_memory is None else pin_memory
+            # Disable pin_memory on systems without CUDA support (e.g., macOS with MPS)
+            # to avoid MPS kernel compatibility issues
+            if torch.cuda.is_available():
+                pin_memory = True if pin_memory is None else pin_memory
+            else:
+                pin_memory = False
         else:
             pin_memory = False
         if dtype in np_type:

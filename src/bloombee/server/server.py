@@ -121,6 +121,7 @@ class Server:
         use_relay: bool = True,
         use_auto_relay: bool = True,
         adapters: Sequence[str] = (),
+        batch_size: int = 1,
         **kwargs,
     ):
         """Create a server with one or more bloom blocks. See run_server.py for documentation."""
@@ -224,8 +225,14 @@ class Server:
         is_multiquery_attn = self.block_config.num_key_value_groups > 1
         if max_batch_size is None:
             max_batch_size = 8192 if is_multiquery_attn else 2048
+
+        model_max_positions = getattr(self.block_config, "max_position_embeddings", None)
+        default_max_length = 8192 if is_multiquery_attn else 2048
         if inference_max_length is None:
-            inference_max_length = 8192 if is_multiquery_attn else 2048
+            inference_max_length = model_max_positions or default_max_length
+        elif model_max_positions is not None:
+            inference_max_length = min(inference_max_length, model_max_positions)
+
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
         self.inference_max_length = inference_max_length
         self.max_chunk_size_bytes = max_chunk_size_bytes
@@ -260,18 +267,25 @@ class Server:
         self.strict_block_indices, self.num_blocks = block_indices, num_blocks
 
         ##############################################################
-        self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
+        self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
-        # Policy: weights on GPU, KV cache on DISK (100%), activations on CPU
-        # If you want to switch to mixed, change cache_cpu_percent to >0 (the rest will automatically be assigned to disk)
-        # Enable KV cache compression. Start with CPU-only cache for stability.
-        # You can switch to Disk-only by setting cache_cpu_percent=0 and cache_gpu_percent=0, and using disk 100% in env.
-        # Default to GPU-only, no offloading, no compression
+        # Configure resource distribution based on device type
+        if device.type == "cpu":
+            # CPU-only mode: all resources on CPU
+            w_gpu_percent, w_cpu_percent = 0, 100
+            cache_gpu_percent, cache_cpu_percent = 0, 100
+            act_gpu_percent, act_cpu_percent = 0, 100
+        else:
+            # GPU mode: all resources on GPU (default)
+            w_gpu_percent, w_cpu_percent = 100, 0
+            cache_gpu_percent, cache_cpu_percent = 100, 0
+            act_gpu_percent, act_cpu_percent = 100, 0
+
         self.policy = Policy(
-            1, 1,            # gpu_batch_size, num_gpu_batches
-            100, 0,          # w_gpu_percent, w_cpu_percent
-            100, 0,          # cache_gpu_percent, cache_cpu_percent (KV on GPU)
-            100, 0,          # act_gpu_percent, act_cpu_percent (activations on GPU)
+            batch_size, 1,   # gpu_batch_size, num_gpu_batches
+            w_gpu_percent, w_cpu_percent,          # w_gpu_percent, w_cpu_percent
+            cache_gpu_percent, cache_cpu_percent,  # cache_gpu_percent, cache_cpu_percent
+            act_gpu_percent, act_cpu_percent,      # act_gpu_percent, act_cpu_percent
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
             compress_weight=False,
@@ -279,6 +293,16 @@ class Server:
             compress_cache=False,
             comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
         )
+        
+        # 🔍 Batch Size Debug: Log batch size configuration
+        logger.info(f"[BATCH_SIZE_CONFIG] GPU Batch Size: {batch_size}")
+        logger.info(f"[BATCH_SIZE_CONFIG] Min Batch Size: {min_batch_size}")
+        logger.info(f"[BATCH_SIZE_CONFIG] Max Batch Size: {max_batch_size}")
+        logger.info(f"[BATCH_SIZE_CONFIG] Policy GPU Batch Size: {self.policy.gpu_batch_size}")
+        logger.info(f"[BATCH_SIZE_CONFIG] Policy Num GPU Batches: {self.policy.num_gpu_batches}")
+        
+        # Log detailed policy strategy
+        self.policy.log_batch_size_strategy()
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
@@ -331,6 +355,15 @@ class Server:
 
         self.module_container = None
         self.stop = threading.Event()
+        
+        # 🔍 Batch Size Performance Tracking
+        self.batch_size_stats = {
+            'total_requests': 0,
+            'total_tokens': 0,
+            'total_time': 0.0,
+            'batch_sizes': [],
+            'throughput_history': []
+        }
 
     def _choose_num_blocks(self) -> int:
         assert self.device.type in ("cuda", "mps"), (
@@ -441,6 +474,9 @@ class Server:
                     if self._should_choose_other_blocks():
                         logger.info("Swarm is imbalanced, server will load other blocks")
                         break  # Stop serving this set of modules
+                    
+                    # 🔍 Batch Size Debug: Log performance statistics periodically
+                    self.log_batch_size_performance()
             finally:
                 self.module_container.shutdown()
 
@@ -483,6 +519,28 @@ class Server:
 
         module_infos = get_remote_module_infos(self.dht, self.module_uids, latest=True)
         return block_selection.should_choose_other_blocks(self.dht.peer_id, module_infos, self.balance_quality)
+    
+    def log_batch_size_performance(self):
+        """Log batch size performance statistics for debugging"""
+        if self.batch_size_stats['total_requests'] > 0:
+            avg_batch_size = sum(self.batch_size_stats['batch_sizes']) / len(self.batch_size_stats['batch_sizes'])
+            avg_throughput = self.batch_size_stats['total_tokens'] / self.batch_size_stats['total_time'] if self.batch_size_stats['total_time'] > 0 else 0
+            
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Requests: {self.batch_size_stats['total_requests']}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Average Batch Size: {avg_batch_size:.2f}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Average Throughput: {avg_throughput:.1f} tokens/sec")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Tokens: {self.batch_size_stats['total_tokens']}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Time: {self.batch_size_stats['total_time']:.2f}s")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Batch Size Range: {min(self.batch_size_stats['batch_sizes'])}-{max(self.batch_size_stats['batch_sizes'])}")
+            
+            # Analyze batch size efficiency
+            if len(self.batch_size_stats['throughput_history']) > 1:
+                throughput_trend = self.batch_size_stats['throughput_history'][-1] - self.batch_size_stats['throughput_history'][0]
+                logger.info(f"[BATCH_SIZE_TREND] Throughput Trend: {throughput_trend:.1f} tokens/sec change")
+                if throughput_trend < 0:
+                    logger.warning(f"[BATCH_SIZE_WARNING] Throughput is decreasing! Consider adjusting batch size.")
+                else:
+                    logger.info(f"[BATCH_SIZE_SUCCESS] Throughput is improving with current batch size.")
 
     def shutdown(self, timeout: Optional[float] = 5):
         self.stop.set()

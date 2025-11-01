@@ -54,7 +54,7 @@ setup(
         "tokenizers>=0.13.3",  
         "transformers==4.43.1",  
         "speedtest-cli==2.1.3",  
-        "hivemind",  
+        "hivemind @ git+https://github.com/learning-at-home/hivemind.git@213bff98a62accb91f254e2afdccbf1d69ebdea9",  
         "tensor_parallel==1.0.23",  
         "humanfriendly",  
         "async-timeout>=4.0.2",  
@@ -63,8 +63,10 @@ setup(
         "sentencepiece>=0.1.99",  
         "peft==0.8.2",  
         "safetensors>=0.3.1",  
-        "Dijkstar>=2.6.0",  
-        "numpy<2",  
+        "Dijkstar>=2.6.0",
+        "numpy<2",
+        "attrs",
+        "nvidia-ml-py"
     ],  
     extras_require={  
         "dev": [  
