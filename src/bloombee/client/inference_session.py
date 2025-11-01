@@ -139,12 +139,8 @@ class _ServerInferenceSession:
         # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
         if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
-            print(f"[DEBUG] use_server_to_server=True, next_servers={next_servers}")
             if next_servers:
                 request_metadata["next_servers"] = next_servers
-                print(f"[DEBUG] Added next_servers to request_metadata: {request_metadata.get('next_servers')}")
-        else:
-            print(f"[DEBUG] use_server_to_server=False")
 
         request_metadata["args_structure"] = args_structure
 
@@ -337,7 +333,6 @@ class InferenceSession:
 
         server_idx = 0
         block_idx = 0
-        inference_step_start = time.perf_counter()
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
                 logger.debug(f"Inference: block {block_idx}, attempt {attempt_no}")
@@ -349,20 +344,12 @@ class InferenceSession:
                     server_session = self._server_sessions[server_idx]
                     assert server_session.position == self.position, f"{server_session.position} and {self.position}"
                     
-                    # 🔍 CLIENT DEBUG: Log server span processing start
-                    span_start_time = time.perf_counter()
-                    
                     inputs = server_session.step( 
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
                         step_id=step_id,
                     )
-                    
-                    # 🔍 CLIENT DEBUG: Log server span processing end
-                    span_end_time = time.perf_counter()
-                    span_duration = (span_end_time - span_start_time) * 1000  # ms
-                    logger.info(f"[CLIENT_SERVER_END] ServerIdx={server_idx} | Blocks={server_session.span.start}:{server_session.span.end} | Duration={span_duration:.2f}ms")
                     # print('inputs ', inputs)
                     # print('inputs.shape ', inputs.shape)
                     server_idx += 1
@@ -386,13 +373,6 @@ class InferenceSession:
         self._position += n_input_tokens 
         # print(f"lient inference session outputs, inputs: {inputs}")
         outputs = inputs 
-        
-        # 🔍 CLIENT DEBUG: Log inference step end
-        inference_step_end = time.perf_counter()
-        inference_step_duration = (inference_step_end - inference_step_start) * 1000  # ms
-        logger.info(f"[CLIENT_INFERENCE_END] Position={self._position} | Duration={inference_step_duration:.2f}ms | Servers={server_idx}")
-        logger.info("="*80)
-        
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         # print('client inference session outputs ', outputs.shape)
         return outputs

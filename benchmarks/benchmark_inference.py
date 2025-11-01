@@ -147,9 +147,6 @@ def benchmark_inference(process_idx, args, result_pipe):
     logger.info(f"[DEBUG] {process_idx=} prompt_length={prompt_length}, generating {args.seq_len} tokens, total_max_length={total_max_length}")
     
     step_times = []
-    step_latencies = []  # Track individual step latencies for cross-GPU analysis
-    cross_gpu_latencies = []  # Track cross-GPU transfer latencies
-    server_processing_latencies = []  # Track server processing latencies
     
     with model.transformer.h.inference_session(max_length=total_max_length) as sess:
         logger.info(f"[DEBUG] {process_idx=} Created inference session with max_length={total_max_length}")
@@ -163,17 +160,7 @@ def benchmark_inference(process_idx, args, result_pipe):
                 logger.info(f"[DEBUG] {process_idx=} {step=} First step, passing input_ids.shape={input_ids.shape}")
                 outputs = model.generate(input_ids, max_new_tokens=1, session=sess)
             else:
-                logger.info(f"[DEBUG] {process_idx=} {step=} Subsequent step, using session state")
                 outputs = model.generate(max_new_tokens=1, session=sess)
-            
-            step_end_time = perf_counter()
-            step_latency_ms = (step_end_time - step_start_time) * 1000
-            step_latencies.append(step_latency_ms)
-            
-            # Enhanced logging for cross-GPU analysis
-            logger.info(f"[STEP_LATENCY] Process={process_idx} | Step={step} | "
-                       f"Latency={step_latency_ms:.2f}ms | BatchSize={batch_size}")
-            logger.info(f"[DEBUG] {process_idx=} {step=} After generate, outputs.shape={outputs.shape}")
             
             # Log generated tokens for all sequences in the batch
             for batch_idx in range(outputs.shape[0]):
@@ -189,77 +176,11 @@ def benchmark_inference(process_idx, args, result_pipe):
                 # Report speed per sequence (total tokens / time) 
                 effective_speed = speed * batch_size
                 logger.info(f"{process_idx=} {step=} {speed=:.2f} tokens/sec/sequence, effective={effective_speed:.2f} tokens/sec")
-                
-                # Collect latencies for analysis
-                cross_gpu_latencies.append(step_latency_ms)
-                server_processing_latencies.append(step_latency_ms)
         
-        # Calculate and log statistics
-        warmup_latencies = step_latencies[args.warmup_steps:]
-        warmup_cross_gpu_latencies = cross_gpu_latencies[args.warmup_steps:]
-        warmup_server_processing_latencies = server_processing_latencies[args.warmup_steps:]
-        
-        if warmup_latencies:
-            mean_latency = np.mean(warmup_latencies)
-            median_latency = np.median(warmup_latencies)
-            p95_latency = np.percentile(warmup_latencies, 95)
-            p99_latency = np.percentile(warmup_latencies, 99)
-            min_latency = np.min(warmup_latencies)
-            max_latency = np.max(warmup_latencies)
-            
-            # Cross-GPU Transfer Latency statistics
-            if warmup_cross_gpu_latencies:
-                cross_gpu_mean = np.mean(warmup_cross_gpu_latencies)
-                cross_gpu_median = np.median(warmup_cross_gpu_latencies)
-                cross_gpu_p95 = np.percentile(warmup_cross_gpu_latencies, 95)
-                cross_gpu_p99 = np.percentile(warmup_cross_gpu_latencies, 99)
-            
-            # Server Processing Latency statistics
-            if warmup_server_processing_latencies:
-                server_mean = np.mean(warmup_server_processing_latencies)
-                server_median = np.median(warmup_server_processing_latencies)
-                server_p95 = np.percentile(warmup_server_processing_latencies, 95)
-                server_p99 = np.percentile(warmup_server_processing_latencies, 99)
-            
-            logger.info(f"\n{'='*80}")
-            logger.info(f"[PERFORMANCE_SUMMARY] Process={process_idx}")
-            logger.info(f"{'='*80}")
-            
-            # Overall Latency Summary
-            logger.info(f"[OVERALL_LATENCY]")
-            logger.info(f"  Mean:   {mean_latency:.2f}ms")
-            logger.info(f"  Median: {median_latency:.2f}ms")
-            logger.info(f"  P95:    {p95_latency:.2f}ms")
-            logger.info(f"  P99:    {p99_latency:.2f}ms")
-            logger.info(f"  Min:    {min_latency:.2f}ms")
-            logger.info(f"  Max:    {max_latency:.2f}ms")
-            
-            # Cross-GPU Transfer Latency Summary
-            if warmup_cross_gpu_latencies:
-                logger.info(f"\n[CROSS_GPU_TRANSFER_LATENCY]")
-                logger.info(f"  Mean:   {cross_gpu_mean:.2f}ms")
-                logger.info(f"  Median: {cross_gpu_median:.2f}ms")
-                logger.info(f"  P95:    {cross_gpu_p95:.2f}ms")
-                logger.info(f"  P99:    {cross_gpu_p99:.2f}ms")
-            
-            # Server Processing Latency Summary
-            if warmup_server_processing_latencies:
-                logger.info(f"\n[SERVER_PROCESSING_LATENCY]")
-                logger.info(f"  Mean:   {server_mean:.2f}ms")
-                logger.info(f"  Median: {server_median:.2f}ms")
-                logger.info(f"  P95:    {server_p95:.2f}ms")
-                logger.info(f"  P99:    {server_p99:.2f}ms")
-            
-            logger.info(f"{'='*80}\n")
-    
     # Show final generated text for each batch
-    logger.info(f"\n{'='*80}")
-    logger.info(f"[FINAL RESULTS] {process_idx=}")
-    logger.info(f"{'='*80}")
     for batch_idx in range(temp_result_tokens.shape[0]):
         full_text = tokenizer.decode(temp_result_tokens[batch_idx], skip_special_tokens=True)
         logger.info(f"\nbatch[{batch_idx}] Full generated text:\n{full_text}\n")
-    logger.info(f"{'='*80}\n")
     
     result_pipe.send(speed)
 
