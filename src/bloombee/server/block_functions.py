@@ -194,7 +194,7 @@ async def iterate_rpc_inference(
 
         hidden_states, prompts, hypo_ids, combined_mask, *_ = flat_tensors
         
-        logger.info(f"combined_mask shape: {combined_mask.shape}, combined_mask: {combined_mask}")
+        # logger.info(f"combined_mask shape: {combined_mask.shape}, combined_mask: {combined_mask}")
         
         # combined_mask: [B, H, W] 例如 [1, 33, 30]
         # 约定：[-3] 行为 KV，[-2]、[-1] 行为 Draft，其它行为 tree_attention_mask
@@ -345,7 +345,7 @@ async def iterate_rpc_inference(
             # print('the inference computing time ', end_compute_time - start_compute_time)
             # print_time_now('')
         # serialize and send last layer outputs
-        logger.info(f"before _prune_draft_tree, hidden_states shape: {hidden_states.shape}, full_mask: {full_mask}")
+        # logger.info(f"before _prune_draft_tree, hidden_states shape: {hidden_states.shape}, full_mask: {full_mask}")
         hidden_states, keep_indices = _prune_draft_tree(hidden_states, draft_tokens, full_mask)
         logger.info(f"after _prune_draft_tree, hidden_states shape: {hidden_states.shape}")
         logger.info(f"keep_indices: {keep_indices}")
@@ -387,7 +387,7 @@ def _prune_draft_tree(hidden_states: torch.Tensor, draft_tokens: torch.Tensor, t
         config = PruningConfig(
             method=PruningMethod.SIMPLE_PROBABILITY,
             neural_threshold=0.5,
-            simple_threshold=0.3
+            simple_threshold=-100
         )
         
         # Create manager

@@ -40,7 +40,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
-        max_new_tokens: int = 128,
+        max_new_tokens: int = 64,
         **model_kwargs,
     ) -> torch.LongTensor:
         
@@ -52,7 +52,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         generation_config.return_dict_in_generate = False
 
         # Calculate session max length - this is critical for distributed inference
-        session_max_length = 1280
+        session_max_length = 4096
 
         # Use inference session for proper distributed caching
         with self.transformer.h.inference_session(max_length=session_max_length) as session:
@@ -170,6 +170,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             trees, input_ids, input_ids.device
         )
         
+        logger.info(f"[DEBUG] Tree tokens: {tree_tokens}")
+        
         if attention_mask is None or tree_tokens.shape[1] == 0:
             logger.warning("No tree tokens to verify, falling back to regular generation")
             return self._fallback_generation_with_forward(input_ids, logits_processor, past_key_values), past_key_values
@@ -245,6 +247,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         verified_tokens, verified_tokens_positions, llm_generated_token = self._extract_best_verified_paths_fixed(
             logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1]
         )
+        logger.info(f"verified_tokens: {verified_tokens},  verified_tokens_positions: {verified_tokens_positions},  llm_generated_token: {llm_generated_token}")
         return verified_tokens, verified_tokens_positions, new_past_key_values, llm_generated_token
     
     def pack_bool_mask_to_int64(self, mask_bool: torch.Tensor) -> torch.Tensor:
@@ -407,6 +410,9 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         fallback_pos = max(0, logits.shape[1] - total_tree_tokens)
         tree_root_position = input_ids.shape[1] - 1
         
+        logger.info(f"_extract_best_verified_paths_fixed, logits: {logits}")
+        logger.info(f"_extract_best_verified_paths_fixed, input_ids: {input_ids}")
+        
         node_paths = batch_node_paths[0]
         best_verified = []
         best_positions = []
@@ -432,14 +438,22 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 best_score = len(verified_tokens)
                 best_verified = verified_tokens
                 best_positions = verified_positions
+                
+        logger.info(f"_extract_best_verified_paths_fixed, best_verified: {best_verified}, best_positions: {best_positions}, logits: {logits.shape}, fallback_pos: {fallback_pos}, input_ids.shape: {input_ids.shape}")
         
         if len(best_verified) == 0:
             final_logits = logits[0, fallback_pos-1:fallback_pos]  # 取单个位置的logits
+            logger.info(f"final_logits: {final_logits}")
             processed_logits = final_logits
             for processor in logits_processor:
                 processed_logits = processor(input_ids, processed_logits)
+                
+            top5_values, top5_indices = torch.topk(final_logits[0], k=5)
+            logger.info(f"Top 5 tokens: {top5_indices.tolist()}")
+            logger.info(f"Top 5 values: {top5_values.tolist()}")
             
             next_token = torch.argmax(logits[0, fallback_pos-1]).item()
+            logger.info(f"next_token: {next_token}")
             kv_cache_position_ids = torch.tensor([tree_root_position], 
                                             device=logits.device)
             llm_generated_token = torch.tensor([next_token], device=logits.device)

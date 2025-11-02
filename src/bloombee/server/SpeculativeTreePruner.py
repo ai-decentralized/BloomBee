@@ -173,12 +173,12 @@ class SimpleProbabilityPruner(PrunerInterface):
                 scores[i] = 0.0  # Set score to 0 for discarded nodes
                 continue
             
-            logger.info(f"draft_tokens[i]: {draft_tokens[i]}")
+            # logger.info(f"draft_tokens[i]: {draft_tokens[i]}")
             
             # Get token probability
             token_prob = probs[0, i, draft_tokens[i]]
             
-            logger.info(f"probs shape : {probs.shape}, tree_attention_mask shape: {tree_attention_mask.shape}")
+            # logger.info(f"probs shape : {probs.shape}, tree_attention_mask shape: {tree_attention_mask.shape}")
             
             # Calculate score with optional adjustments
             score = token_prob
@@ -194,7 +194,7 @@ class SimpleProbabilityPruner(PrunerInterface):
             # depth_factor = 1.0 - (depth * 0.1)
             # score = score * max(depth_factor, 0.5)
                 
-            logger.info(f"current node score: {score}")
+            # logger.info(f"current node score: {score}")
             
             scores[i] = score
             

@@ -230,16 +230,20 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # Initialize output states
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
                 # Centralized select: aggregate + reorder + slice
-                selected = self.cache_manager.select_cache(
+                k_pkv, v_pkv, need_reorder = self.cache_manager.select_cache(
                     prefix_length=inference_info.prefix_length,
                     hypo_ids=hypo_ids,
                     kv_cache_position_ids=inference_info.kv_cache_position_ids
                 )
-                layer_past = selected
+                layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
+                if need_reorder:
+                    self.cache_manager.write_pkv_cache(
+                        k_pkv=k_pkv,
+                        v_pkv=v_pkv,
+                        start_position=0  # 从头覆盖整个 cache
+                    )
                 
-                past_key_values_length = 0
-                if layer_past is not None and len(layer_past) > 0:
-                    past_key_values_length = layer_past[0].shape[2]
+                past_key_values_length = k_pkv.shape[2] if k_pkv is not None else 0
                     
                 logger.info(f"past_key_values_length: {past_key_values_length}")
                     
@@ -250,10 +254,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     device=hidden_states.device,
                 )
                 
-                logger.info(f"full_mask: {full_mask.shape}")
-                # attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
-                attention_mask = full_mask
-                
+                # logger.info(f"full_mask: {full_mask}")
+                attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                # logger.info(f"attention_mask: {attention_mask}")
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
                     # print('transformer backend inference step() offset ', offset )
@@ -270,11 +273,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     
                     # Add offset to cached base tensor (avoids creating new tensor)
                     position_ids = self._position_ids_cache[cache_key] + (past_key_values_length + offset)
+                    
+                    logger.info(f"hidden states in backend before compute: {hidden_states}")
 
-                    logger.info(f"Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}")
+                    # logger.info(f"Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}")
                     rotary_position_ids = self._create_tree_position_ids(2, 4, past_key_values_length, device='cuda:0') if inference_info.tree_attention_mask is not None else None
                     
-                    logger.info(f"rotary_position_ids: {rotary_position_ids}, hidden_states_chunk: {hidden_states_chunk.shape}")
+                    # logger.info(f"rotary_position_ids: {rotary_position_ids}, hidden_states_chunk: {hidden_states_chunk.shape}")
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
                         # print(f' About to call module.forward with position_ids...')
@@ -320,7 +325,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
 
-                # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
+                logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
                 return (output_hidden_states, full_mask) # Return output hidden states

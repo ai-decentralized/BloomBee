@@ -652,8 +652,10 @@ class TorchDevice:
 
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
-        # import pdb; pdb.set_trace()
+        
         hidden = rms_norm(hidden_states.data, input_layernorm.data)
+        
+        logger.info(f"after norm, hidden states: {hidden}")
 
         q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
@@ -663,30 +665,49 @@ class TorchDevice:
         k = k.view(bsz, q_len, num_attention_heads, head_dim)
         v = v.view(bsz, q_len, num_attention_heads, head_dim)
         
+        logger.info(f"after projection, query_states: {q}")
+        logger.info(f"after projection, key_states: {k}")
+        logger.info(f"after projection, value_states: {v}")
+        
         q, k = apply_rotary_emb(q, k, freqs_cis=freq_cis[:q_len])
+        
+        logger.info(f"after rotary, query_states: {q}")
+        logger.info(f"after rotary, key_states: {k}")
 
         # (b * n_head, s, d), (b * n_head, d, s), (b * n_head, s, d)
         q = q.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
         k = k.permute(0, 2, 3, 1).reshape(bsz * num_attention_heads, head_dim, q_len)
         v = v.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
+        
+        attn_scores = torch.bmm(q, k) / math.sqrt(head_dim)  # [b*n_h, q_len, q_len]
 
-        attn_weights = torch.bmm(q, k) / math.sqrt(head_dim)
+        # logger.info(f"attention_mask: {attention_mask.shape}")
+        # logger.info(f"attention_mask: {attention_mask.data}")
 
-        idx = torch.arange(q_len, device=self.dev)
-        causal_mask = (idx <= idx.view(q_len, 1)).view(1, 1, q_len, q_len)
-        mask = attention_mask.data.view(bsz, 1, q_len, q_len).to(torch.bool) & causal_mask
+        # ===== 关键修复：mask 已经是加性格式，直接加到 scores 上 =====
+        # mask shape: [bsz, 1, q_len, q_len]
+        # attn_scores shape: [bsz*n_h, q_len, q_len] -> reshape to [bsz, n_h, q_len, q_len]
+        
+        attn_scores = attn_scores.view(bsz, num_attention_heads, q_len, q_len)
+        
+        # 直接加上 mask（0 表示可见，-65504 表示 mask）
+        # mask 的 shape [bsz, 1, q_len, q_len] 会自动广播到 [bsz, n_h, q_len, q_len]
+        attn_scores = attn_scores + attention_mask.data
+        
+        logger.info(f"attn_scores after adding mask: {attn_scores}")
+        
+        # 转换为 float32 做 softmax（数值更稳定）
+        attn_scores = attn_scores.to(torch.float32)
+        attn_weights = F.softmax(attn_scores, dim=-1).to(q.dtype)  # [B, n_h, q_len, q_len]
+        
+        logger.info(f"after softmax, attn_weights: {attn_weights}")
 
-        attn_weights = attn_weights.view(bsz, num_attention_heads, q_len, q_len)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        # 计算输出
         attn_weights = attn_weights.view(bsz * num_attention_heads, q_len, q_len)
-
-        attn_weights = F.softmax(attn_weights.to(torch.float32), dim=2).to(q.dtype)
-
         value = torch.bmm(attn_weights, v).view(bsz, num_attention_heads, q_len, head_dim)
         value = value.transpose(1, 2).reshape(bsz, q_len, h)
 
         value = F.linear(value, w_out.data)
-
         value.add_(hidden_states.data)
 
         if donate[0]: hidden_states.delete()
@@ -702,6 +723,7 @@ class TorchDevice:
         else:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
+
         return TorchTensor.create_from_torch(value, self), k, v
     
     def mha_gen_llama(self, inputs, attention_mask, w_q, w_k, w_v,
@@ -722,6 +744,8 @@ class TorchDevice:
         scaling = head_dim ** -0.5
 
         hidden = rms_norm(inputs.data, input_layernorm.data)
+        
+        logger.info(f"after norm, hidden states: {hidden}")
 
         # shape: (b, 1, h)
         q = F.linear(hidden, w_q.data)
@@ -733,6 +757,10 @@ class TorchDevice:
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
         
+        logger.info(f"after projection, query_states: {q}")
+        logger.info(f"after projection, key_states: {k}")
+        logger.info(f"after projection, value_states: {v}")
+        
         logger.info(f"attention_mask: {attention_mask.shape}")
         logger.info(f"inputs: {inputs.shape}")
         logger.info(f"freq_cis: {freq_cis.shape}")
@@ -742,7 +770,10 @@ class TorchDevice:
         
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
         
-         # shape: (b * n_head, 1, head_dim)
+        logger.info(f"after rotary, query_states: {q}")
+        logger.info(f"after rotary, key_states: {k}")
+        
+        # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
         # shape: (1, b * n_head, head_dim)
         k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
@@ -824,24 +855,38 @@ class TorchDevice:
 
 
     def _attention_weights(self, q, k, mask, b, src_s, tgt_s, n_head, head_dim):
-        # shape: (b * n_head, 1, s)
-        attn_weights = torch.bmm(q, k) / math.sqrt(head_dim)
+        """
+        计算 attention weights
+        mask 格式：加性 mask，其中 0.0 表示可见，-65504(或其他大负数) 表示 mask
+        """
 
-        # shape: (b, 1, 1, s)
-        mask = mask.view(b, 1, tgt_s, src_s).to(torch.bool)
+        # shape: (b * n_head, tgt_s, src_s)
+        attn_scores = torch.bmm(q, k) / math.sqrt(head_dim)
         
-        mask = mask.to(attn_weights.device)
-        # shape: (b * n_head, 1, s)
-        attn_weights = attn_weights.view(b, n_head, tgt_s, src_s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        # reshape 到 [b, n_head, tgt_s, src_s] 以便和 mask 广播
+        attn_scores = attn_scores.view(b, n_head, tgt_s, src_s).to(torch.float32)
+        
+        # ===== 关键修复：直接加上 mask，不要转 bool =====
+        # mask shape: [b, 1, tgt_s, src_s] 会自动广播到 [b, n_head, tgt_s, src_s]
+        mask_expanded = mask.view(b, 1, tgt_s, src_s).to(attn_scores.device)
+        attn_scores = attn_scores + mask_expanded  # 直接相加
+        
+        logger.info(f"attn_scores after adding mask: {attn_scores}")
+        
+        # softmax 在 fp32，数值更稳定
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [b, n_head, tgt_s, src_s]
+        
+        logger.info(f"after softmax, attn_weights: {attn_weights}")
         attn_weights = attn_weights.view(b * n_head, tgt_s, src_s)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        return attn_weights
+        
+        # 回到 q 的 dtype（fp16/bf16）
+        return attn_weights.to(q.dtype)
+
 
     def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
-        # shape: (b * n_head, 1, s)
+        # shape: (b * n_head, tgt_s, src_s)
         attn_weights = self._attention_weights(q, k, mask, b, src_s, tgt_s, n_head, head_dim)
-        # shape: (b, n_head, 1, head_dim)
+        # shape: (b, n_head, tgt_s, head_dim)
         return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 
     def _sparse_attention_value(self, q, k, v_new, v_cache, mask, b,

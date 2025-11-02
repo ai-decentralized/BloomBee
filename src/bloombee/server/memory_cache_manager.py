@@ -142,7 +142,7 @@ class KVCacheManager:
         """
         assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
         if prefix_length <= 0:
-            return None
+            return None, None, False
 
         cache_tensors = self._active_cache_tensors_stack[-1]
         (k_cache, v_cache), = cache_tensors
@@ -230,7 +230,7 @@ class KVCacheManager:
         #     # hypo_ids: shape (B,)
         #     k_pkv = k_pkv.index_select(0, hypo_ids)
         #     v_pkv = v_pkv.index_select(0, hypo_ids)
-        return k_pkv, v_pkv
+        return k_pkv, v_pkv, need_reorder
 
 
     
@@ -330,6 +330,41 @@ class KVCacheManager:
         # Actual write (compatible with COMPRESSED / MIXED / DISK etc.)
         general_copy(k_cache, dst_idx, k_src_tt, None)
         general_copy(v_cache, dst_idx, v_src_tt, None)
+        
+    def write_pkv_cache(self, k_pkv: torch.Tensor, v_pkv: torch.Tensor, start_position: int = 0) -> None:
+        """
+        Write PKV format cache back to internal cache storage
+        
+        Args:
+            k_pkv: (B, H, S, D) - standard PKV format key cache
+            v_pkv: (B, H, S, D) - standard PKV format value cache
+            start_position: starting position in the cache to write to
+        """
+        assert self._active_cache_tensors_stack, "write_pkv_cache called outside of use_cache context"
+        
+        B, H, S, D = k_pkv.shape
+        BH = B * H
+        
+        logger.info(f"write_pkv_cache: B={B}, H={H}, S={S}, D={D}, start_position={start_position}")
+        
+        # Convert PKV format (B, H, S, D) to write format
+        # Target format for _write_kvs:
+        #   key:   (B*H, D, S)
+        #   value: (B*H, S, D)
+        
+        # Method 1: Direct reshape and permute
+        k_write = k_pkv.reshape(BH, S, D).permute(0, 2, 1)  # (B, H, S, D) -> (B*H, S, D) -> (B*H, D, S)
+        v_write = v_pkv.reshape(BH, S, D)                    # (B, H, S, D) -> (B*H, S, D)
+        
+        logger.info(f"k_write shape: {k_write.shape}, v_write shape: {v_write.shape}")
+        
+        # Call internal write method
+        self._write_kvs(
+            kvs=(k_write, v_write),
+            start_position=start_position
+        )
+        
+        logger.info(f"Successfully wrote PKV cache at position {start_position}")
 
 
         

@@ -776,14 +776,14 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
                     past_key_values_length=past_key_values_length,
                 )
             attention_mask = self._attention_mask_cache[cache_key]
-        else:
-            # If attention_mask is provided, prepare it (don't cache custom masks)
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask=attention_mask,
-                input_shape=(batch_size, seq_length),
-                inputs_embeds=hidden_states,
-                past_key_values_length=past_key_values_length,
-            )
+        # else:
+        #     # If attention_mask is provided, prepare it (don't cache custom masks)
+        #     attention_mask = _prepare_4d_causal_attention_mask(
+        #         attention_mask=attention_mask,
+        #         input_shape=(batch_size, seq_length),
+        #         inputs_embeds=hidden_states,
+        #         past_key_values_length=past_key_values_length,
+        #     )
 
         if attention_mask.dim() == 3:
             attention_mask = attention_mask.unsqueeze(1)

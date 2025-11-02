@@ -130,12 +130,12 @@ class _ServerInferenceSession:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        logger.info(f"kv_cache_position_ids: {kv_cache_position_ids}, draft_tokens: {draft_tokens}")
+        # logger.info(f"kv_cache_position_ids: {kv_cache_position_ids}, draft_tokens: {draft_tokens}")
         combined_mask = self._pack_kv_into_tree_mask(tree_attention_mask, kv_cache_position_ids, draft_tokens)
-        logger.info(f"combined_mask: {combined_mask}")
+        # logger.info(f"combined_mask: {combined_mask}")
         input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, combined_mask)
-        logger.info(f"client inference session step() input_tensors after packing {input_tensors}")
-        logger.info(f"client inference session step() input_tensors after packing shape: {input_tensors[0].shape}")
+        # logger.info(f"client inference session step() input_tensors after packing {input_tensors}")
+        # logger.info(f"client inference session step() input_tensors after packing shape: {input_tensors[0].shape}")
         logger.info(f"_ServerInferenceSession  step id {step_id}")
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
@@ -191,7 +191,7 @@ class _ServerInferenceSession:
         original_dtype = tree_attention_mask.dtype
         device = tree_attention_mask.device
         
-        logger.info(f"tree_attention_mask, shape: {tree_attention_mask.shape}, mask: {tree_attention_mask}")
+        # logger.info(f"tree_attention_mask, shape: {tree_attention_mask.shape}, mask: {tree_attention_mask}")
 
         # shape (B, 1, seq_len)
         extra_row_shape = (original_shape[0], 1) + original_shape[2:]
@@ -400,6 +400,9 @@ class InferenceSession:
 
         server_idx = 0
         block_idx = 0
+        
+        logger.info(f"hidden states in inference session: {inputs}")
+        
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
                 logger.debug(f"Inference: block {block_idx}, attempt {attempt_no}")
