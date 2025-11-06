@@ -427,6 +427,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 
                 predicted_token = torch.argmax(logits[0, pos]).item()
                 
+                current_logits = logits[0, node.position_in_sequence + 1]
+                
+                if (torch.all(current_logits == 0)):
+                    break
+                
                 if predicted_token == node.token_id:
                     verified_tokens.append(node.token_id)
                     absolute_position = tree_root_position + node.position_in_sequence + 1
@@ -452,7 +457,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             logger.info(f"Top 5 tokens: {top5_indices.tolist()}")
             logger.info(f"Top 5 values: {top5_values.tolist()}")
             
-            next_token = torch.argmax(logits[0, fallback_pos-1]).item()
+            next_token = torch.argmax(final_logits[0]).item()
             logger.info(f"next_token: {next_token}")
             kv_cache_position_ids = torch.tensor([tree_root_position], 
                                             device=logits.device)
@@ -461,14 +466,22 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         
         verified_tensor = torch.tensor([best_verified], device=logits.device)  # [1, num_verified]
         pos = best_positions[-1] - tree_root_position
-        final_logits = logits[0, pos - 1:pos]  # 取单个位置的logits
+        final_logits = logits[0, pos]  # 取单个位置的logits
+        logger.info(f"pos: {pos}, tree_root_position: {tree_root_position}")
+        logger.info(f"final_logits: {final_logits}")
+        top5_values, top5_indices = torch.topk(final_logits, k=5)
+        logger.info(f"Top 5 tokens: {top5_indices.tolist()}")
+        logger.info(f"Top 5 values: {top5_values.tolist()}")
+        
         processed_logits = final_logits
         for processor in logits_processor:
             processed_logits = processor(input_ids, processed_logits)
-        next_token = torch.argmax(logits[0, pos]).item()
+        next_token = torch.argmax(final_logits).item()
+        logger.info(f"next_token: {next_token}")
         llm_generated_token = torch.tensor([next_token], device=logits.device)
         
         all_positions = [tree_root_position] + best_positions
         kv_cache_position_ids = torch.tensor(all_positions, device=logits.device)
+        logger.info(f"kv_cache_position_ids: {kv_cache_position_ids}")
 
         return verified_tensor, kv_cache_position_ids, llm_generated_token

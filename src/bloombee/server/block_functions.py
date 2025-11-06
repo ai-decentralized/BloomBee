@@ -387,7 +387,7 @@ def _prune_draft_tree(hidden_states: torch.Tensor, draft_tokens: torch.Tensor, t
         config = PruningConfig(
             method=PruningMethod.SIMPLE_PROBABILITY,
             neural_threshold=0.5,
-            simple_threshold=-100
+            simple_threshold=0.1
         )
         
         # Create manager

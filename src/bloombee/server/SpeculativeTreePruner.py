@@ -146,15 +146,19 @@ class SimpleProbabilityPruner(PrunerInterface):
             tree_attention_mask: [seq_len, seq_len] - encodes tree structure
         """
         
-        seq_len = len(draft_tokens)
+        seq_len = middle_hidden_states.shape[1]
+        
+        prefix_len = tree_attention_mask.shape[2] - seq_len
         
         # Get middle layer logits and probabilities
+        logger.info(f"draft_tokens: {draft_tokens}")
         logger.info(f"middle_hidden_states: {middle_hidden_states}")
         middle_logits = self.lm_head(middle_hidden_states)
         logger.info(f"middle_logits: {middle_logits}")
         probs = F.softmax(middle_logits, dim=-1)
         logger.info(f"probs: {probs}")
-        logger.info(f"tree_attention_mask : {tree_attention_mask}")
+        logger.info(f"seq_len: {seq_len}")
+        logger.info(f"tree_attention_mask : {tree_attention_mask.shape}, {tree_attention_mask}")
         
         # Initialize keep mask (all True initially)
         keep_mask = torch.ones(seq_len, dtype=torch.bool)
@@ -179,22 +183,7 @@ class SimpleProbabilityPruner(PrunerInterface):
             token_prob = probs[0, i, draft_tokens[i]]
             
             # logger.info(f"probs shape : {probs.shape}, tree_attention_mask shape: {tree_attention_mask.shape}")
-            
-            # Calculate score with optional adjustments
             score = token_prob
-            
-            if self.config.simple_use_entropy:
-                # Adjust score based on entropy (higher entropy = less confident)
-                entropy = -torch.sum(probs[i] * torch.log(probs[i] + 1e-10))
-                normalized_entropy = entropy / torch.log(torch.tensor(float(self.vocab_size)))
-                score = token_prob * (1.0 - 0.3 * normalized_entropy)
-            
-            # Apply depth penalty (depth = number of ancestors)
-            # depth = torch.sum(tree_attention_mask[i, :i]).item()
-            # depth_factor = 1.0 - (depth * 0.1)
-            # score = score * max(depth_factor, 0.5)
-                
-            # logger.info(f"current node score: {score}")
             
             scores[i] = score
             
@@ -206,44 +195,62 @@ class SimpleProbabilityPruner(PrunerInterface):
                 # Mark all descendants as discarded
                 # Descendants are nodes j > i where j can attend to i
                 for j in range(i + 1, seq_len):
-                    if tree_attention_mask[0, j, i] == 1:
+                    if tree_attention_mask[0, j, i + prefix_len] == 1:
                         discarded[j] = True
                         keep_mask[j] = False
         
         # Ensure minimum branches are kept
         kept_count = keep_mask.sum().item()
+        logger.info(f"prune_branches keep_mask: {keep_mask}")
+        logger.info(f"prune_branches discarded: {discarded}")
+        logger.info(f"prune_branches kept_count: {kept_count}")
+        # logger.info(f"prune_branches tree_attention_mask: {tree_attention_mask}")
         if kept_count < self.config.min_keep_branches:
-            # Find leaf nodes (nodes with no children)
-            leaf_nodes = []
-            for i in range(seq_len):
-                is_leaf = True
-                for j in range(i + 1, seq_len):
-                    if tree_attention_mask[0, j, i] == 1:  # j is child of i
-                        is_leaf = False
-                        break
-                if is_leaf:
-                    leaf_nodes.append(i)
+            # Initialize all nodes as potential leaf nodes
+            is_leaf = torch.ones(seq_len, dtype=torch.bool)
             
-            # Sort leaf nodes by their scores
-            leaf_scores = [(scores[i].item(), i) for i in leaf_nodes]
-            leaf_scores.sort(reverse=True)
+            # Store leaf nodes with their path scores
+            leaf_paths = []  # List of (score, leaf_idx, path_indices)
+            
+            # Traverse from back to front
+            for i in range(seq_len - 1, -1, -1):
+                if is_leaf[i]:
+                    # This is a leaf node, calculate its path score
+                    path_indices = [i]
+                    path_score = scores[i].item()
+                    
+                    # Find all ancestors of node i (from i-1 to 0)
+                    for j in range(i - 1, -1, -1):
+                        # Check if j is an ancestor of i
+                        if tree_attention_mask[0, i, j + prefix_len] == 1:
+                            # Mark j as non-leaf (it has descendants)
+                            is_leaf[j] = False
+                            
+                            # Add to path
+                            path_indices.append(j)
+                            # Multiply path score
+                            path_score *= scores[j].item()
+                    
+                    # Save this leaf and its path score
+                    path_indices.reverse()  # Order from root to leaf
+                    leaf_paths.append((path_score, i, path_indices))
+            
+            # Sort leaf nodes by path score (high to low)
+            logger.info(f"prune_branches is_leaf : {is_leaf}")
+            leaf_paths.sort(key=lambda x: x[0], reverse=True)
+            logger.info(f"prune_branches leaf_paths : {leaf_paths}")
             
             # Keep top branches (complete paths from root to leaf)
-            keep_mask = torch.zeros(seq_len, dtype=torch.bool)
+            # keep_mask = torch.zeros(seq_len, dtype=torch.bool)
             branches_kept = 0
             
-            for score, leaf_idx in leaf_scores:
+            for path_score, leaf_idx, path_indices in leaf_paths:
                 if branches_kept >= self.config.min_keep_branches:
                     break
                 
-                # Keep this leaf and all its ancestors
-                current = leaf_idx
-                keep_mask[current] = True
-                
-                # Trace back to root and keep all ancestors
-                for j in range(leaf_idx):
-                    if tree_attention_mask[0, leaf_idx, j] == 1:
-                        keep_mask[j] = True
+                # Keep all nodes in this path
+                for idx in path_indices:
+                    keep_mask[idx] = True
                 
                 branches_kept += 1
         
@@ -273,22 +280,15 @@ class SimpleProbabilityPruner(PrunerInterface):
         self.total_branches += seq_len
         self.pruned_branches += len(prune_indices)
         
-        # Create new attention mask for kept nodes
-        # new_attention_mask = self._create_pruned_attention_mask(
-        #     tree_attention_mask, keep_indices
-        # )
-        
         return {
             'keep_indices': keep_indices,
             'prune_indices': prune_indices,
             'keep_probs': scores.tolist(),
             'keep_mask': keep_mask,
-            # 'new_attention_mask': new_attention_mask,
             'metadata': {
                 'middle_logits': middle_logits,
                 'threshold_used': self.config.simple_threshold,
                 'avg_score': scores[keep_mask].mean().item() if keep_mask.any() else 0.0,
-                # 'depth_distribution': self._get_depth_distribution(tree_attention_mask, keep_mask)
             }
         }
     
