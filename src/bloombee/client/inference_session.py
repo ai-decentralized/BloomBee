@@ -159,8 +159,12 @@ class _ServerInferenceSession:
         ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
         # Serialize and send data (debug output removed for performance)
+        # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
         serialized_tensors = [
-            serialize_torch_tensor(tensor.to(proto.dtype), proto.compression)
+            serialize_torch_tensor(
+                tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
+                proto.compression
+            )
             for tensor, proto in zip(input_tensors, inference_schema)
         ]
         serialized_metadata = MSGPackSerializer.dumps(request_metadata)

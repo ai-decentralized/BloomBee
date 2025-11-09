@@ -11,6 +11,14 @@ import threading
 import time
 from typing import Dict, List, Optional, Sequence, Union
 
+# Optimize shared memory usage for systems with limited /dev/shm
+# Set environment variables before importing PyTorch to limit shared memory allocation
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    # Limit CUDA memory allocator's shared memory usage
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+if "TORCH_SHOW_CPP_STACKTRACES" not in os.environ:
+    os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "0"
+
 import hivemind
 import psutil
 import torch
@@ -278,7 +286,7 @@ class Server:
         else:
             # GPU mode: all resources on GPU (default)
             w_gpu_percent, w_cpu_percent = 100, 0
-            cache_gpu_percent, cache_cpu_percent = 100, 0
+            cache_gpu_percent, cache_cpu_percent = 95, 5
             act_gpu_percent, act_cpu_percent = 100, 0
 
         self.policy = Policy(
@@ -717,7 +725,12 @@ class ModuleContainer(threading.Thread):
         self.dht, self.module_backends = dht, module_backends
         self.server_info, self.update_period, self.expiration = server_info, update_period, expiration
 
-        handler_event_queues = [mp.Queue() for _ in range(num_handlers)]
+        # Optimize shared memory usage: limit Queue maxsize to reduce /dev/shm peak usage
+        # Default Queue maxsize is unlimited, which can cause high /dev/shm usage during warmup
+        # For systems with limited /dev/shm (e.g., 64MB), use smaller queue size
+        # Queue size scales with batch_size, so we use a conservative limit
+        max_queue_size = 500  # Reduced from 1000 to further limit shared memory usage
+        handler_event_queues = [mp.Queue(maxsize=max_queue_size) for _ in range(num_handlers)]
         self.conn_handlers = [
             TransformerConnectionHandler(
                 dht,

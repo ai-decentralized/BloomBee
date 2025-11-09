@@ -68,6 +68,14 @@ async def run_rpc_forward(
         flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     hidden_states, prompts, *_ = flat_tensors
 
+    # Fix for bus error in cross-machine setups: ensure tensors are contiguous
+    # Deserialized tensors from network buffers may not be properly aligned,
+    # especially for certain batch sizes (e.g., batch_size=16)
+    if not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
+    if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
+        prompts = prompts.contiguous()
+
     dtype = requested_backends[0].dtype
     # check parse input tensors and cast dtypes
     hidden_states = hidden_states.to(dtype)
@@ -167,6 +175,16 @@ async def run_rpc_backward(
         flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     inputs, grad_outputs, prompts, *_ = flat_tensors
 
+    # Fix for bus error in cross-machine setups: ensure tensors are contiguous
+    # Deserialized tensors from network buffers may not be properly aligned,
+    # especially for certain batch sizes (e.g., batch_size=16)
+    if not inputs.is_contiguous():
+        inputs = inputs.contiguous()
+    if not grad_outputs.is_contiguous():
+        grad_outputs = grad_outputs.contiguous()
+    if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
+        prompts = prompts.contiguous()
+
     # Cast inputs & grad outputs to backend dtype
     inputs = inputs.to(requested_backends[0].dtype)
     grad_outputs = grad_outputs.to(requested_backends[-1].dtype)
@@ -252,6 +270,16 @@ async def iterate_rpc_inference(
 
         hidden_states, prompts, hypo_ids, *_ = flat_tensors
         batch_size, length_increment, _ = hidden_states.shape
+
+        # Fix for bus error in cross-machine setups: ensure tensors are contiguous
+        # Deserialized tensors from network buffers may not be properly aligned,
+        # especially for certain batch sizes (e.g., batch_size=16)
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
+            prompts = prompts.contiguous()
+        if not hypo_ids.is_contiguous():
+            hypo_ids = hypo_ids.contiguous()
 
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)

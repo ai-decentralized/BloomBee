@@ -19,6 +19,17 @@ import torch
 import dataclasses
 from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
 
+# Optimize shared memory usage: configure multiprocessing to use smaller buffers
+# This helps reduce /dev/shm peak usage during warmup/prefill phase
+if hasattr(mp, 'set_sharing_strategy'):
+    # Use 'file_system' instead of 'file_descriptor' to reduce shared memory usage
+    # Note: This may have slight performance impact but significantly reduces /dev/shm usage
+    try:
+        mp.set_sharing_strategy('file_system')
+    except RuntimeError:
+        # Already set, ignore
+        pass
+
 
 from bloombee.data_structures import Handle
 from transformers import PretrainedConfig

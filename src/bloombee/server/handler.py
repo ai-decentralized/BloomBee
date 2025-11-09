@@ -217,6 +217,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     
                     background_tasks = set()
                     step_=0
+                    warmup_completed = False  # Track if warmup/prefill phase is completed
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
                     # offload_logger.info(" Start inference iteration")
@@ -238,6 +239,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                         # print('=================================================   server rpc_inference step ',step_) ###
                         # print_time_now('')
                         step_+=1 ###
+                        
+                        # After first step (warmup/prefill), clean up temporary shared memory
+                        # This helps reduce /dev/shm peak usage on systems with limited shared memory
+                        # For larger batch sizes, perform cleanup more aggressively
+                        if not warmup_completed and step_ > 0:
+                            warmup_completed = True
+                            self._cleanup_warmup_shared_memory()
+                        # For large batch sizes, also cleanup periodically to prevent accumulation
+                        elif step_ > 0 and step_ % 5 == 0 and batch_size >= 20:
+                            self._cleanup_warmup_shared_memory()
                         
                         can_push_case_time=perf_counter() ###
 
@@ -705,6 +716,28 @@ class TransformerConnectionHandler(ConnectionHandler):
         async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as raw_handles:
             logger.info("OFFLOAD: allocation completed; entering use_cache region")
             yield nested_pack(raw_handles, descriptors)
+
+    def _cleanup_warmup_shared_memory(self):
+        """
+        Clean up temporary shared memory after warmup/prefill phase.
+        This helps reduce /dev/shm peak usage on systems with limited shared memory.
+        For larger batch sizes, this is called more frequently to prevent accumulation.
+        """
+        try:
+            import gc
+            # Force garbage collection to free up temporary objects
+            # This helps release shared memory used by temporary Python objects
+            gc.collect()
+            
+            # Clear CUDA cache if available (this may free some shared memory)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                # Synchronize to ensure cleanup is complete
+                torch.cuda.synchronize()
+            
+            logger.debug("Cleaned up temporary shared memory after warmup phase")
+        except Exception as e:
+            logger.debug(f"Failed to cleanup warmup shared memory: {e}", exc_info=True)
 
     def _log_request(
         self,
