@@ -508,18 +508,17 @@ def set_module_tensor_to_device(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
-
-def compare_tensors(new_value, weight_data):  
-    print('new_value ', new_value.device)
-    print('weight_data ', weight_data.device)
-    print()
-    # Compare data types  
-    if new_value.dtype != weight_data.dtype:  
-        return f"Data types are different: {new_value.dtype} vs {weight_data.dtype}"  
+# def compare_tensors(new_value, weight_data):  
+#     print('new_value ', new_value.device)
+#     print('weight_data ', weight_data.device)
+#     print()
+#     # Compare data types  
+#     if new_value.dtype != weight_data.dtype:  
+#         return f"Data types are different: {new_value.dtype} vs {weight_data.dtype}"  
     
-    # Compare values  
-    if torch.equal(new_value.to('cpu'), weight_data.to('cpu')):  
-        return "The tensors are equal in value."  
-    else:  
-        return "The tensors are not equal in value."  
+#     # Compare values  
+#     if torch.equal(new_value.to('cpu'), weight_data.to('cpu')):  
+#         return "The tensors are equal in value."  
+#     else:  
+#         return "The tensors are not equal in value."  
     
