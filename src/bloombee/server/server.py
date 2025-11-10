@@ -277,25 +277,13 @@ class Server:
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
-        # Configure resource distribution based on device type
-        if device.type == "cpu":
-            # CPU-only mode: all resources on CPU
-            w_gpu_percent, w_cpu_percent = 0, 100
-            cache_gpu_percent, cache_cpu_percent = 0, 100
-            act_gpu_percent, act_cpu_percent = 0, 100
-        else:
-            # GPU mode: all resources on GPU (default)
-            w_gpu_percent, w_cpu_percent = 100, 0
-            cache_gpu_percent, cache_cpu_percent = 95, 5
-            act_gpu_percent, act_cpu_percent = 100, 0
-
-        # FlexGen compression is disabled by default
-        # (quantization CLI parameter has been removed)
+        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU
+        # Default to GPU-only, no offloading, no compression
         self.policy = Policy(
-            batch_size, 1,   # gpu_batch_size, num_gpu_batches
-            w_gpu_percent, w_cpu_percent,          # w_gpu_percent, w_cpu_percent
-            cache_gpu_percent, cache_cpu_percent,  # cache_gpu_percent, cache_cpu_percent
-            act_gpu_percent, act_cpu_percent,      # act_gpu_percent, act_cpu_percent
+            batch_size, 1,            # gpu_batch_size, num_gpu_batches
+            100, 0,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # cache_gpu_percent, cache_cpu_percent (KV on GPU)
+            100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
             compress_weight=False,
@@ -304,14 +292,7 @@ class Server:
             comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
         )
         
-        # 🔍 Batch Size Debug: Log batch size configuration
-        logger.info(f"[BATCH_SIZE_CONFIG] GPU Batch Size: {batch_size}")
-        logger.info(f"[BATCH_SIZE_CONFIG] Min Batch Size: {min_batch_size}")
-        logger.info(f"[BATCH_SIZE_CONFIG] Max Batch Size: {max_batch_size}")
-        logger.info(f"[BATCH_SIZE_CONFIG] Policy GPU Batch Size: {self.policy.gpu_batch_size}")
-        logger.info(f"[BATCH_SIZE_CONFIG] Policy Num GPU Batches: {self.policy.num_gpu_batches}")
-        
-        # Log detailed policy strategy
+        # Log compression configuration
         self.policy.log_batch_size_strategy()
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
@@ -406,7 +387,7 @@ class Server:
         block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
         total_memory_per_block = block_size + self._cache_bytes_per_block
         if self.adapters:
-            from bloombee.utils.peft import estimate_adapter_memory_per_block
+
 
             total_memory_per_block += estimate_adapter_memory_per_block(
                 self.block_config,

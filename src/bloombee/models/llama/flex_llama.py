@@ -378,7 +378,6 @@ class FLEX_LlamaAttention(LlamaAttention):
                                 else self.compute)
         self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
                                   else self.env.gpu)
-        
         self.task = None
 
     def set_task(self, task):
@@ -530,7 +529,6 @@ class FLEX_LlamaMLP(LlamaMLP):
         self.compute = self.env.gpu
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
                                 else self.compute)
-
         self.task = None
         self.temp_hidden_states = ValueHolder()
 
@@ -563,10 +561,10 @@ class FLEX_LlamaMLP(LlamaMLP):
             dst1 = self.weight_load_dst
             dst2 = self.compute
             weight_read_buf.store((
-                    gate.smart_copy(dst1),
-                    down.smart_copy(dst1),
-                    up.smart_copy(dst1),
-                    post_attention_layernorm.smart_copy(dst2)
+                gate.smart_copy(dst1),
+                down.smart_copy(dst1),
+                up.smart_copy(dst1),
+                post_attention_layernorm.smart_copy(dst2),
             ))
 
     def init_cache_one_gpu_batch(self, cache_home):
