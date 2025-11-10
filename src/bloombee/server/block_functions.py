@@ -19,7 +19,7 @@ from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
-from bloombee.server.SpeculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 
 from time import perf_counter
 from datetime import datetime, timezone  
@@ -163,6 +163,7 @@ async def iterate_rpc_inference(
     active_adapter: Optional[str],
     input_iterator: AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]],
     cache_handles: Sequence[Sequence[Handle]],
+    pruner_manager: BloombeePrunerManager,
     *,
     max_length: int,
     prioritizer: TaskPrioritizerBase,
@@ -346,7 +347,7 @@ async def iterate_rpc_inference(
             # print_time_now('')
         # serialize and send last layer outputs
         # logger.info(f"before _prune_draft_tree, hidden_states shape: {hidden_states.shape}, full_mask: {full_mask}")
-        hidden_states, keep_indices = _prune_draft_tree(hidden_states, draft_tokens, full_mask)
+        hidden_states, keep_indices = _prune_draft_tree(pruner_manager, hidden_states, draft_tokens, full_mask)
         logger.info(f"after _prune_draft_tree, hidden_states shape: {hidden_states.shape}")
         logger.info(f"keep_indices: {keep_indices}")
         logger.info(f"outputs_schema: {requested_backends[-1].outputs_schema}")
@@ -379,23 +380,7 @@ async def iterate_rpc_inference(
     # #print_time_now('')
     # print()
     
-def _prune_draft_tree(hidden_states: torch.Tensor, draft_tokens: torch.Tensor, tree_attention_mask):
-        hidden_size = 4096
-        vocab_size = 32000
-        
-        # Create configuration
-        config = PruningConfig(
-            method=PruningMethod.SIMPLE_PROBABILITY,
-            neural_threshold=0.5,
-            simple_threshold=0.1
-        )
-        
-        # Create manager
-        manager = BloombeePrunerManager(
-            hidden_size=hidden_size,
-            vocab_size=vocab_size,
-            config=config
-        )
+def _prune_draft_tree(manager: BloombeePrunerManager, hidden_states: torch.Tensor, draft_tokens: torch.Tensor, tree_attention_mask):
         results = manager.prune_speculation_tree(
             hidden_states,
             draft_tokens,

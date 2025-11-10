@@ -337,234 +337,372 @@ class SimpleProbabilityPruner(PrunerInterface):
             'pruned_branches': self.pruned_branches
         }
 
-class AdaptiveNeuralPruner(PrunerInterface):
+@dataclass
+class NetworkCondition:
+    """Network condition metrics"""
+    latency: float  # ms
+    bandwidth: float  # Mbps
+    packet_loss: float  # 0-1
+    throughput: float  # Current throughput Mbps
+    
+    def to_features(self) -> List[float]:
+        """Convert to normalized features for neural network"""
+        return [
+            min(self.latency / 200.0, 1.0),  # Normalize to [0, 1]
+            min(self.bandwidth / 100.0, 1.0),
+            self.packet_loss,
+            min(self.throughput / 100.0, 1.0)
+        ]
+    
+    @classmethod
+    def mock(cls, condition_type: str = 'normal'):
+        """Mock network condition for training"""
+        conditions = {
+            'good': {'latency': 10, 'bandwidth': 100, 'packet_loss': 0.001, 'throughput': 90},
+            'normal': {'latency': 50, 'bandwidth': 50, 'packet_loss': 0.01, 'throughput': 40},
+            'poor': {'latency': 150, 'bandwidth': 20, 'packet_loss': 0.05, 'throughput': 15}
+        }
+        
+        base = conditions.get(condition_type, conditions['normal'])
+        # Add some randomness
+        return cls(
+            latency=base['latency'] * (1 + random.uniform(-0.2, 0.2)),
+            bandwidth=base['bandwidth'] * (1 + random.uniform(-0.1, 0.1)),
+            packet_loss=base['packet_loss'] * (1 + random.uniform(-0.3, 0.3)),
+            throughput=base['throughput'] * (1 + random.uniform(-0.15, 0.15))
+        )
+
+class AdaptiveNeuralPruner:
     """
-    Adaptive neural network based pruner
-    Uses a trainable network that considers multiple factors
+    Neural pruner that directly outputs keep/prune decisions
+    No threshold adjustment needed - network learns everything
     """
     
     def __init__(
         self,
         hidden_size: int,
         vocab_size: int,
-        config: PruningConfig,
-        tie_weights: Optional[nn.Linear] = None
+        neural_hidden: int = 64,
+        device: str = 'cuda',
+        config: PruningConfig = None,
     ):
-        self.config = config
+        self.hidden_size = hidden_size
         self.vocab_size = vocab_size
+        self.device = device
+        self.config = config
         
-        # Middle layer LM head
-        if tie_weights is not None:
-            self.lm_head = tie_weights
-        else:
-            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        # LM head for getting probabilities
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False).to(device)
         
-        # Pruning network
-        self.pruning_net = self._build_pruning_network()
-        
-        # Optimizer for online learning
-        self.optimizer = torch.optim.AdamW(
-            self.pruning_net.parameters(),
-            lr=config.neural_learning_rate
-        )
-        
-        # Statistics tracking
-        self.acceptance_history = deque(maxlen=100)
-        self.pruning_decisions = deque(maxlen=100)
-        self.latency_history = deque(maxlen=50)
-        self.last_acceptances = deque(maxlen=32)
-        
-    def _build_pruning_network(self) -> nn.Module:
-        """Build the neural network for pruning decisions"""
-        input_size = 15  # Features: 6 prob + 4 network + 4 context + 1 last accept
-        hidden = self.config.neural_hidden_size
-        dropout = self.config.neural_dropout
-        
-        return nn.Sequential(
-            nn.Linear(input_size, hidden),
-            nn.LayerNorm(hidden),
+        # Neural network for direct decision
+        # Input: 4 network + 3 probability + 1 acceptance = 8 features
+        # Output: Single probability (>0.5 means keep, ≤0.5 means prune)
+        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        dt  = torch.float32
+        torch.set_default_dtype(dt)
+        self.decision_net = nn.Sequential(
+            nn.Linear(8, neural_hidden),
+            nn.LayerNorm(neural_hidden),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden, hidden // 2),
-            nn.LayerNorm(hidden // 2),
+            nn.Dropout(0.1),
+
+            nn.Linear(neural_hidden, neural_hidden // 2),
+            nn.LayerNorm(neural_hidden // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden // 2, hidden // 4),
-            nn.ReLU(),
-            
-            nn.Linear(hidden // 4, 1),
+            nn.Dropout(0.1),
+
+            nn.Linear(neural_hidden // 2, 1),
             nn.Sigmoid()
         )
-    
+        
+        # Optimizer
+        self.optimizer = torch.optim.AdamW(self.decision_net.parameters(), lr=1e-4)
+        
+        # Historical acceptance rate tracking
+        self.acceptance_history = deque(maxlen=100)
+        self.current_acceptance_rate = 0.5  # Initial guess
+        
+        # Training mode flag
+        self.training = False
+
+        
+        
     def extract_features(
         self,
-        middle_logits: torch.Tensor,
-        draft_logits: torch.Tensor,
-        context: BranchContext,
+        logits: torch.Tensor,
+        position: int,
         network_condition: NetworkCondition,
-        last_acceptance: bool
+        acceptance_rate: float,
+        draft_token: Optional[int] = None
     ) -> torch.Tensor:
-        """Extract features for the neural network"""
+        """Extract all features for decision making"""
         
-        middle_probs = F.softmax(middle_logits, dim=-1)
-        draft_probs = F.softmax(draft_logits, dim=-1)
+        probs = F.softmax(logits[position], dim=-1)
         
         # Probability features
-        draft_token_prob = middle_probs[context.token_id].item()
-        max_prob = torch.max(middle_probs).item()
-        entropy = -torch.sum(middle_probs * torch.log(middle_probs + 1e-10)).item()
-        kl_div = F.kl_div(
-            middle_probs.log(),
-            draft_probs,
-            reduction='sum'
-        ).item()
-        top5_mass = torch.topk(middle_probs, k=5).values.sum().item()
-        sorted_probs = torch.argsort(middle_probs, descending=True)
-        draft_rank = (sorted_probs == context.token_id).nonzero(as_tuple=True)[0].item()
-        draft_rank_normalized = draft_rank / len(middle_probs)
+        max_prob = torch.max(probs).item()
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
+        normalized_entropy = entropy / torch.log(torch.tensor(float(self.vocab_size)))
         
-        # All features
-        features = torch.tensor([
-            # Probability features (6)
-            draft_token_prob,
-            max_prob,
-            entropy,
-            kl_div,
-            top5_mass,
-            draft_rank_normalized,
-            # Network features (4)
-            network_condition.avg_acceptance_rate,
-            network_condition.recent_latency,
-            network_condition.pruning_accuracy,
-            min(network_condition.tokens_generated / 1000.0, 1.0),
-            # Context features (4)
-            context.tree_depth / 10.0,
-            context.num_siblings / 20.0,
-            context.parent_acceptance_prob,
-            context.branch_index / max(context.num_siblings, 1),
-            # Last acceptance (1)
-            float(last_acceptance)
-        ])
+        if draft_token is not None:
+            token_prob = probs[draft_token].item()
+        else:
+            # Use top-5 probability mass as proxy
+            token_prob = torch.topk(probs, k=min(5, self.vocab_size)).values.sum().item()
+        
+        # Combine all features
+        features = torch.tensor(
+            network_condition.to_features() +  # 4 network features
+            [max_prob, normalized_entropy, token_prob] +  # 3 probability features
+            [acceptance_rate],  # 1 acceptance rate
+            dtype=torch.float32,
+            device=self.device
+        )
         
         return features
     
     def prune_branches(
         self,
         middle_hidden_states: torch.Tensor,
-        draft_tokens: List[int],
         tree_attention_mask: torch.Tensor,
-        **kwargs
-    ) -> Dict[str, Any]:
-        pass
-    
-        # if network_condition is None:
-        #     network_condition = self.get_network_condition()
+        network_condition: Optional[NetworkCondition] = None,
+        draft_tokens: Optional[List[int]] = None
+    ) -> Dict:
+        """
+        Main pruning interface - directly outputs decisions
         
-        # # Get middle layer logits
-        # middle_logits = self.lm_head(middle_hidden_states)
+        Args:
+            middle_hidden_states: [seq_len, hidden_size]
+            tree_attention_mask: [seq_len, seq_len]
+            network_condition: Current network state (will mock if None)
+            draft_tokens: Optional draft token IDs
+        """
         
-        # keep_probs = []
-        # for i, context in enumerate(branch_contexts):
-        #     # Get last acceptance for this branch
-        #     last_accept = self.last_acceptances[i] if i < len(self.last_acceptances) else True
+        seq_len = middle_hidden_states.shape[0]
+        
+        prefix_len = tree_attention_mask.shape[2] - seq_len
+        
+        # Mock network condition if not provided
+        if network_condition is None:
+            network_condition = NetworkCondition.mock()
+        
+        # Move to device
+        middle_hidden_states = middle_hidden_states.to(self.device)
+        tree_attention_mask = tree_attention_mask.to(self.device)
+        
+        # Get logits from middle layer
+        logits = self.lm_head(middle_hidden_states)
+        
+        # Initialize masks
+        keep_mask = torch.ones(seq_len, dtype=torch.bool, device=self.device)
+        discarded = torch.zeros(seq_len, dtype=torch.bool, device=self.device)
+        decision_probs = torch.zeros(seq_len, device=self.device)
+        
+        # Process each position in depth-first order
+        for i in range(seq_len):
+            if discarded[i]:
+                keep_mask[i] = False
+                decision_probs[i] = 0.0
+                continue
             
-        #     # Extract features
-        #     features = self.extract_features(
-        #         middle_logits[i] if middle_logits.dim() > 1 else middle_logits,
-        #         draft_logits[i] if draft_logits.dim() > 1 else draft_logits,
-        #         context,
-        #         network_condition,
-        #         last_accept
-        #     )
+            # Extract features
+            features = self.extract_features(
+                logits, i,
+                network_condition,
+                self.current_acceptance_rate,
+                draft_tokens[i] if draft_tokens else None
+            )
             
-        #     # Predict keep probability
-        #     with torch.no_grad():
-        #         keep_prob = self.pruning_net(features.unsqueeze(0)).squeeze().item()
-        #     keep_probs.append(keep_prob)
+            # Get decision from neural network
+            with torch.no_grad():
+                prob = self.decision_net(features.unsqueeze(0)).squeeze()
+                decision_probs[i] = prob
+                
+                # Direct decision: >0.5 means keep
+                keep = prob > self.config.neural_threshold
+            
+            if not keep:
+                keep_mask[i] = False
+                discarded[i] = True
+                
+                # Discard descendants
+                for j in range(i + 1, seq_len):
+                    if tree_attention_mask[0, j, i + prefix_len] == 1:
+                        discarded[j] = True
+                        keep_mask[j] = False
         
-        # keep_probs_tensor = torch.tensor(keep_probs)
+        # Ensure at least one branch is kept
+        kept_count = keep_mask.sum().item()
+        logger.info(f"prune_branches keep_mask: {keep_mask}")
+        logger.info(f"prune_branches discarded: {discarded}")
+        logger.info(f"prune_branches kept_count: {kept_count}")
+        # logger.info(f"prune_branches tree_attention_mask: {tree_attention_mask}")
+        if kept_count < self.config.min_keep_branches:
+            # Initialize all nodes as potential leaf nodes
+            is_leaf = torch.ones(seq_len, dtype=torch.bool)
+            
+            # Store leaf nodes with their path scores
+            leaf_paths = []  # List of (score, leaf_idx, path_indices)
+            
+            # Traverse from back to front
+            for i in range(seq_len - 1, -1, -1):
+                if is_leaf[i]:
+                    # This is a leaf node, calculate its path score
+                    path_indices = [i]
+                    path_score = decision_probs[i].item()
+                    
+                    # Find all ancestors of node i (from i-1 to 0)
+                    for j in range(i - 1, -1, -1):
+                        # Check if j is an ancestor of i
+                        if tree_attention_mask[0, i, j + prefix_len] == 1:
+                            # Mark j as non-leaf (it has descendants)
+                            is_leaf[j] = False
+                            
+                            # Add to path
+                            path_indices.append(j)
+                            # Multiply path score
+                            path_score *= decision_probs[j].item()
+                    
+                    # Save this leaf and its path score
+                    path_indices.reverse()  # Order from root to leaf
+                    leaf_paths.append((path_score, i, path_indices))
+            
+            # Sort leaf nodes by path score (high to low)
+            logger.info(f"prune_branches is_leaf : {is_leaf}")
+            leaf_paths.sort(key=lambda x: x[0], reverse=True)
+            logger.info(f"prune_branches leaf_paths : {leaf_paths}")
+            
+            # Keep top branches (complete paths from root to leaf)
+            # keep_mask = torch.zeros(seq_len, dtype=torch.bool)
+            branches_kept = 0
+            
+            for path_score, leaf_idx, path_indices in leaf_paths:
+                if branches_kept >= self.config.min_keep_branches:
+                    break
+                
+                # Keep all nodes in this path
+                for idx in path_indices:
+                    keep_mask[idx] = True
+                
+                branches_kept += 1
         
-        # # Apply threshold
-        # keep_mask = keep_probs_tensor > self.config.neural_threshold
+        # Get final indices
+        keep_indices = torch.where(keep_mask)[0].tolist()
+        prune_indices = torch.where(~keep_mask)[0].tolist()
         
-        # # Ensure constraints
-        # if keep_mask.sum() < self.config.min_keep_branches:
-        #     _, top_indices = torch.topk(keep_probs_tensor, self.config.min_keep_branches)
-        #     keep_mask = torch.zeros_like(keep_probs_tensor, dtype=torch.bool)
-        #     keep_mask[top_indices] = True
-        
-        # if keep_mask.sum() > self.config.max_branches:
-        #     scores_masked = keep_probs_tensor * keep_mask.float()
-        #     _, top_indices = torch.topk(scores_masked, self.config.max_branches)
-        #     keep_mask = torch.zeros_like(keep_probs_tensor, dtype=torch.bool)
-        #     keep_mask[top_indices] = True
-        
-        # keep_indices = torch.where(keep_mask)[0].tolist()
-        # prune_indices = torch.where(~keep_mask)[0].tolist()
-        
-        # return {
-        #     'keep_indices': keep_indices,
-        #     'prune_indices': prune_indices,
-        #     'keep_probs': keep_probs,
-        #     'metadata': {
-        #         'middle_logits': middle_logits,
-        #         'network_condition': network_condition,
-        #         'avg_keep_prob': sum(keep_probs) / len(keep_probs)
-        #     }
-        # }
+        return {
+            'keep_indices': keep_indices,
+            'prune_indices': prune_indices,
+            'decision_probs': decision_probs.cpu().tolist(),
+            'network_condition': network_condition,
+            'acceptance_rate': self.current_acceptance_rate
+        }
     
-    def get_network_condition(self) -> NetworkCondition:
-        """Get current network condition"""
-        return NetworkCondition(
-            avg_acceptance_rate=sum(self.acceptance_history) / max(len(self.acceptance_history), 1),
-            recent_latency=sum(self.latency_history) / max(len(self.latency_history), 1),
-            tokens_generated=len(self.acceptance_history),
-            pruning_accuracy=sum(self.pruning_decisions) / max(len(self.pruning_decisions), 1)
-        )
-    
-    def update_statistics(self, feedback: Dict[str, Any]):
-        """Update statistics and optionally train the network"""
-        if 'acceptance' in feedback:
-            self.acceptance_history.append(float(feedback['acceptance']))
-        if 'latency' in feedback:
-            self.latency_history.append(feedback['latency'])
-        if 'pruning_correct' in feedback:
-            self.pruning_decisions.append(float(feedback['pruning_correct']))
-        if 'branch_acceptances' in feedback:
-            self.last_acceptances.extend(feedback['branch_acceptances'])
+    def collect_training_data(
+        self,
+        middle_hidden_states: torch.Tensor,
+        tree_attention_mask: torch.Tensor,
+        accepted_indices: List[int],
+        network_condition: NetworkCondition,
+        draft_tokens: Optional[List[int]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Collect features and labels for training
         
-        # Online training if enough data
-        if 'training_data' in feedback and len(self.acceptance_history) > 10:
-            self._train_step(feedback['training_data'])
+        Args:
+            accepted_indices: Indices that were actually accepted by main model
+            
+        Returns:
+            features: [seq_len, 8] tensor of features
+            labels: [seq_len] tensor of 0/1 labels
+        """
+        
+        seq_len = middle_hidden_states.shape[0]
+        middle_hidden_states = middle_hidden_states.to(self.device)
+        
+        # Get logits
+        logits = self.lm_head(middle_hidden_states)
+        
+        features_list = []
+        labels_list = []
+        
+        for i in range(seq_len):
+            # Extract features
+            features = self.extract_features(
+                logits, i,
+                network_condition,
+                self.current_acceptance_rate,
+                draft_tokens[i] if draft_tokens else None
+            )
+            features_list.append(features)
+            
+            # Label: 1 if accepted, 0 if rejected
+            label = 1.0 if i in accepted_indices else 0.0
+            labels_list.append(label)
+        
+        return torch.stack(features_list), torch.tensor(labels_list, device=self.device)
     
-    def _train_step(self, training_data: Dict[str, Any]):
-        """Perform a single training step"""
+    def train_step(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        pruning_weight: float = 0.1
+    ) -> float:
+        """
+        Single training step
+        
+        Args:
+            features: [batch_size, 8] features
+            labels: [batch_size] binary labels (1=keep, 0=prune)
+            pruning_weight: Weight for encouraging pruning
+        """
+        
+        self.decision_net.train()
         self.optimizer.zero_grad()
         
-        features = training_data['features']
-        targets = training_data['targets']
+        # Forward pass
+        predictions = self.decision_net(features).squeeze()
         
-        predictions = self.pruning_net(features)
-        loss = F.binary_cross_entropy(predictions, targets)
+        # Binary cross-entropy loss
+        bce_loss = F.binary_cross_entropy(predictions, labels)
         
-        # Add speedup bonus
-        num_pruned = (predictions < self.config.neural_threshold).sum()
-        speedup_bonus = (num_pruned / len(predictions)) * self.config.neural_speedup_weight
-        total_loss = loss - speedup_bonus
+        # Add small penalty to encourage pruning (for speedup)
+        # This prevents the model from being too conservative
+        pruning_rate = (predictions < 0.5).float().mean()
+        pruning_bonus = pruning_weight * pruning_rate
         
-        total_loss.backward()
+        # Total loss
+        loss = bce_loss - pruning_bonus
+        
+        # Backward pass
+        loss.backward()
         self.optimizer.step()
+        
+        self.decision_net.eval()
+        
+        return loss.item()
     
-    def get_metrics(self) -> Dict[str, float]:
-        """Get performance metrics"""
-        return {
-            'avg_acceptance_rate': sum(self.acceptance_history) / max(len(self.acceptance_history), 1),
-            'pruning_accuracy': sum(self.pruning_decisions) / max(len(self.pruning_decisions), 1),
-            'avg_latency': sum(self.latency_history) / max(len(self.latency_history), 1),
-            'history_size': len(self.acceptance_history)
-        }
+    def update_acceptance_rate(self, rate: float):
+        """Update historical acceptance rate"""
+        self.acceptance_history.append(rate)
+        self.current_acceptance_rate = sum(self.acceptance_history) / len(self.acceptance_history)
+    
+    def save_model(self, path: str):
+        """Save model weights"""
+        torch.save({
+            'decision_net': self.decision_net.state_dict(),
+            'lm_head': self.lm_head.state_dict(),
+            'acceptance_history': list(self.acceptance_history),
+            'current_acceptance_rate': self.current_acceptance_rate
+        }, path)
+    
+    def load_model(self, path: str):
+        """Load model weights"""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.decision_net.load_state_dict(checkpoint['decision_net'])
+        self.lm_head.load_state_dict(checkpoint['lm_head'])
+        self.acceptance_history = deque(checkpoint['acceptance_history'], maxlen=100)
+        self.current_acceptance_rate = checkpoint['current_acceptance_rate']
 
 
 class BloombeePrunerFactory:
@@ -799,70 +937,3 @@ class BloombeePrunerManager:
             self.pruner.pruning_net.load_state_dict(state['pruner_weights'])
         
         logger.info(f"Loaded pruner state from {path}")
-
-
-# Example usage and integration
-if __name__ == "__main__":
-    # Configuration
-    hidden_size = 4096
-    vocab_size = 32000
-    
-    # Create configuration
-    config = PruningConfig(
-        method=PruningMethod.SIMPLE_PROBABILITY,
-        neural_threshold=0.5,
-        simple_threshold=0.3
-    )
-    
-    # Create manager
-    manager = BloombeePrunerManager(
-        hidden_size=hidden_size,
-        vocab_size=vocab_size,
-        config=config
-    )
-    
-    # Example: Prune a speculation tree
-    batch_size = 1
-    num_branches = 10
-    
-    middle_hidden = torch.randn(batch_size, num_branches, hidden_size)
-    draft_logits = torch.randn(batch_size, num_branches, vocab_size)
-    draft_tokens = [i for i in range(num_branches)]
-    
-    tree_structure = {
-        'depths': [1, 2, 2, 3, 3, 3, 4, 4, 4, 4],
-        'num_siblings': [1, 2, 2, 3, 3, 3, 4, 4, 4, 4],
-        'parent_probs': [1.0, 0.9, 0.9, 0.8, 0.8, 0.8, 0.7, 0.7, 0.7, 0.7],
-        'positions': list(range(num_branches))
-    }
-    
-    # Perform pruning
-    results = manager.prune_speculation_tree(
-        middle_hidden[0],  # Remove batch dimension for this example
-        draft_logits[0],
-        draft_tokens,
-        tree_structure
-    )
-    
-    print(f"Kept branches: {results['keep_indices']}")
-    print(f"Pruned branches: {results['prune_indices']}")
-    print(f"Keep probabilities: {results['keep_probs']}")
-    print(f"Manager metrics: {results['manager_metrics']}")
-    
-    # Switch to simple method
-    manager.switch_method(PruningMethod.SIMPLE_PROBABILITY)
-    
-    # Perform pruning with simple method
-    results_simple = manager.prune_speculation_tree(
-        middle_hidden[0],
-        draft_logits[0],
-        draft_tokens,
-        tree_structure
-    )
-    
-    print(f"\nSimple method results:")
-    print(f"Kept branches: {results_simple['keep_indices']}")
-    
-    # Get comprehensive metrics
-    metrics = manager.get_comprehensive_metrics()
-    print(f"\nComprehensive metrics: {metrics}")

@@ -36,6 +36,7 @@ from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, Mod
 from bloombee.server.backend import TransformerBackend
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
+from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 from bloombee.utils.convert_block import QuantType
 
 logger = get_logger(__name__)
@@ -89,6 +90,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         step_timeout: float,
         task_prioritizer: TaskPrioritizerBase = DummyTaskPrioritizer(),
         quant_type: QuantType,
+        pruner_manager: BloombeePrunerManager,
     ):
         super().__init__(dht, module_backends)
         for module_backend in self.module_backends.values():
@@ -107,6 +109,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.session_timeout, self.step_timeout = session_timeout, step_timeout
         self._prioritizer = task_prioritizer
         self.quant_type = quant_type
+        self.pruner_manager = pruner_manager
 
     async def add_p2p_handlers(self, *args, **kwargs) -> None:
         if self._listener_task is None:
@@ -227,6 +230,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             request, requests, session_id, requested_uids, context
                         ),
                         cache_handles=cache_handles,
+                        pruner_manager=self.pruner_manager,
                         max_length=max_length,
                         prioritizer=self._prioritizer,
                         points=points,

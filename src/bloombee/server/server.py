@@ -33,6 +33,7 @@ from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
+from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
@@ -282,6 +283,22 @@ class Server:
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
+        
+        hidden_size = 4096
+        vocab_size = 32000
+        
+        # Create configuration
+        config = PruningConfig(
+            method=PruningMethod.ADAPTIVE_NEURAL,
+            neural_threshold=0.5,
+            simple_threshold=0.1
+        )
+        
+        self.pruner_manager = BloombeePrunerManager(
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            config=config
+        )
         ##############################################################
         
         # see_memory_usage("-----------------------------------------in server: after policy  ")
@@ -399,6 +416,7 @@ class Server:
                 path=self.path, ######
                 server_info=self.server_info,
                 model_info=self.model_info,
+                pruner_manager = self.pruner_manager,
                 block_indices=block_indices,
                 num_handlers=self.num_handlers,
                 min_batch_size=self.min_batch_size,
@@ -513,6 +531,7 @@ class ModuleContainer(threading.Thread):
         path: str,
         server_info: ServerInfo,
         model_info: ModelInfo,
+        pruner_manager: BloombeePrunerManager,
         block_indices: List[int],
         min_batch_size: int,
         max_batch_size: int,
@@ -634,6 +653,7 @@ class ModuleContainer(threading.Thread):
             dht_prefix,
             blocks,
             inference_max_length=inference_max_length,
+            pruner_manager = pruner_manager,
             dht_announcer=dht_announcer,
             server_info=server_info,
             update_period=update_period,
@@ -648,6 +668,7 @@ class ModuleContainer(threading.Thread):
         module_backends: Dict[str, TransformerBackend],
         *,
         inference_max_length: int,
+        pruner_manager: BloombeePrunerManager,
         num_handlers: int,
         dht_announcer: ModuleAnnouncerThread,
         server_info: ServerInfo,
@@ -678,6 +699,7 @@ class ModuleContainer(threading.Thread):
                 session_timeout=session_timeout,
                 step_timeout=step_timeout,
                 quant_type=QuantType[server_info.quant_type.upper()],
+                pruner_manager = pruner_manager,
             )
             for i in range(num_handlers)
         ]
