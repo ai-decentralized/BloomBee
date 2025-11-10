@@ -224,9 +224,9 @@ class Server:
             logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
             check_device_balance(self.tensor_parallel_devices)
 
+        # Quantization is disabled by default. Use FlexGen compression internally if needed.
         if quant_type is None:
-            quant_type = QuantType.NF4 if device.type == "cuda" else QuantType.NONE
-        quant_type = QuantType.NONE ########## manually change the QuantType
+            quant_type = QuantType.NONE
         self.quant_type = quant_type
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
 
@@ -289,6 +289,8 @@ class Server:
             cache_gpu_percent, cache_cpu_percent = 95, 5
             act_gpu_percent, act_cpu_percent = 100, 0
 
+        # FlexGen compression is disabled by default
+        # (quantization CLI parameter has been removed)
         self.policy = Policy(
             batch_size, 1,   # gpu_batch_size, num_gpu_batches
             w_gpu_percent, w_cpu_percent,          # w_gpu_percent, w_cpu_percent
@@ -404,7 +406,6 @@ class Server:
         block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
         total_memory_per_block = block_size + self._cache_bytes_per_block
         if self.adapters:
-            # Delay import of petals.utils.peft to avoid unnecessary import of bitsandbytes
             from bloombee.utils.peft import estimate_adapter_memory_per_block
 
             total_memory_per_block += estimate_adapter_memory_per_block(

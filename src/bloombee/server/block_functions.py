@@ -32,7 +32,7 @@ def print_time_now(s):
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
-# TODO: Increase the NF4 threshold once bitsandbytes ships efficient NF4 kernel for parallel forward
+# Note: NF4 refers to FlexGen's 4-bit group quantization, not bitsandbytes
 MAX_SHORT_INFERENCE_TOKENS = 128
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
@@ -317,7 +317,8 @@ async def iterate_rpc_inference(
                 f" exceeds pre-allocated maximum {max_length}"
             )
 
-        merge_max_tokens = MAX_NF4_SHORT_INFERENCE_TOKENS if quant_type == QuantType.NF4 else MAX_SHORT_INFERENCE_TOKENS
+        # Note: quant_type is always NONE (quantization CLI removed), so always use standard threshold
+        merge_max_tokens = MAX_SHORT_INFERENCE_TOKENS
         can_merge_pools = batch_size * length_increment <= merge_max_tokens
         # print('-=-=-=-=-=-=-=-==-=- can merge pools : ', can_merge_pools)
         priority = prioritizer.prioritize(

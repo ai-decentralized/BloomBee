@@ -388,9 +388,8 @@ def set_module_tensor_to_device(
     param = module._parameters[tensor_name] if tensor_name in module._parameters else None
     param_cls = type(param) # param_cls is <class 'torch.nn.parameter.Parameter'>
     if value is not None:
-        # We can expect mismatches when using bnb 4bit since Params4bit will reshape and pack the weights.
-        # In other cases, we want to make sure we're not loading checkpoints that do not match the config.
-        if old_value.shape != value.shape and param_cls.__name__ != "Params4bit":
+        # Check shape mismatch (bitsandbytes quantization is not used, so no special handling needed)
+        if old_value.shape != value.shape:
             raise ValueError(
                 f'Trying to set a tensor of shape {value.shape} in "{tensor_name}" (which has shape {old_value.shape}), this looks incorrect.'
             )
@@ -401,19 +400,9 @@ def set_module_tensor_to_device(
         elif not str(value.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
             value = value.to(dtype) #------------
 
-    device_quantization = None #------------
-    
     with torch.no_grad(): #------------
         # leave it on cpu first before moving them to cuda
-        # # fix the case where the device is meta, we don't want to put it on cpu because there is no data =0
-        if (
-            param is not None
-            and param.device.type != "cuda"
-            and torch.device(device).type == "cuda"
-            and param_cls.__name__ in ["Int8Params", "FP4Params", "Params4bit"]
-        ):
-            device_quantization = device
-            device = "cpu"
+        # Note: bitsandbytes quantization is not used, so no special device handling needed
         # # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16)).
         if isinstance(device, int):
             if is_npu_available():
@@ -438,25 +427,13 @@ def set_module_tensor_to_device(
             new_value = value.to(device) #------------
         else:
             new_value = torch.tensor(value, device=device)
-        if device_quantization is not None:
-            device = device_quantization
         if is_buffer:
             module._buffers[tensor_name] = new_value
         elif value is not None or not check_device_same(torch.device(device), module._parameters[tensor_name].device):
             param_cls = type(module._parameters[tensor_name]) #------------
-            kwargs = module._parameters[tensor_name].__dict__
-            if param_cls.__name__ in ["Int8Params", "FP4Params", "Params4bit"]:
-                if param_cls.__name__ == "Int8Params" and new_value.dtype == torch.float32:
-                    # downcast to fp16 if any - needed for 8bit serialization
-                    new_value = new_value.to(torch.float16)
-                # quantize module that are going to stay on the cpu so that we offload quantized weights
-                if device == "cpu" and param_cls.__name__ == "Int8Params":
-                    new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(0).to("cpu")
-                    new_value.CB = new_value.CB.to("cpu")
-                    new_value.SCB = new_value.SCB.to("cpu")
-                else:
-                    new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(device)
-            elif param_cls.__name__ in ["QTensor", "QBitsTensor"]:
+            # Note: bitsandbytes quantization is not used, so no special handling for Int8Params, Params4bit, etc.
+            # Standard parameter handling only
+            if param_cls.__name__ in ["QTensor", "QBitsTensor"]:
                 new_value = torch.nn.Parameter(new_value, requires_grad=old_value.requires_grad).to(device)
             elif param_cls.__name__ in ["AffineQuantizedTensor"]:
                 new_value = torch.nn.Parameter(
@@ -480,30 +457,7 @@ def set_module_tensor_to_device(
             if fp16_statistics is not None:
                 module._parameters[tensor_name].SCB = fp16_statistics.to(device)
                 del fp16_statistics
-            # as we put the weight to meta, it doesn't have SCB attr anymore. make sure that it is not a meta weight
-            if (
-                module.__class__.__name__ == "Linear8bitLt"
-                and getattr(module.weight, "SCB", None) is None
-                and str(module.weight.device) != "meta"
-            ):
-                # quantize only if necessary
-                device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
-                if not getattr(module.weight, "SCB", None) and device_index is not None:
-                    if module.bias is not None and module.bias.device.type != "meta":
-                        # if a bias exists, we need to wait until the bias is set on the correct device
-                        module = module.cuda(device_index)
-                    elif module.bias is None:
-                        # if no bias exists, we can quantize right away
-                        module = module.cuda(device_index)
-            elif (
-                module.__class__.__name__ == "Linear4bit"
-                and getattr(module.weight, "quant_state", None) is None
-                and str(module.weight.device) != "meta"
-            ):
-                # quantize only if necessary
-                device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
-                if not getattr(module.weight, "quant_state", None) and device_index is not None:
-                    module.weight = module.weight.cuda(device_index)
+            # Note: bitsandbytes Linear8bitLt and Linear4bit handling removed (not used)
     if device != "cpu": #---------
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
