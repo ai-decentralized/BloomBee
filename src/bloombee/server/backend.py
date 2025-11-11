@@ -18,6 +18,7 @@ from transformers import PretrainedConfig
 from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
+from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
 from pynvml import *
@@ -72,6 +73,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         *args,
         config: PretrainedConfig,
         cache_manager: KVCacheManager,
+        pruner_manager: BloombeePrunerManager,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
         **kwargs,
@@ -86,6 +88,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 hasattr(self.module, 'devices') and hasattr(self.module, 'module_shards'))
         self.config = config
         self.cache_manager = cache_manager
+        self.pruner_manager = pruner_manager
         self.max_chunk_size_bytes = max_chunk_size_bytes
 
         for name, param in self.module.named_parameters():
@@ -103,6 +106,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         )
         self.backward_pool = PrioritizedTaskPool(
             self.backward, max_batch_size=max_batch_size, device=device, name=f"{self.name}_backward"
+        )
+        
+        self.pruning_pool = PrioritizedTaskPool(
+            self.prune_draft_tree, max_batch_size=max_batch_size, device=device, name=f"{self.name}_pruning"
         )
 
         self.dtype = backend_dtype
@@ -162,6 +169,19 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             # values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
             cache_tensors.append(keys)
         return cache_tensors
+    
+    def prune_draft_tree(self, hidden_states: torch.Tensor,  draft_tokens: torch.Tensor, tree_attention_mask):
+        logger.info(f"start prune_draft_tree")
+        results = self.pruner_manager.prune_speculation_tree(
+            hidden_states,
+            draft_tokens,
+            tree_attention_mask
+        )
+        
+        keep_indices = results['keep_indices']
+        logger.info(f"keep_indices: {keep_indices}")
+        new_hidden_states = hidden_states[:, keep_indices, :]
+        return new_hidden_states, keep_indices
 
     def forward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
         *inputs, active_adapter = inputs
@@ -295,7 +315,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         
                         if forward_result is None:
                             # print(f' ERROR: module.forward returned None!')
-                            return (hidden_states, full_mask)  # Return original input as fallback
+                            return (hidden_states, None)  # Return original input as fallback
                         
                         output_hidden_states_chunk, new_kvs = forward_result
                         # print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
@@ -312,7 +332,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         print(f' ERROR in module.forward: {type(e).__name__}: {e}')
                         # import traceback
                         traceback.print_exc()
-                        return (hidden_states, full_mask)  # Return original input as fallback
+                        return (hidden_states, None)  # Return original input as fallback
                     
                     if seq_len > max_chunk_length:
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk # Store output
@@ -325,10 +345,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
 
-                logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
+                logger.info(f"inference_step, output_hidden_states: {output_hidden_states}, draft_tokens: {inference_info.draft_tokens}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
-                return (output_hidden_states, full_mask) # Return output hidden states
+                keep_indices = None
+                if inference_info.uid == 'llama-7b-hf.31':
+                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, inference_info.draft_tokens, full_mask)
+                
+                return (output_hidden_states, keep_indices) # Return output hidden states
                 
         except Exception as e:
             print(f' CRITICAL ERROR in inference_step: {type(e).__name__}: {e}')

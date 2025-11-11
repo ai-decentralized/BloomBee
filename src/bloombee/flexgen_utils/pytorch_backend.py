@@ -655,7 +655,7 @@ class TorchDevice:
         
         hidden = rms_norm(hidden_states.data, input_layernorm.data)
         
-        logger.info(f"after norm, hidden states: {hidden}")
+        # logger.info(f"after norm, hidden states: {hidden}")
 
         q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
@@ -665,14 +665,14 @@ class TorchDevice:
         k = k.view(bsz, q_len, num_attention_heads, head_dim)
         v = v.view(bsz, q_len, num_attention_heads, head_dim)
         
-        logger.info(f"after projection, query_states: {q}")
-        logger.info(f"after projection, key_states: {k}")
-        logger.info(f"after projection, value_states: {v}")
+        # logger.info(f"after projection, query_states: {q}")
+        # logger.info(f"after projection, key_states: {k}")
+        # logger.info(f"after projection, value_states: {v}")
         
         q, k = apply_rotary_emb(q, k, freqs_cis=freq_cis[:q_len])
         
-        logger.info(f"after rotary, query_states: {q}")
-        logger.info(f"after rotary, key_states: {k}")
+        # logger.info(f"after rotary, query_states: {q}")
+        # logger.info(f"after rotary, key_states: {k}")
 
         # (b * n_head, s, d), (b * n_head, d, s), (b * n_head, s, d)
         q = q.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
@@ -694,13 +694,13 @@ class TorchDevice:
         # mask 的 shape [bsz, 1, q_len, q_len] 会自动广播到 [bsz, n_h, q_len, q_len]
         attn_scores = attn_scores + attention_mask.data
         
-        logger.info(f"attn_scores after adding mask: {attn_scores}")
+        # logger.info(f"attn_scores after adding mask: {attn_scores}")
         
         # 转换为 float32 做 softmax（数值更稳定）
         attn_scores = attn_scores.to(torch.float32)
         attn_weights = F.softmax(attn_scores, dim=-1).to(q.dtype)  # [B, n_h, q_len, q_len]
         
-        logger.info(f"after softmax, attn_weights: {attn_weights}")
+        # logger.info(f"after softmax, attn_weights: {attn_weights}")
 
         # 计算输出
         attn_weights = attn_weights.view(bsz * num_attention_heads, q_len, q_len)
@@ -745,7 +745,7 @@ class TorchDevice:
 
         hidden = rms_norm(inputs.data, input_layernorm.data)
         
-        logger.info(f"after norm, hidden states: {hidden}")
+        # logger.info(f"after norm, hidden states: {hidden}")
 
         # shape: (b, 1, h)
         q = F.linear(hidden, w_q.data)
@@ -757,21 +757,21 @@ class TorchDevice:
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
         
-        logger.info(f"after projection, query_states: {q}")
-        logger.info(f"after projection, key_states: {k}")
-        logger.info(f"after projection, value_states: {v}")
+        # logger.info(f"after projection, query_states: {q}")
+        # logger.info(f"after projection, key_states: {k}")
+        # logger.info(f"after projection, value_states: {v}")
         
-        logger.info(f"attention_mask: {attention_mask.shape}")
-        logger.info(f"inputs: {inputs.shape}")
-        logger.info(f"freq_cis: {freq_cis.shape}")
-        logger.info(f"src_s: {src_s}")
-        logger.info(f"tgt_s: {tgt_s}")
+        # logger.info(f"attention_mask: {attention_mask.shape}")
+        # logger.info(f"inputs: {inputs.shape}")
+        # logger.info(f"freq_cis: {freq_cis.shape}")
+        # logger.info(f"src_s: {src_s}")
+        # logger.info(f"tgt_s: {tgt_s}")
         freqs_slice = freq_cis[-tgt_s:]
         
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
         
-        logger.info(f"after rotary, query_states: {q}")
-        logger.info(f"after rotary, key_states: {k}")
+        # logger.info(f"after rotary, query_states: {q}")
+        # logger.info(f"after rotary, key_states: {k}")
         
         # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
@@ -871,12 +871,12 @@ class TorchDevice:
         mask_expanded = mask.view(b, 1, tgt_s, src_s).to(attn_scores.device)
         attn_scores = attn_scores + mask_expanded  # 直接相加
         
-        logger.info(f"attn_scores after adding mask: {attn_scores}")
+        # logger.info(f"attn_scores after adding mask: {attn_scores}")
         
         # softmax 在 fp32，数值更稳定
         attn_weights = F.softmax(attn_scores, dim=-1)  # [b, n_head, tgt_s, src_s]
         
-        logger.info(f"after softmax, attn_weights: {attn_weights}")
+        # logger.info(f"after softmax, attn_weights: {attn_weights}")
         attn_weights = attn_weights.view(b * n_head, tgt_s, src_s)
         
         # 回到 q 的 dtype（fp16/bf16）

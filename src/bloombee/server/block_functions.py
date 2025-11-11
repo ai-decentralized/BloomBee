@@ -295,38 +295,20 @@ async def iterate_rpc_inference(
         )
         # print('after priority = prioritizer.prioritize( )')
         #print_time_now('')
+        logger.info(f"requested_uids: {requested_uids}")
         # A client may pass a tensor with 0 tokens. This is a special case that occurs, e.g.
         # when user wants to pre-allocate cache or check that server *can* allocate that cache.
         if hidden_states.numel() > 0:
             assert hidden_states.ndim == 3, f"hidden states must be a single 3d tensor"
-            start_compute_time = perf_counter()
-            # print('before merge pools ')
-            #print_time_now('')
-            
-            # Add offloading debug information
-            # offload_logger.info(f" Inference computation started - step {prefix_length}")
-            # offload_logger.info(f"   - Batch size: {batch_size}")
-            # offload_logger.info(f"   - Length increment: {length_increment}")
-            # offload_logger.info(f"   - Prefix length: {prefix_length}")
-            # offload_logger.info(f"   - Max length: {max_length}")
-            
-            # # Check cache usage
-            # for i, (backend, handles) in enumerate(zip(requested_backends, cache_handles)):
-            #     cache_manager = backend.cache_manager
-            #     offload_logger.info(f"   - Backend {i}: {len(handles)} cache handles")
-            #     offload_logger.info(f"     GPU cache ratio: {cache_manager.offloading_policy.cache_gpu_percent}%")
-            #     offload_logger.info(f"     CPU cache ratio: {cache_manager.offloading_policy.cache_cpu_percent}%")
-            #     offload_logger.info(f"     CPU cache compute: {cache_manager.offloading_policy.cpu_cache_compute}")
-            
             if can_merge_pools:
                 # print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
                 # offload_logger.info(" Using merged pool for inference")
                 
                 inference_infos = tuple(
-                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids)
+                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens)
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
-                (hidden_states, full_mask) = await requested_backends[0].inference_pool.submit_task(
+                (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
                     hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                 )
                 
@@ -336,18 +318,13 @@ async def iterate_rpc_inference(
                 # offload_logger.info(" Using separate pools for inference")
                 
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
-                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids),)
-                    (hidden_states, full_mask) = await backend.inference_pool.submit_task(
+                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens),)
+                    (hidden_states, keep_indices) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
             
-            # offload_logger.info(f" Inference computation completed - step {prefix_length}")
-            # end_compute_time = perf_counter()
-            # print('the inference computing time ', end_compute_time - start_compute_time)
-            # print_time_now('')
-        # serialize and send last layer outputs
-        # logger.info(f"before _prune_draft_tree, hidden_states shape: {hidden_states.shape}, full_mask: {full_mask}")
-        hidden_states, keep_indices = _prune_draft_tree(pruner_manager, hidden_states, draft_tokens, full_mask)
+        logger.info(f"hidden_states device: {hidden_states.device}")
+        # (hidden_states, keep_indices) = await requested_backends[0].pruning_pool.submit_task(hidden_states.to('cpu', non_blocking=True), draft_tokens.to('cpu', non_blocking=True), full_mask.to('cpu', non_blocking=True))
         logger.info(f"after _prune_draft_tree, hidden_states shape: {hidden_states.shape}")
         logger.info(f"keep_indices: {keep_indices}")
         logger.info(f"outputs_schema: {requested_backends[-1].outputs_schema}")
@@ -379,18 +356,6 @@ async def iterate_rpc_inference(
     # print('iterate (all steps) rpc infer time cost (sec): ', end_iterate_rpc_infer_time - start_iterate_rpc_infer_time)########
     # #print_time_now('')
     # print()
-    
-def _prune_draft_tree(manager: BloombeePrunerManager, hidden_states: torch.Tensor, draft_tokens: torch.Tensor, tree_attention_mask):
-        results = manager.prune_speculation_tree(
-            hidden_states,
-            draft_tokens,
-            tree_attention_mask
-        )
-        
-        keep_indices = results['keep_indices']
-        logger.info(f"keep_indices: {keep_indices}")
-        new_hidden_states = hidden_states[:, keep_indices, :]
-        return new_hidden_states, keep_indices
         
         
         

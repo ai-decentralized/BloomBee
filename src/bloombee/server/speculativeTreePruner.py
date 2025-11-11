@@ -7,6 +7,7 @@ from collections import deque
 from abc import ABC, abstractmethod
 from enum import Enum
 import logging
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -28,15 +29,15 @@ class BranchContext:
     position: int  # Position in sequence
 
 
-@dataclass
-class NetworkCondition:
-    """Network statistics for adaptive pruning"""
-    avg_acceptance_rate: float
-    recent_latency: float
-    tokens_generated: int
-    pruning_accuracy: float
-    bandwidth_usage: float = 0.8  # Network bandwidth utilization
-    gpu_memory_usage: float = 0.7  # GPU memory utilization
+# @dataclass
+# class NetworkCondition:
+#     """Network statistics for adaptive pruning"""
+#     avg_acceptance_rate: float
+#     recent_latency: float
+#     tokens_generated: int
+#     pruning_accuracy: float
+#     bandwidth_usage: float = 0.8  # Network bandwidth utilization
+#     gpu_memory_usage: float = 0.7  # GPU memory utilization
 
 
 @dataclass
@@ -372,10 +373,59 @@ class NetworkCondition:
             throughput=base['throughput'] * (1 + random.uniform(-0.15, 0.15))
         )
 
+class DualPathPruner(nn.Module):
+    """
+    两条路径的网络：
+    - 质量路径：评估token质量（不看网络）
+    - 阈值路径：根据网络状况动态调整决策阈值
+    """
+    def __init__(self, hidden_size=64):
+        super().__init__()
+        
+        # 质量评估路径（只看token特征，不看网络）
+        self.quality_path = nn.Sequential(
+            nn.Linear(4, hidden_size),  # prob(3) + acceptance(1)
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)  # 输出质量分数
+        )
+        
+        # 阈值调整路径（只看网络状况）
+        self.threshold_path = nn.Sequential(
+            nn.Linear(4, hidden_size // 2),  # network features(4)
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)  # 输出阈值调整量
+        )
+    
+    def forward(self, prob_features, network_features):
+        """
+        Args:
+            prob_features: [batch, 4] - max_prob, entropy, token_prob, acceptance_rate
+            network_features: [batch, 4] - bandwidth, latency, packet_loss, jitter
+        
+        Returns:
+            decision_prob: [batch] - 最终决策概率
+            quality_score: [batch] - 质量分数
+            threshold_adjust: [batch] - 阈值调整量
+        """
+        quality_score = self.quality_path(prob_features).squeeze(-1)  # [batch]
+        threshold_adjust = self.threshold_path(network_features).squeeze(-1)  # [batch]
+        
+        # 决策分数 = 质量 - 阈值
+        # 网络好时，threshold小，容易keep
+        # 网络差时，threshold大，难以keep
+        decision_score = quality_score - threshold_adjust
+        
+        # 通过sigmoid转换为概率
+        decision_prob = torch.sigmoid(decision_score)
+        
+        return decision_prob, quality_score, threshold_adjust
+
+
 class AdaptiveNeuralPruner:
     """
-    Neural pruner that directly outputs keep/prune decisions
-    No threshold adjustment needed - network learns everything
+    Neural pruner with dual-path architecture
     """
     
     def __init__(
@@ -384,7 +434,7 @@ class AdaptiveNeuralPruner:
         vocab_size: int,
         neural_hidden: int = 64,
         device: str = 'cuda',
-        config: PruningConfig = None,
+        config = None,
     ):
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
@@ -393,133 +443,168 @@ class AdaptiveNeuralPruner:
         
         # LM head for getting probabilities
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False).to(device)
+        self.lm_head.requires_grad_(False)
+        self.lm_head.to(dtype=torch.float16)
         
-        # Neural network for direct decision
-        # Input: 4 network + 3 probability + 1 acceptance = 8 features
-        # Output: Single probability (>0.5 means keep, ≤0.5 means prune)
-        dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        dt  = torch.float32
-        torch.set_default_dtype(dt)
-        self.decision_net = nn.Sequential(
-            nn.Linear(8, neural_hidden),
-            nn.LayerNorm(neural_hidden),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-
-            nn.Linear(neural_hidden, neural_hidden // 2),
-            nn.LayerNorm(neural_hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-
-            nn.Linear(neural_hidden // 2, 1),
-            nn.Sigmoid()
-        )
+        # Dual-path decision network
+        self.decision_net = DualPathPruner(hidden_size=neural_hidden).to(device)
         
         # Optimizer
-        self.optimizer = torch.optim.AdamW(self.decision_net.parameters(), lr=1e-4)
+        self.optimizer = torch.optim.AdamW(
+            self.decision_net.parameters(), 
+            lr=1e-4
+        )
         
         # Historical acceptance rate tracking
         self.acceptance_history = deque(maxlen=100)
-        self.current_acceptance_rate = 0.5  # Initial guess
+        self.current_acceptance_rate = 0.5
         
         # Training mode flag
         self.training = False
-
-        
-        
+    
     def extract_features(
         self,
         logits: torch.Tensor,
-        position: int,
+        parent_position: int,
         network_condition: NetworkCondition,
         acceptance_rate: float,
         draft_token: Optional[int] = None
-    ) -> torch.Tensor:
-        """Extract all features for decision making"""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        probs = F.softmax(logits[position], dim=-1)
+        """
+        Extract features and split into prob_features and network_features
+        TODO: position error
+        Returns:
+            prob_features: [4] - max_prob, entropy, token_prob, acceptance_rate
+            network_features: [4] - bandwidth, latency, packet_loss, jitter
+        """
         
-        # Probability features
+        # 获取特定位置的logits
+        logits_at_pos = logits[0, parent_position]  # [vocab_size]
+        
+        # 计算概率
+        probs = F.softmax(logits_at_pos, dim=-1)
+        
+        # 概率特征
         max_prob = torch.max(probs).item()
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
-        normalized_entropy = entropy / torch.log(torch.tensor(float(self.vocab_size)))
+        logger.info(f"max_prob: {max_prob}")
+        entropy = -torch.sum(torch.where(
+            probs > 1e-10,
+            probs * torch.log(probs),
+            torch.zeros_like(probs)
+        ))
+        logger.info(f"entropy: {entropy}")
+        log_vocab_size = torch.log(torch.tensor(float(self.vocab_size)))
+        logger.info(f"log_vocab_size: {log_vocab_size}")
+        if log_vocab_size > 0:
+            normalized_entropy = (entropy / log_vocab_size).item()
+        else:
+            normalized_entropy = 0.0  # vocab_size <= 1 时
+        logger.info(f"normalized_entropy: {normalized_entropy}")
         
+        # Token概率
         if draft_token is not None:
             token_prob = probs[draft_token].item()
         else:
-            # Use top-5 probability mass as proxy
             token_prob = torch.topk(probs, k=min(5, self.vocab_size)).values.sum().item()
         
-        # Combine all features
-        features = torch.tensor(
-            network_condition.to_features() +  # 4 network features
-            [max_prob, normalized_entropy, token_prob] +  # 3 probability features
-            [acceptance_rate],  # 1 acceptance rate
+        # 组合特征
+        prob_features = torch.tensor(
+            [max_prob, normalized_entropy, token_prob, acceptance_rate],
             dtype=torch.float32,
             device=self.device
         )
         
-        return features
+        network_features = torch.tensor(
+            network_condition.to_features(),  # [bandwidth, latency, packet_loss, jitter]
+            dtype=torch.float32,
+            device=self.device
+        )
+        
+        return prob_features, network_features
+    
+    def _get_parent_postion(self, i, mask):
+        for j in range(i-1, -1, -1):
+            if mask[0, i, j] == 1:
+                return j
+        return i
     
     def prune_branches(
         self,
         middle_hidden_states: torch.Tensor,
-        tree_attention_mask: torch.Tensor,
-        network_condition: Optional[NetworkCondition] = None,
-        draft_tokens: Optional[List[int]] = None
+        draft_tokens: Optional[List[int]] = None,
+        tree_attention_mask: torch.Tensor = None,
+        network_condition = None,
     ) -> Dict:
         """
-        Main pruning interface - directly outputs decisions
+        Main pruning interface
         
         Args:
-            middle_hidden_states: [seq_len, hidden_size]
-            tree_attention_mask: [seq_len, seq_len]
-            network_condition: Current network state (will mock if None)
+            middle_hidden_states: [1, seq_len, hidden_size]
+            tree_attention_mask: [1, seq_len, total_len]
+            network_condition: Current network state
             draft_tokens: Optional draft token IDs
         """
         
-        seq_len = middle_hidden_states.shape[0]
-        
+        seq_len = middle_hidden_states.shape[1]
         prefix_len = tree_attention_mask.shape[2] - seq_len
         
         # Mock network condition if not provided
         if network_condition is None:
-            network_condition = NetworkCondition.mock()
-        
-        # Move to device
-        middle_hidden_states = middle_hidden_states.to(self.device)
-        tree_attention_mask = tree_attention_mask.to(self.device)
+            network_condition = self.get_network_condition() or NetworkCondition.mock()
         
         # Get logits from middle layer
         logits = self.lm_head(middle_hidden_states)
         
         # Initialize masks
-        keep_mask = torch.ones(seq_len, dtype=torch.bool, device=self.device)
-        discarded = torch.zeros(seq_len, dtype=torch.bool, device=self.device)
-        decision_probs = torch.zeros(seq_len, device=self.device)
+        keep_mask = torch.ones(seq_len, dtype=torch.bool)
+        discarded = torch.zeros(seq_len, dtype=torch.bool)
+        decision_probs = torch.zeros(seq_len)
+        quality_scores = torch.zeros(seq_len)
+        threshold_adjusts = torch.zeros(seq_len)
         
-        # Process each position in depth-first order
+        logger.info(f"prune_branches, seq_len: {seq_len}")
+        logger.info(f"prune_branches, discarded: {discarded}")
+        
+        # Process each position
         for i in range(seq_len):
+            if i == 0:
+                keep_mask[0] = True
+                decision_probs[0] = 1.0
+                continue
+            
             if discarded[i]:
                 keep_mask[i] = False
                 decision_probs[i] = 0.0
                 continue
             
             # Extract features
-            features = self.extract_features(
-                logits, i,
+            parent_postion = self._get_parent_postion(i, tree_attention_mask)
+            prob_features, network_features = self.extract_features(
+                logits, parent_postion,
                 network_condition,
                 self.current_acceptance_rate,
-                draft_tokens[i] if draft_tokens else None
+                draft_tokens[i] if draft_tokens is not None else None
             )
             
-            # Get decision from neural network
+            logger.info(f"prune_branches, prob_features: {prob_features}")
+            logger.info(f"prune_branches, network_features: {network_features}")
+            
+            # Get decision from dual-path network
             with torch.no_grad():
-                prob = self.decision_net(features.unsqueeze(0)).squeeze()
-                decision_probs[i] = prob
+                prob, quality, threshold = self.decision_net(
+                    prob_features.unsqueeze(0),
+                    network_features.unsqueeze(0)
+                )
                 
-                # Direct decision: >0.5 means keep
-                keep = prob > self.config.neural_threshold
+                decision_probs[i] = prob.item()
+                quality_scores[i] = quality.item()
+                threshold_adjusts[i] = threshold.item()
+                
+                # Decision: >0.5 means keep
+                keep = prob.item() > self.config.neural_threshold
+                
+                logger.info(f"prune_branches, prob: {prob}, quality: {quality}, threshold: {threshold}, i: {i}")
             
             if not keep:
                 keep_mask[i] = False
@@ -533,57 +618,34 @@ class AdaptiveNeuralPruner:
         
         # Ensure at least one branch is kept
         kept_count = keep_mask.sum().item()
-        logger.info(f"prune_branches keep_mask: {keep_mask}")
-        logger.info(f"prune_branches discarded: {discarded}")
-        logger.info(f"prune_branches kept_count: {kept_count}")
-        # logger.info(f"prune_branches tree_attention_mask: {tree_attention_mask}")
+        
         if kept_count < self.config.min_keep_branches:
-            # Initialize all nodes as potential leaf nodes
+            # Keep top-scoring branches
             is_leaf = torch.ones(seq_len, dtype=torch.bool)
+            leaf_paths = []
             
-            # Store leaf nodes with their path scores
-            leaf_paths = []  # List of (score, leaf_idx, path_indices)
-            
-            # Traverse from back to front
             for i in range(seq_len - 1, -1, -1):
                 if is_leaf[i]:
-                    # This is a leaf node, calculate its path score
                     path_indices = [i]
                     path_score = decision_probs[i].item()
                     
-                    # Find all ancestors of node i (from i-1 to 0)
                     for j in range(i - 1, -1, -1):
-                        # Check if j is an ancestor of i
                         if tree_attention_mask[0, i, j + prefix_len] == 1:
-                            # Mark j as non-leaf (it has descendants)
                             is_leaf[j] = False
-                            
-                            # Add to path
                             path_indices.append(j)
-                            # Multiply path score
                             path_score *= decision_probs[j].item()
                     
-                    # Save this leaf and its path score
-                    path_indices.reverse()  # Order from root to leaf
+                    path_indices.reverse()
                     leaf_paths.append((path_score, i, path_indices))
             
-            # Sort leaf nodes by path score (high to low)
-            logger.info(f"prune_branches is_leaf : {is_leaf}")
             leaf_paths.sort(key=lambda x: x[0], reverse=True)
-            logger.info(f"prune_branches leaf_paths : {leaf_paths}")
-            
-            # Keep top branches (complete paths from root to leaf)
-            # keep_mask = torch.zeros(seq_len, dtype=torch.bool)
             branches_kept = 0
             
             for path_score, leaf_idx, path_indices in leaf_paths:
                 if branches_kept >= self.config.min_keep_branches:
                     break
-                
-                # Keep all nodes in this path
                 for idx in path_indices:
                     keep_mask[idx] = True
-                
                 branches_kept += 1
         
         # Get final indices
@@ -594,6 +656,8 @@ class AdaptiveNeuralPruner:
             'keep_indices': keep_indices,
             'prune_indices': prune_indices,
             'decision_probs': decision_probs.cpu().tolist(),
+            'quality_scores': quality_scores.cpu().tolist(),
+            'threshold_adjusts': threshold_adjusts.cpu().tolist(),
             'network_condition': network_condition,
             'acceptance_rate': self.current_acceptance_rate
         }
@@ -603,84 +667,129 @@ class AdaptiveNeuralPruner:
         middle_hidden_states: torch.Tensor,
         tree_attention_mask: torch.Tensor,
         accepted_indices: List[int],
-        network_condition: NetworkCondition,
+        network_condition,
         draft_tokens: Optional[List[int]] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Collect features and labels for training
         
-        Args:
-            accepted_indices: Indices that were actually accepted by main model
-            
         Returns:
-            features: [seq_len, 8] tensor of features
-            labels: [seq_len] tensor of 0/1 labels
+            prob_features: [seq_len, 4]
+            network_features: [seq_len, 4]
+            labels: [seq_len]
         """
         
         seq_len = middle_hidden_states.shape[0]
         middle_hidden_states = middle_hidden_states.to(self.device)
         
         # Get logits
-        logits = self.lm_head(middle_hidden_states)
+        logits = self.lm_head(middle_hidden_states.unsqueeze(0))
         
-        features_list = []
+        prob_features_list = []
+        network_features_list = []
         labels_list = []
         
         for i in range(seq_len):
             # Extract features
-            features = self.extract_features(
+            prob_feat, net_feat = self.extract_features(
                 logits, i,
                 network_condition,
                 self.current_acceptance_rate,
                 draft_tokens[i] if draft_tokens else None
             )
-            features_list.append(features)
+            prob_features_list.append(prob_feat)
+            network_features_list.append(net_feat)
             
             # Label: 1 if accepted, 0 if rejected
             label = 1.0 if i in accepted_indices else 0.0
             labels_list.append(label)
         
-        return torch.stack(features_list), torch.tensor(labels_list, device=self.device)
+        return (
+            torch.stack(prob_features_list),
+            torch.stack(network_features_list),
+            torch.tensor(labels_list, device=self.device)
+        )
     
     def train_step(
         self,
-        features: torch.Tensor,
-        labels: torch.Tensor,
-        pruning_weight: float = 0.1
-    ) -> float:
+        prob_features: torch.Tensor,      # [tree_size, 4]
+        network_features: torch.Tensor,   # [tree_size, 4]
+        labels: torch.Tensor,             # [tree_size]
+        alpha: float = 1.0,               # BCE loss weight
+        beta: float = 0.1                 # Pruning alignment weight
+    ) -> dict:
         """
-        Single training step
+        Single training step for ONE tree
         
         Args:
-            features: [batch_size, 8] features
-            labels: [batch_size] binary labels (1=keep, 0=prune)
-            pruning_weight: Weight for encouraging pruning
+            prob_features: Token probability features
+            network_features: Network condition features
+            labels: Whether each token was accepted
+            alpha: Weight for BCE loss
+            beta: Weight for pruning alignment loss
         """
         
         self.decision_net.train()
         self.optimizer.zero_grad()
         
+        tree_size = prob_features.shape[0]
+        
         # Forward pass
-        predictions = self.decision_net(features).squeeze()
+        predictions, quality_scores, threshold_adjusts = self.decision_net(
+            prob_features, 
+            network_features
+        )
         
-        # Binary cross-entropy loss
-        bce_loss = F.binary_cross_entropy(predictions, labels)
+        # === Loss 1: Token Quality Prediction (with class weighting) ===
+        pos_count = labels.sum()
+        neg_count = tree_size - pos_count
         
-        # Add small penalty to encourage pruning (for speedup)
-        # This prevents the model from being too conservative
-        pruning_rate = (predictions < 0.5).float().mean()
-        pruning_bonus = pruning_weight * pruning_rate
+        if pos_count > 0:
+            pos_weight = neg_count / pos_count
+            # 为正样本加权
+            sample_weights = torch.where(labels == 1, pos_weight, 1.0)
+        else:
+            sample_weights = torch.ones_like(labels)
         
-        # Total loss
-        loss = bce_loss - pruning_bonus
+        bce_loss = F.binary_cross_entropy(
+            predictions, 
+            labels, 
+            weight=sample_weights
+        )
         
-        # Backward pass
-        loss.backward()
+        # === Loss 2: Network-Aware Pruning Alignment ===
+        # 当前预测的pruning rate
+        current_pruning_rate = (predictions < 0.5).float().mean()
+        
+        # 从网络特征计算目标pruning rate
+        # 使用第一个token的网络特征（整棵树共享）
+        bandwidth = network_features[0, 0].item()
+        network_severity = 1.0 - min(bandwidth / 100.0, 1.0)
+        target_pruning_rate = 0.2 + 0.6 * network_severity  # 20%-80%
+        
+        # Alignment loss
+        pruning_alignment = (current_pruning_rate - target_pruning_rate) ** 2
+        
+        # === Total Loss ===
+        total_loss = alpha * bce_loss + beta * pruning_alignment
+        
+        total_loss.backward()
         self.optimizer.step()
         
         self.decision_net.eval()
         
-        return loss.item()
+        return {
+            'total_loss': total_loss.item(),
+            'bce_loss': bce_loss.item(),
+            'pruning_alignment': pruning_alignment.item(),
+            'current_pruning_rate': current_pruning_rate.item(),
+            'target_pruning_rate': target_pruning_rate,
+            'network_severity': network_severity,
+            'avg_quality_score': quality_scores.mean().item(),
+            'avg_threshold': threshold_adjusts.mean().item(),
+            'pos_count': pos_count.item(),
+            'neg_count': neg_count.item()
+        }
     
     def update_acceptance_rate(self, rate: float):
         """Update historical acceptance rate"""
@@ -703,6 +812,10 @@ class AdaptiveNeuralPruner:
         self.lm_head.load_state_dict(checkpoint['lm_head'])
         self.acceptance_history = deque(checkpoint['acceptance_history'], maxlen=100)
         self.current_acceptance_rate = checkpoint['current_acceptance_rate']
+    
+    def get_network_condition(self):
+        """Override this in subclass if needed"""
+        return None
 
 
 class BloombeePrunerFactory:
@@ -743,7 +856,7 @@ class BloombeePrunerFactory:
             return SimpleProbabilityPruner(hidden_size, vocab_size, config, tie_weights)
         elif method == PruningMethod.ADAPTIVE_NEURAL:
             logger.info("Creating Adaptive Neural Pruner")
-            return AdaptiveNeuralPruner(hidden_size, vocab_size, config, tie_weights)
+            return AdaptiveNeuralPruner(hidden_size, vocab_size, 64, 'cuda', config)
         else:
             raise ValueError(f"Unknown pruning method: {method}")
 
@@ -803,22 +916,6 @@ class BloombeePrunerManager:
         draft_tokens: List[int],
         tree_attention_mask: torch.Tensor,
     ) -> Dict[str, Any]:
-        """
-        Main interface for pruning speculation tree
-        
-        Args:
-            middle_hidden_states: Hidden states from middle layer
-            draft_logits: Logits from draft model
-            draft_tokens: Draft token IDs
-            tree_structure: Tree structure information
-            
-        Returns:
-            Pruning results with kept branches and statistics
-        """
-        
-        # Build branch contexts from tree structure
-        
-        # Get network condition if using adaptive method
         kwargs = {}
         if isinstance(self.pruner, AdaptiveNeuralPruner):
             kwargs['network_condition'] = self.pruner.get_network_condition()

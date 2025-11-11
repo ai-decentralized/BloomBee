@@ -613,6 +613,7 @@ class ModuleContainer(threading.Thread):
                     block,  ###### block instance
                     config=block_config,
                     cache_manager=cache_manager,
+                    pruner_manager=pruner_manager,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
                     args_schema=(
