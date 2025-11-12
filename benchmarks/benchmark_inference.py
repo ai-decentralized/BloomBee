@@ -47,8 +47,13 @@ def main():
     for proc in processes:
         proc.join()
 
-    speed = np.mean([pipe_recv.recv() for _ in range(args.n_processes)])
-    logger.info(f"Final result: {speed=:.2f}")
+    results = [pipe_recv.recv() for _ in range(args.n_processes)]
+    speeds = [r[0] for r in results]
+    effective_speeds = [r[1] for r in results]
+    
+    avg_speed = np.mean(speeds)
+    avg_effective_throughput = np.mean(effective_speeds)
+    logger.info(f"Final result: throughput={avg_speed:.2f} tokens/sec/sequence, effective_throughput={avg_effective_throughput:.2f} tokens/sec")
 
 
 @torch.inference_mode()
@@ -252,6 +257,14 @@ def benchmark_inference(process_idx, args, result_pipe):
             
             logger.info(f"{'='*80}\n")
     
+    # Calculate final throughput and effective throughput
+    if step_times:
+        speed = 1 / np.mean(step_times)
+    else:
+        # Fallback if no steps were measured (shouldn't happen in normal operation)
+        speed = 0.0
+    effective_speed = speed * batch_size
+    
     # Show final generated text for each batch
     logger.info(f"\n{'='*80}")
     logger.info(f"[FINAL RESULTS] {process_idx=}")
@@ -261,7 +274,7 @@ def benchmark_inference(process_idx, args, result_pipe):
         logger.info(f"\nbatch[{batch_idx}] Full generated text:\n{full_text}\n")
     logger.info(f"{'='*80}\n")
     
-    result_pipe.send(speed)
+    result_pipe.send((speed, effective_speed))
 
 
 if __name__ == "__main__":
