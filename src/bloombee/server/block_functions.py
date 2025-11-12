@@ -85,10 +85,6 @@ async def run_rpc_forward(
     else:
         prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
 
-    # Log input tensor info for debugging
-    logger.info(f"[CROSS_GPU_DEBUG] Input hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-    logger.info(f"[CROSS_GPU_DEBUG] Number of requested backends: {len(requested_backends)}")
-    
     # Track S1->S2 transfer latency specifically
     s1_to_s2_transfer_times = []
     backend_processing_times = []
@@ -290,14 +286,9 @@ async def iterate_rpc_inference(
         deserialize_end = perf_counter()
         deserialize_time = (deserialize_end - deserialize_start) * 1000  # ms
         step_num = step_metadata.get("step", 0)
-        logger.info(f"[DATA_TRANSFER_RECV] Step={step_num} | Deserialize={deserialize_time:.2f}ms | Batch={batch_size} | Len={length_increment}")
         
         # Add Cross-GPU Transfer Latency measurement
         cross_gpu_start_time = perf_counter()
-        logger.info(f"[CROSS_GPU_TRANSFER_RECV_START] Step={step_num} | FromBlocks=remote | ToBlocks={requested_backends[0].name if requested_backends else 'unknown'}")
-        logger.info(f"[CROSS_GPU_DEBUG] Input hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-        logger.info(f"[CROSS_GPU_DEBUG] Number of requested backends: {len(requested_backends)}")
-        logger.info(f"[CROSS_GPU_DEBUG] Batch size: {batch_size}, Length increment: {length_increment}")
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
@@ -432,7 +423,6 @@ async def iterate_rpc_inference(
             # offload_logger.info(f" Inference computation completed - step {prefix_length}")
             end_compute_time = perf_counter()
             compute_time = (end_compute_time - start_compute_time) * 1000  # ms
-            logger.info(f"[COMPUTE_END] Step={step_num} | Duration={compute_time:.2f}ms")
             # print('the inference computing time ', end_compute_time - start_compute_time)
             # print_time_now('')
         # serialize and send last layer outputs
@@ -443,7 +433,6 @@ async def iterate_rpc_inference(
         ]
         serialize_end = perf_counter()
         serialize_time = (serialize_end - serialize_start) * 1000  # ms
-        logger.info(f"[DATA_TRANSFER_SEND] Step={step_num} | Serialize={serialize_time:.2f}ms")
         # print('after serialize and send last layer outputs ', )
         # print_time_now('')
         # print('hidden_states ', hidden_states)
@@ -458,13 +447,10 @@ async def iterate_rpc_inference(
         # Calculate Cross-GPU Transfer receive time
         cross_gpu_end_time = perf_counter()
         cross_gpu_receive_time = (cross_gpu_end_time - cross_gpu_start_time) * 1000  # ms
-        logger.info(f"[CROSS_GPU_TRANSFER_RECV_END] Step={step_num} | ReceiveTime={cross_gpu_receive_time:.2f}ms | FromBlocks=remote")
         
         # Calculate total step time
         step_end_time = perf_counter()
         step_total_time = (step_end_time - step_receive_time) * 1000  # ms
-        logger.info(f"[STEP_TOTAL] Step={step_num} | TotalTime={step_total_time:.2f}ms | Prefix={prefix_length}")
-        logger.info("="*80)
         
         yield output_tensors, can_push, step_metadata
         # print('output_tensors ',output_tensors)

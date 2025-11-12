@@ -365,11 +365,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                             processed_step_ids.add(step_id)
                     elif pushed:
                         n_late_pushes += 1
+                        # Downgrade to debug to reduce log noise
                         self._log_request(
                             "rpc_inference.push",
                             requested_uids,
                             context,
-                            warning=f"arrived late {n_late_pushes / n_pushes * 100:.1f}% of the time",
+                            debug=f"arrived late {n_late_pushes / n_pushes * 100:.1f}% of the time",
                         )
                     
                     end_meta_push_time = perf_counter()
@@ -433,9 +434,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         push_start_time = perf_counter()
         try:
             next_servers = metadata.get("next_servers")
-            print(f"[DEBUG] _push_outputs: next_servers={next_servers}")
             if not next_servers:
-                print(f"[DEBUG] _push_outputs: No next_servers, returning early")
                 return
 
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]
