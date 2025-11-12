@@ -139,12 +139,8 @@ class _ServerInferenceSession:
         # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
         if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
-            print(f"[DEBUG] use_server_to_server=True, next_servers={next_servers}")
             if next_servers:
                 request_metadata["next_servers"] = next_servers
-                print(f"[DEBUG] Added next_servers to request_metadata: {request_metadata.get('next_servers')}")
-        else:
-            print(f"[DEBUG] use_server_to_server=False")
 
         request_metadata["args_structure"] = args_structure
 
