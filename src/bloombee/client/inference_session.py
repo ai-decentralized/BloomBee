@@ -155,8 +155,12 @@ class _ServerInferenceSession:
         ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
         # Serialize and send data (debug output removed for performance)
+        # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
         serialized_tensors = [
-            serialize_torch_tensor(tensor.to(proto.dtype), proto.compression)
+            serialize_torch_tensor(
+                tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
+                proto.compression
+            )
             for tensor, proto in zip(input_tensors, inference_schema)
         ]
         serialized_metadata = MSGPackSerializer.dumps(request_metadata)
@@ -333,6 +337,7 @@ class InferenceSession:
 
         server_idx = 0
         block_idx = 0
+        inference_step_start = time.perf_counter()
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
                 logger.debug(f"Inference: block {block_idx}, attempt {attempt_no}")
@@ -344,12 +349,20 @@ class InferenceSession:
                     server_session = self._server_sessions[server_idx]
                     assert server_session.position == self.position, f"{server_session.position} and {self.position}"
                     
+                    # 🔍 CLIENT DEBUG: Log server span processing start
+                    span_start_time = time.perf_counter()
+                    
                     inputs = server_session.step( 
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
                         step_id=step_id,
                     )
+                    
+                    # 🔍 CLIENT DEBUG: Log server span processing end
+                    span_end_time = time.perf_counter()
+                    span_duration = (span_end_time - span_start_time) * 1000  # ms
+                    logger.info(f"[CLIENT_SERVER_END] ServerIdx={server_idx} | Blocks={server_session.span.start}:{server_session.span.end} | Duration={span_duration:.2f}ms")
                     # print('inputs ', inputs)
                     # print('inputs.shape ', inputs.shape)
                     server_idx += 1
@@ -373,6 +386,13 @@ class InferenceSession:
         self._position += n_input_tokens 
         # print(f"lient inference session outputs, inputs: {inputs}")
         outputs = inputs 
+        
+        # 🔍 CLIENT DEBUG: Log inference step end
+        inference_step_end = time.perf_counter()
+        inference_step_duration = (inference_step_end - inference_step_start) * 1000  # ms
+        logger.info(f"[CLIENT_INFERENCE_END] Position={self._position} | Duration={inference_step_duration:.2f}ms | Servers={server_idx}")
+        logger.info("="*80)
+        
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         # print('client inference session outputs ', outputs.shape)
         return outputs

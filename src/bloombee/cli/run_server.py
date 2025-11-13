@@ -10,7 +10,6 @@ from humanfriendly import parse_size
 
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 from bloombee.server.server import Server
-from bloombee.utils.convert_block import QuantType
 from bloombee.utils.version import validate_version
 
 logger = get_logger(__name__)
@@ -150,10 +149,6 @@ def main():
     parser.add_argument("--mean_balance_check_period", type=float, default=60,
                         help="Check the swarm's balance every N seconds (and rebalance it if necessary)")
 
-    parser.add_argument('--quant_type', type=str, default=None, choices=[choice.name.lower() for choice in QuantType],
-                        help="Quantize blocks to 8-bit (int8 from the LLM.int8() paper) or "
-                             "4-bit (nf4 from the QLoRA paper) formats to save GPU memory. "
-                             "Default: 'int8' if GPU is available, 'none' otherwise")
     parser.add_argument("--tensor_parallel_devices", nargs='+', default=None,
                         help=
                         "Split each block between the specified GPUs such that each device holds a portion of every "
@@ -210,10 +205,6 @@ def main():
 
     if args.pop("new_swarm"):
         args["initial_peers"] = []
-
-    quant_type = args.pop("quant_type")
-    if quant_type is not None:
-        args["quant_type"] = QuantType[quant_type.upper()]
 
     validate_version()
 

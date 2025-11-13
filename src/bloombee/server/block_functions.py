@@ -32,7 +32,7 @@ def print_time_now(s):
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
-# TODO: Increase the NF4 threshold once bitsandbytes ships efficient NF4 kernel for parallel forward
+# Note: NF4 refers to FlexGen's 4-bit group quantization, not bitsandbytes
 MAX_SHORT_INFERENCE_TOKENS = 128
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
@@ -60,10 +60,21 @@ async def run_rpc_forward(
     :param requested_backends: a sequence of transformer blocks in the same order as they appear in forward pass
     :returns: hidden states after the last layer [batch_size, seq_length, hid_size]
     """
+    # Start timing for Cross-GPU Transfer Latency measurement
+    cross_gpu_start_time = perf_counter()
+    
     if args_structure is not None:
         # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
         flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     hidden_states, prompts, *_ = flat_tensors
+
+    # Fix for bus error in cross-machine setups: ensure tensors are contiguous
+    # Deserialized tensors from network buffers may not be properly aligned,
+    # especially for certain batch sizes (e.g., batch_size=16)
+    if not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
+    if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
+        prompts = prompts.contiguous()
 
     dtype = requested_backends[0].dtype
     # check parse input tensors and cast dtypes
@@ -74,8 +85,14 @@ async def run_rpc_forward(
     else:
         prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
 
+    # Track S1->S2 transfer latency specifically
+    s1_to_s2_transfer_times = []
+    backend_processing_times = []
+    
     # Run a chain of requested backends
     for i, (backend, prompt) in enumerate(zip(requested_backends, prompts)):
+        backend_start_time = perf_counter()
+        
         if not is_dummy(prompt):
             hidden_states[:, : prompt.shape[1]] += prompt
 
@@ -84,16 +101,59 @@ async def run_rpc_forward(
             hidden_states, points=points / len(requested_backends), backend=backend, type="forward"
         )
         
+        # Submit task and measure processing time
+        task_start_time = perf_counter()
         (hidden_states,) = await backend.forward_pool.submit_task(
             hidden_states,
             active_adapter,
             priority=priority,
         )
+        task_end_time = perf_counter()
+        task_processing_time = (task_end_time - task_start_time) * 1000  # Convert to milliseconds
+        
+        backend_end_time = perf_counter()
+        backend_total_time = (backend_end_time - backend_start_time) * 1000
+        
+        # Track individual backend processing times
+        backend_processing_times.append(task_processing_time)
+        
+        # Estimate S1->S2 transfer time (this is an approximation)
+        # The transfer time is roughly the total time minus pure processing time
+        if i > 0:  # Only measure transfer between different backends
+            estimated_transfer_time = backend_total_time - task_processing_time
+            s1_to_s2_transfer_times.append(estimated_transfer_time)
+            logger.info(f"[S1_TO_S2_TRANSFER] Backend {i} | "
+                       f"Estimated Transfer Time: {estimated_transfer_time:.2f}ms | "
+                       f"Total Backend Time: {backend_total_time:.2f}ms | "
+                       f"Pure Processing: {task_processing_time:.2f}ms")
+        
+        # Log processing latency for each backend
+        logger.info(f"[PROCESSING_LATENCY] Backend {i} | "
+                   f"Task Processing: {task_processing_time:.2f}ms | "
+                   f"Total Backend Time: {backend_total_time:.2f}ms | "
+                   f"Hidden States Shape: {hidden_states.shape}")
         
         assert isinstance(hidden_states, torch.Tensor)
         assert (
             hidden_states.ndim == 3
         ), f"inputs to {type(backend)} must be a list with a single 3d tensor of hidden states"
+
+    # Calculate total Cross-GPU Transfer Latency
+    cross_gpu_end_time = perf_counter()
+    cross_gpu_latency = (cross_gpu_end_time - cross_gpu_start_time) * 1000
+    
+    # Calculate S1->S2 transfer statistics
+    if s1_to_s2_transfer_times:
+        s1_to_s2_mean = sum(s1_to_s2_transfer_times) / len(s1_to_s2_transfer_times)
+        s1_to_s2_total = sum(s1_to_s2_transfer_times)
+        logger.info(f"[S1_TO_S2_TRANSFER_SUMMARY] "
+                   f"Average Transfer: {s1_to_s2_mean:.2f}ms | "
+                   f"Total Transfer: {s1_to_s2_total:.2f}ms | "
+                   f"Transfer Count: {len(s1_to_s2_transfer_times)}")
+    
+    logger.info(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
+               f"Backends: {len(requested_backends)} | "
+               f"Output Shape: {hidden_states.shape}")
 
     return hidden_states
 
@@ -110,6 +170,16 @@ async def run_rpc_backward(
         # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
         flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     inputs, grad_outputs, prompts, *_ = flat_tensors
+
+    # Fix for bus error in cross-machine setups: ensure tensors are contiguous
+    # Deserialized tensors from network buffers may not be properly aligned,
+    # especially for certain batch sizes (e.g., batch_size=16)
+    if not inputs.is_contiguous():
+        inputs = inputs.contiguous()
+    if not grad_outputs.is_contiguous():
+        grad_outputs = grad_outputs.contiguous()
+    if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
+        prompts = prompts.contiguous()
 
     # Cast inputs & grad outputs to backend dtype
     inputs = inputs.to(requested_backends[0].dtype)
@@ -181,6 +251,7 @@ async def iterate_rpc_inference(
 
     async for request, step_metadata in input_iterator:
         # print('------------------ iterate_rpc_inference step_metadata ', step_metadata)
+        step_receive_time = perf_counter()
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
             assert (
@@ -196,11 +267,28 @@ async def iterate_rpc_inference(
         hidden_states, prompts, hypo_ids, *_ = flat_tensors
         batch_size, length_increment, _ = hidden_states.shape
 
+        # Fix for bus error in cross-machine setups: ensure tensors are contiguous
+        # Deserialized tensors from network buffers may not be properly aligned,
+        # especially for certain batch sizes (e.g., batch_size=16)
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
+            prompts = prompts.contiguous()
+        if not hypo_ids.is_contiguous():
+            hypo_ids = hypo_ids.contiguous()
+
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
         
+        # Add deserialize timing
+        deserialize_start = perf_counter()
+        deserialize_end = perf_counter()
+        deserialize_time = (deserialize_end - deserialize_start) * 1000  # ms
         step_num = step_metadata.get("step", 0)
+        
+        # Add Cross-GPU Transfer Latency measurement
+        cross_gpu_start_time = perf_counter()
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
@@ -220,7 +308,8 @@ async def iterate_rpc_inference(
                 f" exceeds pre-allocated maximum {max_length}"
             )
 
-        merge_max_tokens = MAX_NF4_SHORT_INFERENCE_TOKENS if quant_type == QuantType.NF4 else MAX_SHORT_INFERENCE_TOKENS
+        # Note: quant_type is always NONE (quantization CLI removed), so always use standard threshold
+        merge_max_tokens = MAX_SHORT_INFERENCE_TOKENS
         can_merge_pools = batch_size * length_increment <= merge_max_tokens
         # print('-=-=-=-=-=-=-=-==-=- can merge pools : ', can_merge_pools)
         priority = prioritizer.prioritize(
@@ -271,24 +360,78 @@ async def iterate_rpc_inference(
                 # print('-=-=-=-=-=-=-=-==-=- not come into can merge pools : ', can_merge_pools)
                 # offload_logger.info(" Using separate pools for inference")
                 
+                # Track S1->S2 transfer latency specifically
+                s1_to_s2_transfer_times = []
+                backend_processing_times = []
+                
                 for i, (backend, uid, handles, prompt) in enumerate(zip(requested_backends, requested_uids, cache_handles, prompts)):
+                    backend_start_time = perf_counter()
+                    
                     # offload_logger.info(f"   - Processing backend: {uid}")
                     # offload_logger.info(f"     - Cache handles: {len(handles)}")
                     
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
                     
+                    # Submit task and measure processing time
+                    task_start_time = perf_counter()
                     (hidden_states,) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
+                    task_end_time = perf_counter()
+                    task_processing_time = (task_end_time - task_start_time) * 1000  # Convert to milliseconds
+                    
+                    backend_end_time = perf_counter()
+                    backend_total_time = (backend_end_time - backend_start_time) * 1000
+                    
+                    # Track individual backend processing times
+                    backend_processing_times.append(task_processing_time)
+                    
+                    # Estimate S1->S2 transfer time (this is an approximation)
+                    # The transfer time is roughly the total time minus pure processing time
+                    if i > 0:  # Only measure transfer between different backends
+                        estimated_transfer_time = backend_total_time - task_processing_time
+                        s1_to_s2_transfer_times.append(estimated_transfer_time)
+                        logger.info(f"[S1_TO_S2_TRANSFER] Backend {i} | "
+                                   f"Estimated Transfer Time: {estimated_transfer_time:.2f}ms | "
+                                   f"Total Backend Time: {backend_total_time:.2f}ms | "
+                                   f"Pure Processing: {task_processing_time:.2f}ms")
+                    
+                    # Log processing latency for each backend
+                    logger.info(f"[PROCESSING_LATENCY] Backend {i} | "
+                               f"Task Processing: {task_processing_time:.2f}ms | "
+                               f"Total Backend Time: {backend_total_time:.2f}ms | "
+                               f"Hidden States Shape: {hidden_states.shape}")
+                
+                # Calculate S1->S2 transfer statistics
+                if s1_to_s2_transfer_times:
+                    s1_to_s2_mean = sum(s1_to_s2_transfer_times) / len(s1_to_s2_transfer_times)
+                    s1_to_s2_total = sum(s1_to_s2_transfer_times)
+                    logger.info(f"[S1_TO_S2_TRANSFER_SUMMARY] "
+                               f"Average Transfer: {s1_to_s2_mean:.2f}ms | "
+                               f"Total Transfer: {s1_to_s2_total:.2f}ms | "
+                               f"Transfer Count: {len(s1_to_s2_transfer_times)}")
+                
+                # Calculate total Cross-GPU Transfer Latency
+                cross_gpu_end_time = perf_counter()
+                cross_gpu_latency = (cross_gpu_end_time - cross_gpu_start_time) * 1000
+                
+                logger.info(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
+                           f"Backends: {len(requested_backends)} | "
+                           f"Output Shape: {hidden_states.shape}")
             
             # offload_logger.info(f" Inference computation completed - step {prefix_length}")
+            end_compute_time = perf_counter()
+            compute_time = (end_compute_time - start_compute_time) * 1000  # ms
             # print('the inference computing time ', end_compute_time - start_compute_time)
             # print_time_now('')
         # serialize and send last layer outputs
+        serialize_start = perf_counter()
         output_tensors = [
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
             for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
         ]
+        serialize_end = perf_counter()
+        serialize_time = (serialize_end - serialize_start) * 1000  # ms
         # print('after serialize and send last layer outputs ', )
         # print_time_now('')
         # print('hidden_states ', hidden_states)
@@ -300,6 +443,13 @@ async def iterate_rpc_inference(
         
         can_push = not has_prompts
         
+        # Calculate Cross-GPU Transfer receive time
+        cross_gpu_end_time = perf_counter()
+        cross_gpu_receive_time = (cross_gpu_end_time - cross_gpu_start_time) * 1000  # ms
+        
+        # Calculate total step time
+        step_end_time = perf_counter()
+        step_total_time = (step_end_time - step_receive_time) * 1000  # ms
         
         yield output_tensors, can_push, step_metadata
         # print('output_tensors ',output_tensors)

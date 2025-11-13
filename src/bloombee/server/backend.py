@@ -309,6 +309,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
                 
+                
                 return (output_hidden_states,) # Return output hidden states
                 
         except Exception as e:

@@ -35,9 +35,13 @@ logger = get_logger(__name__)
 
 
 class QuantType(Enum):
+    """
+    Quantization type enum for FlexGen compression.
+    Note: bitsandbytes quantization is not used. This enum only controls FlexGen's group-wise quantization.
+    """
     NONE = 0
-    INT8 = 1  # 8-bit as in the LLM.int8() paper
-    NF4 = 2  # 4-bit as in the QLoRA paper
+    INT8 = 1  # 8-bit group-wise quantization for FlexGen
+    NF4 = 2  # 4-bit group-wise quantization for FlexGen
 
 
 def convert_block(
@@ -52,7 +56,10 @@ def convert_block(
     **kwargs,
 ) -> tp.TensorParallel:
     """
-    Optimize a transformer block for use in a Petals server, apply tensor parallelism and/or LLM.8bit quantization
+    Optimize a transformer block for use in a Petals server with FlexGen.
+    
+    Note: Quantization is handled by FlexGen's weight loading system, not here.
+    The quant_type parameter is passed through but not used in this function.
 
     :note: some optimizations will modify the input block in-place!
     :param block: a single transformer block, either pre-trained or newly initialized
@@ -60,7 +67,7 @@ def convert_block(
     :param tensor_parallel_devices: if specified, use tensor parallelism to split the model between these devices
     :note: if there is only a single device, model wil still be wrapped with TensorParallel (for uniformity)
     :param output_device: if tensor_parallel_devices is True, output
-    :param quant_type: quantization type
+    :param quant_type: quantization type (used by FlexGen compression, not applied here)
     :param freeze: if True (default), make all module parameters non-trainable
     :return: a module that acts like the original block, but runs with all specified optimizations
 
@@ -71,13 +78,9 @@ def convert_block(
     log_prefix = f"[convert_block:{block_index}]"
     # log_mem(f"{log_prefix} skipping tensor parallelism - FlexGen manages weights directly")
     
-    # Only apply quantization if needed
-    if quant_type != QuantType.NONE:
-        block = quantize_module(block, quant_type=quant_type)
-        # log_mem(f"{log_prefix} after quantization")
-    else:
-        # log_mem(f"{log_prefix} no quantization applied")
-        pass
+    # Quantization is handled by FlexGen's compression system during weight loading
+    # No bitsandbytes quantization is applied here
+    # log_mem(f"{log_prefix} quantization handled by FlexGen compression system")
     
     # Create a simple wrapper that provides TensorParallel interface for pipeline parallelism
     # but uses FlexGen's forward method directly
@@ -119,47 +122,16 @@ def convert_block(
     return tp_block
 
 
+# NOTE: bitsandbytes quantization has been removed.
+# Quantization is now handled entirely by FlexGen's compression system during weight loading.
+# This function is kept for backward compatibility but does nothing.
 def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
-    # Import bitsandbytes only when necessary, so Petals runs on platforms not supported by bitsandbytes
-    import bitsandbytes as bnb
-
-    for n, module in model.named_children():
-        if len(list(module.children())) > 0:
-            # import pdb; pdb.set_trace() 
-            quantize_module(module, quant_type=quant_type)
-
-        if isinstance(module, torch.nn.Linear) and n not in ["lm_head", "score"]:
-            # import pdb; pdb.set_trace() 
-            assert module.weight.device.type == "cpu", f"expected linear layers on CPU, got {module.weight.device}"
-            if quant_type == QuantType.INT8:
-                model._modules[n] = bnb.nn.Linear8bitLt(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    has_fp16_weights=False,
-                    threshold=6.0,  # Default from the LLM.int8() paper
-                )
-                model._modules[n].weight = bnb.nn.Int8Params(
-                    module.weight.data, requires_grad=False, has_fp16_weights=False
-                ).to(module.weight.dtype)
-            elif quant_type == QuantType.NF4: #------
-                compress_statistics = True
-                model._modules[n] = bnb.nn.LinearNF4(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    compress_statistics=compress_statistics,
-                )
-                model._modules[n].weight = bnb.nn.Params4bit(
-                    module.weight.data,
-                    requires_grad=False,
-                    quant_type="nf4",
-                    blocksize=64,
-                    compress_statistics=compress_statistics,
-                ).to(module.weight.dtype)
-            else:
-                raise ValueError(f"Unsupported quant_type='{quant_type}'")
-            model._modules[n].bias = module.bias
+    """
+    Deprecated: Quantization is now handled by FlexGen's compression system.
+    This function is a no-op and kept for backward compatibility.
+    """
+    if quant_type != QuantType.NONE:
+        logger.debug(f"Quantization type {quant_type} specified, but quantization is handled by FlexGen compression system")
     return model
 
 

@@ -11,6 +11,14 @@ import threading
 import time
 from typing import Dict, List, Optional, Sequence, Union
 
+# Optimize shared memory usage for systems with limited /dev/shm
+# Set environment variables before importing PyTorch to limit shared memory allocation
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    # Limit CUDA memory allocator's shared memory usage
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+if "TORCH_SHOW_CPP_STACKTRACES" not in os.environ:
+    os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "0"
+
 import hivemind
 import psutil
 import torch
@@ -216,9 +224,9 @@ class Server:
             logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
             check_device_balance(self.tensor_parallel_devices)
 
+        # Quantization is disabled by default. Use FlexGen compression internally if needed.
         if quant_type is None:
-            quant_type = QuantType.NF4 if device.type == "cuda" else QuantType.NONE
-        quant_type = QuantType.NONE ########## manually change the QuantType
+            quant_type = QuantType.NONE
         self.quant_type = quant_type
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
 
@@ -269,23 +277,13 @@ class Server:
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
-        # Configure resource distribution based on device type
-        if device.type == "cpu":
-            # CPU-only mode: all resources on CPU
-            w_gpu_percent, w_cpu_percent = 0, 100
-            cache_gpu_percent, cache_cpu_percent = 0, 100
-            act_gpu_percent, act_cpu_percent = 0, 100
-        else:
-            # GPU mode: all resources on GPU (default)
-            w_gpu_percent, w_cpu_percent = 100, 0
-            cache_gpu_percent, cache_cpu_percent = 100, 0
-            act_gpu_percent, act_cpu_percent = 100, 0
-
+        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU
+        # Default to GPU-only, no offloading, no compression
         self.policy = Policy(
-            batch_size, 1,   # gpu_batch_size, num_gpu_batches
-            w_gpu_percent, w_cpu_percent,          # w_gpu_percent, w_cpu_percent
-            cache_gpu_percent, cache_cpu_percent,  # cache_gpu_percent, cache_cpu_percent
-            act_gpu_percent, act_cpu_percent,      # act_gpu_percent, act_cpu_percent
+            batch_size, 1,            # gpu_batch_size, num_gpu_batches
+            100, 0,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # cache_gpu_percent, cache_cpu_percent (KV on GPU)
+            100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
             compress_weight=False,
@@ -294,14 +292,7 @@ class Server:
             comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
         )
         
-        # 🔍 Batch Size Debug: Log batch size configuration
-        logger.info(f"[BATCH_SIZE_CONFIG] GPU Batch Size: {batch_size}")
-        logger.info(f"[BATCH_SIZE_CONFIG] Min Batch Size: {min_batch_size}")
-        logger.info(f"[BATCH_SIZE_CONFIG] Max Batch Size: {max_batch_size}")
-        logger.info(f"[BATCH_SIZE_CONFIG] Policy GPU Batch Size: {self.policy.gpu_batch_size}")
-        logger.info(f"[BATCH_SIZE_CONFIG] Policy Num GPU Batches: {self.policy.num_gpu_batches}")
-        
-        # Log detailed policy strategy
+        # Log compression configuration
         self.policy.log_batch_size_strategy()
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
@@ -396,8 +387,7 @@ class Server:
         block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
         total_memory_per_block = block_size + self._cache_bytes_per_block
         if self.adapters:
-            # Delay import of petals.utils.peft to avoid unnecessary import of bitsandbytes
-            from bloombee.utils.peft import estimate_adapter_memory_per_block
+
 
             total_memory_per_block += estimate_adapter_memory_per_block(
                 self.block_config,
@@ -717,7 +707,12 @@ class ModuleContainer(threading.Thread):
         self.dht, self.module_backends = dht, module_backends
         self.server_info, self.update_period, self.expiration = server_info, update_period, expiration
 
-        handler_event_queues = [mp.Queue() for _ in range(num_handlers)]
+        # Optimize shared memory usage: limit Queue maxsize to reduce /dev/shm peak usage
+        # Default Queue maxsize is unlimited, which can cause high /dev/shm usage during warmup
+        # For systems with limited /dev/shm (e.g., 64MB), use smaller queue size
+        # Queue size scales with batch_size, so we use a conservative limit
+        max_queue_size = 500  # Reduced from 1000 to further limit shared memory usage
+        handler_event_queues = [mp.Queue(maxsize=max_queue_size) for _ in range(num_handlers)]
         self.conn_handlers = [
             TransformerConnectionHandler(
                 dht,
