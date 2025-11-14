@@ -294,7 +294,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # Add offset to cached base tensor (avoids creating new tensor)
                     position_ids = self._position_ids_cache[cache_key] + (past_key_values_length + offset)
                     
-                    logger.info(f"hidden states in backend before compute: {hidden_states}")
+                    # logger.info(f"hidden states in backend before compute: {hidden_states}")
 
                     # logger.info(f"Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}")
                     rotary_position_ids = self._create_tree_position_ids(2, 4, past_key_values_length, device='cuda:0') if inference_info.tree_attention_mask is not None else None

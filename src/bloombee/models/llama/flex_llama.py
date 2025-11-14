@@ -486,8 +486,8 @@ class FLEX_LlamaAttention(LlamaAttention):
         else:
             ((w_q, _), (w_k, _),  (w_v, _), (w_out, _), (input_layernorm, _), (rotary_emb_inv_freq, _)) = weight_read_buf.val
             
-        logger.info(f"forward rotary_position_ids: {rotary_position_ids}")
-        logger.info(f"forward in flex llama, hidden states: {h.data}")
+        # logger.info(f"forward rotary_position_ids: {rotary_position_ids}")
+        # logger.info(f"forward in flex llama, hidden states: {h.data}")
         
         if i == 0:
             # prefill
@@ -504,7 +504,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start decode) i={i} k={k}")
             
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            logger.info(f"flex llama, attention_mask: {mask}")
+            # logger.info(f"flex llama, attention_mask: {mask}")
             k_cache, v_cache = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,

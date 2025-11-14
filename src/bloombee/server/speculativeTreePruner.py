@@ -59,7 +59,7 @@ class PruningConfig:
     
     # Shared config
     max_branches: int = 32
-    min_keep_branches: int = 1
+    min_keep_branches: int = 5
     enable_caching: bool = True
     cache_size: int = 1000
 
@@ -619,6 +619,8 @@ class AdaptiveNeuralPruner:
         # Ensure at least one branch is kept
         kept_count = keep_mask.sum().item()
         
+        # logger.info(f"kept_count: {kept_count}")
+        
         if kept_count < self.config.min_keep_branches:
             # Keep top-scoring branches
             is_leaf = torch.ones(seq_len, dtype=torch.bool)
@@ -715,8 +717,13 @@ class AdaptiveNeuralPruner:
         prob_features: torch.Tensor,      # [tree_size, 4]
         network_features: torch.Tensor,   # [tree_size, 4]
         labels: torch.Tensor,             # [tree_size]
+        middle_hidden_states: torch.Tensor,
+        final_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        acceptance_rate,
         alpha: float = 1.0,               # BCE loss weight
-        beta: float = 0.1                 # Pruning alignment weight
+        beta: float = 0.1,                 # Pruning alignment weight
     ) -> dict:
         """
         Single training step for ONE tree
@@ -998,39 +1005,44 @@ class BloombeePrunerManager:
         }
     
     def save_state(self, path: str):
-        """Save pruner state for later restoration"""
         state = {
-            'config': self.config,
-            'total_tokens': self.total_tokens,
-            'pruned_tokens': self.pruned_tokens,
-            'speedup_factor': self.speedup_factor,
-            'pruner_metrics': self.pruner.get_metrics()
+            'config': {
+                'method': self.config.method.value,
+                'hidden_size': self.hidden_size,
+                'vocab_size': self.vocab_size,
+            },
+            'manager_metrics': {
+                'total_tokens': self.total_tokens,
+                'pruned_tokens': self.pruned_tokens,
+                'speedup_factor': self.speedup_factor,
+            }
         }
         
-        if isinstance(self.pruner, AdaptiveNeuralPruner):
-            state['pruner_weights'] = self.pruner.pruning_net.state_dict()
+        # Save pruner-specific state if available
+        if hasattr(self.pruner, 'save_model'):
+            pruner_path = path.replace('.pt', '_pruner.pt')
+            self.pruner.save_model(pruner_path)
+            state['pruner_path'] = pruner_path
         
         torch.save(state, path)
-        logger.info(f"Saved pruner state to {path}")
+        logger.info(f"Saved pruner manager state to {path}")
     
     def load_state(self, path: str):
-        """Load pruner state"""
-        state = torch.load(path)
+        state = torch.load(path, map_location=self.device)
+    
+        # Restore manager metrics
+        self.total_tokens = state['manager_metrics']['total_tokens']
+        self.pruned_tokens = state['manager_metrics']['pruned_tokens']
+        self.speedup_factor = state['manager_metrics']['speedup_factor']
         
-        self.config = state['config']
-        self.total_tokens = state['total_tokens']
-        self.pruned_tokens = state['pruned_tokens']
-        self.speedup_factor = state['speedup_factor']
+        # Load pruner-specific state if available
+        if 'pruner_path' in state and hasattr(self.pruner, 'load_model'):
+            self.pruner.load_model(state['pruner_path'])
+            logger.info(f"Loaded pruner model from {state['pruner_path']}")
         
-        # Recreate pruner with loaded config
-        self.pruner = BloombeePrunerFactory.create_pruner(
-            self.config.method,
-            self.hidden_size,
-            self.vocab_size,
-            self.config
-        )
+        logger.info(f"Loaded pruner manager state from {path}")
         
-        if isinstance(self.pruner, AdaptiveNeuralPruner) and 'pruner_weights' in state:
-            self.pruner.pruning_net.load_state_dict(state['pruner_weights'])
+    def train_model(self, middle_hidden_states, final_hidden_states, attention_mask, draft_tokens, acceptance_rate):
+        if hasattr(self.pruner, 'train_step'):
+            self.pruner.train_step(middle_hidden_states, final_hidden_states, attention_mask, draft_tokens, acceptance_rate)
         
-        logger.info(f"Loaded pruner state from {path}")

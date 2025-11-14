@@ -299,6 +299,7 @@ class Server:
             vocab_size=vocab_size,
             config=config
         )
+        self.pruner_manager.load_state("checkpoints/pruner/model_v1.pt")
         ##############################################################
         
         # see_memory_usage("-----------------------------------------in server: after policy  ")
