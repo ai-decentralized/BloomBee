@@ -329,7 +329,14 @@ async def iterate_rpc_inference(
         logger.info(f"keep_indices: {keep_indices}")
         logger.info(f"outputs_schema: {requested_backends[-1].outputs_schema}")
         
-        keep_indices = torch.tensor(keep_indices, dtype=torch.int64, device=hidden_states.device)
+        if keep_indices is not None:
+            keep_indices = torch.tensor(keep_indices, dtype=torch.int64, device=hidden_states.device)    
+        else:
+            keep_indices = torch.arange(
+                hidden_states.shape[1],
+                dtype=torch.int64,
+                device=hidden_states.device
+            )  
         
         output_tensors = [
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)

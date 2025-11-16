@@ -178,6 +178,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             tree_attention_mask
         )
         
+        if self.pruner_manager.iteration == 100:
+            self.pruner_manager.save_state("checkpoints/pruner/model_v1.pt")
+            self.pruner_manager.iteration = 0
+        
         keep_indices = results['keep_indices']
         logger.info(f"keep_indices: {keep_indices}")
         new_hidden_states = hidden_states[:, keep_indices, :]
@@ -351,6 +355,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 keep_indices = None
                 if inference_info.uid == 'llama-7b-hf.31':
                     output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, inference_info.draft_tokens, full_mask)
+                    self.pruner_manager.train_model(output_hidden_states, full_mask, inference_info.draft_tokens)
+                    
+                if inference_info.uid == 'llama-7b-hf.15':
+                    self.pruner_manager.middle_states = output_hidden_states
                 
                 return (output_hidden_states, keep_indices) # Return output hidden states
                 
@@ -534,7 +542,6 @@ class _MergedInferenceStep:
     def __init__(self, backends: Dict[ExpertUID, TransformerBackend]):
         self.backends = backends
 
-    @torch.inference_mode()
     def __call__(
         self,
         hidden_states: torch.Tensor,

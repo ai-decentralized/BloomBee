@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 from enum import Enum
 import logging
 import random
+import os
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -457,7 +459,7 @@ class AdaptiveNeuralPruner:
         
         # Historical acceptance rate tracking
         self.acceptance_history = deque(maxlen=100)
-        self.current_acceptance_rate = 0.5
+        self.current_acceptance_rate = 1
         
         # Training mode flag
         self.training = False
@@ -486,39 +488,41 @@ class AdaptiveNeuralPruner:
         probs = F.softmax(logits_at_pos, dim=-1)
         
         # 概率特征
-        max_prob = torch.max(probs).item()
-        logger.info(f"max_prob: {max_prob}")
+        max_prob = torch.max(probs)
+        # logger.info(f"max_prob: {max_prob}")
         entropy = -torch.sum(torch.where(
             probs > 1e-10,
             probs * torch.log(probs),
             torch.zeros_like(probs)
         ))
-        logger.info(f"entropy: {entropy}")
+        # logger.info(f"entropy: {entropy}")
         log_vocab_size = torch.log(torch.tensor(float(self.vocab_size)))
-        logger.info(f"log_vocab_size: {log_vocab_size}")
+        # logger.info(f"log_vocab_size: {log_vocab_size}")
         if log_vocab_size > 0:
-            normalized_entropy = (entropy / log_vocab_size).item()
+            normalized_entropy = (entropy / log_vocab_size)
         else:
             normalized_entropy = 0.0  # vocab_size <= 1 时
-        logger.info(f"normalized_entropy: {normalized_entropy}")
+        # logger.info(f"normalized_entropy: {normalized_entropy}")
         
         # Token概率
         if draft_token is not None:
-            token_prob = probs[draft_token].item()
+            token_prob = probs[draft_token]
         else:
-            token_prob = torch.topk(probs, k=min(5, self.vocab_size)).values.sum().item()
+            token_prob = torch.topk(probs, k=min(5, self.vocab_size)).values.sum()
         
         # 组合特征
-        prob_features = torch.tensor(
-            [max_prob, normalized_entropy, token_prob, acceptance_rate],
-            dtype=torch.float32,
-            device=self.device
-        )
+        prob_features = torch.stack([
+            max_prob, 
+            normalized_entropy, 
+            token_prob, 
+            torch.tensor(acceptance_rate, dtype=torch.float32, device=self.device)
+        ])
         
         network_features = torch.tensor(
-            network_condition.to_features(),  # [bandwidth, latency, packet_loss, jitter]
+            network_condition.to_features(),
             dtype=torch.float32,
-            device=self.device
+            device=self.device,
+            requires_grad=True
         )
         
         return prob_features, network_features
@@ -672,56 +676,148 @@ class AdaptiveNeuralPruner:
         network_condition,
         draft_tokens: Optional[List[int]] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Collect features and labels for training
         
-        Returns:
-            prob_features: [seq_len, 4]
-            network_features: [seq_len, 4]
-            labels: [seq_len]
-        """
+        seq_len = middle_hidden_states.shape[1]
         
-        seq_len = middle_hidden_states.shape[0]
-        middle_hidden_states = middle_hidden_states.to(self.device)
-        
-        # Get logits
-        logits = self.lm_head(middle_hidden_states.unsqueeze(0))
-        
-        prob_features_list = []
-        network_features_list = []
-        labels_list = []
-        
-        for i in range(seq_len):
-            # Extract features
-            prob_feat, net_feat = self.extract_features(
-                logits, i,
-                network_condition,
-                self.current_acceptance_rate,
-                draft_tokens[i] if draft_tokens else None
-            )
-            prob_features_list.append(prob_feat)
-            network_features_list.append(net_feat)
+        # ✅ 在 no_grad 中提取所有数值
+        with torch.no_grad():
+            middle_hidden_states = middle_hidden_states.to(self.device)
+            logits = self.lm_head(middle_hidden_states)
             
-            # Label: 1 if accepted, 0 if rejected
-            label = 1.0 if i in accepted_indices else 0.0
-            labels_list.append(label)
+            prob_features_list = []
+            labels_list = []
+            
+            acceptance_rate_value = self.current_acceptance_rate  # Python float
+            network_features_values = network_condition.to_features()  # Python list/array
+            
+            for i in range(seq_len):
+                parent_postion = self._get_parent_postion(i, tree_attention_mask)
+                
+                logits_at_pos = logits[0, parent_postion]
+                probs = F.softmax(logits_at_pos, dim=-1)
+                
+                max_prob = torch.max(probs).item()  # ✅ 转为 Python float
+                
+                entropy = -torch.sum(torch.where(
+                    probs > 1e-10,
+                    probs * torch.log(probs),
+                    torch.zeros_like(probs)
+                )).item()  # ✅ 转为 Python float
+                
+                log_vocab_size = math.log(float(self.vocab_size))
+                if log_vocab_size > 0:
+                    normalized_entropy = entropy / log_vocab_size
+                else:
+                    normalized_entropy = 0.0
+                
+                if draft_tokens is not None:
+                    token_prob = probs[draft_tokens[i]].item()  # ✅ 转为 Python float
+                else:
+                    token_prob = torch.topk(probs, k=min(5, self.vocab_size)).values.sum().item()
+                
+                # ✅ 存储 Python 值
+                prob_features_list.append([
+                    max_prob,
+                    normalized_entropy,
+                    token_prob,
+                    acceptance_rate_value
+                ])
+                
+                label = 1.0 if i in accepted_indices else 0.0
+                labels_list.append(label)
         
-        return (
-            torch.stack(prob_features_list),
-            torch.stack(network_features_list),
-            torch.tensor(labels_list, device=self.device)
+        # ✅ 在 no_grad 外面创建新张量（带梯度）
+        prob_features = torch.tensor(
+            prob_features_list, 
+            dtype=torch.float32, 
+            device=self.device,
         )
+        
+        network_features = torch.tensor(
+            network_features_values,
+            dtype=torch.float32,
+            device=self.device
+        ).unsqueeze(0).repeat(seq_len, 1)
+        
+        labels = torch.tensor(
+            labels_list, 
+            dtype=torch.float32, 
+            device=self.device
+        )
+        
+        return prob_features, network_features, labels
+        
+    def _get_current_accepted_tokens_indices(
+            self, 
+            final_hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            draft_tokens: torch.Tensor,
+        ):
+        """
+        final_hidden_states: [B, seq_len, hidden_dim]
+        attention_mask: [B, seq_len, seq_len + prefix_len]
+        draft_tokens: [B, seq_len]
+        """
+        B, seq_len, _ = final_hidden_states.shape
+        prefix_len = attention_mask.shape[2] - seq_len
+
+        # logits = [1, seq_len, vocab]
+        logits = self.lm_head(final_hidden_states)
+        probs = torch.softmax(logits, dim=-1)
+
+        # ==================================
+        # Step 1 — 根据 attention mask 还原每条 root→leaf path
+        # ==================================
+        is_leaf = torch.ones(seq_len, dtype=torch.bool)
+        leaf_paths = []
+
+        for i in range(seq_len - 1, -1, -1):
+            if is_leaf[i]:
+                path = [i]
+
+                # 回溯依赖链
+                for j in range(i - 1, -1, -1):
+                    # attention_mask[0, child, parent+prefix] == 1
+                    if attention_mask[0, i, j + prefix_len] == 1:
+                        is_leaf[j] = False
+                        path.append(j)
+
+                path.reverse()
+                leaf_paths.append((i, path))
+
+        # ==================================
+        # Step 2 — 对每个 path 做验证（root 默认成功）
+        # ==================================
+        best_path = None
+        best_validated = -1
+        
+        logger.info(f"leaf_paths {leaf_paths}")
+
+        for leaf_idx, path in leaf_paths:
+            validated = 1   # root always validated
+
+            for i in range(1, len(path)):
+                idx = path[i]
+                token_id = draft_tokens[idx].item()
+                pred_id = probs[0, path[i - 1]].argmax().item()
+
+                if pred_id == token_id:
+                    validated += 1
+                else:
+                    break
+
+            if validated > best_validated:
+                best_validated = validated
+                best_path = path[:validated]
+
+        return best_path, best_validated
     
     def train_step(
         self,
-        prob_features: torch.Tensor,      # [tree_size, 4]
-        network_features: torch.Tensor,   # [tree_size, 4]
-        labels: torch.Tensor,             # [tree_size]
         middle_hidden_states: torch.Tensor,
         final_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         draft_tokens: torch.Tensor,
-        acceptance_rate,
         alpha: float = 1.0,               # BCE loss weight
         beta: float = 0.1,                 # Pruning alignment weight
     ) -> dict:
@@ -735,13 +831,39 @@ class AdaptiveNeuralPruner:
             alpha: Weight for BCE loss
             beta: Weight for pruning alignment loss
         """
+        param_count = 0
+        grad_param_count = 0
+        for name, param in self.decision_net.named_parameters():
+            param_count += 1
+            if param.requires_grad:
+                grad_param_count += 1
+            else:
+                logger.error(f"❌ Parameter {name} does NOT require grad!")
+        
+        logger.info(f"Model has {param_count} parameters, {grad_param_count} require grad")
+        
+        accepted_indices, best_validated = self._get_current_accepted_tokens_indices(final_hidden_states, attention_mask, draft_tokens)
+        prob_features, network_features, labels = self.collect_training_data(
+            middle_hidden_states,                
+            attention_mask, 
+            accepted_indices, 
+            NetworkCondition.mock(), 
+            draft_tokens)
+        
+        # logger.info(f"prob_features.requires_grad: {prob_features.requires_grad}")
+        # logger.info(f"prob_features.grad_fn: {prob_features.grad_fn}")
+        # logger.info(f"network_features.requires_grad: {network_features.requires_grad}")
+        # logger.info(f"network_features.grad_fn: {network_features.grad_fn}")
+        
+        # prob_features = torch.stack(prob_features_list, dim=0)              # [T, P]
+        # network_features = torch.stack(network_features_list, dim=0)        # [T, N]
+        # labels = torch.tensor(labels_list, dtype=torch.float32, device="cuda")
         
         self.decision_net.train()
         self.optimizer.zero_grad()
         
-        tree_size = prob_features.shape[0]
+        tree_size = draft_tokens.shape[0]
         
-        # Forward pass
         predictions, quality_scores, threshold_adjusts = self.decision_net(
             prob_features, 
             network_features
@@ -757,6 +879,9 @@ class AdaptiveNeuralPruner:
             sample_weights = torch.where(labels == 1, pos_weight, 1.0)
         else:
             sample_weights = torch.ones_like(labels)
+            
+        logger.info(f"predictions: {predictions}")
+        logger.info(f"labels: {labels}")
         
         bce_loss = F.binary_cross_entropy(
             predictions, 
@@ -764,9 +889,11 @@ class AdaptiveNeuralPruner:
             weight=sample_weights
         )
         
+        print(f"bce_loss: {bce_loss}")
+        
         # === Loss 2: Network-Aware Pruning Alignment ===
         # 当前预测的pruning rate
-        current_pruning_rate = (predictions < 0.5).float().mean()
+        current_pruning_rate = torch.sigmoid((0.5 - predictions) * 10).mean()
         
         # 从网络特征计算目标pruning rate
         # 使用第一个token的网络特征（整棵树共享）
@@ -780,10 +907,19 @@ class AdaptiveNeuralPruner:
         # === Total Loss ===
         total_loss = alpha * bce_loss + beta * pruning_alignment
         
+        print(f"total_loss: {total_loss}")
+        
         total_loss.backward()
         self.optimizer.step()
         
         self.decision_net.eval()
+        
+        # update acceptance rate
+        count = 0
+        for indice in accepted_indices:
+            if predictions[indice] == 1:
+                count +=1
+        self.current_acceptance_rate = count / len(accepted_indices)
         
         return {
             'total_loss': total_loss.item(),
@@ -799,9 +935,7 @@ class AdaptiveNeuralPruner:
         }
     
     def update_acceptance_rate(self, rate: float):
-        """Update historical acceptance rate"""
-        self.acceptance_history.append(rate)
-        self.current_acceptance_rate = sum(self.acceptance_history) / len(self.acceptance_history)
+        self.current_acceptance_rate = rate
     
     def save_model(self, path: str):
         """Save model weights"""
@@ -822,7 +956,7 @@ class AdaptiveNeuralPruner:
     
     def get_network_condition(self):
         """Override this in subclass if needed"""
-        return None
+        return NetworkCondition.mock()
 
 
 class BloombeePrunerFactory:
@@ -898,6 +1032,8 @@ class BloombeePrunerManager:
         self.total_tokens = 0
         self.pruned_tokens = 0
         self.speedup_factor = 1.0
+        self.iteration = 0
+        self.middle_states = None
         
     def switch_method(self, method: Union[str, PruningMethod], keep_stats: bool = False):
         """Switch to a different pruning method"""
@@ -952,7 +1088,7 @@ class BloombeePrunerManager:
             'speedup_factor': self.speedup_factor,
             'keep_rate': 1.0 - (self.pruned_tokens / self.total_tokens)
         }
-        
+        self.iteration = self.iteration + 1
         return results
     
     def _build_branch_contexts(
@@ -1028,6 +1164,10 @@ class BloombeePrunerManager:
         logger.info(f"Saved pruner manager state to {path}")
     
     def load_state(self, path: str):
+        if not os.path.exists(path):
+            print(f"[Pruner] No checkpoint found at {path}, starting fresh.")
+            return False
+        
         state = torch.load(path, map_location=self.device)
     
         # Restore manager metrics
@@ -1042,7 +1182,8 @@ class BloombeePrunerManager:
         
         logger.info(f"Loaded pruner manager state from {path}")
         
-    def train_model(self, middle_hidden_states, final_hidden_states, attention_mask, draft_tokens, acceptance_rate):
+    def train_model(self, final_hidden_states, attention_mask, draft_tokens):
         if hasattr(self.pruner, 'train_step'):
-            self.pruner.train_step(middle_hidden_states, final_hidden_states, attention_mask, draft_tokens, acceptance_rate)
+            with torch.enable_grad():
+                self.pruner.train_step(self.middle_states, final_hidden_states, attention_mask, draft_tokens)
         
