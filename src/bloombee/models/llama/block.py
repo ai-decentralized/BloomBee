@@ -210,6 +210,11 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         
         # GPU stream management optimization
         self._streams_initialized = False
+        
+        # Rolling buffer for output_ids to avoid O(prompt_len) copy on each forward
+        self._cached_output_ids = None
+        self._cached_output_ids_shape = None
+        self._output_ids_prompt_initialized = False
 
         # log_mem(f"[LlamaDecoderLayer:{self.layer_id}] before init_all_weights")
         self.init_all_weights()
@@ -406,6 +411,9 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self._last_prompt_len = actual_prompt_len
             self._last_gen_len = max_new_tokens
             
+            # Reset output_ids prompt flag when task changes
+            self._output_ids_prompt_initialized = False
+            
             if not self._is_initialized:
                 self._is_initialized = True
                 
@@ -424,8 +432,29 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         num_prompts = len(task.inputs)
         prompt_len, gen_len = task.prompt_len, task.gen_len
 
-        self.output_ids = np.ones((num_prompts, prompt_len + gen_len), dtype=np.int64)
-        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        # ✨ Optimization: Use rolling buffer to avoid O(prompt_len) copy on each forward
+        # Only reallocate when shape changes
+        output_ids_start = time.time()
+        target_shape = (num_prompts, prompt_len + gen_len)
+        if self._cached_output_ids is None or self._cached_output_ids_shape != target_shape:
+            # Shape changed, need to reallocate
+            self._cached_output_ids = np.ones(target_shape, dtype=np.int64)
+            self._cached_output_ids_shape = target_shape
+            self._output_ids_prompt_initialized = False
+            if verbose > 0:
+                print(f"[OUTPUT_IDS_PERF] Layer {self.layer_id}: Reallocated output_ids with shape {target_shape}")
+        
+        # Only copy prompt tokens when necessary (first time or task changed)
+        if not self._output_ids_prompt_initialized:
+            self._cached_output_ids[:, :prompt_len] = np.asarray(task.inputs)
+            self._output_ids_prompt_initialized = True
+            if verbose > 0:
+                print(f"[OUTPUT_IDS_PERF] Layer {self.layer_id}: Initialized prompt tokens ({prompt_len} tokens)")
+        
+        self.output_ids = self._cached_output_ids
+        output_ids_time = (time.time() - output_ids_start) * 1000
+        if output_ids_time > 1.0:
+            print(f"[OUTPUT_IDS_PERF] Layer {self.layer_id} output_ids setup took: {output_ids_time:.3f}ms")
 
         # Smart cache clearing - avoid clearing every time
         cache_clear_start = time.time()
