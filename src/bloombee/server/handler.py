@@ -435,6 +435,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         try:
             next_servers = metadata.get("next_servers")
             if not next_servers:
+                print(f"[DEBUG] _push_outputs: No next_servers, returning early")
                 return
 
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]

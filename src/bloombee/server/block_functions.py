@@ -325,7 +325,6 @@ async def iterate_rpc_inference(
         # when user wants to pre-allocate cache or check that server *can* allocate that cache.
         if hidden_states.numel() > 0:
             assert hidden_states.ndim == 3, f"hidden states must be a single 3d tensor"
-            start_compute_time = perf_counter()
             # print('before merge pools ')
             #print_time_now('')
             
