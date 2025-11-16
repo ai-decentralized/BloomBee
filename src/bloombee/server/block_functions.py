@@ -289,6 +289,7 @@ async def iterate_rpc_inference(
         
         # Add Cross-GPU Transfer Latency measurement
         cross_gpu_start_time = perf_counter()
+        start_compute_time = perf_counter()  # Initialize compute time tracking
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
