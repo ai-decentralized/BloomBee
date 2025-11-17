@@ -649,13 +649,13 @@ class TorchDevice:
 
         bsz, q_len, h = hidden_states.shape
         head_dim = h // num_attention_heads
+        
+        logger.info(f"mha_llama, hidden states: {hidden_states.shape}, position_ids: {rotary_position_ids}")
 
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
         
         hidden = rms_norm(hidden_states.data, input_layernorm.data)
-        
-        # logger.info(f"after norm, hidden states: {hidden}")
 
         q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)

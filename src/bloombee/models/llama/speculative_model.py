@@ -40,7 +40,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 128,
         **model_kwargs,
     ) -> torch.LongTensor:
         

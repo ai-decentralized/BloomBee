@@ -424,10 +424,12 @@ class InferenceSession:
                         step_id=step_id,
                     )
                     
-                    logger.info(f"get output and keep_indices: {keep_indices}")
+                    logger.info(f"get output and keep_indices: {keep_indices}, kv_cache_position_ids: {kv_cache_position_ids}")
                     kv_cache_position_ids = self._update_kv_cache_position_ids(kv_cache_position_ids, self.keep_indices)
                     self.keep_indices = keep_indices
-                    attention_mask_indices = keep_indices[1:] - 1
+                    prefill_length = n_input_tokens - tree_attention_mask.shape[1]
+                    attention_mask_indices = keep_indices[prefill_length:] - prefill_length
+                    # logger.info(f"attention_mask_indices: {attention_mask_indices}, tree_attention_mask: {tree_attention_mask}")
                     tree_attention_mask = tree_attention_mask[:, attention_mask_indices, attention_mask_indices]
                     # print('inputs ', inputs)
                     # print('inputs.shape ', inputs.shape)

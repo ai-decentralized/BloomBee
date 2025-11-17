@@ -454,7 +454,7 @@ class AdaptiveNeuralPruner:
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             self.decision_net.parameters(), 
-            lr=1e-4
+            lr=1e-3
         )
         
         # Historical acceptance rate tracking
@@ -770,6 +770,8 @@ class AdaptiveNeuralPruner:
         # ==================================
         is_leaf = torch.ones(seq_len, dtype=torch.bool)
         leaf_paths = []
+        
+        logger.info(f"_get_current_accepted_tokens_indices, seq_len: {seq_len}, prefix_len: {prefix_len}")
 
         for i in range(seq_len - 1, -1, -1):
             if is_leaf[i]:
@@ -791,7 +793,7 @@ class AdaptiveNeuralPruner:
         best_path = None
         best_validated = -1
         
-        logger.info(f"leaf_paths {leaf_paths}")
+        logger.info(f"_get_current_accepted_tokens_indices, leaf_paths {leaf_paths}")
 
         for leaf_idx, path in leaf_paths:
             validated = 1   # root always validated
@@ -831,18 +833,11 @@ class AdaptiveNeuralPruner:
             alpha: Weight for BCE loss
             beta: Weight for pruning alignment loss
         """
-        param_count = 0
-        grad_param_count = 0
-        for name, param in self.decision_net.named_parameters():
-            param_count += 1
-            if param.requires_grad:
-                grad_param_count += 1
-            else:
-                logger.error(f"❌ Parameter {name} does NOT require grad!")
+
         
-        logger.info(f"Model has {param_count} parameters, {grad_param_count} require grad")
         
         accepted_indices, best_validated = self._get_current_accepted_tokens_indices(final_hidden_states, attention_mask, draft_tokens)
+        logger.info(f"train_step, accepted_indices: {accepted_indices}")
         prob_features, network_features, labels = self.collect_training_data(
             middle_hidden_states,                
             attention_mask, 
@@ -850,24 +845,16 @@ class AdaptiveNeuralPruner:
             NetworkCondition.mock(), 
             draft_tokens)
         
-        # logger.info(f"prob_features.requires_grad: {prob_features.requires_grad}")
-        # logger.info(f"prob_features.grad_fn: {prob_features.grad_fn}")
-        # logger.info(f"network_features.requires_grad: {network_features.requires_grad}")
-        # logger.info(f"network_features.grad_fn: {network_features.grad_fn}")
-        
-        # prob_features = torch.stack(prob_features_list, dim=0)              # [T, P]
-        # network_features = torch.stack(network_features_list, dim=0)        # [T, N]
-        # labels = torch.tensor(labels_list, dtype=torch.float32, device="cuda")
-        
         self.decision_net.train()
         self.optimizer.zero_grad()
         
         tree_size = draft_tokens.shape[0]
         
-        predictions, quality_scores, threshold_adjusts = self.decision_net(
-            prob_features, 
-            network_features
-        )
+        with torch.enable_grad():
+            predictions, quality_scores, threshold_adjusts = self.decision_net(
+                prob_features, 
+                network_features
+            )
         
         # === Loss 1: Token Quality Prediction (with class weighting) ===
         pos_count = labels.sum()
@@ -889,7 +876,7 @@ class AdaptiveNeuralPruner:
             weight=sample_weights
         )
         
-        print(f"bce_loss: {bce_loss}")
+        logger.info(f"train_step, bce_loss: {bce_loss}")
         
         # === Loss 2: Network-Aware Pruning Alignment ===
         # 当前预测的pruning rate
@@ -907,7 +894,7 @@ class AdaptiveNeuralPruner:
         # === Total Loss ===
         total_loss = alpha * bce_loss + beta * pruning_alignment
         
-        print(f"total_loss: {total_loss}")
+        logger.info(f"train_step, total_loss: {total_loss}")
         
         total_loss.backward()
         self.optimizer.step()

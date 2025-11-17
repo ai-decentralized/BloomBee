@@ -178,8 +178,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             tree_attention_mask
         )
         
-        if self.pruner_manager.iteration == 100:
-            self.pruner_manager.save_state("checkpoints/pruner/model_v1.pt")
+        if self.pruner_manager.iteration == 10:
+            self.pruner_manager.save_state("/home/cc/BloomBee/checkpoints/pruner/model_v1.pt")
             self.pruner_manager.iteration = 0
         
         keep_indices = results['keep_indices']
@@ -224,7 +224,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # Mark as already set to skip future checks
         self._device_already_set = True
 
-    @torch.inference_mode() # Enter inference mode, no gradient computation to save memory
+     # Enter inference mode, no gradient computation to save memory
     def inference_step( # Each block will execute once
         self,
         hidden_states: torch.Tensor,  # Input hidden state tensor
@@ -301,7 +301,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # logger.info(f"hidden states in backend before compute: {hidden_states}")
 
                     # logger.info(f"Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}")
-                    rotary_position_ids = self._create_tree_position_ids(2, 4, past_key_values_length, device='cuda:0') if inference_info.tree_attention_mask is not None else None
+                    prefill_length = hidden_states.shape[1] - 31
+                    rotary_position_ids = self._create_tree_position_ids(2, 4, prefill_length, past_key_values_length, device='cuda:0') if inference_info.tree_attention_mask is not None else None
                     
                     # logger.info(f"rotary_position_ids: {rotary_position_ids}, hidden_states_chunk: {hidden_states_chunk.shape}")
                     try:
@@ -354,8 +355,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
                 keep_indices = None
                 if inference_info.uid == 'llama-7b-hf.31':
-                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, inference_info.draft_tokens, full_mask)
                     self.pruner_manager.train_model(output_hidden_states, full_mask, inference_info.draft_tokens)
+                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, inference_info.draft_tokens, full_mask)
                     
                 if inference_info.uid == 'llama-7b-hf.15':
                     self.pruner_manager.middle_states = output_hidden_states
@@ -382,9 +383,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             for cache_tensor in cache_tensors:
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
 
-    def _create_tree_position_ids(self, width: int, depth: int, past_len: int, device: torch.device) -> torch.Tensor:
+    def _create_tree_position_ids(
+        self, width: int, depth: int, prefill_length: int, past_len: int, device: torch.device
+    ) -> torch.Tensor:
         position_ids = []
         depth = depth + 1
+
         def dfs_generate(node_depth, current_depth):
             position_ids.append(node_depth)
             if current_depth < depth - 1:
@@ -392,9 +396,17 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     dfs_generate(node_depth + 1, current_depth + 1)
 
         dfs_generate(0, 0)
-        tree_position_ids = torch.tensor(position_ids, device=device) + past_len
-        
-        return tree_position_ids
+
+        # 原树序列 + past_len + prefill_length 偏移
+        tree_position_ids = torch.tensor(position_ids, device=device) + past_len + prefill_length
+
+        # 生成 prefill 序列
+        prefill_ids = torch.arange(prefill_length, device=device) + past_len
+
+        # 拼接 prefill 与树序列
+        full_position_ids = torch.cat([prefill_ids, tree_position_ids], dim=0)
+
+        return full_position_ids
 
     def _get_tree_mask_from_cache(self, tree_attention_mask: torch.Tensor, device: torch.device) -> torch.Tensor:
         """从缓存中获取解析后的 tree mask，如果不存在则解析并缓存"""
