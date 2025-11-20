@@ -94,10 +94,10 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         output_attentions = False
         assert not output_attentions
 
-        # print('🔧 OptimizedLlamaAttention.forward(): received position_ids:', position_ids)
+        # print(' OptimizedLlamaAttention.forward(): received position_ids:', position_ids)
         # if position_ids is not None:
-        #     print(f'🔧 position_ids shape: {position_ids.shape}, dtype: {position_ids.dtype}')
-        #     print(f'🔧 position_ids content: {position_ids}')
+        #     print(f' position_ids shape: {position_ids.shape}, dtype: {position_ids.dtype}')
+        #     print(f' position_ids content: {position_ids}')
 
         if position_ids is None:
             past_seen_tokens = past_key_value[0].shape[2] if past_key_value is not None else 0
@@ -107,9 +107,9 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
                 device=hidden_states.device,
                 dtype=torch.long
             ).unsqueeze(0) # pyright: ignore[reportAssignmentType]
-            # print(f'🔧 Generated fallback position_ids: {position_ids}')
+            # print(f' Generated fallback position_ids: {position_ids}')
 
-        # print('🔧 Final position_ids before processing:', position_ids)
+        # print(' Final position_ids before processing:', position_ids)
 
         #   Optimized: Avoid .item() CPU-GPU sync by using direct indexing
         # Most common case: 2D tensor [batch_size, seq_len]
@@ -124,7 +124,7 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         else:
             start_position = 0
 
-        # print(f'🔧 Extracted start_position: {start_position}')
+        # print(f' Extracted start_position: {start_position}')
 
         self.temp_hidden_states.val = super(OptimizedLlamaAttention, self).forward(
             hidden_states, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, start_position, k
@@ -420,7 +420,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             # Performance monitoring: record Task rebuild time
             if task_rebuild_start is not None:
                 task_rebuild_time = (time.time() - task_rebuild_start) * 1000
-                if task_rebuild_time > 1.0:  # 只记录超过1ms的情况
+                if task_rebuild_time > 1.0:  # Record only when it takes more than 1ms
                     print(f"[BLOCK_PERF] Layer {self.layer_id} Task rebuild took: {task_rebuild_time:.3f}ms")
 
         task = self._cached_task
@@ -432,7 +432,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         num_prompts = len(task.inputs)
         prompt_len, gen_len = task.prompt_len, task.gen_len
 
-        # ✨ Optimization: Use rolling buffer to avoid O(prompt_len) copy on each forward
+        # Use rolling buffer to avoid O(prompt_len) copy on each forward
         # Only reallocate when shape changes
         output_ids_start = time.time()
         target_shape = (num_prompts, prompt_len + gen_len)
@@ -525,10 +525,10 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                 if position_ids is not None and position_ids.numel() > 0:
                     #   Optimized: Avoid .item() sync
                     current_position = position_ids.flatten()[0]
-                    # print(f'🔧 Using actual position from position_ids: {current_position}')
+                    # print(f' Using actual position from position_ids: {current_position}')
                 else:
                     current_position = 0
-                    # print(f'🔧 No position_ids provided, using fallback position: {current_position}')
+                    # print(f' No position_ids provided, using fallback position: {current_position}')
 
                 i = current_position
 
@@ -642,7 +642,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         outputs = (hidden_states, past_key_value)
         # log_mem(f"[Layer:{self.layer_id}] forward(end) out_shape={hidden_states.shape}")
         # Remove empty_cache call from each forward to reduce GPU overhead
-        # torch.cuda.empty_cache()  # 这会导致性能问题
+        # torch.cuda.empty_cache()  
         return outputs
 
     def load_weight(self, i, j, k, overlap=True):
@@ -701,7 +701,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             with torch.cuda.stream(self.store_cache_stream):
                 self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
             # Remove unnecessary synchronization to reduce GPU blocking
-            # torch.cuda.synchronize()  # 这会造成性能瓶颈
+            # torch.cuda.synchronize()  
         else:
             self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
 
@@ -771,7 +771,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         if j == 1:
             self.hidden[0][j][k].val = self.temp_hidden.val
 
-        # print(f'🔧 compute_layer: i={i}, j={j}, k={k}, received position_ids={position_ids}')
+        # print(f' compute_layer: i={i}, j={j}, k={k}, received position_ids={position_ids}')
 
         self.layers[j].forward(hidden_states=self.hidden[0][j][k],
                                cache_read_buf=self.cache_read_buf[j][k],
@@ -813,10 +813,10 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             seq_length_with_past = seq_length_with_past + past_key_values_length
             past_key_value = self._reorder_cache_from_bloom_to_llama(past_key_value, batch_size, past_key_values_length)
 
-        # print(f'🔧 WrappedLlamaBlock.forward: received position_ids={position_ids}')
+        # print(f' WrappedLlamaBlock.forward: received position_ids={position_ids}')
         if position_ids is not None:
             pass
-            # print(f'🔧 WrappedLlamaBlock.forward: position_ids shape={position_ids.shape}, content={position_ids}')
+            # print(f' WrappedLlamaBlock.forward: position_ids shape={position_ids.shape}, content={position_ids}')
 
         # print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}, past_key_value: {past_key_value}")
         #   Optimized: Reuse cached attention_mask
