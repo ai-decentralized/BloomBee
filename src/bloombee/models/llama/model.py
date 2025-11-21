@@ -185,7 +185,7 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
                 input_ids = input_ids[:, past_length:]
                 # print(f"   Past length case: {original_shape} -> {input_ids.shape}, kept tokens: {input_ids}")
             else:
-                print(f"   No truncation needed: past_length={past_length}, input_ids.shape[1]={input_ids.shape[1]}")
+                logger.debug(f"No truncation needed: past_length={past_length}, input_ids.shape[1]={input_ids.shape[1]}")
 
             if (
                 max_cache_length is not None
@@ -205,10 +205,10 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
-            print(f"   Using inputs_embeds for first generation step")
+            logger.debug("Using inputs_embeds for first generation step")
         else:
             model_inputs = {"input_ids": input_ids}
-            # print(f"   Using input_ids: {input_ids}")
+            # logger.debug(f"Using input_ids: {input_ids}")
 
         model_inputs.update(
             {
