@@ -797,7 +797,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
                 past_key_values_length=past_key_values_length,
             )
             
-        logger.info(f"block, attention_mask: {attention_mask.shape}")
+        # logger.info(f"block, attention_mask: {attention_mask.shape}")
 
         outputs = super().forward(
             hidden_states,
@@ -864,6 +864,10 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         key_states = key_states.view(*value_states.shape)
         key_states = key_states.permute(0, 2, 1)
         return (key_states, value_states)
+    
+    def rms_norm(self, hidden_states: torch.Tensor):
+        path = "/tmp/data/llama_weights/llama-7b-np"
+        return self.input_layernorm.forward(hidden_states, path)
 
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):

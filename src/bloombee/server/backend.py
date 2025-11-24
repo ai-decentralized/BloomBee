@@ -107,10 +107,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.backward_pool = PrioritizedTaskPool(
             self.backward, max_batch_size=max_batch_size, device=device, name=f"{self.name}_backward"
         )
-        
-        self.pruning_pool = PrioritizedTaskPool(
-            self.prune_draft_tree, max_batch_size=max_batch_size, device=device, name=f"{self.name}_pruning"
-        )
 
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
@@ -170,7 +166,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             cache_tensors.append(keys)
         return cache_tensors
     
-    def prune_draft_tree(self, hidden_states: torch.Tensor,  draft_tokens: torch.Tensor, tree_attention_mask):
+    def prune_draft_tree(self, original_hidden_states: torch.Tensor, hidden_states: torch.Tensor,  draft_tokens: torch.Tensor, tree_attention_mask):
         logger.info(f"start prune_draft_tree")
         results = self.pruner_manager.prune_speculation_tree(
             hidden_states,
@@ -184,7 +180,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         
         keep_indices = results['keep_indices']
         logger.info(f"keep_indices: {keep_indices}")
-        new_hidden_states = hidden_states[:, keep_indices, :]
+        new_hidden_states = original_hidden_states[:, keep_indices, :]
         return new_hidden_states, keep_indices
 
     def forward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
@@ -269,7 +265,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 past_key_values_length = k_pkv.shape[2] if k_pkv is not None else 0
                     
-                logger.info(f"past_key_values_length: {past_key_values_length}")
+                # logger.info(f"past_key_values_length: {past_key_values_length}")
                     
                 full_mask = self._create_attention_mask(
                     tree_attention_mask=inference_info.tree_attention_mask,
@@ -350,16 +346,21 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
 
-                logger.info(f"inference_step, output_hidden_states: {output_hidden_states}, draft_tokens: {inference_info.draft_tokens}")
+                # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}, draft_tokens: {inference_info.draft_tokens}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
                 keep_indices = None
                 if inference_info.uid == 'llama-7b-hf.31':
-                    self.pruner_manager.train_model(output_hidden_states, full_mask, inference_info.draft_tokens)
-                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, inference_info.draft_tokens, full_mask)
+                    # logger.info(f"before norm, output_hidden_states: {output_hidden_states}")
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    # logger.info(f"after norm, norm_hidden_states: {norm_hidden_states}")
+                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    self.pruner_manager.train_model(norm_hidden_states, full_mask, inference_info.draft_tokens)
+                    
                     
                 if inference_info.uid == 'llama-7b-hf.15':
-                    self.pruner_manager.middle_states = output_hidden_states
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    self.pruner_manager.middle_states = norm_hidden_states
                 
                 return (output_hidden_states, keep_indices) # Return output hidden states
                 

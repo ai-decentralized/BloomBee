@@ -452,11 +452,11 @@ class InferenceSession:
                     time.sleep(delay) 
 
         self._position += n_input_tokens 
-        print(f"lient inference session outputs before recover, inputs: {inputs.shape}, {inputs}")
+        # logger.info(f"Client inference session outputs before recover, inputs: {inputs.shape}, {inputs}")
         if draft_tokens is not None:
             inputs = self._recover_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
             
-        logger.info(f"hidden states in inference session after inference: {inputs.shape}, {inputs}")
+        # logger.info(f"hidden states in inference session after inference: {inputs.shape}, {inputs}")
         outputs = inputs 
         
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 

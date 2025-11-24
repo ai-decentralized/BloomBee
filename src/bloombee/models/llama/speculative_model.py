@@ -410,8 +410,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         fallback_pos = max(0, logits.shape[1] - total_tree_tokens)
         tree_root_position = input_ids.shape[1] - 1
         
-        logger.info(f"_extract_best_verified_paths_fixed, logits: {logits}")
-        logger.info(f"_extract_best_verified_paths_fixed, input_ids: {input_ids}")
+        # logger.info(f"_extract_best_verified_paths_fixed, logits: {logits}")
+        # logger.info(f"_extract_best_verified_paths_fixed, input_ids: {input_ids}")
         
         node_paths = batch_node_paths[0]
         best_verified = []

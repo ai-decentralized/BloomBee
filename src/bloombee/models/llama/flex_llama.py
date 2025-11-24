@@ -50,16 +50,31 @@ class FLEX_LlamaRMSNorm(LlamaRMSNorm): #put in fex_llama
         super().__init__(hidden_size, eps=1e-6)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.hidden_size = hidden_size
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, path):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        
+        loaded_weight = self.load_weight(path)
+        loaded_weight = loaded_weight.to(device=hidden_states.device, dtype=input_dtype)
+        return loaded_weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+    
+    def load_weight(self, path):
+        if os.path.isdir(path):
+            path = os.path.join(path, "norm.weight")
+        arr = np.load(path)
+        w = torch.from_numpy(arr).to(torch.float32)
+        if w.numel() != self.hidden_size:
+            raise ValueError("norm.weight shape mismatch")
+        # self.loaded_weight = w   # 就这么直接赋值
+        print("[OK] loaded", path)
+        return w
     
     
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -386,6 +401,7 @@ class FLEX_LlamaAttention(LlamaAttention):
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, np.float16)
+        logger.info(f"init_weight, path: {path}")
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
         weight_specs = [
             # 5 weight files
@@ -494,7 +510,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # import pdb;pdb.set_trace()---------------------
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start prefill) i={i} k={k}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            logger.info(f"flex llama, attention_mask: {mask}")
+            # logger.info(f"flex llama, attention_mask: {mask}")
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids)
             cache_write_buf.store((new_k_cache, new_v_cache))

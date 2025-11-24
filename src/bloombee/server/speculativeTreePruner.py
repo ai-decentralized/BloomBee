@@ -10,6 +10,7 @@ import logging
 import random
 import os
 import math
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +424,26 @@ class DualPathPruner(nn.Module):
         decision_prob = torch.sigmoid(decision_score)
         
         return decision_prob, quality_score, threshold_adjust
+    
+class SimpleLMHead(nn.Module):
+    def __init__(self, hidden_size, vocab_size):
+        super().__init__()
+        self.weight = None
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+
+    def load_weight(self, path):
+        if os.path.isdir(path):
+            path = os.path.join(path, "lm_head.weight")
+        w = np.load(path)
+        t = torch.from_numpy(w).to(torch.float32)
+        self.weight = t  # 不用 nn.Parameter
+        print("[OK] loaded lm_head.weight", t.shape)
+
+    def forward(self, hidden_states):
+        # hidden_states: [B, T, H]
+        w = self.weight.to(hidden_states.device, hidden_states.dtype)
+        return hidden_states @ w.t()  # [B, T, vocab]
 
 
 class AdaptiveNeuralPruner:
@@ -444,7 +465,9 @@ class AdaptiveNeuralPruner:
         self.config = config
         
         # LM head for getting probabilities
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False).to(device)
+        self.lm_head = SimpleLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
+        self.lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
+        
         self.lm_head.requires_grad_(False)
         self.lm_head.to(dtype=torch.float16)
         
@@ -454,7 +477,7 @@ class AdaptiveNeuralPruner:
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             self.decision_net.parameters(), 
-            lr=1e-3
+            lr=1e-4
         )
         
         # Historical acceptance rate tracking
@@ -558,6 +581,7 @@ class AdaptiveNeuralPruner:
             network_condition = self.get_network_condition() or NetworkCondition.mock()
         
         # Get logits from middle layer
+        # norm_middle_hidden_states = 
         logits = self.lm_head(middle_hidden_states)
         
         # Initialize masks
@@ -763,7 +787,9 @@ class AdaptiveNeuralPruner:
 
         # logits = [1, seq_len, vocab]
         logits = self.lm_head(final_hidden_states)
+        # logger.info(f"_get_current_accepted_tokens_indices, logits: {logits}")
         probs = torch.softmax(logits, dim=-1)
+        # logger.info(f"_get_current_accepted_tokens_indices, probs: {probs}")
 
         # ==================================
         # Step 1 — 根据 attention mask 还原每条 root→leaf path
@@ -771,7 +797,7 @@ class AdaptiveNeuralPruner:
         is_leaf = torch.ones(seq_len, dtype=torch.bool)
         leaf_paths = []
         
-        logger.info(f"_get_current_accepted_tokens_indices, seq_len: {seq_len}, prefix_len: {prefix_len}")
+        # logger.info(f"_get_current_accepted_tokens_indices, seq_len: {seq_len}, prefix_len: {prefix_len}")
 
         for i in range(seq_len - 1, -1, -1):
             if is_leaf[i]:
@@ -793,15 +819,16 @@ class AdaptiveNeuralPruner:
         best_path = None
         best_validated = -1
         
-        logger.info(f"_get_current_accepted_tokens_indices, leaf_paths {leaf_paths}")
+        # logger.info(f"_get_current_accepted_tokens_indices, leaf_paths {leaf_paths}")
 
         for leaf_idx, path in leaf_paths:
             validated = 1   # root always validated
-
+            # logger.info(f"current path : {path}")
             for i in range(1, len(path)):
                 idx = path[i]
                 token_id = draft_tokens[idx].item()
                 pred_id = probs[0, path[i - 1]].argmax().item()
+                # logger.info(f"current i: {i}, token_id: {token_id}, pred_id: {pred_id}")
 
                 if pred_id == token_id:
                     validated += 1
@@ -811,6 +838,10 @@ class AdaptiveNeuralPruner:
             if validated > best_validated:
                 best_validated = validated
                 best_path = path[:validated]
+                
+        last_index = best_path[-1]
+        next_token = probs[0, last_index].argmax().item()
+        logger.info(f"next token: {next_token}")
 
         return best_path, best_validated
     
@@ -855,6 +886,36 @@ class AdaptiveNeuralPruner:
                 prob_features, 
                 network_features
             )
+            
+        # === 关键诊断信息 ===
+        logger.info("="*60)
+        logger.info("📊 训练诊断")
+        
+        # 1. 检查特征分布
+        logger.info(f"prob_features 统计:")
+        logger.info(f"  min: {prob_features.min().item():.4f}, max: {prob_features.max().item():.4f}")
+        logger.info(f"  mean: {prob_features.mean().item():.4f}, std: {prob_features.std().item():.4f}")
+        
+        logger.info(f"network_features 统计:")
+        logger.info(f"  min: {network_features.min().item():.4f}, max: {network_features.max().item():.4f}")
+        logger.info(f"  mean: {network_features.mean().item():.4f}, std: {network_features.std().item():.4f}")
+        
+        # 2. 检查预测分布
+        logger.info(f"predictions 统计:")
+        logger.info(f"  min: {predictions.min().item():.4f}, max: {predictions.max().item():.4f}")
+        logger.info(f"  mean: {predictions.mean().item():.4f}, std: {predictions.std().item():.4f}")
+        
+        # 3. 检查标签分布
+        logger.info(f"labels: 正样本={labels.sum().item()}/{len(labels)}")
+        
+        # 4. 检查正负样本的预测差异
+        if labels.sum() > 0:
+            pos_preds = predictions[labels == 1]
+            neg_preds = predictions[labels == 0]
+            logger.info(f"正样本预测均值: {pos_preds.mean().item():.4f}")
+            logger.info(f"负样本预测均值: {neg_preds.mean().item():.4f}")
+            logger.info(f"预测分离度: {(pos_preds.mean() - neg_preds.mean()).item():.4f}")
+        
         
         # === Loss 1: Token Quality Prediction (with class weighting) ===
         pos_count = labels.sum()
@@ -897,6 +958,17 @@ class AdaptiveNeuralPruner:
         logger.info(f"train_step, total_loss: {total_loss}")
         
         total_loss.backward()
+        
+        logger.info("梯度统计:")
+        for name, param in self.decision_net.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                logger.info(f"  {name}: grad_norm={grad_norm:.6f}")
+                if grad_norm < 1e-7:
+                    logger.warning(f"  ⚠️ {name} 梯度几乎为0！")
+            else:
+                logger.error(f"  ❌ {name} 没有梯度！")
+        
         self.optimizer.step()
         
         self.decision_net.eval()
@@ -928,7 +1000,7 @@ class AdaptiveNeuralPruner:
         """Save model weights"""
         torch.save({
             'decision_net': self.decision_net.state_dict(),
-            'lm_head': self.lm_head.state_dict(),
+            # 'lm_head': self.lm_head.state_dict(),
             'acceptance_history': list(self.acceptance_history),
             'current_acceptance_rate': self.current_acceptance_rate
         }, path)
@@ -937,7 +1009,7 @@ class AdaptiveNeuralPruner:
         """Load model weights"""
         checkpoint = torch.load(path, map_location=self.device)
         self.decision_net.load_state_dict(checkpoint['decision_net'])
-        self.lm_head.load_state_dict(checkpoint['lm_head'])
+        # self.lm_head.load_state_dict(checkpoint['lm_head'])
         self.acceptance_history = deque(checkpoint['acceptance_history'], maxlen=100)
         self.current_acceptance_rate = checkpoint['current_acceptance_rate']
     
