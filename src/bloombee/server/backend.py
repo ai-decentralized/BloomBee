@@ -297,8 +297,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # logger.info(f"hidden states in backend before compute: {hidden_states}")
 
                     # logger.info(f"Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}")
-                    prefill_length = hidden_states.shape[1] - 31
-                    rotary_position_ids = self._create_tree_position_ids(2, 4, prefill_length, past_key_values_length, device='cuda:0') if inference_info.tree_attention_mask is not None else None
+                    rotary_position_ids = self._create_tree_position_ids(2, 4, inference_info.prefill_length - 1,               past_key_values_length, device='cuda:0') if inference_info.tree_attention_mask is not None else None
+                    rotary_position_ids = rotary_position_ids[inference_info.keep_indices]
                     
                     # logger.info(f"rotary_position_ids: {rotary_position_ids}, hidden_states_chunk: {hidden_states_chunk.shape}")
                     try:
@@ -349,18 +349,20 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}, draft_tokens: {inference_info.draft_tokens}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
-                keep_indices = None
+                keep_indices = inference_info.keep_indices
                 if inference_info.uid == 'llama-7b-hf.31':
-                    # logger.info(f"before norm, output_hidden_states: {output_hidden_states}")
+                    
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     # logger.info(f"after norm, norm_hidden_states: {norm_hidden_states}")
-                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, norm_hidden_states, inference_info.draft_tokens, full_mask)
                     self.pruner_manager.train_model(norm_hidden_states, full_mask, inference_info.draft_tokens)
                     
                     
                 if inference_info.uid == 'llama-7b-hf.15':
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     self.pruner_manager.middle_states = norm_hidden_states
+                    
+                    temp_output_hidden_states, temp_keep_indices = self.prune_draft_tree(output_hidden_states, norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    logger.info(f"temp_keep_indices: {temp_keep_indices}")
                 
                 return (output_hidden_states, keep_indices) # Return output hidden states
                 

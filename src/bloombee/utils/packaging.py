@@ -47,3 +47,8 @@ def unpack_args_kwargs(flat_tensors: List[torch.Tensor], args_structure: Any):
         ),
         args_structure,
     )
+    
+def normalize_arg(x):
+    if x is None:
+        return torch.tensor([], dtype=torch.float32)
+    return x

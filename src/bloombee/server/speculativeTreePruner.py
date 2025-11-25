@@ -864,8 +864,6 @@ class AdaptiveNeuralPruner:
             alpha: Weight for BCE loss
             beta: Weight for pruning alignment loss
         """
-
-        
         
         accepted_indices, best_validated = self._get_current_accepted_tokens_indices(final_hidden_states, attention_mask, draft_tokens)
         logger.info(f"train_step, accepted_indices: {accepted_indices}")

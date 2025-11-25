@@ -126,3 +126,5 @@ class InferenceMetadata:
     tree_attention_mask: Optional[torch.Tensor] = None
     kv_cache_position_ids: Optional[torch.Tensor] = None
     draft_tokens: Optional[torch.Tensor] = None
+    prefill_length: Optional[torch.Tensor] = None
+    keep_indices: Optional[torch.Tensor] = None

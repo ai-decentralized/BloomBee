@@ -401,7 +401,7 @@ class FLEX_LlamaAttention(LlamaAttention):
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, np.float16)
-        logger.info(f"init_weight, path: {path}")
+        # logger.info(f"init_weight, path: {path}")
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
         weight_specs = [
             # 5 weight files

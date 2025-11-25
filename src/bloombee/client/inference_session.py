@@ -18,7 +18,7 @@ from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo, RPCInfo
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
-from bloombee.utils.packaging import pack_args_kwargs
+from bloombee.utils.packaging import pack_args_kwargs, normalize_arg
 
 logger = get_logger(__name__)
 
@@ -102,6 +102,8 @@ class _ServerInferenceSession:
         tree_attention_mask: Optional[torch.Tensor] = None,
         kv_cache_position_ids: Optional[torch.Tensor] = None,
         draft_tokens: Optional[torch.Tensor] = None,
+        prefill_length: int = 0,
+        keep_indices: Optional[torch.Tensor] = None,
         *,
         step_id: str,
     ) -> torch.Tensor:
@@ -130,10 +132,15 @@ class _ServerInferenceSession:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        # logger.info(f"kv_cache_position_ids: {kv_cache_position_ids}, draft_tokens: {draft_tokens}")
-        combined_mask = self._pack_kv_into_tree_mask(tree_attention_mask, kv_cache_position_ids, draft_tokens)
-        # logger.info(f"combined_mask: {combined_mask}")
-        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, combined_mask)
+        
+        
+        input_tensors, args_structure = pack_args_kwargs(
+            inputs, prompts, hypo_ids, 
+            normalize_arg(tree_attention_mask),
+            normalize_arg(kv_cache_position_ids),
+            normalize_arg(draft_tokens),
+            normalize_arg(torch.tensor(prefill_length)),
+            normalize_arg(keep_indices))
         # logger.info(f"client inference session step() input_tensors after packing {input_tensors}")
         # logger.info(f"client inference session step() input_tensors after packing shape: {input_tensors[0].shape}")
         logger.info(f"_ServerInferenceSession  step id {step_id}")
@@ -186,61 +193,24 @@ class _ServerInferenceSession:
         logger.info(f"server inference session output and shape: {len(outputs)},  {outputs} "  )
         return outputs
     
-    def _pack_kv_into_tree_mask(self, tree_attention_mask, kv_cache_position_ids, draft_tokens):
-        original_shape = tree_attention_mask.shape
-        original_dtype = tree_attention_mask.dtype
-        device = tree_attention_mask.device
+    def _update_kv_cache_position_ids(self, kv_cache_position_ids, keep_indices):
+        if kv_cache_position_ids is None:
+            return
         
-        # logger.info(f"tree_attention_mask, shape: {tree_attention_mask.shape}, mask: {tree_attention_mask}")
+        if not torch.is_tensor(keep_indices):
+            keep_indices = torch.tensor(keep_indices, device=kv_cache_position_ids.device)
 
-        # shape (B, 1, seq_len)
-        extra_row_shape = (original_shape[0], 1) + original_shape[2:]
+        # 建立映射表：原始 id → 新位置
+        # 例如 keep_indices = [2,4,7] → map: {2:0, 4:1, 7:2}
+        mapping = {int(k.item()): i for i, k in enumerate(keep_indices)}
 
-        # ---- KV 行（倒数第6行） ----
-        kv_extra_row = torch.full(extra_row_shape, 0, dtype=original_dtype, device=device)  # 改为0初始化
-        if kv_cache_position_ids is not None:
-            kv_flat = kv_cache_position_ids.flatten()
-            available_space = kv_extra_row.numel() - 1
-            actual_len = min(len(kv_flat), available_space)
-            kv_extra_flat = kv_extra_row.view(-1)
-            kv_extra_flat[:actual_len] = kv_flat[:actual_len].to(original_dtype)
-            kv_extra_flat[-1] = actual_len  # 长度标记
-        else:
-            kv_extra_flat = kv_extra_row.view(-1)
-            kv_extra_flat[-1] = 255  # 无数据标记
+        # 生成新 ids：查表
+        new_ids = torch.tensor(
+            [mapping.get(int(x.item()), -1) for x in kv_cache_position_ids],
+            device=kv_cache_position_ids.device
+        )
 
-        # ---- Draft 行（最后5行） ----
-        draft_rows = []
-        logger.info(f"_pack_kv_into_tree_mask, shape: {draft_tokens.shape} draft_tokens: {draft_tokens}")
-        if draft_tokens is not None:
-            draft_flat = draft_tokens.flatten()
-            payload_per_row = kv_extra_row.numel() - 1  # 每行可写的数据数量（留一个位置给长度标记）
-            
-            for i in range(2):  # 5行
-                row = torch.zeros(extra_row_shape, dtype=original_dtype, device=device)  # 初始化为0
-                row_flat = row.view(-1)
-                start = i * payload_per_row
-                
-                if start < len(draft_flat):
-                    actual_len = min(len(draft_flat) - start, payload_per_row)
-                    # 写入实际的draft tokens
-                    row_flat[:actual_len] = draft_flat[start:start+actual_len].to(original_dtype)
-                    row_flat[-1] = actual_len  # 最后一个元素存储长度
-                else:
-                    # 无数据的行
-                    row_flat[-1] = 255
-                    
-                draft_rows.append(row)
-        else:
-            # 没有draft tokens，创建5个空行
-            for _ in range(2):
-                row = torch.zeros(extra_row_shape, dtype=original_dtype, device=device)
-                row.view(-1)[-1] = 255  # 标记为无数据
-                draft_rows.append(row)
-
-        # ---- 拼接 ----
-        combined_mask = torch.cat([tree_attention_mask, kv_extra_row] + draft_rows, dim=1)
-        return combined_mask
+        return new_ids
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
         next_servers = []
@@ -302,6 +272,7 @@ class InferenceSession:
         self.output_ids = None
         self.past_key_values = None
         self.keep_indices = None
+        self.prefill_length = 0
 
     @property
     def num_blocks(self) -> int:
@@ -400,6 +371,15 @@ class InferenceSession:
 
         server_idx = 0
         block_idx = 0
+        self.prefill_length = inputs.shape[1] - tree_attention_mask.shape[1]
+        logger.info(f"inputs.shape[1]: {inputs.shape}")
+        logger.info(f"tree_attention_mask: {tree_attention_mask.shape}")
+        logger.info(f"self.prefill_length: {self.prefill_length}")
+        keep_indices = torch.arange(
+                inputs.shape[1],
+                dtype=torch.int64,
+                device=inputs.device
+            ) 
         
         logger.info(f"hidden states in inference session: {inputs.shape}, {inputs}")
         
@@ -421,16 +401,19 @@ class InferenceSession:
                         tree_attention_mask,
                         kv_cache_position_ids,
                         draft_tokens,
+                        self.prefill_length,
+                        keep_indices,
                         step_id=step_id,
                     )
                     
                     logger.info(f"get output and keep_indices: {keep_indices}, kv_cache_position_ids: {kv_cache_position_ids}")
-                    kv_cache_position_ids = self._update_kv_cache_position_ids(kv_cache_position_ids, self.keep_indices)
+                    kv_cache_position_ids = self._update_kv_cache_position_ids(kv_cache_position_ids, keep_indices)
                     self.keep_indices = keep_indices
-                    prefill_length = n_input_tokens - tree_attention_mask.shape[1]
+                    prefill_length = self.prefill_length
                     attention_mask_indices = keep_indices[prefill_length:] - prefill_length
                     # logger.info(f"attention_mask_indices: {attention_mask_indices}, tree_attention_mask: {tree_attention_mask}")
-                    tree_attention_mask = tree_attention_mask[:, attention_mask_indices, attention_mask_indices]
+                    idx = attention_mask_indices
+                    tree_attention_mask = tree_attention_mask[:, idx][:, :, idx]
                     # print('inputs ', inputs)
                     # print('inputs.shape ', inputs.shape)
                     server_idx += 1
@@ -454,7 +437,7 @@ class InferenceSession:
         self._position += n_input_tokens 
         # logger.info(f"Client inference session outputs before recover, inputs: {inputs.shape}, {inputs}")
         if draft_tokens is not None:
-            inputs = self._recover_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
+            inputs = self._recover_hidden_states(inputs, keep_indices, draft_tokens.shape[1])
             
         # logger.info(f"hidden states in inference session after inference: {inputs.shape}, {inputs}")
         outputs = inputs 

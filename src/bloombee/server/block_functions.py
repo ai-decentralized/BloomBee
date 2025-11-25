@@ -193,72 +193,12 @@ async def iterate_rpc_inference(
             # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
-        hidden_states, prompts, hypo_ids, combined_mask, *_ = flat_tensors
-        
+        hidden_states, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, keep_indices,  *_ = flat_tensors
+        draft_tokens = draft_tokens[0]
         # logger.info(f"combined_mask shape: {combined_mask.shape}, combined_mask: {combined_mask}")
-        
-        # combined_mask: [B, H, W] 例如 [1, 33, 30]
-        # 约定：[-3] 行为 KV，[-2]、[-1] 行为 Draft，其它行为 tree_attention_mask
-        # 每行最后一个位置（索引 -1）为长度标记，前面的位置存放数据
+        # logger.info(f"kv_cache_position_ids: {kv_cache_position_ids}")
+        logger.info(f"draft_tokens: {draft_tokens}")
 
-        if combined_mask is not None:
-            B, H, W = combined_mask.shape
-
-            if H >= 3 and W >= 1:
-                # ---- 取出三行 ----
-                kv_row     = combined_mask[:, -3, :]    # [B, W]
-                draft_rows = combined_mask[:, -2:, :]   # [B, 2, W]
-
-                # ---- 解析 KV（倒数第3行）----
-                kv_len = kv_row[:, -1].to(torch.long)                 # [B]
-                # 合法长度：1..W-1
-                kv_len = torch.clamp(kv_len, min=0, max=W-1)
-
-                kv_cache_position_ids_list = []
-                for b in range(B):
-                    L = int(kv_len[b].item())
-                    if L > 0:
-                        kv_cache_position_ids_list.append(kv_row[b, :L].to(torch.long))
-                    else:
-                        kv_cache_position_ids_list.append(None)
-
-                # B==1 时返回单个张量或 None；否则按 batch 返回列表
-                kv_cache_position_ids = (
-                    kv_cache_position_ids_list[0] if B == 1 else kv_cache_position_ids_list
-                )
-
-                # ---- 解析 Draft tokens（最后两行）----
-                draft_tokens_all_batches = []
-                for b in range(B):
-                    tokens = []
-                    for i in range(2):  # 两行：-2 与 -1
-                        row = draft_rows[b, i, :]              # [W]
-                        L = int(row[-1].item())
-                        if 0 < L <= W - 1:
-                            tokens.extend(row[:L].to(torch.long).tolist())
-                    draft_tokens_all_batches.append(
-                        (torch.tensor(tokens, dtype=torch.long, device=combined_mask.device)
-                        if len(tokens) > 0 else None)
-                    )
-
-                draft_tokens = (
-                    draft_tokens_all_batches[0] if B == 1 else draft_tokens_all_batches
-                )
-
-                # ---- tree_attention_mask（去掉最后3行）----
-                tree_attention_mask = combined_mask[:, :-3, :]
-
-            else:
-                # 行数不足3或宽度为0，无法拆出 KV / Draft
-                tree_attention_mask = combined_mask
-                kv_cache_position_ids = None
-                draft_tokens = None
-        else:
-            tree_attention_mask = None
-            kv_cache_position_ids = None
-            draft_tokens = None
-
-        
         batch_size, length_increment, _ = hidden_states.shape
 
         # Cast inputs to backend dtype
@@ -295,7 +235,7 @@ async def iterate_rpc_inference(
         )
         # print('after priority = prioritizer.prioritize( )')
         #print_time_now('')
-        logger.info(f"requested_uids: {requested_uids}")
+        # logger.info(f"requested_uids: {requested_uids}")
         # A client may pass a tensor with 0 tokens. This is a special case that occurs, e.g.
         # when user wants to pre-allocate cache or check that server *can* allocate that cache.
         if hidden_states.numel() > 0:
@@ -305,7 +245,7 @@ async def iterate_rpc_inference(
                 # offload_logger.info(" Using merged pool for inference")
                 
                 inference_infos = tuple(
-                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens)
+                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices)
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
                 (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
@@ -318,12 +258,12 @@ async def iterate_rpc_inference(
                 # offload_logger.info(" Using separate pools for inference")
                 
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
-                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens),)
+                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices),)
                     (hidden_states, keep_indices) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
             
-        logger.info(f"hidden_states device: {hidden_states.device}")
+        # logger.info(f"hidden_states device: {hidden_states.device}")
         # (hidden_states, keep_indices) = await requested_backends[0].pruning_pool.submit_task(hidden_states.to('cpu', non_blocking=True), draft_tokens.to('cpu', non_blocking=True), full_mask.to('cpu', non_blocking=True))
         logger.info(f"after _prune_draft_tree, hidden_states shape: {hidden_states.shape}")
         logger.info(f"keep_indices: {keep_indices}")

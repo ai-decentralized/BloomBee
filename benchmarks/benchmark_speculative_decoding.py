@@ -13,6 +13,9 @@ from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from datasets import load_dataset
+import random
+
 logger = get_logger()
 
 def main():
@@ -44,45 +47,50 @@ def main():
 @torch.inference_mode()
 def benchmark_inference(process_idx, args, result_pipe):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-    test_prompt = "Hello world from Xu, I am a master student from"
-    # test_prompt = ""
-    bos_token_id = tokenizer.bos_token_id
-    if bos_token_id is not None:
-        input_ids = torch.tensor([[bos_token_id]], dtype=torch.long, device=device)
-    else:
-        # 如果tokenizer没有bos_token_id，可能需要手动获取或处理
-        logger.warning("Tokenizer does not have a bos_token_id. Using an empty tensor.")
-        input_ids = torch.tensor([[]], dtype=torch.long, device=device)
-
-
-    input_ids = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=False).to(device)
-    # Using use_fast=False since LlamaTokenizerFast takes a long time to start, and we decode 1 token at a time anyway
-
+    
     ssm = AutoModelForCausalLM.from_pretrained("JackFram/llama-68m")
-
     ssm = ssm.to(device).eval()
-
-    model = AutoDistributedSpeculativeModel.from_pretrained(
-        args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype]
-    ).to(device)
-
-    result = ""
-
     # warm up ssm to reduce inference later
     with torch.no_grad():
         dummy_input = torch.ones(1, 8, dtype=torch.long, device=device)
         ssm(dummy_input, attention_mask=torch.ones_like(dummy_input))
 
-    start_time = perf_counter()
-    result = model.generate(input_ids=input_ids, ssm=ssm)
-    time = perf_counter() - start_time
-    generated_tokens_num = result.shape[1] - input_ids.shape[1]
-    speed = generated_tokens_num / time
-    decoded_result = tokenizer.decode(result[0], skip_special_tokens=True)
+    model = AutoDistributedSpeculativeModel.from_pretrained(
+        args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype]
+    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    
+    dataset = load_dataset("tatsu-lab/alpaca")["train"]
+    indices = random.sample(range(len(dataset)), 1000)
+    sampled = dataset.select(indices)
+    
+    for item in sampled:
+    
+        test_prompt = item["instruction"]
+        logger.info(f"test_prompt: {test_prompt}")
+        input_ids = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=False).to(device)
+        
+        # test_prompt = ""
+        # bos_token_id = tokenizer.bos_token_id
+        # if bos_token_id is not None:
+        #     input_ids = torch.tensor([[bos_token_id]], dtype=torch.long, device=device)
+        # else:
+        #     # 如果tokenizer没有bos_token_id，可能需要手动获取或处理
+        #     logger.warning("Tokenizer does not have a bos_token_id. Using an empty tensor.")
+        #     input_ids = torch.tensor([[]], dtype=torch.long, device=device)
+        
 
-    logger.info(f"benchmark_inference, result: {result}, generated_tokens_num: {generated_tokens_num}, time: {time} speed: {speed}, decoded_result: {decoded_result}")
+        result = ""
+        start_time = perf_counter()
+        result = model.generate(input_ids=input_ids, ssm=ssm)
+        time = perf_counter() - start_time
+        generated_tokens_num = result.shape[1] - input_ids.shape[1]
+        speed = generated_tokens_num / time
+        decoded_result = tokenizer.decode(result[0], skip_special_tokens=True)
+
+        logger.info(f"benchmark_inference, result: {result}, generated_tokens_num: {generated_tokens_num}, time: {time} speed: {speed}, decoded_result: {decoded_result}")
+    
+    
     result_pipe.send(speed)
 
 
