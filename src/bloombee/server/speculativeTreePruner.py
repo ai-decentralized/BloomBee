@@ -57,12 +57,13 @@ class PruningConfig:
     neural_threshold: float = 0.5
     neural_hidden_size: int = 128
     neural_dropout: float = 0.1
-    neural_learning_rate: float = 1e-4
+    neural_learning_rate: float = 1e-3
     neural_speedup_weight: float = 0.1
     
     # Shared config
     max_branches: int = 32
-    min_keep_branches: int = 5
+    min_keep_branches: int = 1
+    min_keep_nodes: int = 5
     enable_caching: bool = True
     cache_size: int = 1000
 
@@ -362,19 +363,25 @@ class NetworkCondition:
     def mock(cls, condition_type: str = 'normal'):
         """Mock network condition for training"""
         conditions = {
-            'good': {'latency': 10, 'bandwidth': 100, 'packet_loss': 0.001, 'throughput': 90},
-            'normal': {'latency': 50, 'bandwidth': 50, 'packet_loss': 0.01, 'throughput': 40},
+            'good': {'latency': 10, 'bandwidth': 500, 'packet_loss': 0.001, 'throughput': 90},
+            'normal': {'latency': 50, 'bandwidth': 100, 'packet_loss': 0.01, 'throughput': 40},
             'poor': {'latency': 150, 'bandwidth': 20, 'packet_loss': 0.05, 'throughput': 15}
         }
         
-        base = conditions.get(condition_type, conditions['normal'])
-        # Add some randomness
+        base = conditions.get(condition_type, conditions['poor'])
         return cls(
-            latency=base['latency'] * (1 + random.uniform(-0.2, 0.2)),
-            bandwidth=base['bandwidth'] * (1 + random.uniform(-0.1, 0.1)),
-            packet_loss=base['packet_loss'] * (1 + random.uniform(-0.3, 0.3)),
-            throughput=base['throughput'] * (1 + random.uniform(-0.15, 0.15))
+            latency=base['latency'],
+            bandwidth=base['bandwidth'],
+            packet_loss=base['packet_loss'],
+            throughput=base['throughput'],
         )
+        # Add some randomness
+        # return cls(
+        #     latency=base['latency'] * (1 + random.uniform(-0.2, 0.2)),
+        #     bandwidth=base['bandwidth'] * (1 + random.uniform(-0.1, 0.1)),
+        #     packet_loss=base['packet_loss'] * (1 + random.uniform(-0.3, 0.3)),
+        #     throughput=base['throughput'] * (1 + random.uniform(-0.15, 0.15))
+        # )
 
 class DualPathPruner(nn.Module):
     """
@@ -477,7 +484,7 @@ class AdaptiveNeuralPruner:
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             self.decision_net.parameters(), 
-            lr=1e-4
+            lr=1e-3
         )
         
         # Historical acceptance rate tracking
@@ -545,7 +552,6 @@ class AdaptiveNeuralPruner:
             network_condition.to_features(),
             dtype=torch.float32,
             device=self.device,
-            requires_grad=True
         )
         
         return prob_features, network_features
@@ -591,8 +597,8 @@ class AdaptiveNeuralPruner:
         quality_scores = torch.zeros(seq_len)
         threshold_adjusts = torch.zeros(seq_len)
         
-        logger.info(f"prune_branches, seq_len: {seq_len}")
-        logger.info(f"prune_branches, discarded: {discarded}")
+        # logger.info(f"prune_branches, seq_len: {seq_len}")
+        # logger.info(f"prune_branches, discarded: {discarded}")
         
         # Process each position
         for i in range(seq_len):
@@ -643,34 +649,48 @@ class AdaptiveNeuralPruner:
                     if tree_attention_mask[0, j, i + prefix_len] == 1:
                         discarded[j] = True
                         keep_mask[j] = False
+            else:
+                keep_mask[i] = True
+                discarded[i] = False
         
         # Ensure at least one branch is kept
         kept_count = keep_mask.sum().item()
         
         # logger.info(f"kept_count: {kept_count}")
         
-        if kept_count < self.config.min_keep_branches:
+        if kept_count < self.config.min_keep_nodes:
             # Keep top-scoring branches
             is_leaf = torch.ones(seq_len, dtype=torch.bool)
             leaf_paths = []
             
+            alpha = 0.2   # 越小，叶子影响越弱，可以自己调
+
             for i in range(seq_len - 1, -1, -1):
                 if is_leaf[i]:
                     path_indices = [i]
-                    path_score = decision_probs[i].item()
                     
                     for j in range(i - 1, -1, -1):
                         if tree_attention_mask[0, i, j + prefix_len] == 1:
                             is_leaf[j] = False
                             path_indices.append(j)
-                            path_score *= decision_probs[j].item()
-                    
+
+                    # 现在 path_indices 是 [leaf, ..., root]，翻转成 [root, ..., leaf]
                     path_indices.reverse()
+
+                    # 计算加权 log-score：根的权重要大，叶子权重要小
+                    log_score = 0.0
+                    for depth, idx in enumerate(path_indices):  # depth: 0 是根，越大越靠近叶
+                        p = float(decision_probs[idx].item())
+                        p = max(p, 1e-6)  # 防止 log(0)
+                        w = alpha ** depth  # 根节点 depth=0 -> w=1, 越往下 w 越小
+                        log_score += w * math.log(p)
+                    
+                    path_score = math.exp(log_score)
                     leaf_paths.append((path_score, i, path_indices))
-            
+
             leaf_paths.sort(key=lambda x: x[0], reverse=True)
-            branches_kept = 0
             
+            branches_kept = 0
             for path_score, leaf_idx, path_indices in leaf_paths:
                 if branches_kept >= self.config.min_keep_branches:
                     break
@@ -916,24 +936,32 @@ class AdaptiveNeuralPruner:
         
         
         # === Loss 1: Token Quality Prediction (with class weighting) ===
-        pos_count = labels.sum()
-        neg_count = tree_size - pos_count
-        
-        if pos_count > 0:
-            pos_weight = neg_count / pos_count
-            # 为正样本加权
-            sample_weights = torch.where(labels == 1, pos_weight, 1.0)
+        pos_mask = (labels == 1)
+        neg_mask = (labels == 0)
+
+        if pos_mask.any():
+            pos_loss = F.binary_cross_entropy(
+                predictions[pos_mask],
+                labels[pos_mask],
+                reduction='mean'
+            )
         else:
-            sample_weights = torch.ones_like(labels)
-            
-        logger.info(f"predictions: {predictions}")
-        logger.info(f"labels: {labels}")
-        
-        bce_loss = F.binary_cross_entropy(
-            predictions, 
-            labels, 
-            weight=sample_weights
-        )
+            pos_loss = torch.tensor(0.0, device=labels.device)
+
+        if neg_mask.any():
+            neg_loss = F.binary_cross_entropy(
+                predictions[neg_mask],
+                labels[neg_mask],
+                reduction='mean'
+            )
+        else:
+            neg_loss = torch.tensor(0.0, device=labels.device)
+
+        # 关键：FN 惩罚更大
+        w_pos = 4.0   # 正样本（该保留的），错砍代价大
+        w_neg = 1.0   # 负样本（可以剪掉的）
+
+        bce_loss = w_pos * pos_loss + w_neg * neg_loss
         
         logger.info(f"train_step, bce_loss: {bce_loss}")
         
@@ -950,8 +978,16 @@ class AdaptiveNeuralPruner:
         # Alignment loss
         pruning_alignment = (current_pruning_rate - target_pruning_rate) ** 2
         
+        margin = 0.7  # 希望正样本的预测概率尽量 >= 0.7
+        if pos_mask.any():
+            pos_preds = predictions[pos_mask]
+            fn_margin_penalty = F.relu(margin - pos_preds).mean()  # 只有 p < margin 会被惩罚
+        else:
+            fn_margin_penalty = torch.tensor(0.0, device=labels.device)
+        gamma = 0.5 
+        
         # === Total Loss ===
-        total_loss = alpha * bce_loss + beta * pruning_alignment
+        total_loss = alpha * bce_loss + beta * pruning_alignment + gamma * fn_margin_penalty
         
         logger.info(f"train_step, total_loss: {total_loss}")
         
@@ -974,9 +1010,12 @@ class AdaptiveNeuralPruner:
         # update acceptance rate
         count = 0
         for indice in accepted_indices:
-            if predictions[indice] == 1:
+            if predictions[indice] > 0.5:
                 count +=1
-        self.current_acceptance_rate = count / len(accepted_indices)
+        if len(accepted_indices) > 0:
+            self.current_acceptance_rate = count / len(accepted_indices)
+        else:
+            self.current_acceptance_rate = 1.0
         
         return {
             'total_loss': total_loss.item(),
@@ -987,8 +1026,6 @@ class AdaptiveNeuralPruner:
             'network_severity': network_severity,
             'avg_quality_score': quality_scores.mean().item(),
             'avg_threshold': threshold_adjusts.mean().item(),
-            'pos_count': pos_count.item(),
-            'neg_count': neg_count.item()
         }
     
     def update_acceptance_rate(self, rate: float):

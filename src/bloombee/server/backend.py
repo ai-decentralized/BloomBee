@@ -175,7 +175,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         )
         
         if self.pruner_manager.iteration == 10:
-            self.pruner_manager.save_state("/home/cc/BloomBee/checkpoints/pruner/model_v1.pt")
+            self.pruner_manager.save_state("/home/cc/BloomBee/checkpoints/pruner/model_v2.pt")
             self.pruner_manager.iteration = 0
         
         keep_indices = results['keep_indices']

@@ -345,7 +345,7 @@ class KVCacheManager:
         B, H, S, D = k_pkv.shape
         BH = B * H
         
-        logger.info(f"write_pkv_cache: B={B}, H={H}, S={S}, D={D}, start_position={start_position}")
+        # logger.info(f"write_pkv_cache: B={B}, H={H}, S={S}, D={D}, start_position={start_position}")
         
         # Convert PKV format (B, H, S, D) to write format
         # Target format for _write_kvs:
@@ -356,7 +356,7 @@ class KVCacheManager:
         k_write = k_pkv.reshape(BH, S, D).permute(0, 2, 1)  # (B, H, S, D) -> (B*H, S, D) -> (B*H, D, S)
         v_write = v_pkv.reshape(BH, S, D)                    # (B, H, S, D) -> (B*H, S, D)
         
-        logger.info(f"k_write shape: {k_write.shape}, v_write shape: {v_write.shape}")
+        # logger.info(f"k_write shape: {k_write.shape}, v_write shape: {v_write.shape}")
         
         # Call internal write method
         self._write_kvs(
@@ -364,7 +364,7 @@ class KVCacheManager:
             start_position=start_position
         )
         
-        logger.info(f"Successfully wrote PKV cache at position {start_position}")
+        # logger.info(f"Successfully wrote PKV cache at position {start_position}")
 
 
         
