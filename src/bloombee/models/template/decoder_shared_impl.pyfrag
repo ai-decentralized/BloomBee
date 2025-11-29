@@ -1,0 +1,218 @@
+    # ===== decoder implementation (FlexGen) =====
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *args,
+        max_new_tokens: int = 1,
+        do_sample: bool = True,
+        temperature: float = 0.6,
+        stop: Optional[int] = None,
+        debug_mode: Optional[str] = None,
+        cut_gen_len: Optional[int] = None,
+        top_p: float = 0.9,
+        verbose: int = 0,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+
+        num_prompts = 1
+        actual_prompt_len = hidden_states.shape[1] if hidden_states.shape[1] > 0 else 1
+        prompt_len, gen_len, cut_gen_len = actual_prompt_len, max_new_tokens, max_new_tokens
+
+        # Use simplified Task rebuild logic
+        if self._should_rebuild_task(max_new_tokens, actual_prompt_len):
+            # Use cached test_inputs
+            inputs = self._get_cached_test_inputs(prompt_len, num_prompts)
+
+            self._cached_task = Task(
+                inputs=inputs,
+                prompt_len=len(inputs[0]),
+                gen_len=max_new_tokens,
+                cut_gen_len=cut_gen_len,
+                do_sample=do_sample,
+                temperature=temperature,
+                stop=stop,
+                top_p=top_p
+            )
+
+            # Cache parameters for next comparison
+            self._last_prompt_len = actual_prompt_len
+            self._last_gen_len = max_new_tokens
+
+            # Reset output_ids prompt flag when task changes
+            self._output_ids_prompt_initialized = False
+
+            if not self._is_initialized:
+                self._is_initialized = True
+
+        task = self._cached_task
+
+        num_layers = self.num_layers
+        num_gpu_batches = self.num_gpu_batches
+        gpu_batch_size = self.policy.gpu_batch_size
+        overlap = self.policy.overlap
+        num_prompts = len(task.inputs)
+        prompt_len, gen_len = task.prompt_len, task.gen_len
+
+        # Rolling buffer for output_ids - avoid O(prompt_len) copy on each forward
+        target_shape = (num_prompts, prompt_len + gen_len)
+        if self._cached_output_ids is None or self._cached_output_ids_shape != target_shape:
+            self._cached_output_ids = np.ones(target_shape, dtype=np.int64)
+            self._cached_output_ids_shape = target_shape
+            self._output_ids_prompt_initialized = False
+
+        if not self._output_ids_prompt_initialized:
+            self._cached_output_ids[:, :prompt_len] = np.asarray(task.inputs)
+            self._output_ids_prompt_initialized = True
+
+        self.output_ids = self._cached_output_ids
+
+        # Smart cache clearing - avoid clearing every time
+        if not self._cache_cleared or self._should_force_cache_clear():
+            num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+            for j in range(num_layers):
+                for k in range(num_gpu_batches):
+                    self.cache_read_buf[j][k].clear()
+                    self.cache_write_buf[j][k].clear()
+            for j in range(num_layers):
+                self.weight_read_buf[j].clear()
+            for k in range(num_gpu_batches):
+                self.attention_mask[k].clear()
+            self._cache_cleared = True
+
+        # Smart hidden array reuse
+        if (self._cached_hidden_array is None or
+            self._last_gen_len_for_hidden != gen_len):
+            self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
+            self._cached_hidden_array = self.hidden
+            self._last_gen_len_for_hidden = gen_len
+        else:
+            self.hidden = self._cached_hidden_array
+
+        # TorchDevice object reuse
+        data = hidden_states
+        if (self._cached_torch_device is None or
+            self._cached_torch_device.name != str(data.device)):
+            self._cached_torch_device = TorchDevice(data.device)
+        device = self._cached_torch_device
+
+        tensor_data = TorchTensor(shape=data.shape, data=data, dtype=data.dtype, device=device)
+        self.hidden[0][0][0].store(tensor_data)
+
+        # CPU cache compute workspace initialization
+        self.task = task
+        self.set_task(task)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+
+        debug_mode = kwargs.get('debug_mode', None)
+        overlap = self.policy.overlap if hasattr(self.policy, 'overlap') else False
+
+        if debug_mode is None:
+            if not overlap:
+                # CRITICAL: Keep current_position as tensor to match original behavior
+                if position_ids is not None and position_ids.numel() > 0:
+                    current_position = position_ids.flatten()[0]  # Keep as tensor!
+                else:
+                    current_position = 0
+
+                i = current_position
+
+                for k in range(self.num_gpu_batches):
+                    if i == 0:
+                        mask_length = hidden_states.shape[1]
+                    else:
+                        mask_length = i + 1
+                    self.update_attention_mask(0, k, mask_length)
+
+                # Weight loading
+                for j in range(self.num_layers):
+                    for k in range(self.num_gpu_batches):
+                        self.load_weight(i, j, k, overlap=False)
+
+                final_outputs = []
+                generated_tokens_num = 0
+                if position_ids is not None and position_ids.numel() > 0:
+                    # CRITICAL: Keep as tensor for consistency with original
+                    generated_tokens_num = position_ids.flatten()[-1] - self.task.prompt_len + 1
+
+                for k in range(self.num_gpu_batches):
+                    for j in range(self.num_layers):
+                        # Load current layer cache
+                        if j == 0 and past_key_value is not None:
+                            past_key, past_value = past_key_value
+                            # Normalize past shapes into [B, H, S, D]
+                            if past_key.dim() == 3:
+                                # from backend packed: [B*H, D, S] or [B*H, S, D]
+                                bh, x1, x2 = past_key.shape
+                                b = hidden_states.shape[0]
+                                h = bh // b
+                                d = self.self_attn.head_dim
+                                s = x2 if x1 == d else x1
+                                if x1 == d and x2 == s:
+                                    k_bhsd = past_key.permute(0, 2, 1)
+                                else:
+                                    k_bhsd = past_key
+                                v_bhsd = past_value if past_value.shape[1] == s else past_value.permute(0, 2, 1)
+                                past_key = k_bhsd.view(b, h, s, d)
+                                past_value = v_bhsd.view(b, h, s, d)
+                            # Transform to FlexGen expected (s, b*h, d)
+                            b, h, s, d = past_key.shape
+                            # Use reshape instead of permute+contiguous+view
+                            past_k_new = past_key.permute(2, 0, 1, 3).reshape(s, b * h, d)
+                            past_v_new = past_value.permute(2, 0, 1, 3).reshape(s, b * h, d)
+                            self.cache_read_buf[0][0].store((past_k_new, past_v_new))
+
+                        layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num)
+
+                        if j == 0:
+                            k_new, v_new = self.cache_write_buf[0][0].pop()
+
+                            # Support compressed KV: decompress to torch.Tensor when needed
+                            try:
+                                from bloombee.flexgen_utils.pytorch_backend import DeviceType
+                                def to_torch_tensor(x):
+                                    # If FlexGen compressed tensor, decompress
+                                    if hasattr(x, 'device') and (
+                                        getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
+                                        or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
+                                    ):
+                                        return x.device.decompress(x)
+                                    # If FlexGen TorchTensor, return underlying torch tensor
+                                    return getattr(x, 'data', x)
+                                k_new_tensor = to_torch_tensor(k_new)
+                                v_new_tensor = to_torch_tensor(v_new)
+                            except Exception:
+                                # Fallback to raw data if decompress pathway is unavailable
+                                k_new_tensor = getattr(k_new, 'data', k_new)
+                                v_new_tensor = getattr(v_new, 'data', v_new)
+
+                            # Backend expects new_kvs shapes:
+                            #   key:   (b*h, d, s)
+                            #   value: (b*h, s, d)
+                            key = k_new_tensor.permute(1, 2, 0)  # → (b*h, d, s)
+                            value = v_new_tensor.permute(1, 0, 2)  # → (b*h, s, d)
+                            past_key_value = (key, value)
+
+                            self.cache_write_buf[0][0].store((k_new, v_new))
+
+                    # Avoid clone if not necessary
+                    if layer_output.data.requires_grad or layer_output.data._base is not None:
+                        final_outputs.append(layer_output.data.clone())
+                    else:
+                        final_outputs.append(layer_output.data)
+
+        if len(final_outputs) == 1:
+            hidden_states = final_outputs[0]
+        else:
+            hidden_states = torch.cat(final_outputs, dim=0)
+
+        outputs = (hidden_states, past_key_value)
+        return outputs

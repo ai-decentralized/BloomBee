@@ -1,0 +1,61 @@
+{% set M = class_prefix %}
+import os
+from typing import Optional, Union
+
+from hivemind import get_logger
+from transformers.models.{{ hf_model_key }} import {{ config_class }}
+from transformers.models.{{ hf_model_key }}.modeling_{{ hf_model_key }} import {{ hf_attention_class }}
+
+from bloombee.client.config import ClientConfig
+from bloombee.client.lm_head import LMHeadConfig
+from bloombee.client.ptune import PTuneConfig
+from bloombee.models.{{ model_name }}.block import Wrapped{{ M }}Block
+
+logger = get_logger(__name__)
+
+
+class Distributed{{ M }}Config({{ config_class }}, ClientConfig, PTuneConfig, LMHeadConfig):
+    block_class = Wrapped{{ M }}Block
+    attn_class = {{ hf_attention_class }}
+    block_prefix = "{{ block_prefix | default("model.layers") }}"
+
+    {% if has_num_key_value_groups %}
+    @property
+    def num_key_value_groups(self):
+        return self.num_attention_heads // self.num_key_value_heads
+    {% endif %}
+
+    @classmethod
+    def from_pretrained(
+        cls, model_name_or_path: Union[str, os.PathLike, None], *args, dht_prefix: Optional[str] = None, **kwargs
+    ):
+        {% if license_notice %}
+        logger.info(
+            "{{ license_notice }}"
+        )
+        {% endif %}
+
+        loading_from_repo = model_name_or_path is not None and not os.path.isdir(model_name_or_path)
+        if loading_from_repo and dht_prefix is None:
+            dht_prefix = str(model_name_or_path)
+            dht_prefix = dht_prefix.split("/")[-1]  # Use only repo name to merge blocks hosted by different accounts
+            dht_prefix = dht_prefix.replace(".", "-")
+            {% if dht_suffix %}
+            if not dht_prefix.endswith("{{ dht_suffix }}"):
+                dht_prefix += "{{ dht_suffix }}"
+            {% else %}
+            if not dht_prefix.endswith("-hf"):
+                dht_prefix += "-hf"
+            {% endif %}
+            logger.info(f"Using DHT prefix: {dht_prefix}")
+
+        result = super().from_pretrained(model_name_or_path, *args, dht_prefix=dht_prefix, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        {% for attr, value in config_overrides.items() %}
+        config.{{ attr }} = {{ value }}  
+        {% endfor %}
+        {% if not config_overrides %}
+        config.pretraining_tp = 1  # This may give less accurate results but it doesn't matter if we use quantization
+        config.use_cache = True  # use_cache=False leads to identical results but is slower and not supported by Petals
+        {% endif %}
+        return result
