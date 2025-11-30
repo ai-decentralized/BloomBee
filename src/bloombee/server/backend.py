@@ -179,6 +179,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             self.pruner_manager.iteration = 0
         
         keep_indices = results['keep_indices']
+        self.pruner_manager.middle_keep_indices = keep_indices
         logger.info(f"keep_indices: {keep_indices}")
         new_hidden_states = original_hidden_states[:, keep_indices, :]
         return new_hidden_states, keep_indices
