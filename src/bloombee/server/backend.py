@@ -175,7 +175,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         )
         
         if self.pruner_manager.iteration == 10:
-            self.pruner_manager.save_state("/home/cc/BloomBee/checkpoints/pruner/model_v2.pt")
+            self.pruner_manager.save_state("/home/cc/BloomBee/checkpoints/pruner/model_v3.pt")
             self.pruner_manager.iteration = 0
         
         keep_indices = results['keep_indices']
@@ -362,8 +362,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     self.pruner_manager.middle_states = norm_hidden_states
                     
-                    temp_output_hidden_states, temp_keep_indices = self.prune_draft_tree(output_hidden_states, norm_hidden_states, inference_info.draft_tokens, full_mask)
-                    logger.info(f"temp_keep_indices: {temp_keep_indices}")
+                    # temp_output_hidden_states, temp_keep_indices = self.prune_draft_tree(output_hidden_states, norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    # logger.info(f"temp_keep_indices: {temp_keep_indices}")
                 
                 return (output_hidden_states, keep_indices) # Return output hidden states
                 

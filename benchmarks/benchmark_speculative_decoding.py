@@ -61,7 +61,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
-    indices = random.sample(range(len(dataset)), 100)
+    indices = random.sample(range(len(dataset)), 1000)
     sampled = dataset.select(indices)
     
     for item in sampled:

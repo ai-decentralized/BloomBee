@@ -383,61 +383,59 @@ class NetworkCondition:
         #     throughput=base['throughput'] * (1 + random.uniform(-0.15, 0.15))
         # )
 
-class DualPathPruner(nn.Module):
-    """
-    两条路径的网络：
-    - 质量路径：评估token质量（不看网络）
-    - 阈值路径：根据网络状况动态调整决策阈值
-    """
-    def __init__(self, hidden_size=64):
+
+class PathPruner(nn.Module):
+    def __init__(self, num_paths=16, depth=4, hidden_dim=32):
         super().__init__()
         
-        # 质量评估路径（只看token特征，不看网络）
-        self.quality_path = nn.Sequential(
-            nn.Linear(3, hidden_size),  # prob(3) + acceptance(1)
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1)  # 输出质量分数
-        )
+        input_dim = num_paths * depth 
         
-        # 阈值调整路径（只看网络状况）
-        self.threshold_path = nn.Sequential(
-            nn.Linear(4, hidden_size // 2),  # network features(4)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1)  # 输出阈值调整量
+            nn.Linear(hidden_dim, num_paths)
         )
     
-    def forward(self, prob_features, network_features):
+    def forward(self, x):
         """
         Args:
-            prob_features: [batch, 4] - max_prob, closeness, token_prob, acceptance_rate
-            network_features: [batch, 4] - bandwidth, latency, packet_loss, jitter
+            x: [batch_size, 64] 16条path的log概率，每条4个node
         
         Returns:
-            decision_prob: [batch] - 最终决策概率
-            quality_score: [batch] - 质量分数
-            threshold_adjust: [batch] - 阈值调整量
+            logits: [batch_size, 16] 每条path的score
+            probs: [batch_size, 16] softmax后的概率分布
         """
-        prob_features_3 = prob_features[:, :3]
-        quality_score = self.quality_path(prob_features_3).squeeze(-1)  # [batch]
-        raw_threshold = self.threshold_path(network_features).squeeze(-1)  # [batch]
+        # logger.info(f"forward, x: {x}")
+        x = x.float()
+    
+        # 手动拆开看每一步
+        x1 = self.mlp[0](x)  # Linear
+        # logger.info(f"forward, after linear1: {x1}")
         
-        delta = torch.sigmoid(raw_threshold)  # [0, 1]
-        base_threshold = 0.5                  # 全局基础阈值
-        max_shift = 0.3                       # 最多上下偏 0.3
-
-        threshold_adjust = base_threshold + (delta - 0.5) * 2 * max_shift
+        x2 = self.mlp[1](x1)  # ReLU
+        # logger.info(f"forward, after relu: {x2}")
         
-        # 决策分数 = 质量 - 阈值
-        # 网络好时，threshold小，容易keep
-        # 网络差时，threshold大，难以keep
-        decision_score = quality_score - threshold_adjust
+        x3 = self.mlp[2](x2)  # Linear
+        # logger.info(f"forward, after linear2: {x3}")
         
-        # 通过sigmoid转换为概率
-        decision_prob = torch.sigmoid(decision_score)
+        probs = torch.softmax(x3, dim=-1)
+        return x3, probs
+    
+    def get_top_k_paths(self, x, k=8):
+        """
+        推理时用，返回top-k的path indices
         
-        return decision_prob, quality_score, threshold_adjust
+        Args:
+            x: [batch_size, 64]
+            k: 保留几条path
+        
+        Returns:
+            indices: [batch_size, k] 保留的path indices
+        """
+        logits, _ = self.forward(x)
+        _, indices = torch.topk(logits, k, dim=-1)
+        
+        return indices
     
 class SimpleLMHead(nn.Module):
     def __init__(self, hidden_size, vocab_size):
@@ -486,7 +484,12 @@ class AdaptiveNeuralPruner:
         self.lm_head.to(dtype=torch.float16)
         
         # Dual-path decision network
-        self.decision_net = DualPathPruner(hidden_size=neural_hidden).to(device)
+        self.num_paths = 16
+        self.depth = 5
+        self.temperature = 1.0
+        self.decision_net = PathPruner(self.num_paths, self.depth, 32).to(device)
+        
+        self.decision_net.to(device=device, dtype=torch.float32)
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -500,6 +503,8 @@ class AdaptiveNeuralPruner:
         
         # Training mode flag
         self.training = False
+        self.criterion = nn.CrossEntropyLoss()
+        
     
     def extract_features(
         self,
@@ -920,156 +925,147 @@ class AdaptiveNeuralPruner:
 
         return best_path, labels
     
-    def train_step(
-        self,
-        middle_hidden_states: torch.Tensor,
-        final_hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        alpha: float = 1.0,               # BCE loss weight
-        beta: float = 0,                 # Pruning alignment weight
-    ) -> dict:
+    
+    def extract_paths(self, attention_mask, seq_len, prefix_len):
         """
-        Single training step for ONE tree
+        从 attention mask 还原所有 root→leaf paths
+        
+        Returns:
+            paths: List of List[int], 每条 path 包含的 node indices
+        """
+        is_leaf = torch.ones(seq_len, dtype=torch.bool)
+        paths = []
+        
+        for i in range(seq_len - 1, -1, -1):
+            if is_leaf[i]:
+                path = [i]
+                
+                for j in range(i - 1, -1, -1):
+                    if attention_mask[0, i, j + prefix_len] == 1:
+                        is_leaf[j] = False
+                        path.append(j)
+                
+                path.reverse()
+                paths.append(path)
+        
+        paths.reverse()  # 让顺序一致
+        return paths
+    
+    def compute_path_log_probs(self, hidden_states, draft_tokens, paths, attention_mask, prefix_len):
+        """
+        计算每条 path 的 4 个 node 的 log 概率
         
         Args:
-            prob_features: Token probability features
-            network_features: Network condition features
-            labels: Whether each token was accepted
-            alpha: Weight for BCE loss
-            beta: Weight for pruning alignment loss
+            hidden_states: [B, seq_len, hidden_dim]
+            draft_tokens: [B, seq_len]
+            paths: List of List[int]
+            attention_mask: [B, seq_len, seq_len + prefix_len]
+            prefix_len: int
+        
+        Returns:
+            path_log_probs: [num_paths, depth] 每条 path 每个 node 的 log 概率
         """
-        accepted_indices, labels = self._get_current_accepted_tokens_indices(final_hidden_states, attention_mask, draft_tokens)
-        logger.info(f"train_step, accepted_indices: {accepted_indices}, labels: {labels}")
-        prob_features, network_features, _ = self.collect_training_data(
-            middle_hidden_states,                
-            attention_mask, 
-            accepted_indices, 
-            NetworkCondition.mock(), 
-            draft_tokens)
+        logits = self.lm_head(hidden_states)  # [B, seq_len, vocab]
+        log_probs = torch.log_softmax(logits, dim=-1)  # [B, seq_len, vocab]
         
-        self.decision_net.train()
+        path_log_probs = []
+        
+        for path in paths:
+            path_lp = []
+            for idx in path:
+                token_id = draft_tokens[idx]
+                parent_idx = self._get_parent_postion(idx, attention_mask, prefix_len)
+                lp = log_probs[0, parent_idx, token_id]
+                path_lp.append(lp)
+            
+            # 只取最后 self.depth 个
+            path_lp = path_lp[-self.depth:]
+            path_log_probs.append(torch.stack(path_lp))
+        
+        return torch.stack(path_log_probs)  # [num_paths, depth]
+    
+    def prepare_input(self, path_log_probs):
+        x = path_log_probs.flatten().unsqueeze(0)
+        # 固定范围归一化
+        x = x / 10.0  # 范围大约 [-1, 0]
+        return x
+    
+    def prepare_label(self, path_log_probs):
+        path_log_probs = path_log_probs.float()
+        
+        depth = path_log_probs.shape[1]
+        decay = 0.5
+        weights = torch.tensor([decay**i for i in range(depth)], device=path_log_probs.device)
+        
+        scores = (path_log_probs * weights).sum(dim=-1)
+        
+        # 不做标准化，直接用较大的 temperature 控制平滑度
+        # label = torch.softmax(scores, dim=-1)  # temperature = 5.0
+        
+        return scores.unsqueeze(0)
+    
+    def train_step(
+        self,
+        hidden_states_layer15: torch.Tensor,
+        hidden_states_layer31: torch.Tensor,
+        attention_mask: torch.Tensor,
+        draft_tokens: torch.Tensor,
+    ):
+        """
+        一次训练步骤
+        
+        Args:
+            hidden_states_layer15: [B, seq_len, hidden_dim] layer 15 的输出
+            hidden_states_layer31: [B, seq_len, hidden_dim] layer 31 的输出
+            attention_mask: [B, seq_len, seq_len + prefix_len]
+            draft_tokens: [B, seq_len]
+        
+        Returns:
+            loss: 标量
+        """
+        B, seq_len, _ = hidden_states_layer15.shape
+        prefix_len = attention_mask.shape[2] - seq_len
+        
+        # 1. 提取 paths
+        paths = self.extract_paths(attention_mask, seq_len, prefix_len)
+        logger.info(f"train_step, extracted: {paths}")
+        
+        # 2. 计算 layer 15 的 path log probs 作为输入
+        path_log_probs_15 = self.compute_path_log_probs(
+            hidden_states_layer31, draft_tokens, paths, attention_mask, prefix_len
+        )
+        logger.info(f"train_step, path_log_probs_15: {path_log_probs_15}")
+        x = self.prepare_input(path_log_probs_15)
+        logger.info(f"train_step, input x: {x}")
+        
+        # 3. 计算 layer 31 的 path log probs 作为 label
+        path_log_probs_31 = self.compute_path_log_probs(
+            hidden_states_layer31, draft_tokens, paths, attention_mask, prefix_len
+        )
+        logger.info(f"train_step, path_log_probs_31: {path_log_probs_31}")
+        label = self.prepare_label(path_log_probs_31)
+        logger.info(f"train_step, label: {label}")
+        
+        # 4. 前向传播
+        logits, probs = self.decision_net(x)
+        
+        logger.info(f"train_step, logits: {logits}")
+        logger.info(f"train_step, probs: {probs}")
+        
+        loss = F.mse_loss(logits, label)
+        
+        logger.info(f"train_step, loss: {loss.item()}")
+        
+        # 6. 反向传播
         self.optimizer.zero_grad()
+        loss.backward()
         
-        tree_size = draft_tokens.shape[0]
-        
-        with torch.enable_grad():
-            predictions, quality_scores, threshold_adjusts = self.decision_net(
-                prob_features, 
-                network_features
-            )
-            
-        logger.info(f"predictions: {predictions}")
-        logger.info(f"quality_scores: {quality_scores}")
-        logger.info(f"threshold_adjusts: {threshold_adjusts}")
-        logger.info(f"labels: {labels}")
-            
-        # === 关键诊断信息 ===
-        logger.info("="*60)
-        logger.info("📊 训练诊断")
-        
-        # 1. 检查特征分布
-        logger.info(f"prob_features 统计:")
-        logger.info(f"  min: {prob_features.min().item():.4f}, max: {prob_features.max().item():.4f}")
-        logger.info(f"  mean: {prob_features.mean().item():.4f}, std: {prob_features.std().item():.4f}")
-        
-        logger.info(f"network_features 统计:")
-        logger.info(f"  min: {network_features.min().item():.4f}, max: {network_features.max().item():.4f}")
-        logger.info(f"  mean: {network_features.mean().item():.4f}, std: {network_features.std().item():.4f}")
-        
-        # 2. 检查预测分布
-        logger.info(f"predictions 统计:")
-        logger.info(f"  min: {predictions.min().item():.4f}, max: {predictions.max().item():.4f}")
-        logger.info(f"  mean: {predictions.mean().item():.4f}, std: {predictions.std().item():.4f}")
-        
-        # 3. 检查标签分布
-        logger.info(f"labels: 正样本={labels.sum().item()}/{len(labels)}")
-        
-        # 4. 检查正负样本的预测差异
-        if labels.sum() > 0:
-            pos_preds = predictions[labels == 1]
-            neg_preds = predictions[labels == 0]
-            logger.info(f"正样本预测均值: {pos_preds.mean().item():.4f}")
-            logger.info(f"负样本预测均值: {neg_preds.mean().item():.4f}")
-            logger.info(f"预测分离度: {(pos_preds.mean() - neg_preds.mean()).item():.4f}")
-        
-        
-        # === Loss 1: Token Quality Prediction (with class weighting) ===
-        base_loss = F.binary_cross_entropy(
-            predictions,
-            labels,
-            reduction='none'
-        )  # [batch]
-
-        w_pos = 2.0   # 更“正”的样本（label 越接近 1），权重越偏 w_pos
-        w_neg = 1.0   # 更“负”的样本（label 越接近 0），权重越偏 w_neg
-
-        # 根据 label 软插值权重：
-        # label=1 → w_pos
-        # label=0 → w_neg
-        # 中间值 → 线性插值
-        sample_weight = w_pos * labels + w_neg * (1.0 - labels)  # [batch]
-
-        weighted_loss = base_loss * sample_weight
-        bce_loss = weighted_loss.mean()
-        
-        logger.info(f"train_step, bce_loss: {bce_loss}")
-        
-        # === Loss 2: Network-Aware Pruning Alignment ===
-        # 当前预测的pruning rate
-        current_pruning_rate = torch.sigmoid((0.5 - predictions) * 10).mean()
-        
-        # 从网络特征计算目标pruning rate
-        # 使用第一个token的网络特征（整棵树共享）
-        bandwidth = network_features[0, 0].item()
-        network_severity = 1.0 - min(bandwidth / 100.0, 1.0)
-        target_pruning_rate = 0.2 + 0.6 * network_severity  # 20%-80%
-        
-        # Alignment loss
-        pruning_alignment = (current_pruning_rate - target_pruning_rate) ** 2
-        
-        # === Total Loss ===
-        total_loss = alpha * bce_loss + beta * pruning_alignment
-        
-        logger.info(f"train_step, total_loss: {total_loss}")
-        
-        total_loss.backward()
-        
-        logger.info("梯度统计:")
-        for name, param in self.decision_net.named_parameters():
+        for name, param in self.decision_net.mlp.named_parameters():
             if param.grad is not None:
-                grad_norm = param.grad.norm().item()
-                logger.info(f"  {name}: grad_norm={grad_norm:.6f}")
-                if grad_norm < 1e-7:
-                    logger.warning(f"  ⚠️ {name} 梯度几乎为0！")
-            else:
-                logger.error(f"  ❌ {name} 没有梯度！")
-        
+                logger.info(f"{name} grad norm: {param.grad.norm():.6f}")
         self.optimizer.step()
         
-        self.decision_net.eval()
-        
-        # update acceptance rate
-        count = 0
-        for indice in accepted_indices:
-            if predictions[indice] > 0.5:
-                count +=1
-        if len(accepted_indices) > 0:
-            self.current_acceptance_rate = count / len(accepted_indices)
-        else:
-            self.current_acceptance_rate = 1.0
-        
-        return {
-            'total_loss': total_loss.item(),
-            'bce_loss': bce_loss.item(),
-            'pruning_alignment': pruning_alignment.item(),
-            'current_pruning_rate': current_pruning_rate.item(),
-            'target_pruning_rate': target_pruning_rate,
-            'network_severity': network_severity,
-            'avg_quality_score': quality_scores.mean().item(),
-            'avg_threshold': threshold_adjusts.mean().item(),
-            'accepted_indices': accepted_indices,
-        }
+        return loss.item()
     
     def update_acceptance_rate(self, rate: float):
         self.current_acceptance_rate = rate
@@ -1331,23 +1327,23 @@ class BloombeePrunerManager:
         if hasattr(self.pruner, 'train_step'):
             with torch.enable_grad():
                 result = self.pruner.train_step(self.middle_states, final_hidden_states, attention_mask, draft_tokens)
-                accepted_indices = result['accepted_indices']
-                keep_indices = self.middle_keep_indices
-                self.middle_keep_indices_count += len(keep_indices)
-                self.pruning_count += 1
-                logger.info(f"finish train, accepted_indices: {accepted_indices}")
-                logger.info(f"finish train, middle_keep_indices: {keep_indices}")
+                # accepted_indices = result['accepted_indices']
+                # keep_indices = self.middle_keep_indices
+                # self.middle_keep_indices_count += len(keep_indices)
+                # self.pruning_count += 1
+                # logger.info(f"finish train, accepted_indices: {accepted_indices}")
+                # logger.info(f"finish train, middle_keep_indices: {keep_indices}")
                 
-                current_pruning_rate = self.middle_keep_indices_count / (31 * self.pruning_count)
-                logger.info(f"finish train, current_pruning_rate: {current_pruning_rate}")
-                count = 0
-                self.result_tokens_count += len(accepted_indices)
-                for indice in accepted_indices:
-                    if indice not in keep_indices:
-                        count +=1
-                self.pruning_error_count += count
-                current_pruning_error_rate = self.pruning_error_count / (self.result_tokens_count)
-                logger.info(f"finish train, current_pruning_error_rate: {current_pruning_error_rate}")
+                # current_pruning_rate = self.middle_keep_indices_count / (31 * self.pruning_count)
+                # logger.info(f"finish train, current_pruning_rate: {current_pruning_rate}")
+                # count = 0
+                # self.result_tokens_count += len(accepted_indices)
+                # for indice in accepted_indices:
+                #     if indice not in keep_indices:
+                #         count +=1
+                # self.pruning_error_count += count
+                # current_pruning_error_rate = self.pruning_error_count / (self.result_tokens_count)
+                # logger.info(f"finish train, current_pruning_error_rate: {current_pruning_error_rate}")
                 
                 
                 

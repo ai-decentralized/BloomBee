@@ -289,7 +289,7 @@ class Server:
         
         # Create configuration
         config = PruningConfig(
-            method=PruningMethod.ADAPTIVE_NEURAL,
+            method=PruningMethod.SIMPLE_PROBABILITY,
             neural_threshold=0.5,
             simple_threshold=0.1
         )
@@ -299,7 +299,7 @@ class Server:
             vocab_size=vocab_size,
             config=config
         )
-        self.pruner_manager.load_state("/home/cc/BloomBee/checkpoints/pruner/model_v2.pt")
+        self.pruner_manager.load_state("/home/cc/BloomBee/checkpoints/pruner/model_v3.pt")
         ##############################################################
         
         # see_memory_usage("-----------------------------------------in server: after policy  ")
