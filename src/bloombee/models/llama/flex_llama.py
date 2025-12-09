@@ -45,21 +45,99 @@ from transformers.models.llama.modeling_llama import (
     rotate_half,
 )
 
-class FLEX_LlamaRMSNorm(LlamaRMSNorm): #put in fex_llama
+class FLEX_LlamaRMSNorm(LlamaRMSNorm):  # put in flex_llama
     def __init__(self, hidden_size, eps=1e-6):
-        super().__init__(hidden_size, eps=1e-6)
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        super().__init__(hidden_size, eps=eps)
         self.variance_epsilon = eps
+        self.hidden_size = hidden_size
+
+        # meta 初始化场景下，这里通常会是 meta tensor
+        # 先给一个占位 Parameter，后面 load_weight 再写入真实权重
+        self.loaded_weight = nn.Parameter(
+            torch.ones(hidden_size), requires_grad=False
+        )
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
+
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * torch.rsqrt(
+            variance + self.variance_epsilon
+        )
+
+        # ❗ 不要在这里 self.loaded_weight = ...
+        # 只读，不改属性类型
+        if self.loaded_weight.device.type == "meta":
+            raise RuntimeError(
+                "FLEX_LlamaRMSNorm.loaded_weight is still on 'meta'. "
+                "You must call load_weight() before using this layer."
+            )
+
+        weight = self.loaded_weight.to(
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        hidden_states = hidden_states * weight
+        return hidden_states.to(input_dtype)
 
     def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+        return f"{tuple(self.loaded_weight.shape)}, eps={self.variance_epsilon}"
+
+    def load_weight(self, path, device=None, dtype=None):
+        # 支持传目录或文件
+        if os.path.isdir(path):
+            path = os.path.join(path, "norm.weight")
+
+        arr = np.load(path)
+        w = torch.from_numpy(arr)  # CPU tensor
+
+        if w.numel() != self.hidden_size:
+            raise ValueError("norm.weight shape mismatch")
+
+        if dtype is None:
+            dtype = torch.float32
+        w = w.to(dtype)
+
+        # 决定要放到哪个 device 上
+        if device is None:
+            if self.loaded_weight.device.type != "meta":
+                device = self.loaded_weight.device
+            else:
+                device = "cpu"  # 或者你指定成 "cuda:0" / env 里的 device
+        w = w.to(device)
+
+        with torch.no_grad():
+            if self.loaded_weight.device.type == "meta":
+                # 如果之前是 meta 占位，直接用真正的 Parameter 替换
+                self.loaded_weight = nn.Parameter(w, requires_grad=False)
+            else:
+                # 已经是正常 tensor，就只 copy 数据
+                self.loaded_weight.copy_(w.view_as(self.loaded_weight))
+
+        print("[OK] loaded norm weight from", path)
+        
+    
+class SimpleLMHead(nn.Module):
+    def __init__(self, hidden_size, vocab_size):
+        super().__init__()
+        self.weight = None
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+
+    def load_weight(self, path):
+        if os.path.isdir(path):
+            path = os.path.join(path, "lm_head.weight")
+        w = np.load(path)
+        t = torch.from_numpy(w).to(torch.float32)
+        self.weight = t
+        print("[OK] loaded lm_head.weight", t.shape)
+
+    def forward(self, hidden_states):
+        # hidden_states: [B, T, H]
+        w = self.weight.to(hidden_states.device, hidden_states.dtype)
+        return hidden_states @ w.t()  # [B, T, vocab]
     
     
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -464,6 +542,7 @@ class FLEX_LlamaAttention(LlamaAttention):
         cache_read_buf,
         weight_read_buf,
         attention_mask,
+        rotary_position_ids,
         cache_write_buf,
         i,
         k
@@ -491,7 +570,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start prefill) i={i} k={k}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
-                                       num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
+                                       num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids)
             cache_write_buf.store((new_k_cache, new_v_cache))
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(end prefill) i={i} k={k}")
         else:
@@ -505,7 +584,8 @@ class FLEX_LlamaAttention(LlamaAttention):
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 input_layernorm,
-                rotary_emb_inv_freq)
+                rotary_emb_inv_freq,
+                rotary_position_ids)
             cache_write_buf.store((new_k_cache, new_v_cache))
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(end decode) i={i} k={k}")
         hidden.val = h
@@ -586,6 +666,7 @@ class FLEX_LlamaMLP(LlamaMLP):
         attention_mask,
         cache_write_buf,
         position_ids,
+        rotary_position_ids,
         k: int = 0,
         generated_tokens_num: int = 0,
         ):

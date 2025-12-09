@@ -25,12 +25,13 @@ from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, TorchTensor, TorchDevice
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d, array_2d, array_3d
-from bloombee.models.llama.flex_llama import FLEX_LlamaAttention, FLEX_LlamaMLP, LlamaDecoderLayer, DUMMY_WEIGHT, apply_rotary_pos_emb, FLEX_LlamaRMSNorm
+from bloombee.models.llama.flex_llama import FLEX_LlamaAttention, FLEX_LlamaMLP, LlamaDecoderLayer, DUMMY_WEIGHT, apply_rotary_pos_emb, FLEX_LlamaRMSNorm, SimpleLMHead
 from bloombee.flexgen_utils.llama_config import get_llama_config, download_llama_weights
 from bloombee.flexgen_utils.task import Task
 from transformers import AutoTokenizer
 import os
 from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage, log_mem
+from hivemind.utils import get_logger
 
 # Global tokenizer singleton - avoid creating duplicate tokenizers for each layer
 _global_tokenizer = None
@@ -85,6 +86,7 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         k: Optional[int] = 0,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
@@ -127,7 +129,7 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         # print(f' Extracted start_position: {start_position}')
 
         self.temp_hidden_states.val = super(OptimizedLlamaAttention, self).forward(
-            hidden_states, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, start_position, k
+            hidden_states, cache_read_buf, weight_read_buf, attention_mask, rotary_position_ids, cache_write_buf, start_position, k
         )
         return self.temp_hidden_states.val, None, None
 
@@ -145,12 +147,16 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
 
         self.input_layernorm = FLEX_LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = FLEX_LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = SimpleLMHead(hidden_size=config.hidden_size, vocab_size=config.vocab_size).to("cuda")
+        self.lm_head.requires_grad_(False)
+        self.lm_head.to(dtype=torch.float16)
 
         self.pre_attn_graph = None
         self.post_attn_graph = None
 
         self.llama_config = config
         self.path = path
+        self.expanded_apth = path
         self.num_gpu_batches = policy.num_gpu_batches
 
         layers = []
@@ -321,7 +327,8 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         check_path = os.path.join(expanded_path, "embed_tokens.weight")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
             download_llama_weights(self.llama_config.name, self.path)
-
+            
+        self.expanded_apth = expanded_path
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 
     def _optimized_input_layernorm(self, hidden_states):
@@ -370,6 +377,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         verbose: int = 0,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
@@ -533,11 +541,16 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                 i = current_position
 
                 for k in range(self.num_gpu_batches):
-                    if i == 0:
-                        mask_length = hidden_states.shape[1]
+                    if attention_mask is not None:
+                        attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
+                                else self.env.gpu)
+                        self.attention_mask[k].store(TorchTensor.create_from_torch(attention_mask, attention_compute))
                     else:
-                        mask_length = i + 1
-                    self.update_attention_mask(0, k, mask_length)
+                        if i == 0:
+                            mask_length = hidden_states.shape[1]
+                        else:
+                            mask_length = i + 1
+                        self.update_attention_mask(0, k, mask_length)
 
                 # Weight loading performance monitoring and optimization
                 weight_load_start = time.time()
@@ -589,7 +602,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                             self.cache_read_buf[0][0].store((past_k_new, past_v_new))
 
                         # log_mem(f"[Layer:{self.layer_id}] before self_attn layer={j} i={i} k={k}")
-                        layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num)
+                        layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num, rotary_position_ids=rotary_position_ids)
                         # log_mem(f"[Layer:{self.layer_id}] after self_attn/MLP layer={j} i={i} k={k}")
 
                         if j == 0:
@@ -767,7 +780,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             if x.val:
                 x.val = x.val.move(self.act_home)
 
-    def compute_layer(self, i, j, k, position_ids=None, generated_tokens_num=0):
+    def compute_layer(self, i, j, k, position_ids=None, generated_tokens_num=0, rotary_position_ids=None):
         if j == 1:
             self.hidden[0][j][k].val = self.temp_hidden.val
 
@@ -780,7 +793,8 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                                k=k,
                                attention_mask=self.attention_mask[k],
                                position_ids=position_ids,
-                               generated_tokens_num=generated_tokens_num)
+                               generated_tokens_num=generated_tokens_num,
+                               rotary_position_ids=rotary_position_ids)
 
         self.temp_hidden.val = self.layers[j].temp_hidden_states.val
         return self.layers[j].temp_hidden_states.val
@@ -798,6 +812,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         *args,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
         **kwargs,
@@ -833,8 +848,11 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
                     past_key_values_length=past_key_values_length,
                 )
             attention_mask = self._attention_mask_cache[cache_key]
+        if attention_mask.dim() == 3:
+            attention_mask = attention_mask.unsqueeze(1)
+        elif attention_mask.dim() == 4:
+            pass
         else:
-            # If attention_mask is provided, prepare it (don't cache custom masks)
             attention_mask = _prepare_4d_causal_attention_mask(
                 attention_mask=attention_mask,
                 input_shape=(batch_size, seq_length),
@@ -846,7 +864,8 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             hidden_states,
             *args,
             attention_mask=attention_mask,
-            position_ids=position_ids,
+            position_ids=position_ids,  # 🔧 Pass position_ids to the parent forward method
+            rotary_position_ids=rotary_position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
             **kwargs,
@@ -906,6 +925,17 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         key_states = key_states.view(*value_states.shape)
         key_states = key_states.permute(0, 2, 1)
         return (key_states, value_states)
+    
+    def rms_norm(self, hidden_states: torch.Tensor):
+        return self.input_layernorm.forward(hidden_states)
+    
+    def lm_head_forward(self, hidden_states: torch.Tensor):
+        return self.lm_head.forward(hidden_states)
+    
+    def load_lm_head(self):
+        expanded_path = self.expanded_apth
+        self.input_layernorm.load_weight(expanded_path)
+        self.lm_head.load_weight(expanded_path)
 
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):

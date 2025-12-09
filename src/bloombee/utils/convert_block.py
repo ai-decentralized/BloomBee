@@ -100,6 +100,15 @@ def convert_block(
             
         def named_buffers(self, *args, **kwargs):
             return self._module.named_buffers(*args, **kwargs)
+        
+        def rms_norm(self, *args, **kwargs):
+            return self._module.rms_norm(*args, **kwargs)
+        
+        def load_lm_head(self, *args, **kwargs):
+            return self._module.load_lm_head(*args, **kwargs)
+        
+        def lm_head_forward(self, *args, **kwargs):
+            return self._module.lm_head_forward(*args, **kwargs)
     
     tp_block = PipelineParallelWrapper(block, tensor_parallel_devices, output_device)
     # log_mem(f"{log_prefix} created PipelineParallel wrapper")

@@ -3,6 +3,7 @@ import time
 from enum import Enum
 from typing import Any, Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
+import torch
 import pydantic
 import torch
 from hivemind import PeerID
@@ -122,4 +123,10 @@ class InferenceMetadata:
     prefix_length: int
     cache_handles: Tuple["Handle", ...]  # 使用字符串类型注解避免循环导入
     active_adapter: Optional[str]
-
+    tree_attention_mask: Optional[torch.Tensor] = None
+    kv_cache_position_ids: Optional[torch.Tensor] = None
+    draft_tokens: Optional[torch.Tensor] = None
+    prefill_length: Optional[torch.Tensor] = None
+    keep_indices: Optional[torch.Tensor] = None
+    need_pruning: Optional[torch.Tensor] = None
+    is_spec_dec: Optional[torch.Tensor] = None

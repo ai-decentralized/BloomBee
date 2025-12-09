@@ -131,6 +131,7 @@ class KVCacheManager:
         self,
         prefix_length: int,
         hypo_ids: Optional[torch.Tensor] = None,
+        kv_cache_position_ids: Optional[torch.Tensor] = None,
     ):
         """
         Return standard KV for computation
@@ -141,19 +142,12 @@ class KVCacheManager:
         """
         assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
         if prefix_length <= 0:
-            return None
+            return None, None, False
 
         cache_tensors = self._active_cache_tensors_stack[-1]
         (k_cache, v_cache), = cache_tensors
         S_full, BH, D = k_cache.shape
-        if prefix_length > S_full:
-            logger.warning(
-                "Requested prefix_length=%s exceeds allocated cache %s; clamping to maximum. "
-                "This usually indicates the client requested more tokens than declared.",
-                prefix_length,
-                S_full,
-            )
-            prefix_length = S_full
+        assert prefix_length <= S_full, f"prefix_length={prefix_length} > seq_len={S_full}"
 
         # Target device for computation (CPU/GPU)
         compute_dst = self.attention_compute  # 统一在计算设备上物化
@@ -167,7 +161,16 @@ class KVCacheManager:
             path = 0 if not self.offloading_policy.cpu_cache_compute else 1
 
         # Required slice
-        idx_all = (slice(0, prefix_length), slice(0, BH))
+        need_reorder = False
+        if kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0:
+            idx_all = (slice(0, prefix_length), slice(0, BH))
+        else:
+            root_position = kv_cache_position_ids[0]
+            prefix_positions = list(range(root_position))  # [0, 1, 2, ..., root-1]
+            idx_all = prefix_positions + kv_cache_position_ids.tolist()  # 完整序列
+            expected_continuous = list(range(len(idx_all)))
+            need_reorder = False if (idx_all == expected_continuous) else True
+            prefix_length = len(idx_all)
 
         # Utility: get underlying torch.Tensor
         def _as_torch(x):
@@ -227,7 +230,7 @@ class KVCacheManager:
         #     # hypo_ids: shape (B,)
         #     k_pkv = k_pkv.index_select(0, hypo_ids)
         #     v_pkv = v_pkv.index_select(0, hypo_ids)
-        return k_pkv, v_pkv
+        return k_pkv, v_pkv, need_reorder
 
 
     
@@ -327,7 +330,15 @@ class KVCacheManager:
         # Actual write (compatible with COMPRESSED / MIXED / DISK etc.)
         general_copy(k_cache, dst_idx, k_src_tt, None)
         general_copy(v_cache, dst_idx, v_src_tt, None)
-
-
+    
+    def write_pkv_cache(self, k_pkv: torch.Tensor, v_pkv: torch.Tensor, start_position: int = 0) -> None:
+        assert self._active_cache_tensors_stack, "write_pkv_cache called outside of use_cache context"
         
-        
+        B, H, S, D = k_pkv.shape
+        BH = B * H
+        k_write = k_pkv.reshape(BH, S, D).permute(0, 2, 1)  # (B, H, S, D) -> (B*H, S, D) -> (B*H, D, S)
+        v_write = v_pkv.reshape(BH, S, D)                    # (B, H, S, D) -> (B*H, S, D)
+        self._write_kvs(
+            kvs=(k_write, v_write),
+            start_position=start_position
+        )

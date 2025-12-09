@@ -37,6 +37,7 @@ from bloombee.server.backend import TransformerBackend
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
+from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 from bloombee.utils.convert_block import QuantType
 
 logger = get_logger(__name__)
@@ -90,6 +91,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         step_timeout: float,
         task_prioritizer: TaskPrioritizerBase = DummyTaskPrioritizer(),
         quant_type: QuantType,
+        pruner_manager: BloombeePrunerManager,
     ):
         super().__init__(dht, module_backends)
         for module_backend in self.module_backends.values():
@@ -108,6 +110,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.session_timeout, self.step_timeout = session_timeout, step_timeout
         self._prioritizer = task_prioritizer
         self.quant_type = quant_type
+        self.pruner_manager = pruner_manager
 
     async def add_p2p_handlers(self, *args, **kwargs) -> None:
         if self._listener_task is None:
@@ -229,6 +232,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             request, requests, session_id, requested_uids, context
                         ),
                         cache_handles=cache_handles,
+                        pruner_manager=self.pruner_manager,
                         max_length=max_length,
                         prioritizer=self._prioritizer,
                         points=points,
@@ -256,7 +260,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             # print('request uid list ', request.uid)
                             # print('output_tensors[0] ', output_tensors[0]) # buffer: binary
                             # print('step_metadata ', step_metadata)
-                            task = asyncio.create_task(self._push_outputs(request, output_tensors[0], step_metadata))
+                            task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
                             background_tasks.add(task)  # Keep reference until it is done to save it from GC
                             task.add_done_callback(background_tasks.discard)
                         start_ExpertResponse_time=perf_counter() ###
@@ -446,9 +450,9 @@ class TransformerConnectionHandler(ConnectionHandler):
             logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
             # Sending hidden states serialized with output_schema to avoid double serialization
-            next_tensors = [serialized_outputs] + request.tensors[1:]
+            next_tensors = [serialized_outputs] + request.tensors[2:]
             next_metadata = metadata.copy()
-            next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
+            next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
 
             stub = self.get_stub(self._p2p, next_peer_id)
             transfer_start = perf_counter()
@@ -460,12 +464,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 ),
                 timeout=self.request_timeout,
             )
-            transfer_end = perf_counter()
-            transfer_time = (transfer_end - transfer_start) * 1000  # ms
-            total_push_time = (transfer_end - push_start_time) * 1000  # ms
-            
-            # Log cross-GPU transfer end
-            logger.info(f"[CROSS_GPU_TRANSFER_END] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} | TransferTime={transfer_time:.2f}ms | TotalPushTime={total_push_time:.2f}ms")
         except Exception:
             logger.debug(
                 f"Failed to push outputs to peer_id={next_peer_id}, session_id={next_session_id}, blocks={next_start}:{next_end}:",

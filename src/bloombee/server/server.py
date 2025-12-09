@@ -41,6 +41,7 @@ from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
+from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
@@ -233,14 +234,8 @@ class Server:
         is_multiquery_attn = self.block_config.num_key_value_groups > 1
         if max_batch_size is None:
             max_batch_size = 8192 if is_multiquery_attn else 2048
-
-        model_max_positions = getattr(self.block_config, "max_position_embeddings", None)
-        default_max_length = 8192 if is_multiquery_attn else 2048
         if inference_max_length is None:
-            inference_max_length = model_max_positions or default_max_length
-        elif model_max_positions is not None:
-            inference_max_length = min(inference_max_length, model_max_positions)
-
+            inference_max_length = 8192 if is_multiquery_attn else 2048
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
         self.inference_max_length = inference_max_length
         self.max_chunk_size_bytes = max_chunk_size_bytes
@@ -297,6 +292,23 @@ class Server:
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
+        
+        hidden_size = 4096
+        vocab_size = 32000
+        
+        # Create configuration
+        config = PruningConfig(
+            method=PruningMethod.SIMPLE_PROBABILITY,
+            neural_threshold=0.5,
+            simple_threshold=0.1
+        )
+        
+        self.pruner_manager = BloombeePrunerManager(
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            config=config
+        )
+        
         ##############################################################
         
         # see_memory_usage("-----------------------------------------in server: after policy  ")
@@ -422,6 +434,7 @@ class Server:
                 path=self.path, ######
                 server_info=self.server_info,
                 model_info=self.model_info,
+                pruner_manager = self.pruner_manager,
                 block_indices=block_indices,
                 num_handlers=self.num_handlers,
                 min_batch_size=self.min_batch_size,
@@ -561,6 +574,7 @@ class ModuleContainer(threading.Thread):
         path: str,
         server_info: ServerInfo,
         model_info: ModelInfo,
+        pruner_manager: BloombeePrunerManager,
         block_indices: List[int],
         min_batch_size: int,
         max_batch_size: int,
@@ -637,11 +651,14 @@ class ModuleContainer(threading.Thread):
                     max_disk_space=max_disk_space,
                 )
                 # see_memory_usage("-----------------------------------------sever: after convert_block  ")
+                is_last_block = block_index == block_indices[-1]
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
                     block,  ###### block instance
                     config=block_config,
                     cache_manager=cache_manager,
+                    pruner_manager=pruner_manager,
+                    is_last_block=is_last_block,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
                     args_schema=(
@@ -653,6 +670,16 @@ class ModuleContainer(threading.Thread):
                     outputs_schema=(
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression
+                        ),
+                        BatchTensorDescriptor(
+                            1, 64,                             # keep_indices_padded: [B, 64]
+                            dtype=torch.int64,
+                            compression=compression
+                        ),
+                        BatchTensorDescriptor(
+                            1,                             # if need pruning next
+                            dtype=torch.int64,
+                            compression=compression
                         ),
                     ),
                     min_batch_size=min_batch_size,
@@ -677,6 +704,7 @@ class ModuleContainer(threading.Thread):
             dht_prefix,
             blocks,
             inference_max_length=inference_max_length,
+            pruner_manager = pruner_manager,
             dht_announcer=dht_announcer,
             server_info=server_info,
             update_period=update_period,
@@ -691,6 +719,7 @@ class ModuleContainer(threading.Thread):
         module_backends: Dict[str, TransformerBackend],
         *,
         inference_max_length: int,
+        pruner_manager: BloombeePrunerManager,
         num_handlers: int,
         dht_announcer: ModuleAnnouncerThread,
         server_info: ServerInfo,
@@ -726,6 +755,7 @@ class ModuleContainer(threading.Thread):
                 session_timeout=session_timeout,
                 step_timeout=step_timeout,
                 quant_type=QuantType[server_info.quant_type.upper()],
+                pruner_manager = pruner_manager,
             )
             for i in range(num_handlers)
         ]

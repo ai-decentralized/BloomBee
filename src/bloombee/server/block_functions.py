@@ -19,6 +19,7 @@ from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
+from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 
 from time import perf_counter
 from datetime import datetime, timezone  
@@ -227,6 +228,20 @@ async def run_rpc_backward(
     grad_prompts = torch.cat(grad_prompts_reversed[::-1], dim=0) if grad_prompts_reversed else DUMMY
     return [grad_outputs] if is_dummy(grad_prompts) else [grad_outputs, grad_prompts]  # TODO un-duct-tape
 
+def _update_kv_cache_position_ids(kv_cache_position_ids, keep_indices):
+    if kv_cache_position_ids is None:
+        return
+    
+    if not torch.is_tensor(keep_indices):
+        keep_indices = torch.tensor(keep_indices, device=kv_cache_position_ids.device)
+
+    mapping = {int(k.item()): i for i, k in enumerate(keep_indices)}
+    new_ids = torch.tensor(
+        [mapping.get(int(x.item()), -1) for x in kv_cache_position_ids],
+        device=kv_cache_position_ids.device
+    )
+    return new_ids
+
 
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
@@ -234,6 +249,7 @@ async def iterate_rpc_inference(
     active_adapter: Optional[str],
     input_iterator: AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]],
     cache_handles: Sequence[Sequence[Handle]],
+    pruner_manager: BloombeePrunerManager,
     *,
     max_length: int,
     prioritizer: TaskPrioritizerBase,
@@ -264,7 +280,8 @@ async def iterate_rpc_inference(
             # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
-        hidden_states, prompts, hypo_ids, *_ = flat_tensors
+        hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
+        draft_tokens = draft_tokens[0] if draft_tokens is not None and not is_dummy(draft_tokens) else None
         batch_size, length_increment, _ = hidden_states.shape
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
@@ -276,7 +293,28 @@ async def iterate_rpc_inference(
             prompts = prompts.contiguous()
         if not hypo_ids.is_contiguous():
             hypo_ids = hypo_ids.contiguous()
-
+        if tree_attention_mask is not None and not is_dummy(tree_attention_mask) and not tree_attention_mask.is_contiguous():
+            tree_attention_mask = tree_attention_mask.contiguous()
+        if kv_cache_position_ids is not None and not is_dummy(kv_cache_position_ids) and not kv_cache_position_ids.is_contiguous():
+            kv_cache_position_ids = kv_cache_position_ids.contiguous()
+        if draft_tokens is not None and not is_dummy(draft_tokens) and not draft_tokens.is_contiguous():
+            draft_tokens = draft_tokens.contiguous()
+        if keep_indices is not None and not is_dummy(keep_indices) and not keep_indices.is_contiguous():
+            keep_indices = keep_indices.contiguous()
+        if need_pruning1 is not None and not is_dummy(need_pruning1) and not need_pruning1.is_contiguous():
+            need_pruning1 = need_pruning1.contiguous()
+        if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) and not is_spec_dec1.is_contiguous():
+            is_spec_dec1 = is_spec_dec1.contiguous()
+            
+        need_pruning = need_pruning1 == 1 if need_pruning1 is not None and not is_dummy(need_pruning1) else False
+        is_spec_dec = is_spec_dec1 == 1 if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
+        
+        if is_spec_dec and not need_pruning:
+            kv_cache_position_ids = _update_kv_cache_position_ids(kv_cache_position_ids, keep_indices)
+            attention_mask_indices = keep_indices[prefill_length:] - prefill_length
+            idx = attention_mask_indices
+            tree_attention_mask = tree_attention_mask[:, idx][:, :, idx]
+            
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
@@ -343,16 +381,16 @@ async def iterate_rpc_inference(
             #     offload_logger.info(f"     GPU cache ratio: {cache_manager.offloading_policy.cache_gpu_percent}%")
             #     offload_logger.info(f"     CPU cache ratio: {cache_manager.offloading_policy.cache_cpu_percent}%")
             #     offload_logger.info(f"     CPU cache compute: {cache_manager.offloading_policy.cpu_cache_compute}")
-            
+            last_uid = len(requested_uids) - 1
             if can_merge_pools:
                 # print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
                 # offload_logger.info(" Using merged pool for inference")
                 
                 inference_infos = tuple(
-                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
-                    for uid, handles in zip(requested_uids, cache_handles)
+                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec)
+                    for i, (uid, handles) in enumerate(zip(requested_uids, cache_handles))
                 )
-                (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
+                (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
                     hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                 )
                 
@@ -371,11 +409,11 @@ async def iterate_rpc_inference(
                     # offload_logger.info(f"   - Processing backend: {uid}")
                     # offload_logger.info(f"     - Cache handles: {len(handles)}")
                     
-                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
+                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec),)
                     
                     # Submit task and measure processing time
                     task_start_time = perf_counter()
-                    (hidden_states,) = await backend.inference_pool.submit_task(
+                    (hidden_states, keep_indices) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )
                     task_end_time = perf_counter()
@@ -426,10 +464,23 @@ async def iterate_rpc_inference(
             # print('the inference computing time ', end_compute_time - start_compute_time)
             # print_time_now('')
         # serialize and send last layer outputs
+        if keep_indices is not None:
+            if not torch.is_tensor(keep_indices):
+                keep_indices = torch.tensor(keep_indices, dtype=torch.int64, device=hidden_states.device)
+            else:
+                keep_indices = keep_indices.to(dtype=torch.int64, device=hidden_states.device)
+        else:
+            keep_indices = torch.arange(
+                hidden_states.shape[1],
+                dtype=torch.int64,
+                device=hidden_states.device
+            )
+        
         serialize_start = perf_counter()
+        need_pruning_next = torch.tensor(0)
         output_tensors = [
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-            for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
+            for result, proto in zip((hidden_states, keep_indices, need_pruning_next), nested_flatten(requested_backends[-1].outputs_schema))
         ]
         serialize_end = perf_counter()
         serialize_time = (serialize_end - serialize_start) * 1000  # ms

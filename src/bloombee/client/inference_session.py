@@ -18,7 +18,7 @@ from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo, RPCInfo
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
-from bloombee.utils.packaging import pack_args_kwargs
+from bloombee.utils.packaging import pack_args_kwargs, normalize_arg
 
 logger = get_logger(__name__)
 
@@ -89,7 +89,7 @@ class _ServerInferenceSession:
 
     @position.setter
     def position(self, start_from_position: int):
-        assert start_from_position <= self._position
+        # assert start_from_position <= self._position
         self._position = start_from_position
         if self.history is not None and self.history.shape[1] >= start_from_position:
             self.history = self.history[:, :start_from_position, :] if start_from_position > 0 else None
@@ -99,6 +99,13 @@ class _ServerInferenceSession:
         inputs: torch.Tensor,
         prompts: torch.Tensor,
         hypo_ids: torch.LongTensor,
+        tree_attention_mask: Optional[torch.Tensor] = None,
+        kv_cache_position_ids: Optional[torch.Tensor] = None,
+        draft_tokens: Optional[torch.Tensor] = None,
+        prefill_length: int = 0,
+        keep_indices: Optional[torch.Tensor] = None,
+        need_pruning: bool = False,
+        is_spec_dec: bool = False,
         *,
         step_id: str,
     ) -> torch.Tensor:
@@ -110,27 +117,37 @@ class _ServerInferenceSession:
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
 
-        n_input_tokens = inputs.shape[1] # get the number of token
+        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids.numel() # get the number of token
         # print('client step() n_input_tokens', n_input_tokens)
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # 将当前输入的最后n_input_tokens个token拼接到历史记录中
-        assert self.history.shape[1] == self._position + n_input_tokens, ( #  确保历史记录的长度等于当前位置加上输入的token数量 
-            f"Broken input cache: span={self.span} shape={self.history.shape} "
-            f"position={self._position} n_input_tokens={n_input_tokens}"
-        )
+        # history can cat input if it's spec decoding and pruning happened, need  back
+        # assert self.history.shape[1] == self._position + n_input_tokens,
+        #     f"Broken input cache: span={self.span} shape={self.history.shape} "
+        #     f"position={self._position} n_input_tokens={n_input_tokens}"
+        # )
 
         if not self.stepped: # if not exe step yet
             inputs = self.history  # Pass full inputs including prefix
         else:
-            inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
+            inputs = inputs  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids)
-        # print('client inference session step() input_tensors after packing ', input_tensors)
-        # print('client inference session step() input_tensors after packing shape', input_tensors[0].shape)
-        # print('_ServerInferenceSession  step id ', step_id)
+        
+        input_tensors, args_structure = pack_args_kwargs(
+            inputs, 
+            normalize_arg(keep_indices),
+            normalize_arg(torch.tensor(1 if need_pruning else 0)),
+            prompts, hypo_ids, 
+            normalize_arg(tree_attention_mask),
+            normalize_arg(kv_cache_position_ids),
+            normalize_arg(draft_tokens),
+            normalize_arg(torch.tensor(prefill_length)),
+            normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
+        )
+        logger.info(f"_ServerInferenceSession  step id {step_id}")
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
@@ -150,9 +167,9 @@ class _ServerInferenceSession:
         inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
 
         # TODO: create more explicit way to check servers schema and client's structure
-        assert len(input_tensors) >= len(
-            server_side_inference_schema
-        ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
+        # assert len(input_tensors) >= len(
+        #     server_side_inference_schema
+        # ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
         # Serialize and send data (debug output removed for performance)
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
@@ -176,14 +193,13 @@ class _ServerInferenceSession:
         )
         
         outputs = list(map(deserialize_torch_tensor, outputs_serialized.tensors))
-        assert (
-            outputs[0].shape == inputs.shape
-        ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"
+        # assert (
+        #     outputs[0].shape == inputs.shape
+        # ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"
 
         self._position += n_input_tokens
-        # print('server inference session self._position ', self._position)
-        # print('server inference session output[0].shape ',  outputs[0].shape)
-        return outputs[0]
+        logger.info(f"server inference session self._position: {self._position}")
+        return outputs
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
         next_servers = []
@@ -244,6 +260,8 @@ class InferenceSession:
         self._max_length = max_length
         self.output_ids = None
         self.past_key_values = None
+        self.keep_indices = None
+        self.prefill_length = 0
 
     @property
     def num_blocks(self) -> int:
@@ -300,6 +318,10 @@ class InferenceSession:
         inputs: torch.Tensor,
         prompts: Optional[torch.Tensor] = None,
         hypo_ids: Optional[torch.Tensor] = None,
+        tree_attention_mask: Optional[torch.Tensor] = None,
+        kv_cache_position_ids: Optional[torch.Tensor] = None,
+        draft_tokens: Optional[torch.Tensor] = None,
+        is_spec_decoding: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -326,10 +348,14 @@ class InferenceSession:
         inputs = inputs.cpu()
         prompts = prompts.cpu()
         hypo_ids = hypo_ids.cpu()
+        tree_attention_mask = tree_attention_mask.cpu() if tree_attention_mask is not None else None
+        kv_cache_position_ids = kv_cache_position_ids.cpu() if kv_cache_position_ids is not None else None
+        draft_tokens = draft_tokens.cpu() if draft_tokens is not None else None
+        is_spec_decoding = is_spec_decoding.cpu() if is_spec_decoding is not None else None
         
         step_id = str(uuid.uuid4())  # Generate a unique step ID.
 
-        n_input_tokens = inputs.shape[1]
+        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids.numel()
         if self._position + n_input_tokens > self._max_length:
             raise ValueError(
                 f"Maximum length exceeded: prefix {self._position} + current {n_input_tokens} exceeds pre-allocated maximum {self._max_length}"
@@ -338,6 +364,18 @@ class InferenceSession:
         server_idx = 0
         block_idx = 0
         inference_step_start = time.perf_counter()
+        self.prefill_length = inputs.shape[1] - tree_attention_mask.shape[1] if tree_attention_mask is not None else 0
+        keep_indices = torch.arange(
+                inputs.shape[1],
+                dtype=torch.int64,
+                device=inputs.device
+            )
+        self.keep_indices = keep_indices
+        if is_spec_decoding is not None and is_spec_decoding.item() == 1:
+            is_spec_dec = True
+        else:
+            is_spec_dec = False
+        need_pruning = is_spec_dec
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
                 logger.debug(f"Inference: block {block_idx}, attempt {attempt_no}")
@@ -347,17 +385,28 @@ class InferenceSession:
                         self._update_sequence(server_idx, block_idx, attempt_no)
 
                     server_session = self._server_sessions[server_idx]
-                    assert server_session.position == self.position, f"{server_session.position} and {self.position}"
+                    # assert server_session.position == self.position, f"{server_session.position} and {self.position}"
                     
                     # 🔍 CLIENT DEBUG: Log server span processing start
                     span_start_time = time.perf_counter()
                     
-                    inputs = server_session.step( 
+                    inputs, keep_indices, need_pruning_next = server_session.step( 
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
+                        tree_attention_mask,
+                        kv_cache_position_ids,
+                        draft_tokens,
+                        self.prefill_length,
+                        self.keep_indices,
+                        need_pruning,
+                        is_spec_dec,
                         step_id=step_id,
                     )
+                    if is_spec_dec and need_pruning:
+                        self.keep_indices = keep_indices
+                    
+                    need_pruning = False  # only need to prune on the first server
                     
                     # 🔍 CLIENT DEBUG: Log server span processing end
                     span_end_time = time.perf_counter()
@@ -383,8 +432,9 @@ class InferenceSession:
                     maybe_log_traceback(e)
                     time.sleep(delay) 
 
-        self._position += n_input_tokens 
-        # print(f"lient inference session outputs, inputs: {inputs}")
+        self._position += n_input_tokens
+        if draft_tokens is not None and is_spec_dec:
+            inputs = self._recover_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
         outputs = inputs 
         
         # 🔍 CLIENT DEBUG: Log inference step end
@@ -396,7 +446,29 @@ class InferenceSession:
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         # print('client inference session outputs ', outputs.shape)
         return outputs
+    
+    def _recover_hidden_states(self, hidden_states, keep_indices, original_length):
+        if not torch.is_tensor(keep_indices):
+            keep_indices = torch.tensor(keep_indices, device=hidden_states.device, dtype=torch.long)
 
+        if hidden_states.dim() == 2:
+            # [S_kept, H]
+            recovered = hidden_states.new_zeros((original_length, hidden_states.size(-1)))
+            recovered[keep_indices] = hidden_states
+
+        elif hidden_states.dim() == 3:
+            # [B, S_kept, H]
+            B, _, H = hidden_states.shape
+            recovered = hidden_states.new_zeros((B, original_length, H))
+            recovered[:, keep_indices, :] = hidden_states
+
+        else:
+            raise ValueError(f"Unexpected hidden_states dim {hidden_states.dim()}, expected 2 or 3")
+        mask = torch.ones(original_length, dtype=torch.bool, device=hidden_states.device)
+        mask[keep_indices] = False
+        self._last_padded_mask = mask
+
+        return recovered
     
     def _update_sequence(self, server_idx: int, block_idx: int, attempt_no: int) -> int:
         # If there is a failed server session, this code closes it
