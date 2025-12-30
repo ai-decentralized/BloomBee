@@ -80,6 +80,12 @@ class Event(Enum):
     SHUTDOWN = 3
 
 
+# [MBPIPE] Global micro-batch accumulator shared across all handler instances
+# Key: (session_id, step_id) -> dict mapping micro_batch_idx to (tensors, metadata)
+# Using module-level dict to ensure sharing across handler processes/threads
+_global_microbatch_accumulator: Dict[Tuple[str, Any], Dict[int, Tuple[List, dict]]] = {}
+
+
 class TransformerConnectionHandler(ConnectionHandler):
     """Handles three request types: forward, backward and forward-incremental (inference)"""
 
@@ -264,7 +270,19 @@ class TransformerConnectionHandler(ConnectionHandler):
                             )
                     
                     # [MBPIPE] Cross-stage streaming push callback (for micro-batch level streaming)
-                    cross_stage_push_microbatch = None  # Not used in buffer mode
+                    # This enables Server2 to start processing micro-batch N while Server1 computes N+1
+                    cross_stage_push_microbatch = None
+                    
+                    if is_microbatch_enabled():
+                        # Create the cross-stage push function that captures required context
+                        async def _cross_stage_push_wrapper(mb_hidden, mb_keep, push_metadata):
+                            """Wrapper that calls _push_microbatch with required backends."""
+                            await self._push_microbatch(
+                                mb_hidden, mb_keep, push_metadata, requested_backends
+                            )
+                        
+                        cross_stage_push_microbatch = _cross_stage_push_wrapper
+                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
                     
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
@@ -303,8 +321,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                         can_push_case_time=perf_counter() ###
 
                         if can_push:
-                            # [MBPIPE] Use async buffer or direct task based on configuration
-                            if output_buffer is not None and output_buffer.is_running:
+                            # [MBPIPE] Skip _push_outputs if data was already sent via cross-stage micro-batch push
+                            cross_stage_pushed = step_metadata.get("cross_stage_pushed", False) if step_metadata else False
+                            if cross_stage_pushed:
+                                logger.info(f"{MBPIPE_LOG_PREFIX} Skipping _push_outputs: data sent via cross-stage micro-batch push")
+                            elif output_buffer is not None and output_buffer.is_running:
                                 # Non-blocking put into buffer - actual send happens in background
                                 try:
                                     await output_buffer.put(
@@ -493,9 +514,178 @@ class TransformerConnectionHandler(ConnectionHandler):
         requested_uids = self._check_uids(request.uid)
         metadata = MSGPackSerializer.loads(request.metadata)
         session_id = metadata["session_id"]
+        
+        # [MBPIPE] Check if this is a micro-batch push from cross-stage streaming
+        is_microbatch_push = metadata.get("is_microbatch_push", False)
+        
+        if is_microbatch_push:
+            # Handle micro-batch push: accumulate until we have all micro-batches
+            return await self._handle_microbatch_push(request, metadata, requested_uids, context)
+        
+        # Original flow: put into session queue for normal processing
         self._log_request("rpc_push", requested_uids, context, debug=f"session_id={session_id}")
         self._put_into_session_queue(session_id, request)
         return runtime_pb2.ExpertResponse()
+    
+    async def _handle_microbatch_push(
+        self,
+        request: runtime_pb2.ExpertRequest,
+        metadata: dict,
+        requested_uids: Sequence[str],
+        context: P2PContext,
+    ) -> runtime_pb2.ExpertResponse:
+        """
+        [MBPIPE] Handle a micro-batch push from upstream server.
+        
+        Micro-batches are accumulated until we have all of them for a given step,
+        then the full batch is assembled and processed.
+        """
+        session_id = metadata["session_id"]
+        step_id = metadata.get("step_id")
+        mb_idx = metadata.get("micro_batch_idx", 0)
+        mb_offset = metadata.get("micro_batch_offset", 0)
+        mb_size = metadata.get("micro_batch_size", 1)
+        full_batch_size = metadata.get("full_batch_size", mb_size)
+        
+        # Use total_micro_batches from metadata if available, otherwise calculate
+        expected_num_mb = metadata.get("total_micro_batches")
+        if expected_num_mb is None:
+            micro_batch_size_config = get_micro_batch_size()
+            expected_num_mb = (full_batch_size + micro_batch_size_config - 1) // micro_batch_size_config
+        
+        logger.info(
+            f"{MBPIPE_LOG_PREFIX} rpc_push: received micro-batch push: "
+            f"session={session_id}, step={step_id}, mb_idx={mb_idx}/{expected_num_mb}, "
+            f"offset={mb_offset}, size={mb_size}, full_batch={full_batch_size}"
+        )
+        
+        # Create accumulator key
+        acc_key = (session_id, step_id)
+        
+        # Use global accumulator (shared across all handler instances)
+        global _global_microbatch_accumulator
+        
+        # Initialize accumulator for this step if needed
+        if acc_key not in _global_microbatch_accumulator:
+            _global_microbatch_accumulator[acc_key] = {}
+        
+        # Store this micro-batch
+        _global_microbatch_accumulator[acc_key][mb_idx] = (
+            list(request.tensors),  # Copy tensors
+            metadata.copy()
+        )
+        
+        # Check if we have all micro-batches
+        received_count = len(_global_microbatch_accumulator[acc_key])
+        
+        logger.info(
+            f"{MBPIPE_LOG_PREFIX} rpc_push: micro-batch accumulated: "
+            f"received={received_count}/{expected_num_mb}"
+        )
+        
+        if received_count >= expected_num_mb:
+            # All micro-batches received - assemble and forward to session queue
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} rpc_push: all micro-batches received, "
+                f"assembling full batch for session={session_id}"
+            )
+            
+            try:
+                # Assemble full batch from micro-batches
+                assembled_request = await self._assemble_microbatches(
+                    acc_key, expected_num_mb, requested_uids
+                )
+                
+                # Forward assembled request to session queue
+                self._log_request(
+                    "rpc_push.assembled",
+                    requested_uids,
+                    context,
+                    debug=f"session_id={session_id}, assembled from {expected_num_mb} micro-batches"
+                )
+                self._put_into_session_queue(session_id, assembled_request)
+                
+            finally:
+                # Clean up accumulator
+                if acc_key in _global_microbatch_accumulator:
+                    del _global_microbatch_accumulator[acc_key]
+        
+        return runtime_pb2.ExpertResponse()
+    
+    async def _assemble_microbatches(
+        self,
+        acc_key: Tuple[str, Any],
+        expected_num_mb: int,
+        requested_uids: Sequence[str],
+    ) -> runtime_pb2.ExpertRequest:
+        """
+        [MBPIPE] Assemble accumulated micro-batches into a single request.
+        
+        This reconstructs the original full batch from multiple micro-batch pushes.
+        """
+        global _global_microbatch_accumulator
+        accumulated = _global_microbatch_accumulator.get(acc_key, {})
+        
+        # Sort by micro-batch index to maintain order
+        sorted_mb_indices = sorted(accumulated.keys())
+        
+        if len(sorted_mb_indices) != expected_num_mb:
+            raise ValueError(
+                f"{MBPIPE_LOG_PREFIX} Micro-batch count mismatch: "
+                f"expected {expected_num_mb}, got {len(sorted_mb_indices)}"
+            )
+        
+        # Collect tensors from each micro-batch
+        # Assume each micro-batch has same number of tensors (hidden_states, keep_indices)
+        first_tensors, first_metadata = accumulated[sorted_mb_indices[0]]
+        num_tensor_types = len(first_tensors)
+        
+        # Deserialize and concatenate tensors
+        assembled_tensors = []
+        for tensor_idx in range(num_tensor_types):
+            tensor_parts = []
+            for mb_idx in sorted_mb_indices:
+                tensors, _ = accumulated[mb_idx]
+                if tensor_idx < len(tensors):
+                    # Deserialize tensor
+                    tensor = deserialize_torch_tensor(tensors[tensor_idx])
+                    tensor_parts.append(tensor)
+            
+            if tensor_parts:
+                # Concatenate along batch dimension
+                if len(tensor_parts) > 1:
+                    assembled = torch.cat(tensor_parts, dim=0)
+                else:
+                    assembled = tensor_parts[0]
+                
+                # Re-serialize for the ExpertRequest
+                # Get compression settings from original tensor proto
+                original_proto = first_tensors[tensor_idx]
+                assembled_proto = serialize_torch_tensor(
+                    assembled, original_proto.compression, allow_inplace=True
+                )
+                assembled_tensors.append(assembled_proto)
+        
+        # Build assembled metadata (use first micro-batch's metadata as base)
+        assembled_metadata = first_metadata.copy()
+        # Remove micro-batch specific fields
+        assembled_metadata.pop("is_microbatch_push", None)
+        assembled_metadata.pop("micro_batch_idx", None)
+        assembled_metadata.pop("micro_batch_offset", None)
+        assembled_metadata.pop("micro_batch_size", None)
+        assembled_metadata.pop("full_batch_size", None)
+        
+        logger.info(
+            f"{MBPIPE_LOG_PREFIX} Assembled {len(sorted_mb_indices)} micro-batches: "
+            f"{[t.size for t in assembled_tensors if hasattr(t, 'size')]}"
+        )
+        
+        # Create assembled request
+        return runtime_pb2.ExpertRequest(
+            uid=CHAIN_DELIMITER.join(requested_uids),
+            tensors=assembled_tensors,
+            metadata=MSGPackSerializer.dumps(assembled_metadata),
+        )
 
     async def _push_outputs(
         self, request: runtime_pb2.ExpertRequest, serialized_outputs: runtime_pb2.Tensor, metadata: dict
@@ -534,6 +724,118 @@ class TransformerConnectionHandler(ConnectionHandler):
             logger.debug(
                 f"Failed to push outputs to peer_id={next_peer_id}, session_id={next_session_id}, blocks={next_start}:{next_end}:",
                 exc_info=True,
+            )
+
+    async def _push_microbatch(
+        self,
+        mb_hidden: torch.Tensor,
+        mb_keep_indices: Optional[torch.Tensor],
+        metadata: dict,
+        requested_backends: Sequence[TransformerBackend],
+    ) -> None:
+        """
+        [MBPIPE] Push a single micro-batch to the next server for cross-stage overlap.
+        
+        This enables pipeline parallelism where Server2 can start processing micro-batch N
+        while Server1 is still computing micro-batch N+1.
+        
+        Args:
+            mb_hidden: Hidden states tensor for this micro-batch
+            mb_keep_indices: Keep indices tensor (for speculative decoding)
+            metadata: Contains next_servers, micro_batch_idx, etc.
+            requested_backends: Backends for serialization schema
+        """
+        import os
+        # [MBPIPE] Feature flag for cross-stage micro-batch push
+        # Default: enabled ("1") since Step 4.2 added Server2 support for receiving micro-batches
+        # Set BLOOMBEE_ENABLE_CROSS_STAGE_PUSH=0 to disable
+        enable_actual_push = os.environ.get("BLOOMBEE_ENABLE_CROSS_STAGE_PUSH", "1") == "1"
+        
+        push_start_time = perf_counter()
+        
+        try:
+            next_servers = metadata.get("next_servers")
+            if not next_servers:
+                return
+            
+            mb_idx = metadata.get("micro_batch_idx", 0)
+            mb_offset = metadata.get("micro_batch_offset", 0)
+            mb_size = metadata.get("micro_batch_size", mb_hidden.shape[0])
+            full_batch_size = metadata.get("full_batch_size", mb_size)
+            
+            next_peer_id, next_session_id, next_start, next_end = next_servers[0]
+            
+            # Log the push intent
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} Cross-stage push: mb_idx={mb_idx}, "
+                f"offset={mb_offset}, size={mb_size}, to={next_start}:{next_end}"
+                f"{'' if enable_actual_push else ' (dry-run, set BLOOMBEE_ENABLE_CROSS_STAGE_PUSH=1 to enable)'}"
+            )
+            
+            # Only actually send if the feature is enabled
+            if not enable_actual_push:
+                return
+            
+            next_peer_id = PeerID.from_base58(next_peer_id)
+            next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
+            
+            # Serialize the micro-batch hidden states
+            outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
+            serialized_hidden = serialize_torch_tensor(
+                mb_hidden.to(outputs_schema[0].dtype),
+                outputs_schema[0].compression,
+                allow_inplace=True
+            )
+            
+            # Serialize keep_indices if present
+            if mb_keep_indices is not None:
+                serialized_keep = serialize_torch_tensor(
+                    mb_keep_indices.to(torch.int64),
+                    outputs_schema[1].compression if len(outputs_schema) > 1 else runtime_pb2.CompressionType.NONE,
+                    allow_inplace=True
+                )
+            else:
+                serialized_keep = serialize_torch_tensor(
+                    torch.arange(mb_hidden.shape[1], dtype=torch.int64),
+                    runtime_pb2.CompressionType.NONE,
+                    allow_inplace=True
+                )
+            
+            # Build metadata for micro-batch push
+            push_metadata = {
+                "session_id": next_session_id,
+                "next_servers": next_servers[2:] if len(next_servers) > 2 else [],
+                "pushed": True,
+                # [MBPIPE] Micro-batch specific fields
+                "is_microbatch_push": True,
+                "micro_batch_idx": mb_idx,
+                "micro_batch_offset": mb_offset,
+                "micro_batch_size": mb_size,
+                "full_batch_size": full_batch_size,
+            }
+            
+            # Copy other relevant metadata
+            for key in ["step_id", "max_length", "args_structure"]:
+                if key in metadata:
+                    push_metadata[key] = metadata[key]
+            
+            stub = self.get_stub(self._p2p, next_peer_id)
+            await stub.rpc_push(
+                runtime_pb2.ExpertRequest(
+                    uid=next_uid,
+                    tensors=[serialized_hidden, serialized_keep],
+                    metadata=MSGPackSerializer.dumps(push_metadata),
+                ),
+                timeout=self.request_timeout,
+            )
+            
+            push_time = (perf_counter() - push_start_time) * 1000
+            logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch push completed in {push_time:.1f}ms")
+            
+        except Exception as e:
+            logger.warning(
+                f"{MBPIPE_LOG_PREFIX} Failed to push micro-batch: {e}",
+                exc_info=True
             )
 
     async def rpc_forward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:

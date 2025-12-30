@@ -455,14 +455,15 @@ async def iterate_rpc_inference(
                         mb_end_time = _perf_counter()
                         mb_timings.append((mb_idx, mb_start_time, mb_end_time))
                         
-                        # [MBPIPE] Cross-stage streaming: push micro-batch to next stage immediately
-                        if enable_cross_stage and mb_idx < len(micro_ranges) - 1:
-                            # Only push non-final micro-batches early; final batch handled by normal flow
+                        # [MBPIPE] Cross-stage streaming: push ALL micro-batches to next stage immediately
+                        # This enables Server2 to start processing before Server1 finishes all micro-batches
+                        if enable_cross_stage:
                             push_metadata = step_metadata.copy()
                             push_metadata["micro_batch_idx"] = mb_idx
                             push_metadata["micro_batch_offset"] = mb_start
                             push_metadata["micro_batch_size"] = mb_size
                             push_metadata["full_batch_size"] = batch_size
+                            push_metadata["total_micro_batches"] = len(micro_ranges)
                             push_task = asyncio.create_task(
                                 cross_stage_push_fn(mb_out_hidden, mb_out_keep, push_metadata)
                             )
@@ -488,6 +489,9 @@ async def iterate_rpc_inference(
                     if cross_stage_push_tasks:
                         # Don't await - let them complete in background
                         logger.debug(f"{MBPIPE_LOG_PREFIX} {len(cross_stage_push_tasks)} cross-stage push tasks running in background")
+                        # Mark that cross-stage push is handling the data transfer
+                        if step_metadata is not None:
+                            step_metadata["cross_stage_pushed"] = True
                     
                     # Merge results
                     micro_hidden_list = [r[0] for r in results]
@@ -574,13 +578,14 @@ async def iterate_rpc_inference(
                         mb_end_time = _perf_counter()
                         mb_timings.append((mb_idx, mb_start_time, mb_end_time))
                         
-                        # [MBPIPE] Cross-stage streaming: push micro-batch to next stage immediately
-                        if enable_cross_stage and mb_idx < len(micro_ranges) - 1:
+                        # [MBPIPE] Cross-stage streaming: push ALL micro-batches to next stage immediately
+                        if enable_cross_stage:
                             push_metadata = step_metadata.copy()
                             push_metadata["micro_batch_idx"] = mb_idx
                             push_metadata["micro_batch_offset"] = mb_start
                             push_metadata["micro_batch_size"] = mb_size
                             push_metadata["full_batch_size"] = batch_size
+                            push_metadata["total_micro_batches"] = len(micro_ranges)
                             push_task = asyncio.create_task(
                                 cross_stage_push_fn(mb_hidden, mb_keep_idx, push_metadata)
                             )
@@ -605,6 +610,9 @@ async def iterate_rpc_inference(
                     # [MBPIPE] Wait for cross-stage push tasks (fire-and-forget style)
                     if cross_stage_push_tasks:
                         logger.debug(f"{MBPIPE_LOG_PREFIX} {len(cross_stage_push_tasks)} cross-stage push tasks running in background")
+                        # Mark that cross-stage push is handling the data transfer
+                        if step_metadata is not None:
+                            step_metadata["cross_stage_pushed"] = True
                     
                     # Merge results
                     micro_hidden_list = [r[0] for r in results]
