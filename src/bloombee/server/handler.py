@@ -39,6 +39,15 @@ from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backw
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 from bloombee.utils.convert_block import QuantType
+from bloombee.utils.microbatch_config import (
+    is_microbatch_enabled,
+    get_micro_batch_size,
+    get_current_path,
+    log_path_entry as mbpipe_log_path_entry,
+    MBPIPE_LOG_PREFIX,
+    AsyncOutputBuffer,
+    get_timing_tracker,
+)
 
 logger = get_logger(__name__)
 
@@ -204,6 +213,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 end_batch_size_time = perf_counter()
                 # print_time_now('')
                 
+                # [MBPIPE] Log current path at rpc_inference entry
+                mbpipe_log_path_entry(logger, "handler.rpc_inference", batch_size=batch_size)
+                
                 push_time = []
                 # offload_logger.info(f" Inference parameters:")
                 # offload_logger.info(f"   - batch size: {batch_size}")
@@ -221,6 +233,39 @@ class TransformerConnectionHandler(ConnectionHandler):
                     background_tasks = set()
                     step_=0
                     warmup_completed = False  # Track if warmup/prefill phase is completed
+                    
+                    # [MBPIPE] Async Output Buffer for compute/communication overlap
+                    output_buffer: Optional[AsyncOutputBuffer] = None
+                    use_buffer = False
+                    
+                    # Check if we should use async buffer (based on timing data)
+                    # Server-to-server communication is determined by next_servers in metadata
+                    if is_microbatch_enabled():
+                        # Check timing data for buffer decision
+                        tracker = get_timing_tracker()
+                        use_buffer, buffer_pos = tracker.should_use_buffer()
+                        
+                        if use_buffer and buffer_pos == "producer":
+                            output_buffer = AsyncOutputBuffer(
+                                max_pending=2,  # Allow up to 2 pending sends
+                                logger=logger,
+                                name=f"server_{requested_uids[0]}"
+                            )
+                            
+                            # Define the async push function for the buffer
+                            # Must be async because _push_outputs is async
+                            async def buffered_push_fn(item):
+                                req, tensors, meta = item
+                                await self._push_outputs(req, tensors, meta)
+                            
+                            await output_buffer.start_sender(buffered_push_fn)
+                            logger.info(
+                                f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer started for cross-stage overlap"
+                            )
+                    
+                    # [MBPIPE] Cross-stage streaming push callback (for micro-batch level streaming)
+                    cross_stage_push_microbatch = None  # Not used in buffer mode
+                    
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
                     # offload_logger.info(" Start inference iteration")
@@ -238,6 +283,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         points=points,
                         quant_type=self.quant_type,
                         args_structure=args_structure,
+                        cross_stage_push_fn=cross_stage_push_microbatch,  # [MBPIPE] Cross-stage streaming (currently disabled)
                     ):
                         # offload_logger.info(f" Inference step {step_}: can_push={can_push}")
                         # print('=================================================   server rpc_inference step ',step_) ###
@@ -257,12 +303,24 @@ class TransformerConnectionHandler(ConnectionHandler):
                         can_push_case_time=perf_counter() ###
 
                         if can_push:
-                            # print('request uid list ', request.uid)
-                            # print('output_tensors[0] ', output_tensors[0]) # buffer: binary
-                            # print('step_metadata ', step_metadata)
-                            task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
-                            background_tasks.add(task)  # Keep reference until it is done to save it from GC
-                            task.add_done_callback(background_tasks.discard)
+                            # [MBPIPE] Use async buffer or direct task based on configuration
+                            if output_buffer is not None and output_buffer.is_running:
+                                # Non-blocking put into buffer - actual send happens in background
+                                try:
+                                    await output_buffer.put(
+                                        (request, output_tensors, step_metadata),
+                                        clone=False  # Already serialized, no need to clone
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"{MBPIPE_LOG_PREFIX} Buffer put failed, falling back to direct send: {e}")
+                                    task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
+                                    background_tasks.add(task)
+                                    task.add_done_callback(background_tasks.discard)
+                            else:
+                                # Original direct task creation
+                                task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
+                                background_tasks.add(task)  # Keep reference until it is done to save it from GC
+                                task.add_done_callback(background_tasks.discard)
                         start_ExpertResponse_time=perf_counter() ###
                         push_time.append(start_ExpertResponse_time-can_push_case_time) ###
                         # print('current step push outputs task prepare time ', start_ExpertResponse_time-can_push_case_time) ###
@@ -276,6 +334,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                     # print('mean push time ', np.mean(push_time[4:])) ###
                     # print('finish iterate_rpc_inference time(sec) ', end_iterate_rpc_inference_time - end_cache_time) ###
                     # print_time_now('')
+                    
+                    # [MBPIPE] Cleanup async buffer if used
+                    if output_buffer is not None:
+                        try:
+                            await output_buffer.flush()  # Wait for pending sends
+                            await output_buffer.stop()   # Stop background sender
+                        except Exception as e:
+                            logger.warning(f"{MBPIPE_LOG_PREFIX} Buffer cleanup failed: {e}")
             
             finally:
                 self._log_request("rpc_inference.close", requested_uids, context)

@@ -56,6 +56,13 @@ from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
+from bloombee.utils.microbatch_config import (
+    is_microbatch_enabled,
+    get_micro_batch_size,
+    get_current_path,
+    log_config as mbpipe_log_config,
+    MBPIPE_LOG_PREFIX,
+)
 from pynvml import *
 
 # Create dedicated offloading debug logger
@@ -367,6 +374,9 @@ class Server:
             'batch_sizes': [],
             'throughput_history': []
         }
+        
+        # [MBPIPE] Log micro-batch pipeline configuration at server startup
+        mbpipe_log_config(logger, context="Server.__init__")
 
     def _choose_num_blocks(self) -> int:
         assert self.device.type in ("cuda", "mps"), (

@@ -21,6 +21,13 @@ from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
+from bloombee.utils.microbatch_config import (
+    is_microbatch_enabled,
+    get_micro_batch_size,
+    get_current_path,
+    log_path_entry as mbpipe_log_path_entry,
+    MBPIPE_LOG_PREFIX,
+)
 from pynvml import *
 import logging
 import hashlib
@@ -273,10 +280,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # Initialize output states
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
                 # Centralized select: aggregate + reorder + slice
+                # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for micro-batch support
                 k_pkv, v_pkv, need_reorder = self.cache_manager.select_cache(
                     prefix_length=inference_info.prefix_length,
                     hypo_ids=hypo_ids,
-                    kv_cache_position_ids=inference_info.kv_cache_position_ids
+                    kv_cache_position_ids=inference_info.kv_cache_position_ids,
+                    batch_offset=inference_info.batch_offset,
+                    full_batch_size=inference_info.full_batch_size,
+                    micro_batch_size=inference_info.micro_batch_size,
                 )
                 layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
                 if need_reorder:
@@ -369,7 +380,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
                 # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
-                self.cache_manager.update_cache(new_kvs, past_key_values_length)
+                # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for micro-batch support
+                self.cache_manager.update_cache(
+                    new_kvs, past_key_values_length,
+                    batch_offset=inference_info.batch_offset,
+                    full_batch_size=inference_info.full_batch_size,
+                    micro_batch_size=inference_info.micro_batch_size,
+                )
                 keep_indices = inference_info.keep_indices
                 
                 if self._is_spec_decoding and self._need_pruning and self._is_last_block:
@@ -555,6 +572,7 @@ def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend])
 class _MergedInferenceStep:
     def __init__(self, backends: Dict[ExpertUID, TransformerBackend]):
         self.backends = backends
+        self._call_count = 0  # Track number of calls for logging
 
     @torch.inference_mode()
     def __call__(
@@ -567,6 +585,13 @@ class _MergedInferenceStep:
         assert len(inference_infos) == len(
             optional_prompts
         ), f"found {len(inference_infos)} blocks but {len(optional_prompts)} prompts"
+        
+        # [MBPIPE] Log current path at _MergedInferenceStep entry (first call only to reduce noise)
+        self._call_count += 1
+        if self._call_count == 1:
+            batch_size = hidden_states.shape[0] if hidden_states.ndim >= 1 else 1
+            mbpipe_log_path_entry(logger, "backend._MergedInferenceStep", batch_size=batch_size)
+        
         # print('............... come into the _MergedInferenceStep __call__' )
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:

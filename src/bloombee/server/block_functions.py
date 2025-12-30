@@ -20,6 +20,22 @@ from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.utils.microbatch_config import (
+    is_microbatch_enabled,
+    get_micro_batch_size,
+    should_split_batch,
+    compute_micro_batch_ranges,
+    split_tensor_to_microbatches,
+    merge_microbatch_outputs,
+    log_microbatch_split,
+    log_microbatch_merge,
+    log_stage_timing,
+    get_timing_tracker,
+    MBPIPE_LOG_PREFIX,
+)
+
+# [MBPIPE] Cross-stage streaming push support
+_cross_stage_push_callback = None  # Will be set by handler for cross-stage streaming
 
 from time import perf_counter
 from datetime import datetime, timezone  
@@ -256,6 +272,7 @@ async def iterate_rpc_inference(
     points: int,
     quant_type: QuantType,
     args_structure: Any = None,
+    cross_stage_push_fn=None,  # [MBPIPE] Optional callback for cross-stage micro-batch streaming
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
     assert len(cache_handles) == len(requested_backends)
 
@@ -383,80 +400,281 @@ async def iterate_rpc_inference(
             #     offload_logger.info(f"     CPU cache compute: {cache_manager.offloading_policy.cpu_cache_compute}")
             last_uid = len(requested_uids) - 1
             if can_merge_pools:
-                # print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
-                # offload_logger.info(" Using merged pool for inference")
-                
-                inference_infos = tuple(
-                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec)
-                    for i, (uid, handles) in enumerate(zip(requested_uids, cache_handles))
-                )
-                (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
-                    hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
-                )
+                # Merged pools path: all blocks processed in one call
+                # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
+                if should_split_batch(batch_size):
+                    # Micro-batch pipeline path: split batch, process with overlap
+                    import asyncio
+                    from time import perf_counter as _perf_counter
+                    
+                    micro_ranges = compute_micro_batch_ranges(batch_size)
+                    log_microbatch_split(logger, batch_size, len(micro_ranges), "iterate_rpc_inference.merged_pools")
+                    
+                    # Track timing for overlap statistics
+                    mb_timings = []  # [(start_time, end_time), ...]
+                    cross_stage_push_tasks = []  # [MBPIPE] Track cross-stage push tasks
+                    pipeline_start_time = _perf_counter()
+                    
+                    # [MBPIPE] Get next_servers from step_metadata for cross-stage streaming
+                    next_servers = step_metadata.get("next_servers", None) if step_metadata else None
+                    enable_cross_stage = (cross_stage_push_fn is not None and next_servers is not None)
+                    if enable_cross_stage:
+                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled: {len(next_servers)} downstream stages")
+                    
+                    async def process_microbatch_merged(mb_idx: int, mb_start: int, mb_end: int):
+                        """Process a single micro-batch through merged pool."""
+                        mb_start_time = _perf_counter()
+                        
+                        mb_hidden = hidden_states[mb_start:mb_end].clone()
+                        mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
+                        mb_tree_mask = tree_attention_mask[mb_start:mb_end] if tree_attention_mask is not None and not is_dummy(tree_attention_mask) else tree_attention_mask
+                        mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
+                        
+                        mb_size = mb_end - mb_start
+                        
+                        # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for KV cache slicing
+                        mb_inference_infos = tuple(
+                            InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,
+                                tree_attention_mask=mb_tree_mask,
+                                kv_cache_position_ids=kv_cache_position_ids,
+                                draft_tokens=draft_tokens,
+                                prefill_length=prefill_length,
+                                keep_indices=mb_keep_idx,
+                                need_pruning=need_pruning,
+                                is_spec_dec=is_spec_dec,
+                                batch_offset=mb_start,
+                                full_batch_size=batch_size,
+                                micro_batch_size=mb_size)
+                            for uid, handles in zip(requested_uids, cache_handles)
+                        )
+                        
+                        (mb_out_hidden, mb_out_keep) = await requested_backends[0].inference_pool.submit_task(
+                            mb_hidden, mb_hypo, mb_inference_infos, *prompts, priority=priority
+                        )
+                        
+                        mb_end_time = _perf_counter()
+                        mb_timings.append((mb_idx, mb_start_time, mb_end_time))
+                        
+                        # [MBPIPE] Cross-stage streaming: push micro-batch to next stage immediately
+                        if enable_cross_stage and mb_idx < len(micro_ranges) - 1:
+                            # Only push non-final micro-batches early; final batch handled by normal flow
+                            push_metadata = step_metadata.copy()
+                            push_metadata["micro_batch_idx"] = mb_idx
+                            push_metadata["micro_batch_offset"] = mb_start
+                            push_metadata["micro_batch_size"] = mb_size
+                            push_metadata["full_batch_size"] = batch_size
+                            push_task = asyncio.create_task(
+                                cross_stage_push_fn(mb_out_hidden, mb_out_keep, push_metadata)
+                            )
+                            cross_stage_push_tasks.append(push_task)
+                            logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
+                        
+                        return mb_out_hidden, mb_out_keep
+                    
+                    # Create tasks for all micro-batches (pipeline overlap)
+                    tasks = []
+                    for mb_idx, (mb_start, mb_end) in enumerate(micro_ranges):
+                        task = asyncio.create_task(process_microbatch_merged(mb_idx, mb_start, mb_end))
+                        tasks.append(task)
+                        # Small delay to stagger pipeline stages
+                        if mb_idx < len(micro_ranges) - 1:
+                            await asyncio.sleep(0.001)  # 1ms stagger for pipeline effect
+                    
+                    # Wait for all micro-batches to complete
+                    results = await asyncio.gather(*tasks)
+                    pipeline_end_time = _perf_counter()
+                    
+                    # [MBPIPE] Wait for cross-stage push tasks (fire-and-forget style, don't block)
+                    if cross_stage_push_tasks:
+                        # Don't await - let them complete in background
+                        logger.debug(f"{MBPIPE_LOG_PREFIX} {len(cross_stage_push_tasks)} cross-stage push tasks running in background")
+                    
+                    # Merge results
+                    micro_hidden_list = [r[0] for r in results]
+                    micro_keep_list = [r[1] for r in results]
+                    
+                    hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
+                    keep_indices = micro_keep_list[-1] if micro_keep_list else None
+                    
+                    # Calculate overlap statistics
+                    total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
+                    sum_mb_times = sum((end - start) * 1000 for _, start, end in mb_timings)
+                    overlap_time = max(0, sum_mb_times - total_pipeline_time)
+                    overlap_ratio = (overlap_time / sum_mb_times * 100) if sum_mb_times > 0 else 0
+                    
+                    logger.info(f"{MBPIPE_LOG_PREFIX} Overlap stats: total={total_pipeline_time:.1f}ms, "
+                               f"sum_mb={sum_mb_times:.1f}ms, overlap={overlap_time:.1f}ms ({overlap_ratio:.1f}%)")
+                    
+                    log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.merged_pools")
+                    
+                else:
+                    # Legacy path: process entire batch at once
+                    inference_infos = tuple(
+                        InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec)
+                        for i, (uid, handles) in enumerate(zip(requested_uids, cache_handles))
+                    )
+                    (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
+                        hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
+                    )
                 
             else:
-                pass
-                # print('-=-=-=-=-=-=-=-==-=- not come into can merge pools : ', can_merge_pools)
-                # offload_logger.info(" Using separate pools for inference")
-                
-                # Track S1->S2 transfer latency specifically
-                s1_to_s2_transfer_times = []
-                backend_processing_times = []
-                
-                for i, (backend, uid, handles, prompt) in enumerate(zip(requested_backends, requested_uids, cache_handles, prompts)):
-                    backend_start_time = perf_counter()
+                # Separate pools path: process backends one by one
+                # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
+                if should_split_batch(batch_size):
+                    # Micro-batch pipeline path: split batch, process with overlap
+                    micro_ranges = compute_micro_batch_ranges(batch_size)
+                    log_microbatch_split(logger, batch_size, len(micro_ranges), "iterate_rpc_inference.separate_pools")
                     
-                    # offload_logger.info(f"   - Processing backend: {uid}")
-                    # offload_logger.info(f"     - Cache handles: {len(handles)}")
+                    # Process micro-batches with pipeline overlap using asyncio
+                    import asyncio
+                    from time import perf_counter as _perf_counter
                     
-                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec),)
+                    # Track timing for overlap statistics
+                    mb_timings = []
+                    cross_stage_push_tasks = []  # [MBPIPE] Track cross-stage push tasks
+                    pipeline_start_time = _perf_counter()
                     
-                    # Submit task and measure processing time
-                    task_start_time = perf_counter()
-                    (hidden_states, keep_indices) = await backend.inference_pool.submit_task(
-                        hidden_states, hypo_ids, inference_infos, prompt, priority=priority
-                    )
-                    task_end_time = perf_counter()
-                    task_processing_time = (task_end_time - task_start_time) * 1000  # Convert to milliseconds
+                    # [MBPIPE] Get next_servers from step_metadata for cross-stage streaming
+                    next_servers = step_metadata.get("next_servers", None) if step_metadata else None
+                    enable_cross_stage = (cross_stage_push_fn is not None and next_servers is not None)
+                    if enable_cross_stage:
+                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled (separate_pools): {len(next_servers)} downstream stages")
                     
-                    backend_end_time = perf_counter()
-                    backend_total_time = (backend_end_time - backend_start_time) * 1000
+                    async def process_microbatch(mb_idx: int, mb_start: int, mb_end: int):
+                        """Process a single micro-batch through all backends."""
+                        mb_start_time = _perf_counter()
+                        
+                        mb_hidden = hidden_states[mb_start:mb_end].clone()
+                        mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
+                        mb_tree_mask = tree_attention_mask[mb_start:mb_end] if tree_attention_mask is not None and not is_dummy(tree_attention_mask) else tree_attention_mask
+                        mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
+                        
+                        mb_size = mb_end - mb_start
+                        
+                        for i, (backend, uid, handles, prompt) in enumerate(zip(requested_backends, requested_uids, cache_handles, prompts)):
+                            # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for KV cache slicing
+                            inference_info = (InferenceMetadata(
+                                uid, prefix_length, tuple(handles), active_adapter,
+                                tree_attention_mask=mb_tree_mask,
+                                kv_cache_position_ids=kv_cache_position_ids,
+                                draft_tokens=draft_tokens,
+                                prefill_length=prefill_length,
+                                keep_indices=mb_keep_idx,
+                                need_pruning=need_pruning,
+                                is_spec_dec=is_spec_dec,
+                                batch_offset=mb_start,
+                                full_batch_size=batch_size,
+                                micro_batch_size=mb_size,
+                            ),)
+                            
+                            (mb_hidden, mb_keep_idx) = await backend.inference_pool.submit_task(
+                                mb_hidden, mb_hypo, inference_info, prompt, priority=priority
+                            )
+                        
+                        mb_end_time = _perf_counter()
+                        mb_timings.append((mb_idx, mb_start_time, mb_end_time))
+                        
+                        # [MBPIPE] Cross-stage streaming: push micro-batch to next stage immediately
+                        if enable_cross_stage and mb_idx < len(micro_ranges) - 1:
+                            push_metadata = step_metadata.copy()
+                            push_metadata["micro_batch_idx"] = mb_idx
+                            push_metadata["micro_batch_offset"] = mb_start
+                            push_metadata["micro_batch_size"] = mb_size
+                            push_metadata["full_batch_size"] = batch_size
+                            push_task = asyncio.create_task(
+                                cross_stage_push_fn(mb_hidden, mb_keep_idx, push_metadata)
+                            )
+                            cross_stage_push_tasks.append(push_task)
+                            logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
+                        
+                        return mb_hidden, mb_keep_idx
                     
-                    # Track individual backend processing times
-                    backend_processing_times.append(task_processing_time)
+                    # Create tasks for all micro-batches (pipeline overlap)
+                    tasks = []
+                    for mb_idx, (mb_start, mb_end) in enumerate(micro_ranges):
+                        task = asyncio.create_task(process_microbatch(mb_idx, mb_start, mb_end))
+                        tasks.append(task)
+                        # Small delay to stagger pipeline stages
+                        if mb_idx < len(micro_ranges) - 1:
+                            await asyncio.sleep(0.001)  # 1ms stagger for pipeline effect
                     
-                    # Estimate S1->S2 transfer time (this is an approximation)
-                    # The transfer time is roughly the total time minus pure processing time
-                    if i > 0:  # Only measure transfer between different backends
-                        estimated_transfer_time = backend_total_time - task_processing_time
-                        s1_to_s2_transfer_times.append(estimated_transfer_time)
-                        logger.info(f"[S1_TO_S2_TRANSFER] Backend {i} | "
-                                   f"Estimated Transfer Time: {estimated_transfer_time:.2f}ms | "
+                    # Wait for all micro-batches to complete
+                    results = await asyncio.gather(*tasks)
+                    pipeline_end_time = _perf_counter()
+                    
+                    # [MBPIPE] Wait for cross-stage push tasks (fire-and-forget style)
+                    if cross_stage_push_tasks:
+                        logger.debug(f"{MBPIPE_LOG_PREFIX} {len(cross_stage_push_tasks)} cross-stage push tasks running in background")
+                    
+                    # Merge results
+                    micro_hidden_list = [r[0] for r in results]
+                    micro_keep_list = [r[1] for r in results]
+                    
+                    hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
+                    keep_indices = micro_keep_list[-1] if micro_keep_list else None
+                    
+                    # Calculate overlap statistics
+                    total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
+                    sum_mb_times = sum((end - start) * 1000 for _, start, end in mb_timings)
+                    overlap_time = max(0, sum_mb_times - total_pipeline_time)
+                    overlap_ratio = (overlap_time / sum_mb_times * 100) if sum_mb_times > 0 else 0
+                    
+                    logger.info(f"{MBPIPE_LOG_PREFIX} Overlap stats: total={total_pipeline_time:.1f}ms, "
+                               f"sum_mb={sum_mb_times:.1f}ms, overlap={overlap_time:.1f}ms ({overlap_ratio:.1f}%)")
+                    
+                    log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.separate_pools")
+                    
+                else:
+                    # Legacy path: process entire batch through all backends sequentially
+                    # Track S1->S2 transfer latency specifically
+                    s1_to_s2_transfer_times = []
+                    backend_processing_times = []
+                    
+                    for i, (backend, uid, handles, prompt) in enumerate(zip(requested_backends, requested_uids, cache_handles, prompts)):
+                        backend_start_time = perf_counter()
+                        
+                        inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec),)
+                        
+                        # Submit task and measure processing time
+                        task_start_time = perf_counter()
+                        (hidden_states, keep_indices) = await backend.inference_pool.submit_task(
+                            hidden_states, hypo_ids, inference_infos, prompt, priority=priority
+                        )
+                        task_end_time = perf_counter()
+                        task_processing_time = (task_end_time - task_start_time) * 1000
+                        
+                        backend_end_time = perf_counter()
+                        backend_total_time = (backend_end_time - backend_start_time) * 1000
+                        
+                        backend_processing_times.append(task_processing_time)
+                        
+                        if i > 0:
+                            estimated_transfer_time = backend_total_time - task_processing_time
+                            s1_to_s2_transfer_times.append(estimated_transfer_time)
+                            logger.info(f"[S1_TO_S2_TRANSFER] Backend {i} | "
+                                       f"Estimated Transfer Time: {estimated_transfer_time:.2f}ms | "
+                                       f"Total Backend Time: {backend_total_time:.2f}ms | "
+                                       f"Pure Processing: {task_processing_time:.2f}ms")
+                        
+                        logger.info(f"[PROCESSING_LATENCY] Backend {i} | "
+                                   f"Task Processing: {task_processing_time:.2f}ms | "
                                    f"Total Backend Time: {backend_total_time:.2f}ms | "
-                                   f"Pure Processing: {task_processing_time:.2f}ms")
+                                   f"Hidden States Shape: {hidden_states.shape}")
                     
-                    # Log processing latency for each backend
-                    logger.info(f"[PROCESSING_LATENCY] Backend {i} | "
-                               f"Task Processing: {task_processing_time:.2f}ms | "
-                               f"Total Backend Time: {backend_total_time:.2f}ms | "
-                               f"Hidden States Shape: {hidden_states.shape}")
-                
-                # Calculate S1->S2 transfer statistics
-                if s1_to_s2_transfer_times:
-                    s1_to_s2_mean = sum(s1_to_s2_transfer_times) / len(s1_to_s2_transfer_times)
-                    s1_to_s2_total = sum(s1_to_s2_transfer_times)
-                    logger.info(f"[S1_TO_S2_TRANSFER_SUMMARY] "
-                               f"Average Transfer: {s1_to_s2_mean:.2f}ms | "
-                               f"Total Transfer: {s1_to_s2_total:.2f}ms | "
-                               f"Transfer Count: {len(s1_to_s2_transfer_times)}")
-                
-                # Calculate total Cross-GPU Transfer Latency
-                cross_gpu_end_time = perf_counter()
-                cross_gpu_latency = (cross_gpu_end_time - cross_gpu_start_time) * 1000
-                
-                logger.info(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
-                           f"Backends: {len(requested_backends)} | "
-                           f"Output Shape: {hidden_states.shape}")
+                    if s1_to_s2_transfer_times:
+                        s1_to_s2_mean = sum(s1_to_s2_transfer_times) / len(s1_to_s2_transfer_times)
+                        s1_to_s2_total = sum(s1_to_s2_transfer_times)
+                        logger.info(f"[S1_TO_S2_TRANSFER_SUMMARY] "
+                                   f"Average Transfer: {s1_to_s2_mean:.2f}ms | "
+                                   f"Total Transfer: {s1_to_s2_total:.2f}ms | "
+                                   f"Transfer Count: {len(s1_to_s2_transfer_times)}")
+                    
+                    cross_gpu_end_time = perf_counter()
+                    cross_gpu_latency = (cross_gpu_end_time - cross_gpu_start_time) * 1000
+                    
+                    logger.info(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
+                               f"Backends: {len(requested_backends)} | "
+                               f"Output Shape: {hidden_states.shape}")
             
             # offload_logger.info(f" Inference computation completed - step {prefix_length}")
             end_compute_time = perf_counter()
@@ -502,6 +720,26 @@ async def iterate_rpc_inference(
         # Calculate total step time
         step_end_time = perf_counter()
         step_total_time = (step_end_time - step_receive_time) * 1000  # ms
+        
+        # [MBPIPE] Record stage timing for cross-stage overlap decisions
+        try:
+            # Extract stage ID safely from UIDs (format: "prefix.block_idx")
+            first_uid = str(requested_uids[0]) if requested_uids else "unknown"
+            last_uid = str(requested_uids[-1]) if requested_uids else "unknown"
+            # Try to extract block indices
+            first_idx = first_uid.split('.')[-1] if '.' in first_uid else "0"
+            last_idx = last_uid.split('.')[-1] if '.' in last_uid else "0"
+            stage_id = f"blocks_{first_idx}_{last_idx}"
+            
+            log_stage_timing(
+                logger, stage_id,
+                compute_time_ms=step_total_time - cross_gpu_receive_time,  # Compute time (excluding comm)
+                comm_time_ms=cross_gpu_receive_time,  # Communication time (if any)
+                component="iterate_rpc_inference"
+            )
+        except Exception as e:
+            # Don't let timing logging break the main flow
+            logger.debug(f"{MBPIPE_LOG_PREFIX} Failed to log stage timing: {e}")
         
         yield output_tensors, can_push, step_metadata
         # print('output_tensors ',output_tensors)

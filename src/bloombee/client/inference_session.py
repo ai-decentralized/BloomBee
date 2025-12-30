@@ -19,6 +19,14 @@ from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo,
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import pack_args_kwargs, normalize_arg
+from bloombee.utils.microbatch_config import (
+    is_microbatch_enabled,
+    get_micro_batch_size,
+    get_current_path,
+    log_config as mbpipe_log_config,
+    log_path_entry as mbpipe_log_path_entry,
+    MBPIPE_LOG_PREFIX,
+)
 
 logger = get_logger(__name__)
 
@@ -262,6 +270,10 @@ class InferenceSession:
         self.past_key_values = None
         self.keep_indices = None
         self.prefill_length = 0
+        self._step_count = 0  # Track step count for logging
+        
+        # [MBPIPE] Log micro-batch pipeline configuration at client session creation
+        mbpipe_log_config(logger, context="InferenceSession.__init__")
 
     @property
     def num_blocks(self) -> int:
@@ -354,6 +366,12 @@ class InferenceSession:
         is_spec_decoding = is_spec_decoding.cpu() if is_spec_decoding is not None else None
         
         step_id = str(uuid.uuid4())  # Generate a unique step ID.
+        
+        # [MBPIPE] Log current path at client step entry (first step only to reduce noise)
+        self._step_count += 1
+        if self._step_count == 1:
+            batch_size = inputs.shape[0] if inputs.ndim >= 1 else 1
+            mbpipe_log_path_entry(logger, "client.InferenceSession.step", batch_size=batch_size)
 
         n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids.numel()
         if self._position + n_input_tokens > self._max_length:
