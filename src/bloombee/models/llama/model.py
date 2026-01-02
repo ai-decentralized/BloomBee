@@ -107,6 +107,8 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         # Remove prefix
         if use_prompts:
             hidden_states = hidden_states[:, self.pre_seq_len :]
+            # Recalculate output_shape after removing prefix tokens
+            output_shape = (hidden_states.size(0), hidden_states.size(1), hidden_states.size(2))
 
         # Add last hidden state
         hidden_states = self.norm(hidden_states)
