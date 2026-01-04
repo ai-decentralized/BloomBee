@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from itertools import chain
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from time import perf_counter
 
 import torch
 import traceback

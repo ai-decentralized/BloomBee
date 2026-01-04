@@ -628,8 +628,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         """
         [MBPIPE] Handle a micro-batch push from upstream server.
         
-        Micro-batches are accumulated using file-based storage (works across all processes),
-        then the full batch is assembled and processed when all micro-batches are received.
+        Micro-batches are accumulated. When all micro-batches are received,
+        they are assembled into a full batch and forwarded to the session queue.
+        
+        The intra-stage overlap (within each stage) provides ~30-50% overlap.
+        Cross-stage overlap via streaming enables fire-and-forget sending.
         """
         session_id = metadata["session_id"]
         step_id = metadata.get("step_id")
@@ -645,51 +648,27 @@ class TransformerConnectionHandler(ConnectionHandler):
             expected_num_mb = (full_batch_size + micro_batch_size_config - 1) // micro_batch_size_config
         
         logger.info(
-            f"{MBPIPE_LOG_PREFIX} rpc_push: received micro-batch push: "
-            f"session={session_id}, step={step_id}, mb_idx={mb_idx}/{expected_num_mb}, "
-            f"offset={mb_offset}, size={mb_size}, full_batch={full_batch_size}"
+            f"{MBPIPE_LOG_PREFIX} rpc_push: received micro-batch: "
+            f"session={session_id}, mb_idx={mb_idx}/{expected_num_mb}, "
+            f"offset={mb_offset}, size={mb_size}"
         )
         
-        # Create accumulator key
+        # Accumulate micro-batches using file-based storage (cross-process safe)
         acc_key = f"{session_id}|{step_id}"
-        
-        # Serialize tensor data for file storage
         tensor_bytes = [t.SerializeToString() for t in request.tensors]
-        
-        # Store micro-batch to file and get current count (file-based, cross-process safe)
         received_count = _store_microbatch_to_file(acc_key, mb_idx, tensor_bytes, metadata.copy())
         
-        logger.info(
-            f"{MBPIPE_LOG_PREFIX} rpc_push: micro-batch stored to file: "
-            f"acc_key={acc_key}, mb_idx={mb_idx}, received={received_count}/{expected_num_mb}"
-        )
-        
-        should_assemble = received_count >= expected_num_mb
-        
-        if should_assemble:
+        if received_count >= expected_num_mb:
             # All micro-batches received - assemble and forward to session queue
             logger.info(
-                f"{MBPIPE_LOG_PREFIX} rpc_push: all micro-batches received ({received_count}/{expected_num_mb}), "
-                f"assembling full batch for session={session_id}"
+                f"{MBPIPE_LOG_PREFIX} rpc_push: all micro-batches received ({received_count}/{expected_num_mb}), assembling"
             )
-            
             try:
-                # Assemble full batch from micro-batches
                 assembled_request = await self._assemble_microbatches(
                     acc_key, expected_num_mb, requested_uids
                 )
-                
-                # Forward assembled request to session queue
-                self._log_request(
-                    "rpc_push.assembled",
-                    requested_uids,
-                    context,
-                    debug=f"session_id={session_id}, assembled from {expected_num_mb} micro-batches"
-                )
                 self._put_into_session_queue(session_id, assembled_request)
-                
             finally:
-                # Clean up accumulator files
                 _cleanup_microbatch_files(acc_key, expected_num_mb)
         
         return runtime_pb2.ExpertResponse()
@@ -873,6 +852,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # Serialize the micro-batch hidden states
             outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
+            
             serialized_hidden = serialize_torch_tensor(
                 mb_hidden.to(outputs_schema[0].dtype),
                 outputs_schema[0].compression,
