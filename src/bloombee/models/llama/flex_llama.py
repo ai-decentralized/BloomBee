@@ -50,9 +50,6 @@ class FLEX_LlamaRMSNorm(LlamaRMSNorm):  # put in flex_llama
         super().__init__(hidden_size, eps=eps)
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
-
-        # meta 初始化场景下，这里通常会是 meta tensor
-        # 先给一个占位 Parameter，后面 load_weight 再写入真实权重
         self.loaded_weight = nn.Parameter(
             torch.ones(hidden_size), requires_grad=False
         )
@@ -66,8 +63,6 @@ class FLEX_LlamaRMSNorm(LlamaRMSNorm):  # put in flex_llama
             variance + self.variance_epsilon
         )
 
-        # ❗ 不要在这里 self.loaded_weight = ...
-        # 只读，不改属性类型
         if self.loaded_weight.device.type == "meta":
             raise RuntimeError(
                 "FLEX_LlamaRMSNorm.loaded_weight is still on 'meta'. "
@@ -86,7 +81,6 @@ class FLEX_LlamaRMSNorm(LlamaRMSNorm):  # put in flex_llama
         return f"{tuple(self.loaded_weight.shape)}, eps={self.variance_epsilon}"
 
     def load_weight(self, path, device=None, dtype=None):
-        # 支持传目录或文件
         if os.path.isdir(path):
             path = os.path.join(path, "norm.weight")
 
@@ -100,20 +94,17 @@ class FLEX_LlamaRMSNorm(LlamaRMSNorm):  # put in flex_llama
             dtype = torch.float32
         w = w.to(dtype)
 
-        # 决定要放到哪个 device 上
         if device is None:
             if self.loaded_weight.device.type != "meta":
                 device = self.loaded_weight.device
             else:
-                device = "cpu"  # 或者你指定成 "cuda:0" / env 里的 device
+                device = "cpu"
         w = w.to(device)
 
         with torch.no_grad():
             if self.loaded_weight.device.type == "meta":
-                # 如果之前是 meta 占位，直接用真正的 Parameter 替换
                 self.loaded_weight = nn.Parameter(w, requires_grad=False)
             else:
-                # 已经是正常 tensor，就只 copy 数据
                 self.loaded_weight.copy_(w.view_as(self.loaded_weight))
 
         print("[OK] loaded norm weight from", path)
