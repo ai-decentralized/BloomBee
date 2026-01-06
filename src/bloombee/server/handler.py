@@ -37,7 +37,7 @@ from bloombee.server.backend import TransformerBackend
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
-from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.convert_block import QuantType
 
 logger = get_logger(__name__)
@@ -91,7 +91,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         step_timeout: float,
         task_prioritizer: TaskPrioritizerBase = DummyTaskPrioritizer(),
         quant_type: QuantType,
-        pruner_manager: BloombeePrunerManager,
+        pruner_manager: SpeculativePrunerManager,
     ):
         super().__init__(dht, module_backends)
         for module_backend in self.module_backends.values():

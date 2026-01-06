@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import os
 import numpy as np
 
-class SimpleLMHead(nn.Module):
+class MidLMHead(nn.Module):
     def __init__(self, hidden_size, vocab_size):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(vocab_size, hidden_size))

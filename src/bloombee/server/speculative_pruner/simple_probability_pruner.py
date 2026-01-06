@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Union, Any
+from huggingface_hub import hf_hub_download
+
+from bloombee.server.speculative_pruner.pruner_interface import PrunerInterface
+from bloombee.server.speculative_pruner.utils import PruningConfig
+from bloombee.server.speculative_pruner.mid_layer_LM_head import MidLMHead
 
 class SimpleProbabilityPruner(PrunerInterface):
     
@@ -16,17 +21,35 @@ class SimpleProbabilityPruner(PrunerInterface):
         self.vocab_size = vocab_size
         self.device = device
         
+        # LM head for getting probabilities
+        self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
+        lm_head_weights_path = hf_hub_download(
+            repo_id="xxiong59/lm-head-for-speculative-pruning",
+            filename="lm_head_weights_15.pt",
+            cache_dir="./cache"
+        )
+        lm_head_checkpoint = torch.load(lm_head_weights_path, map_location="cuda")
+        if 'model_state_dict' in lm_head_checkpoint:
+            self.lm_head.load_state_dict(lm_head_checkpoint['model_state_dict'])
+        else:
+            self.lm_head.load_state_dict(lm_head_checkpoint)
+        self.lm_head.requires_grad_(False)
+        self.lm_head.to(dtype=torch.float16)
+        
         # Statistics
         self.total_branches = 0
         self.pruned_branches = 0
         self.correct_prunes = 0
         
-        # Cache for repeated computations
-        self.cache = {} if config.enable_caching else None
+    def _get_parent_postion(self, i, mask, prefix):
+        for j in range(i-1, -1, -1):
+            if mask[0, i, j + prefix] == True:
+                return j
+        return i
     
     def prune_branches(
         self,
-        logits: torch.Tensor,
+        middle_hidden_states: torch.Tensor,
         draft_tokens: List[int],
         tree_attention_mask: torch.Tensor,
         **kwargs
@@ -41,11 +64,14 @@ class SimpleProbabilityPruner(PrunerInterface):
             tree_attention_mask: [seq_len, seq_len] - encodes tree structure
         """
         
-        seq_len = len(draft_tokens)
+        seq_len = middle_hidden_states.shape[1]
+        # logger.info(f"middle_hidden_states: {middle_hidden_states.shape}")
         
         prefix_len = tree_attention_mask.shape[2] - seq_len
         
-        probs = F.softmax(logits, dim=-1)
+        # Get middle layer logits and probabilities
+        middle_logits = self.lm_head(middle_hidden_states)
+        # probs = F.softmax(middle_logits, dim=-1)
         
         # Initialize keep mask (all True initially)
         keep_mask = torch.ones(seq_len, dtype=torch.bool)
@@ -58,84 +84,57 @@ class SimpleProbabilityPruner(PrunerInterface):
         
         # Process each node in depth-first order
         for i in range(seq_len):
+            if i == 0:
+                keep_mask[0] = True
+                scores[i] = 1.0
+                continue
+            
             # Skip if already discarded by ancestor
             if discarded[i]:
                 keep_mask[i] = False
                 scores[i] = 0.0  # Set score to 0 for discarded nodes
                 continue
             
+            # logger.info(f"draft_tokens[i]: {draft_tokens[i]}")
+            
             # Get token probability
-            token_prob = probs[0, i, draft_tokens[i]]
-            score = token_prob
-            scores[i] = score
+            parent_postion = self._get_parent_postion(i, tree_attention_mask, prefix_len)
+            # logger.info(f"xiongxu i : {i}, parent_postion: {parent_postion}")
+            logits_at_pos = middle_logits[0, parent_postion]
+            # logger.info(f"xiongxu i : {i}, logits_at_pos: {logits_at_pos}")
+            probs = F.softmax(logits_at_pos, dim=-1)
+            # logger.info(f"xiongxu i : {i}, probs: {probs}")
+            topk = 50
+
+            # 取 top-50 token ids（在 parent 的分布上）
+            topk_ids = torch.topk(
+                probs,
+                k=min(topk, self.vocab_size),
+                dim=-1
+            ).indices  # shape: [topk]
+
+            # 判断 draft token 是否在 topk
+            label = 1.0 if draft_tokens[i] in topk_ids.tolist() else 0.0
+            
+            draft_id = draft_tokens[i]        # int
+            draft_prob = probs[draft_id].item()
+            # logger.info(f"xiongxu [node {i}] draft_token={draft_id}, prob={draft_prob:.6f}")
             
             # Check if score meets threshold
-            if score < self.config.simple_threshold:
+            if label == 0.0:
                 keep_mask[i] = False
                 discarded[i] = True
                 
                 # Mark all descendants as discarded
                 # Descendants are nodes j > i where j can attend to i
                 for j in range(i + 1, seq_len):
-                    if tree_attention_mask[0, j, i + prefix_len] == True:
+                    if tree_attention_mask[0, j, i + prefix_len] == 1:
                         discarded[j] = True
                         keep_mask[j] = False
         
-        # Ensure minimum branches are kept
-        kept_count = keep_mask.sum().item()
-        if kept_count < self.config.min_keep_nodes:
-            # Initialize all nodes as potential leaf nodes
-            is_leaf = torch.ones(seq_len, dtype=torch.bool)
-            
-            # Store leaf nodes with their path scores
-            leaf_paths = []  # List of (score, leaf_idx, path_indices)
-            
-            # Traverse from back to front
-            for i in range(seq_len - 1, -1, -1):
-                if is_leaf[i]:
-                    # This is a leaf node, calculate its path score
-                    path_indices = [i]
-                    path_score = scores[i].item()
-                    
-                    # Find all ancestors of node i (from i-1 to 0)
-                    for j in range(i - 1, -1, -1):
-                        # Check if j is an ancestor of i
-                        if tree_attention_mask[0, i, j + prefix_len] == True:
-                            # Mark j as non-leaf (it has descendants)
-                            is_leaf[j] = False
-                            
-                            # Add to path
-                            path_indices.append(j)
-                            # Multiply path score
-                            path_score *= scores[j].item()
-                    
-                    # Save this leaf and its path score
-                    path_indices.reverse()  # Order from root to leaf
-                    leaf_paths.append((path_score, i, path_indices))
-            
-            # Sort leaf nodes by path score (high to low)
-            leaf_paths.sort(key=lambda x: x[0], reverse=True)
-            
-            # Keep top branches (complete paths from root to leaf)
-            # keep_mask = torch.zeros(seq_len, dtype=torch.bool)
-            branches_kept = 0
-            
-            for path_score, leaf_idx, path_indices in leaf_paths:
-                if branches_kept > self.config.min_keep_branches:
-                    break
-                
-                # Keep all nodes in this path
-                for idx in path_indices:
-                    keep_mask[idx] = True
-                
-                branches_kept += 1
-        
+        # Get final indices
         keep_indices = torch.where(keep_mask)[0].tolist()
         prune_indices = torch.where(~keep_mask)[0].tolist()
-        
-        # Update statistics
-        self.total_branches += seq_len
-        self.pruned_branches += len(prune_indices)
         
         return {
             'keep_indices': keep_indices,
@@ -143,8 +142,7 @@ class SimpleProbabilityPruner(PrunerInterface):
             'keep_probs': scores.tolist(),
             'keep_mask': keep_mask,
             'metadata': {
-                'middle_logits': logits,
-                'threshold_used': self.config.simple_threshold,
+                'middle_logits': middle_logits,
                 'avg_score': scores[keep_mask].mean().item() if keep_mask.any() else 0.0,
             }
         }
@@ -163,11 +161,6 @@ class SimpleProbabilityPruner(PrunerInterface):
                 new_mask[new_i, new_j] = original_mask[old_i, old_j]
         
         return new_mask
-    
-    def update_statistics(self, feedback: Dict[str, Any]):
-        """Update pruning statistics"""
-        if 'correct_prunes' in feedback:
-            self.correct_prunes += feedback['correct_prunes']
     
     def get_metrics(self) -> Dict[str, float]:
         """Get pruning metrics"""

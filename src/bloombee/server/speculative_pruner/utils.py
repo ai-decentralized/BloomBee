@@ -1,5 +1,35 @@
 from dataclasses import dataclass
 from typing import List
+from enum import Enum
+
+class PruningMethod(Enum):
+    """Enumeration of available pruning methods"""
+    SIMPLE_PROBABILITY = "simple_probability"
+    ADAPTIVE_NEURAL = "adaptive_neural"
+    
+@dataclass
+class PruningConfig:
+    """Configuration for pruning strategies"""
+    method: PruningMethod = PruningMethod.SIMPLE_PROBABILITY
+    
+    # Simple probability method config
+    simple_threshold: float = 0.3
+    simple_top_k: int = 5
+    simple_use_entropy: bool = False
+    
+    # Adaptive neural method config
+    neural_threshold: float = 0.5
+    neural_hidden_size: int = 128
+    neural_dropout: float = 0.1
+    neural_learning_rate: float = 1e-4
+    neural_speedup_weight: float = 0.1
+    
+    # Shared config
+    max_branches: int = 32
+    min_keep_branches: int = 1
+    min_keep_nodes: int = 5
+    enable_caching: bool = True
+    cache_size: int = 1000
 
 @dataclass
 class NetworkCondition:
