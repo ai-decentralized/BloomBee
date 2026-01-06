@@ -48,8 +48,15 @@ from bloombee.utils.microbatch_config import (
     AsyncOutputBuffer,
     get_timing_tracker,
 )
+from bloombee.utils.microbatch_schema import (
+    RequestContext,
+    create_microbatch_queue_item,
+    is_microbatch_queue_item,
+    MBPIPE_SCHEMA_PREFIX,
+)
 
 logger = get_logger(__name__)
+
 
 # Create dedicated offloading debug logger
 import logging
@@ -210,6 +217,26 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._listener_task: Optional[asyncio.Task] = None
         self._session_queues: Dict[str, asyncio.Queue] = {}
         self._session_handlers: Dict[str, int] = {}
+        
+        # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
+        # Key: (session_id, step_id) -> Queue holding individual micro-batches
+        self._mb_queues: Dict[tuple, asyncio.Queue] = {}
+        # Key: (session_id, step_id) -> expected number of micro-batches
+        self._mb_expected: Dict[tuple, int] = {}
+        # Key: (session_id, step_id) -> count of received micro-batches
+        self._mb_received: Dict[tuple, int] = {}
+        # [MBPIPE] Cross-stage pipeline: request context cache (Step C/D)
+        # Key: (session_id, step_id) -> RequestContext with cached mb0 fields
+        self._request_contexts: Dict[tuple, RequestContext] = {}
+        # Key: (session_id, step_id) -> set of (mb_idx) already processed (idempotency)
+        self._mb_processed: Dict[tuple, set] = {}
+        # Feature flag for immediate queuing - ENABLED for cross-stage pipeline overlap
+        self._enable_immediate_mb_queue = os.environ.get(
+            "BLOOMBEE_ENABLE_IMMEDIATE_MB_QUEUE", "1"
+        ) == "1"
+        
+        logger.info(f"{MBPIPE_LOG_PREFIX} Immediate micro-batch queuing: {'ENABLED' if self._enable_immediate_mb_queue else 'disabled'}")
+
 
         self.inference_max_length = inference_max_length
         self.request_timeout = request_timeout
@@ -217,6 +244,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._prioritizer = task_prioritizer
         self.quant_type = quant_type
         self.pruner_manager = pruner_manager
+
 
     async def add_p2p_handlers(self, *args, **kwargs) -> None:
         if self._listener_task is None:
@@ -513,6 +541,63 @@ class TransformerConnectionHandler(ConnectionHandler):
             except Exception as e:
                 logger.exception(e)
 
+    async def _poll_microbatch_file(
+        self,
+        acc_key: str,
+        mb_idx: int,
+        timeout: float = 5.0,
+        poll_interval: float = 0.01,
+    ) -> Optional[Tuple[runtime_pb2.ExpertRequest, dict]]:
+        """
+        [MBPIPE] Poll for a specific micro-batch from file storage.
+        
+        This is used for cross-stage pipeline where micro-batches are stored
+        by one handler and read by another (file-based IPC).
+        
+        Returns (request, metadata) when available, or None on timeout.
+        """
+        file_path = _get_mb_file_path(acc_key, mb_idx)
+        lock_path = _get_mb_lock_path(acc_key)
+        start_time = perf_counter()
+        
+        while (perf_counter() - start_time) < timeout:
+            try:
+                if os.path.exists(file_path):
+                    with open(lock_path, 'w') as lock_file:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                        try:
+                            if os.path.exists(file_path):
+                                with open(file_path, 'rb') as f:
+                                    data = pickle.load(f)
+                                    tensor_bytes = data['tensor_bytes']
+                                    metadata = data['metadata']
+                                    
+                                # Reconstruct the request
+                                tensors = [runtime_pb2.Tensor.FromString(t) for t in tensor_bytes]
+                                request = runtime_pb2.ExpertRequest(
+                                    uid=acc_key.split('|')[0],  # session_id
+                                    tensors=tensors,
+                                    metadata=MSGPackSerializer.dumps(metadata),
+                                )
+                                
+                                logger.info(
+                                    f"{MBPIPE_LOG_PREFIX} poll_file: mb_idx={mb_idx} found "
+                                    f"after {(perf_counter() - start_time)*1000:.1f}ms"
+                                )
+                                return request, metadata
+                        finally:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception as e:
+                logger.debug(f"{MBPIPE_LOG_PREFIX} poll_file error: {e}")
+            
+            await asyncio.sleep(poll_interval)
+        
+        logger.warning(
+            f"{MBPIPE_LOG_PREFIX} poll_file: timeout waiting for mb_idx={mb_idx} "
+            f"after {timeout}s"
+        )
+        return None
+
     async def _iterate_inference_steps(
         self,
         first_request: runtime_pb2.ExpertRequest,
@@ -529,38 +614,66 @@ class TransformerConnectionHandler(ConnectionHandler):
             start_iterate_inference_steps_time = perf_counter()
             
             with self._managed_session(session_id) if session_id is not None else contextlib.nullcontext():
-                while request.tensors:  # iterate while user is willing to supply tensors
-                    start_meta_time = perf_counter()
-                    metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-                    step_id = metadata.get("step_id")
-                    # print('step_id ', step_id)
-                    pushed = metadata.get("pushed")
-                    # print('pushed ', pushed)
-                    # print('metadata ', metadata)
-                    if pushed:
-                        n_pushes += 1
-                        self._log_request("rpc_inference.push", requested_uids, context, debug=f"session received push")
-
-                    if step_id is None or step_id not in processed_step_ids:
-                        yield request, metadata
-                        if step_id is not None:
-                            processed_step_ids.add(step_id)
-                    elif pushed:
-                        n_late_pushes += 1
-                        # Downgrade to debug to reduce log noise
-                        self._log_request(
-                            "rpc_inference.push",
-                            requested_uids,
-                            context,
-                            debug=f"arrived late {n_late_pushes / n_pushes * 100:.1f}% of the time",
+                while request is not None:
+                    # [MBPIPE] Check if this is a micro-batch queue item (dict with type="micro_batch")
+                    if is_microbatch_queue_item(request):
+                        # Yield micro-batch directly with type marker
+                        mb_item = request
+                        mb_metadata = mb_item.get("metadata", {}).copy()
+                        mb_metadata["type"] = "micro_batch"
+                        mb_metadata["mb_idx"] = mb_item.get("mb_idx", 0)
+                        mb_metadata["expected_num_mb"] = mb_item.get("expected_num_mb", 1)
+                        mb_metadata["offset"] = mb_item.get("offset", 0)
+                        mb_metadata["size"] = mb_item.get("size", 1)
+                        mb_metadata["full_batch_size"] = mb_item.get("full_batch_size", 1)
+                        mb_metadata["pushed"] = True
+                        
+                        logger.info(
+                            f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
+                            f"mb_idx={mb_item.get('mb_idx')} for immediate processing"
                         )
+                        
+                        yield mb_item.get("payload"), mb_metadata
+                        
+                        # Continue to next item from queue
+                        request = None
+                    elif hasattr(request, 'tensors') and (request.tensors or (request.metadata and not request.tensors)):
+                        # Original full-batch request path
+                        start_meta_time = perf_counter()
+                        metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
+                        step_id = metadata.get("step_id")
+                        pushed = metadata.get("pushed")
+                        
+                        # [MBPIPE] Note: Micro-batch signal handling removed.
+                        if metadata.get("is_mb_start_signal"):
+                            logger.info(
+                                f"{MBPIPE_LOG_PREFIX} iterate_steps: ignoring mb_start_signal (incompatible format)"
+                            )
+                            request = runtime_pb2.ExpertRequest()
+                            continue
+                        
+                        if pushed:
+                            n_pushes += 1
+                            self._log_request("rpc_inference.push", requested_uids, context, debug=f"session received push")
+
+                        if step_id is None or step_id not in processed_step_ids:
+                            yield request, metadata
+                            if step_id is not None:
+                                processed_step_ids.add(step_id)
+                        elif pushed:
+                            n_late_pushes += 1
+                            self._log_request(
+                                "rpc_inference.push",
+                                requested_uids,
+                                context,
+                                debug=f"arrived late {n_late_pushes / n_pushes * 100:.1f}% of the time",
+                            )
+                        
+                        request = None  # Mark as processed, will fetch next
+                    else:
+                        # Empty or None request - break out
+                        break
                     
-                    end_meta_push_time = perf_counter()
-                    # print('_iterate_inference_steps: prepare time ', end_meta_push_time - start_meta_time)
-                    # print_time_now('')
-                    # print('anext_task ', anext_task)
-                    # print('get_push_task ', get_push_task)
-                    # print('session_id ', session_id)
                     # Wait for the next request, coming either from the `requests` iterator or `push_queue`
                     if anext_task is None:
                         anext_task = asyncio.create_task(anext(requests))
@@ -572,32 +685,21 @@ class TransformerConnectionHandler(ConnectionHandler):
                     done, _ = await asyncio.wait(
                         [anext_task, get_push_task], timeout=self.step_timeout, return_when=asyncio.FIRST_COMPLETED
                     )
-                    #The purpose of this above code is to ensure that there are tasks running while handling asynchronous requests, 
-                    # and to be able to promptly respond to requests coming from different sources.
-                    end_push_time = perf_counter()
-                    # print('async requests handling time ', end_push_time - end_meta_push_time)
-                    # print_time_now('')
+                    
                     if anext_task in done:
                         request = await anext_task
                         anext_task = None
-                        # print(f'----------------------anext_task done first')
-                        # print_time_now('')
                     elif get_push_task in done:
                         request = await get_push_task
                         get_push_task = None
-                        # print(f'get_push_task done first')
-                        # print_time_now('')
                     else:
                         self._log_request("rpc_inference.step", requested_uids, context, warning="timed out")
                         anext_task.cancel()
                         get_push_task.cancel()
                         return
-            # end_iterate_inference_steps_time = perf_counter()
-            # print('infer step  time ', end_iterate_inference_steps_time-start_iterate_inference_steps_time)
-            # print_time_now('')
         except Exception:
-            # logger.warning("rpc_inference._iterate_inference_steps() exception:", exc_info=True)
             raise
+
 
     async def rpc_push(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
         """Directly push activation tensors from one server to another"""
@@ -628,11 +730,12 @@ class TransformerConnectionHandler(ConnectionHandler):
         """
         [MBPIPE] Handle a micro-batch push from upstream server.
         
-        Micro-batches are accumulated. When all micro-batches are received,
-        they are assembled into a full batch and forwarded to the session queue.
+        With immediate queuing enabled (default):
+        - Each micro-batch is put directly into session queue
+        - consume side detects micro-batch items and processes them individually
         
-        The intra-stage overlap (within each stage) provides ~30-50% overlap.
-        Cross-stage overlap via streaming enables fire-and-forget sending.
+        With immediate queuing disabled (fallback):
+        - Wait for all micro-batches, assemble, then put into session queue
         """
         session_id = metadata["session_id"]
         step_id = metadata.get("step_id")
@@ -647,31 +750,103 @@ class TransformerConnectionHandler(ConnectionHandler):
             micro_batch_size_config = get_micro_batch_size()
             expected_num_mb = (full_batch_size + micro_batch_size_config - 1) // micro_batch_size_config
         
-        logger.info(
-            f"{MBPIPE_LOG_PREFIX} rpc_push: received micro-batch: "
-            f"session={session_id}, mb_idx={mb_idx}/{expected_num_mb}, "
-            f"offset={mb_offset}, size={mb_size}"
-        )
+        mb_key = (session_id, step_id)
         
-        # Accumulate micro-batches using file-based storage (cross-process safe)
+        # [MBPIPE] Idempotency check - skip if already processed
+        if mb_key not in self._mb_processed:
+            self._mb_processed[mb_key] = set()
+        
+        if mb_idx in self._mb_processed[mb_key]:
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} already processed (idempotency), skipping"
+            )
+            return runtime_pb2.ExpertResponse()
+        
+        self._mb_processed[mb_key].add(mb_idx)
+        
+        # Initialize tracking for this (session, step) if not exists
+        if mb_key not in self._mb_queues:
+            self._mb_queues[mb_key] = asyncio.Queue()
+            self._mb_expected[mb_key] = expected_num_mb
+            self._mb_received[mb_key] = 0
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} rpc_push: created tracking for step={step_id}, "
+                f"expecting {expected_num_mb} micro-batches, "
+                f"immediate_queue={'enabled' if self._enable_immediate_mb_queue else 'disabled'}"
+            )
+        
+        self._mb_received[mb_key] = self._mb_received.get(mb_key, 0) + 1
+        received_count = self._mb_received[mb_key]
+        
+        # Store to file for cross-handler communication (needed even with immediate queue)
         acc_key = f"{session_id}|{step_id}"
         tensor_bytes = [t.SerializeToString() for t in request.tensors]
-        received_count = _store_microbatch_to_file(acc_key, mb_idx, tensor_bytes, metadata.copy())
+        file_received_count = _store_microbatch_to_file(acc_key, mb_idx, tensor_bytes, metadata.copy())
         
-        if received_count >= expected_num_mb:
-            # All micro-batches received - assemble and forward to session queue
-            logger.info(
-                f"{MBPIPE_LOG_PREFIX} rpc_push: all micro-batches received ({received_count}/{expected_num_mb}), assembling"
+        if self._enable_immediate_mb_queue:
+            # ========== IMMEDIATE QUEUING PATH (Step A) ==========
+            # Put each micro-batch directly into session queue as a queue item
+            
+            mb_queue_item = create_microbatch_queue_item(
+                request_id=session_id,
+                step_id=step_id,
+                mb_idx=mb_idx,
+                expected_num_mb=expected_num_mb,
+                payload=request,
+                metadata=metadata.copy(),
+                offset=mb_offset,
+                size=mb_size,
+                full_batch_size=full_batch_size,
             )
-            try:
-                assembled_request = await self._assemble_microbatches(
-                    acc_key, expected_num_mb, requested_uids
+            
+            # Put into session queue immediately (wrapped in dict to distinguish from regular requests)
+            self._put_into_session_queue(session_id, mb_queue_item)
+            
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} IMMEDIATELY queued to session "
+                f"(received={received_count}/{expected_num_mb})"
+            )
+            
+            # Cleanup file storage when all micro-batches received
+            if file_received_count >= expected_num_mb:
+                logger.info(
+                    f"{MBPIPE_LOG_PREFIX} rpc_push: all {expected_num_mb} micro-batches queued, "
+                    f"cleaning up file storage"
                 )
-                self._put_into_session_queue(session_id, assembled_request)
-            finally:
                 _cleanup_microbatch_files(acc_key, expected_num_mb)
+                # Cleanup tracking data
+                self._mb_queues.pop(mb_key, None)
+                self._mb_expected.pop(mb_key, None)
+                self._mb_received.pop(mb_key, None)
+                self._mb_processed.pop(mb_key, None)
+                self._request_contexts.pop(mb_key, None)
+        else:
+            # ========== LEGACY PATH (wait-all-then-assemble) ==========
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} stored to file "
+                f"(file_count={file_received_count}/{expected_num_mb})"
+            )
+            
+            if file_received_count >= expected_num_mb:
+                logger.info(
+                    f"{MBPIPE_LOG_PREFIX} rpc_push: all {expected_num_mb} micro-batches received, "
+                    f"assembling and forwarding to session"
+                )
+                try:
+                    assembled_request = await self._assemble_microbatches(
+                        acc_key, expected_num_mb, requested_uids
+                    )
+                    self._put_into_session_queue(session_id, assembled_request)
+                finally:
+                    _cleanup_microbatch_files(acc_key, expected_num_mb)
+                    # Cleanup tracking data
+                    self._mb_queues.pop(mb_key, None)
+                    self._mb_expected.pop(mb_key, None)
+                    self._mb_received.pop(mb_key, None)
+                    self._mb_processed.pop(mb_key, None)
         
         return runtime_pb2.ExpertResponse()
+
     
     async def _assemble_microbatches(
         self,

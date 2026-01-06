@@ -33,9 +33,16 @@ from bloombee.utils.microbatch_config import (
     get_timing_tracker,
     MBPIPE_LOG_PREFIX,
 )
+from bloombee.utils.microbatch_schema import (
+    fill_microbatch_defaults,
+    RequestContext,
+    create_microbatch_result_metadata,
+    MBPIPE_SCHEMA_PREFIX,
+)
 
 # [MBPIPE] Cross-stage streaming push support
 _cross_stage_push_callback = None  # Will be set by handler for cross-stage streaming
+
 
 from time import perf_counter
 from datetime import datetime, timezone  
@@ -276,14 +283,14 @@ async def iterate_rpc_inference(
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
     assert len(cache_handles) == len(requested_backends)
 
-    start_iterate_rpc_infer_time = perf_counter() #######
-    # print('start iterate rpc inference -=-=-=-')
-    #print_time_now('')
+    start_iterate_rpc_infer_time = perf_counter()
     prefix_length = 0
     point_per_piece = points / max_length if max_length > 0 else 0.0
+    
+    # [MBPIPE] Request context for caching mb0 data across micro-batches
+    request_context: Optional[RequestContext] = None
 
     async for request, step_metadata in input_iterator:
-        # print('------------------ iterate_rpc_inference step_metadata ', step_metadata)
         step_receive_time = perf_counter()
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
@@ -292,45 +299,293 @@ async def iterate_rpc_inference(
             ), f"prefix_length={prefix_length}, start_from_position={start_from_position}"
             prefix_length = start_from_position
 
-        flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
-        if args_structure is not None:
-            # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-            flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
-
-        hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
-        draft_tokens = draft_tokens[0] if draft_tokens is not None and not is_dummy(draft_tokens) else None
-        batch_size, length_increment, _ = hidden_states.shape
-
-        # Fix for bus error in cross-machine setups: ensure tensors are contiguous
-        # Deserialized tensors from network buffers may not be properly aligned,
-        # especially for certain batch sizes (e.g., batch_size=16)
-        if not hidden_states.is_contiguous():
-            hidden_states = hidden_states.contiguous()
-        if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
-            prompts = prompts.contiguous()
-        if not hypo_ids.is_contiguous():
-            hypo_ids = hypo_ids.contiguous()
-        if tree_attention_mask is not None and not is_dummy(tree_attention_mask) and not tree_attention_mask.is_contiguous():
-            tree_attention_mask = tree_attention_mask.contiguous()
-        if kv_cache_position_ids is not None and not is_dummy(kv_cache_position_ids) and not kv_cache_position_ids.is_contiguous():
-            kv_cache_position_ids = kv_cache_position_ids.contiguous()
-        if draft_tokens is not None and not is_dummy(draft_tokens) and not draft_tokens.is_contiguous():
-            draft_tokens = draft_tokens.contiguous()
-        if keep_indices is not None and not is_dummy(keep_indices) and not keep_indices.is_contiguous():
-            keep_indices = keep_indices.contiguous()
-        if need_pruning1 is not None and not is_dummy(need_pruning1) and not need_pruning1.is_contiguous():
-            need_pruning1 = need_pruning1.contiguous()
-        if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) and not is_spec_dec1.is_contiguous():
-            is_spec_dec1 = is_spec_dec1.contiguous()
+        # ========== [MBPIPE] MICRO-BATCH BRANCH ==========
+        # Handle cross-stage micro-batches with 2-tensor format
+        # Process each immediately (for pipeline overlap) but accumulate results
+        if step_metadata.get("type") == "micro_batch":
+            mb_idx = step_metadata.get("mb_idx", 0)
+            expected_num_mb = step_metadata.get("expected_num_mb", 1)
+            mb_offset = step_metadata.get("offset", 0)
+            mb_size = step_metadata.get("size", 1)
+            full_batch_size = step_metadata.get("full_batch_size", mb_size)
+            step_id = step_metadata.get("step_id")
             
-        need_pruning = need_pruning1 == 1 if need_pruning1 is not None and not is_dummy(need_pruning1) else False
-        is_spec_dec = is_spec_dec1 == 1 if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
-        
-        if is_spec_dec and not need_pruning:
-            kv_cache_position_ids = _update_kv_cache_position_ids(kv_cache_position_ids, keep_indices)
-            attention_mask_indices = keep_indices[prefill_length:] - prefill_length
-            idx = attention_mask_indices
-            tree_attention_mask = tree_attention_mask[:, idx][:, :, idx]
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} iterate_rpc_inference: processing micro-batch "
+                f"mb_idx={mb_idx}/{expected_num_mb}, offset={mb_offset}, size={mb_size}, full_batch={full_batch_size}"
+            )
+            
+            # Deserialize only the 2 tensors from micro-batch push
+            flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+            
+            if len(flat_tensors) >= 2:
+                mb_hidden_states = flat_tensors[0]
+                mb_keep_indices = flat_tensors[1] if len(flat_tensors) > 1 else None
+            else:
+                mb_hidden_states = flat_tensors[0] if flat_tensors else None
+                mb_keep_indices = None
+            
+            if mb_hidden_states is None:
+                logger.warning(f"{MBPIPE_SCHEMA_PREFIX} Empty micro-batch received, skipping")
+                continue
+            
+            # Ensure contiguous
+            if not mb_hidden_states.is_contiguous():
+                mb_hidden_states = mb_hidden_states.contiguous()
+            if mb_keep_indices is not None and not mb_keep_indices.is_contiguous():
+                mb_keep_indices = mb_keep_indices.contiguous()
+            
+            # Initialize or reuse request context
+            session_id = step_metadata.get("session_id", "unknown")
+            
+            if request_context is None:
+                request_context = RequestContext(session_id, step_id)
+            
+            # Fill missing fields using schema defaults
+            (
+                hidden_states, keep_indices, _, _,  # Ignore prompts and hypo_ids from defaults
+                tree_attention_mask, kv_cache_position_ids, draft_tokens,
+                prefill_length, is_spec_dec, need_pruning
+            ) = fill_microbatch_defaults(
+                mb_hidden_states, mb_keep_indices, request_context, len(requested_backends)
+            )
+            
+            # [CRITICAL FIX] For cross-stage micro-batches, always generate correct prompts and hypo_ids
+            # The cached prompts from full-batch path may be a tensor, not a list
+            # prompts must be a list of length num_backends, where each element is None or a tensor
+            prompts = [None] * len(requested_backends)
+            
+            # hypo_ids must match micro-batch size
+            hypo_ids = torch.arange(mb_size, dtype=torch.int64, device=hidden_states.device)
+            
+            # [DEBUG] Log prompts info for debugging
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} [DEBUG] After fix: "
+                f"prompts type={type(prompts)}, len={len(prompts)}, "
+                f"hypo_ids.shape={hypo_ids.shape}, num_backends={len(requested_backends)}"
+            )
+            
+            # For micro-batch processing
+            batch_size = mb_size
+            length_increment = hidden_states.shape[1]
+            
+            # Cast to backend dtype
+            hidden_states = hidden_states.to(requested_backends[0].dtype)
+
+            
+            # ========== PROCESS THIS MICRO-BATCH IMMEDIATELY ==========
+            # This is where pipeline overlap happens - we process each micro-batch
+            # as it arrives while upstream is still computing the next one
+            
+            process_start_time = perf_counter()
+            
+            # Process through backends (simplified path for micro-batch)
+            merge_max_tokens = MAX_SHORT_INFERENCE_TOKENS
+            can_merge_pools = batch_size * length_increment <= merge_max_tokens
+            priority = prioritizer.prioritize(
+                hidden_states, hypo_ids, points=point_per_piece, 
+                requested_uids=requested_uids, type="inference"
+            )
+            
+            # [DEBUG] Log before submitting task
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} [DEBUG] Before submit_task: "
+                f"hidden_states.shape={hidden_states.shape}, "
+                f"hypo_ids.shape={hypo_ids.shape if hasattr(hypo_ids, 'shape') else 'N/A'}, "
+                f"can_merge_pools={can_merge_pools}, "
+                f"prompts unpacked would be {len(prompts)} items"
+            )
+            
+            if hidden_states.numel() > 0:
+                if can_merge_pools:
+                    # Use merged pool for this micro-batch
+                    inference_infos = tuple(
+                        InferenceMetadata(
+                            uid, prefix_length, tuple(handles), active_adapter,
+                            tree_attention_mask=tree_attention_mask,
+                            kv_cache_position_ids=kv_cache_position_ids,
+                            draft_tokens=draft_tokens,
+                            prefill_length=prefill_length,
+                            keep_indices=keep_indices,
+                            need_pruning=need_pruning,
+                            is_spec_dec=is_spec_dec,
+                            batch_offset=mb_offset,
+                            full_batch_size=full_batch_size,
+                            micro_batch_size=mb_size
+                        )
+                        for uid, handles in zip(requested_uids, cache_handles)
+                    )
+                    # [DEBUG] Log inference_infos
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} [DEBUG] inference_infos count={len(inference_infos)}, "
+                        f"submitting with {len(prompts)} prompts"
+                    )
+                    (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
+                        hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
+                    )
+
+                else:
+                    # Process through backends sequentially
+                    for backend, uid, handles, prompt in zip(
+                        requested_backends, requested_uids, cache_handles, prompts
+                    ):
+                        inference_infos = (InferenceMetadata(
+                            uid, prefix_length, tuple(handles), active_adapter,
+                            tree_attention_mask=tree_attention_mask,
+                            kv_cache_position_ids=kv_cache_position_ids,
+                            draft_tokens=draft_tokens,
+                            prefill_length=prefill_length,
+                            keep_indices=keep_indices,
+                            need_pruning=need_pruning,
+                            is_spec_dec=is_spec_dec,
+                            batch_offset=mb_offset,
+                            full_batch_size=full_batch_size,
+                            micro_batch_size=mb_size
+                        ),)
+                        (hidden_states, keep_indices) = await backend.inference_pool.submit_task(
+                            hidden_states, hypo_ids, inference_infos, prompt, priority=priority
+                        )
+            
+            process_time_ms = (perf_counter() - process_start_time) * 1000
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} Micro-batch {mb_idx} processed in {process_time_ms:.1f}ms, "
+                f"output shape: {hidden_states.shape}"
+            )
+            
+            # ========== ACCUMULATE MICRO-BATCH RESULTS ==========
+            # Store this micro-batch result in accumulator
+            mb_accum_key = (session_id, step_id)
+            if not hasattr(iterate_rpc_inference, '_mb_accumulators'):
+                iterate_rpc_inference._mb_accumulators = {}
+            
+            if mb_accum_key not in iterate_rpc_inference._mb_accumulators:
+                iterate_rpc_inference._mb_accumulators[mb_accum_key] = {
+                    'expected': expected_num_mb,
+                    'results': {},  # mb_idx -> (hidden_states, keep_indices, offset)
+                    'full_batch_size': full_batch_size,
+                    'step_metadata': step_metadata.copy(),
+                }
+            
+            accum = iterate_rpc_inference._mb_accumulators[mb_accum_key]
+            accum['results'][mb_idx] = (hidden_states.clone(), keep_indices, mb_offset)
+            
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} Accumulated mb_idx={mb_idx}, "
+                f"have {len(accum['results'])}/{accum['expected']} micro-batches"
+            )
+            
+            # Check if we have all micro-batches
+            if len(accum['results']) >= accum['expected']:
+                logger.info(
+                    f"{MBPIPE_LOG_PREFIX} All {accum['expected']} micro-batches received, merging..."
+                )
+                
+                # Sort by mb_idx and merge
+                sorted_indices = sorted(accum['results'].keys())
+                merged_hidden_list = []
+                for idx in sorted_indices:
+                    h, k, offset = accum['results'][idx]
+                    merged_hidden_list.append(h)
+                
+                # Merge hidden states
+                merged_hidden_states = torch.cat(merged_hidden_list, dim=0)
+                
+                # Use last keep_indices (they should all be the same per-token)
+                _, merged_keep_indices, _ = accum['results'][sorted_indices[-1]]
+                
+                logger.info(
+                    f"{MBPIPE_LOG_PREFIX} Merged output shape: {merged_hidden_states.shape}"
+                )
+                
+                # Cleanup accumulator
+                del iterate_rpc_inference._mb_accumulators[mb_accum_key]
+                
+                # Now serialize and yield the merged result
+                if merged_keep_indices is not None:
+                    if not torch.is_tensor(merged_keep_indices):
+                        merged_keep_indices = torch.tensor(merged_keep_indices, dtype=torch.int64, device=merged_hidden_states.device)
+                    else:
+                        merged_keep_indices = merged_keep_indices.to(dtype=torch.int64, device=merged_hidden_states.device)
+                else:
+                    merged_keep_indices = torch.arange(
+                        merged_hidden_states.shape[1],
+                        dtype=torch.int64,
+                        device=merged_hidden_states.device
+                    )
+                
+                need_pruning_next = torch.tensor(0)
+                output_tensors = [
+                    serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
+                    for result, proto in zip(
+                        (merged_hidden_states, merged_keep_indices, need_pruning_next), 
+                        nested_flatten(requested_backends[-1].outputs_schema)
+                    )
+                ]
+                
+                can_push = True  # Micro-batch results don't have prompts
+                yield output_tensors, can_push, accum['step_metadata']
+                prefix_length += length_increment
+            
+            # Continue to wait for more micro-batches (don't process normal path)
+            continue
+
+            
+        else:
+            # ========== ORIGINAL FULL-BATCH PATH ==========
+            flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+            if args_structure is not None:
+                flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
+
+            hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
+            draft_tokens = draft_tokens[0] if draft_tokens is not None and not is_dummy(draft_tokens) else None
+            batch_size, length_increment, _ = hidden_states.shape
+
+            # Fix for bus error in cross-machine setups: ensure tensors are contiguous
+            if not hidden_states.is_contiguous():
+                hidden_states = hidden_states.contiguous()
+            if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
+                prompts = prompts.contiguous()
+            if not hypo_ids.is_contiguous():
+                hypo_ids = hypo_ids.contiguous()
+            if tree_attention_mask is not None and not is_dummy(tree_attention_mask) and not tree_attention_mask.is_contiguous():
+                tree_attention_mask = tree_attention_mask.contiguous()
+            if kv_cache_position_ids is not None and not is_dummy(kv_cache_position_ids) and not kv_cache_position_ids.is_contiguous():
+                kv_cache_position_ids = kv_cache_position_ids.contiguous()
+            if draft_tokens is not None and not is_dummy(draft_tokens) and not draft_tokens.is_contiguous():
+                draft_tokens = draft_tokens.contiguous()
+            if keep_indices is not None and not is_dummy(keep_indices) and not keep_indices.is_contiguous():
+                keep_indices = keep_indices.contiguous()
+            if need_pruning1 is not None and not is_dummy(need_pruning1) and not need_pruning1.is_contiguous():
+                need_pruning1 = need_pruning1.contiguous()
+            if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) and not is_spec_dec1.is_contiguous():
+                is_spec_dec1 = is_spec_dec1.contiguous()
+                
+            need_pruning = need_pruning1 == 1 if need_pruning1 is not None and not is_dummy(need_pruning1) else False
+            is_spec_dec = is_spec_dec1 == 1 if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
+            
+            # Cache mb0 fields for future micro-batches in this request
+            if request_context is None:
+                session_id = step_metadata.get("session_id", "unknown")
+                step_id = step_metadata.get("step_id")
+                request_context = RequestContext(session_id, step_id)
+                request_context.cache_from_mb0(
+                    prompts=prompts,
+                    hypo_ids=hypo_ids,
+                    tree_attention_mask=tree_attention_mask,
+                    kv_cache_position_ids=kv_cache_position_ids,
+                    draft_tokens=draft_tokens,
+                    prefill_length=prefill_length,
+                    is_spec_dec=is_spec_dec,
+                    need_pruning=need_pruning,
+                    num_backends=len(requested_backends),
+                )
+            
+            if is_spec_dec and not need_pruning:
+                kv_cache_position_ids = _update_kv_cache_position_ids(kv_cache_position_ids, keep_indices)
+                attention_mask_indices = keep_indices[prefill_length:] - prefill_length
+                idx = attention_mask_indices
+                tree_attention_mask = tree_attention_mask[:, idx][:, :, idx]
+
             
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
