@@ -676,18 +676,48 @@ async def iterate_rpc_inference(
                     if enable_cross_stage:
                         logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled: {len(next_servers)} downstream stages")
                     
-                    async def process_microbatch_merged(mb_idx: int, mb_start: int, mb_end: int):
-                        """Process a single micro-batch through merged pool."""
+                    async def process_microbatch_merged(mb_idx: int, mb_start: int, mb_end: int, total_mb: int):
+                        """Process a single micro-batch through merged pool with GPU memory reuse."""
                         mb_start_time = _perf_counter()
+                        
+                        mb_size = mb_end - mb_start
+                        
+                        # [KVCACHE_OFFLOAD] Get cache manager for offload/prefetch operations
+                        cache_manager = requested_backends[0].cache_manager if requested_backends else None
+                        
+                        # [KVCACHE_OFFLOAD] STEP 1: Prefetch this micro-batch's KV cache from CPU
+                        # For mb_idx=0, there's nothing to prefetch yet (first run)
+                        # For mb_idx>0, restore the cached KV from CPU staging buffer
+                        if mb_idx > 0 and cache_manager is not None:
+                            if hasattr(cache_manager, 'prefetch_microbatch_kv'):
+                                cache_manager.prefetch_microbatch_kv(mb_idx)
+                            # [CRITICAL] Sync prefetch before compute to ensure data is ready
+                            if hasattr(cache_manager, 'sync_prefetch'):
+                                cache_manager.sync_prefetch()
+                            logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: prefetch+sync complete, starting compute")
                         
                         mb_hidden = hidden_states[mb_start:mb_end].clone()
                         mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
                         mb_tree_mask = tree_attention_mask[mb_start:mb_end] if tree_attention_mask is not None and not is_dummy(tree_attention_mask) else tree_attention_mask
                         mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
                         
-                        mb_size = mb_end - mb_start
+                        # [TRUE MICRO-BATCH MULTIPLEXING]
+                        # When GPU cache is sized for micro_batch_size only:
+                        # - Each micro-batch uses cache slots [0:mb_size] (same slots, recycled)
+                        # - batch_offset=0 because GPU only has mb_size slots
+                        # - full_batch_size=mb_size because that's all GPU can hold
+                        # - offload/prefetch swaps the data in/out of these fixed slots
+                        from bloombee.utils.microbatch_config import get_micro_batch_config
+                        mb_multiplex_config = get_micro_batch_config()
+                        if mb_multiplex_config['enabled']:
+                            # GPU memory multiplexing: reuse same cache slots [0:mb_size]
+                            cache_batch_offset = 0
+                            cache_full_batch_size = mb_size
+                        else:
+                            # No multiplexing: use original offsets
+                            cache_batch_offset = mb_start
+                            cache_full_batch_size = batch_size
                         
-                        # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for KV cache slicing
                         mb_inference_infos = tuple(
                             InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,
                                 tree_attention_mask=mb_tree_mask,
@@ -697,18 +727,28 @@ async def iterate_rpc_inference(
                                 keep_indices=mb_keep_idx,
                                 need_pruning=need_pruning,
                                 is_spec_dec=is_spec_dec,
-                                batch_offset=mb_start,
-                                full_batch_size=batch_size,
+                                batch_offset=cache_batch_offset,
+                                full_batch_size=cache_full_batch_size,
                                 micro_batch_size=mb_size)
                             for uid, handles in zip(requested_uids, cache_handles)
                         )
                         
+                        # [KVCACHE_OFFLOAD] STEP 2: Compute - forward pass through model
                         (mb_out_hidden, mb_out_keep) = await requested_backends[0].inference_pool.submit_task(
                             mb_hidden, mb_hypo, mb_inference_infos, *prompts, priority=priority
                         )
                         
                         mb_end_time = _perf_counter()
                         mb_timings.append((mb_idx, mb_start_time, mb_end_time))
+                        
+                        # [KVCACHE_OFFLOAD] STEP 3: Offload this micro-batch's KV cache to CPU (async)
+                        # This frees GPU memory for the next micro-batch to reuse
+                        # Don't offload the last micro-batch (we'll clear state instead)
+                        if cache_manager is not None and mb_idx < total_mb - 1:
+                            if hasattr(cache_manager, 'offload_microbatch_kv'):
+                                current_prefix = prefix_length + length_increment
+                                cache_manager.offload_microbatch_kv(mb_idx, current_prefix)
+                                logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: offload started (async)")
                         
                         # [MBPIPE] Cross-stage streaming: push ALL micro-batches to next stage immediately
                         # This enables Server2 to start processing before Server1 finishes all micro-batches
@@ -727,17 +767,19 @@ async def iterate_rpc_inference(
                         
                         return mb_out_hidden, mb_out_keep
                     
-                    # Create tasks for all micro-batches (pipeline overlap)
-                    tasks = []
+                    # [KVCACHE_OFFLOAD] Process micro-batches SEQUENTIALLY for GPU memory reuse
+                    # Parallel processing won't work because GPU only has space for ONE micro-batch
+                    results = []
+                    total_mb = len(micro_ranges)
                     for mb_idx, (mb_start, mb_end) in enumerate(micro_ranges):
-                        task = asyncio.create_task(process_microbatch_merged(mb_idx, mb_start, mb_end))
-                        tasks.append(task)
-                        # Small delay to stagger pipeline stages
-                        if mb_idx < len(micro_ranges) - 1:
-                            await asyncio.sleep(0.001)  # 1ms stagger for pipeline effect
+                        result = await process_microbatch_merged(mb_idx, mb_start, mb_end, total_mb)
+                        results.append(result)
                     
-                    # Wait for all micro-batches to complete
-                    results = await asyncio.gather(*tasks)
+                    # [KVCACHE_OFFLOAD] Clear offload state after processing all micro-batches
+                    cache_manager = requested_backends[0].cache_manager if requested_backends else None
+                    if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
+                        cache_manager.clear_offload_state()
+                    
                     pipeline_end_time = _perf_counter()
                     
                     # [MBPIPE] Wait for cross-stage push tasks (fire-and-forget style, don't block)

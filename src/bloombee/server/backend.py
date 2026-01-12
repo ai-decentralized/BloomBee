@@ -574,6 +574,80 @@ class _MergedInferenceStep:
     def __init__(self, backends: Dict[ExpertUID, TransformerBackend]):
         self.backends = backends
         self._call_count = 0  # Track number of calls for logging
+        # [KVCACHE_OFFLOAD] Track offloaded micro-batch slices: {(mb_offset, mb_size): (k_cpu, v_cpu)}
+        self._offloaded_slices: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+        # Get cache_manager from first backend for offloading operations
+        self._cache_manager = next(iter(backends.values())).cache_manager if backends else None
+
+    def _offload_completed_microbatch(self, k_cache: torch.Tensor, v_cache: torch.Tensor, 
+                                       mb_offset: int, mb_size: int, num_heads: int) -> None:
+        """
+        [KVCACHE_OFFLOAD] Copy micro-batch KV slice from GPU to CPU staging.
+        Called after all blocks complete for this micro-batch.
+        """
+        if k_cache is None or v_cache is None:
+            return
+        
+        # Calculate BH (batch * heads) slice for this micro-batch
+        BH_start = mb_offset * num_heads
+        BH_end = (mb_offset + mb_size) * num_heads
+        
+        try:
+            # k_cache shape: (S, BH_total, D), v_cache shape: (S, BH_total, D)
+            k_slice = k_cache[:, BH_start:BH_end, :].clone()
+            v_slice = v_cache[:, BH_start:BH_end, :]
+            
+            # Async copy to CPU (non-blocking for performance)
+            k_cpu = k_slice.to('cpu', non_blocking=True)
+            v_cpu = v_slice.to('cpu', non_blocking=True)
+            
+            # Store in offload tracking dict
+            key = (mb_offset, mb_size)
+            self._offloaded_slices[key] = (k_cpu, v_cpu)
+            
+            # Clear GPU slice (optional - helps memory but may not be needed if we just reuse)
+            # We don't zero it here as it may be reused in next iteration
+            
+            offload_logger.info(
+                f"[KVCACHE_OFFLOAD] Offloaded: mb_offset={mb_offset}, mb_size={mb_size}, "
+                f"BH=[{BH_start}:{BH_end}], k_shape={k_cpu.shape}"
+            )
+        except Exception as e:
+            offload_logger.warning(f"[KVCACHE_OFFLOAD] Offload failed: {e}")
+
+    def _prefetch_if_needed(self, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                             mb_offset: int, mb_size: int, num_heads: int) -> None:
+        """
+        [KVCACHE_OFFLOAD] Copy micro-batch KV slice from CPU back to GPU if previously offloaded.
+        Called before processing a micro-batch.
+        """
+        key = (mb_offset, mb_size)
+        if key not in self._offloaded_slices:
+            return  # Not offloaded, nothing to prefetch
+        
+        if k_cache is None or v_cache is None:
+            return
+            
+        k_cpu, v_cpu = self._offloaded_slices[key]
+        
+        # Calculate BH slice
+        BH_start = mb_offset * num_heads
+        BH_end = (mb_offset + mb_size) * num_heads
+        
+        try:
+            # Async copy back to GPU
+            k_cache[:, BH_start:BH_end, :].copy_(k_cpu.to(k_cache.device, non_blocking=True))
+            v_cache[:, BH_start:BH_end, :].copy_(v_cpu.to(v_cache.device, non_blocking=True))
+            
+            # Remove from tracking
+            del self._offloaded_slices[key]
+            
+            offload_logger.info(
+                f"[KVCACHE_OFFLOAD] Prefetched: mb_offset={mb_offset}, mb_size={mb_size}, "
+                f"BH=[{BH_start}:{BH_end}]"
+            )
+        except Exception as e:
+            offload_logger.warning(f"[KVCACHE_OFFLOAD] Prefetch failed: {e}")
 
     @torch.inference_mode()
     def __call__(
@@ -593,11 +667,42 @@ class _MergedInferenceStep:
             batch_size = hidden_states.shape[0] if hidden_states.ndim >= 1 else 1
             mbpipe_log_path_entry(logger, "backend._MergedInferenceStep", batch_size=batch_size)
         
-        # print('............... come into the _MergedInferenceStep __call__' )
+        # [KVCACHE_OFFLOAD] Get micro-batch info from first inference_info
+        mb_info = inference_infos[0] if inference_infos else None
+        mb_offset = getattr(mb_info, 'batch_offset', None) if mb_info else None
+        mb_size = getattr(mb_info, 'micro_batch_size', None) if mb_info else None
+        full_batch_size = getattr(mb_info, 'full_batch_size', None) if mb_info else None
+        
+        # Determine if this is a micro-batch run (not full batch)
+        is_microbatch_run = (mb_offset is not None and mb_size is not None and 
+                            full_batch_size is not None and mb_size < full_batch_size)
+        
+        # Get num_heads from first backend for BH calculation
+        first_backend = next(iter(self.backends.values()))
+        num_heads = sum(first_backend.shard_num_heads)
+        
+        # [KVCACHE_OFFLOAD] Prefetch if this micro-batch was previously offloaded
+        # This happens when we're cycling through micro-batches in a generate loop
+        if is_microbatch_run and self._cache_manager and self._cache_manager._active_cache_tensors_stack:
+            k_cache, v_cache = self._cache_manager._active_cache_tensors_stack[-1]
+            if hasattr(k_cache, 'data'):  # AdaptedKVCache wrapper
+                k_cache, v_cache = k_cache.data, v_cache.data
+            self._prefetch_if_needed(k_cache, v_cache, mb_offset, mb_size, num_heads)
+        
+        # Process all blocks for this micro-batch
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:
                 hidden_states[:, : optional_prompt.shape[1]] += optional_prompt
-            # print('............... come into the _MergedInferenceStep __call__ inference_info.uid ', inference_info.uid)
-            (hidden_states, keep_indices) = self.backends[inference_info.uid].inference_step(hidden_states, hypo_ids, inference_info)
-        # import pdb; pdb.set_trace()
+            (hidden_states, keep_indices) = self.backends[inference_info.uid].inference_step(
+                hidden_states, hypo_ids, inference_info
+            )
+        
+        # [KVCACHE_OFFLOAD] After all blocks complete, offload this micro-batch's KV to CPU
+        # This frees GPU memory for the next micro-batch to use
+        if is_microbatch_run and self._cache_manager and self._cache_manager._active_cache_tensors_stack:
+            k_cache, v_cache = self._cache_manager._active_cache_tensors_stack[-1]
+            if hasattr(k_cache, 'data'):
+                k_cache, v_cache = k_cache.data, v_cache.data
+            self._offload_completed_microbatch(k_cache, v_cache, mb_offset, mb_size, num_heads)
+        
         return (hidden_states, keep_indices)

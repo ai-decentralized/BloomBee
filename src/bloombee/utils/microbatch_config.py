@@ -25,7 +25,7 @@ ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
-DEFAULT_MICRO_BATCH_SIZE = 2  # Default micro-batch size for pipeline overlap
+DEFAULT_MICRO_BATCH_SIZE = 4  # Default micro-batch size for pipeline overlap
 
 
 def is_microbatch_enabled() -> bool:
@@ -61,6 +61,21 @@ def get_micro_batch_size() -> int:
         return size
     except ValueError:
         return DEFAULT_MICRO_BATCH_SIZE
+
+
+def get_micro_batch_config() -> dict:
+    """
+    Get the complete micro-batch configuration as a dictionary.
+    
+    Returns:
+        A dictionary with:
+        - 'enabled': bool - whether micro-batching is enabled
+        - 'micro_batch_size': int - the configured micro-batch size
+    """
+    return {
+        'enabled': is_microbatch_enabled(),
+        'micro_batch_size': get_micro_batch_size()
+    }
 
 
 def get_current_path() -> str:
@@ -147,8 +162,12 @@ def should_split_batch(batch_size: int) -> bool:
         return False
     
     micro_batch_size = get_micro_batch_size()
+    # If micro_batch_size <= 0, don't split (disabled)
+    if micro_batch_size <= 0:
+        return False
     # Only split if batch is larger than micro-batch size
     return batch_size > micro_batch_size
+
 
 
 def compute_micro_batch_ranges(batch_size: int) -> List[Tuple[int, int]]:

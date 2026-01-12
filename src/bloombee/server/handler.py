@@ -1309,22 +1309,37 @@ class TransformerConnectionHandler(ConnectionHandler):
         # Use KVCacheManager's offloading strategy
         cache_manager = backends[0].cache_manager
 
-        # Enforce server-side batch capacity to avoid silent cache corruption
+        # [TRUE MICRO-BATCH MULTIPLEXING] 
+        # When micro-batching is enabled:
+        # - GPU cache is sized for micro_batch_size only
+        # - Client can request larger batch_size (handled via offload/prefetch)
+        # - Each micro-batch reuses the same GPU cache slots
+        from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
+        mb_config = get_micro_batch_config()
         policy = cache_manager.offloading_policy
         max_supported_batch = policy.gpu_batch_size
-        if batch_size > max_supported_batch:
-            raise AllocationFailed(
-                f"Requested batch size {batch_size} exceeds server capacity "
-                f"{max_supported_batch}. Reduce client batch size or restart the "
-                f"server with a larger --batch_size value."
-            )
+        
+        if mb_config['enabled']:
+            # Micro-batching enabled: GPU allocates for micro_batch_size, client can request larger batches
+            alloc_batch_size = get_micro_batch_size()
+            logger.info(f"[MB_MULTIPLEX_ALLOC] client batch_size={batch_size}, GPU alloc_batch_size={alloc_batch_size} "
+                       f"(micro-batch multiplexing enabled)")
+        else:
+            # Micro-batching disabled: enforce strict batch limit
+            alloc_batch_size = batch_size
+            if batch_size > max_supported_batch:
+                raise AllocationFailed(
+                    f"Requested batch size {batch_size} exceeds server capacity "
+                    f"{max_supported_batch}. Reduce client batch size or restart the "
+                    f"server with a larger --batch_size value."
+                )
 
-        # Use the original cache allocation method, but add offloading debug information
-        descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
+        # Allocate cache descriptors for alloc_batch_size (= micro_batch_size when MB enabled)
+        descriptors = [backend.get_inference_cache_descriptors(alloc_batch_size, max_length) for backend in backends]
 
         logger.info(
             f"OFFLOAD: requesting KV allocation for {len(backends)} blocks, "
-            f"batch={batch_size}, max_length={max_length}"
+            f"alloc_batch={alloc_batch_size}, client_batch={batch_size}, max_length={max_length}"
         )
         async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as raw_handles:
             logger.info("OFFLOAD: allocation completed; entering use_cache region")

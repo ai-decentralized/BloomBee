@@ -39,6 +39,22 @@ class KVCacheManager:
         self.max_alloc_timeout = max_alloc_timeout
         self._active_cache_tensors_stack = []
         
+        # [KVCACHE_OFFLOAD] Micro-batch level memory reuse state
+        # With micro-batch-scoped allocation, GPU cache shape = (S, micro_batch_size * H, D)
+        # We maintain per-micro-batch CPU staging buffers to swap cache content
+        self._mb_cpu_staging = {}  # {mb_index: (k_cpu, v_cpu)} - CPU buffers for each offloaded micro-batch
+        self._current_gpu_mb = None  # Which micro-batch currently owns GPU cache (0, 1, 2, ...)
+        self._offload_enabled = True  # Enable/disable offloading
+        
+        # [KVCACHE_OFFLOAD] CUDA streams for async data transfer (created lazily)
+        # offload_stream: GPU->CPU transfer (runs async while next micro-batch computes)
+        # prefetch_stream: CPU->GPU transfer (runs async before compute starts)
+        # NOTE: Streams are created lazily to ensure correct device context
+        self._offload_stream = None
+        self._prefetch_stream = None
+        self._prefetch_event = None  # Event to sync prefetch completion
+        self._streams_device = None  # Track which device streams were created on
+        
         
     def get_cache_device(self, policy):
         if policy.cache_gpu_percent == 100:
@@ -229,12 +245,72 @@ class KVCacheManager:
 
         # 1) Materialize to (S, BH, D) torch.Tensor (located on compute_dst)
         if path == 0:
-            # Directly slice prefix on compute_dst (view for same device, copy/decompress for cross-device)
-            k_sel, _ = k_cache.smart_copy(compute_dst, idx_all)
-            v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
-            k_sbh = _as_torch(k_sel)
-            v_sbh = _as_torch(v_sel)
-            # logger.info(f"k_cache: {k_cache.shape}, k_sbh: {k_sbh.shape}")
+            # [KVCACHE_OFFLOAD] Handle TorchMixedDevice reading for micro-batch correctly
+            # When cache is MixedDevice and we're reading a BH slice, we need to manually
+            # read from each segment and concatenate, because general_copy's cut_indices
+            # doesn't work correctly for micro-batch BH offsets
+            from bloombee.flexgen_utils.pytorch_backend import DeviceType
+            
+            if hasattr(k_cache, 'device') and getattr(k_cache.device, 'device_type', None) == DeviceType.MIXED:
+                # TorchMixedDevice: manually read from each segment and concatenate
+                tensors, seg_points = k_cache.data  # ([gpu_tensor, cpu_tensor, ...], [0, seg1, seg2, ...])
+                v_tensors, _ = v_cache.data
+                
+                s_slice, bh_slice = idx_all[:2]
+                bh_start, bh_end = bh_slice.start, bh_slice.stop
+                
+                logger.info(f"[KVCACHE_OFFLOAD] select_cache MixedDevice: seg_points={seg_points}, "
+                            f"bh_range=[{bh_start}:{bh_end}], prefix_length={prefix_length}")
+                
+                k_parts = []
+                v_parts = []
+                
+                for i, (k_seg, v_seg) in enumerate(zip(tensors, v_tensors)):
+                    if k_seg is None:
+                        continue
+                    seg_start = seg_points[i]
+                    seg_end = seg_points[i + 1]
+                    
+                    # Calculate overlap between requested BH range and this segment
+                    overlap_start = max(bh_start, seg_start)
+                    overlap_end = min(bh_end, seg_end)
+                    
+                    if overlap_start < overlap_end:
+                        # There is overlap, read from this segment
+                        # Segment-local indices
+                        local_bh_start = overlap_start - seg_start
+                        local_bh_end = overlap_end - seg_start
+                        
+                        logger.debug(f"[KVCACHE_OFFLOAD] select_cache seg[{i}]: "
+                                    f"seg_range=[{seg_start}:{seg_end}], local_bh=[{local_bh_start}:{local_bh_end}]")
+                        
+                        # Get underlying tensor data
+                        k_data = k_seg.data if hasattr(k_seg, 'data') else k_seg
+                        v_data = v_seg.data if hasattr(v_seg, 'data') else v_seg
+                        
+                        # Read the slice: (S, local_bh, D)
+                        k_part = k_data[s_slice, local_bh_start:local_bh_end, :].to(compute_dst.dev, non_blocking=True)
+                        v_part = v_data[s_slice, local_bh_start:local_bh_end, :].to(compute_dst.dev, non_blocking=True)
+                        
+                        k_parts.append(k_part)
+                        v_parts.append(v_part)
+                
+                # Concatenate all parts along BH dimension
+                if len(k_parts) == 1:
+                    k_sbh = k_parts[0]
+                    v_sbh = v_parts[0]
+                else:
+                    k_sbh = torch.cat(k_parts, dim=1)
+                    v_sbh = torch.cat(v_parts, dim=1)
+                    
+                logger.debug(f"[KVCACHE_OFFLOAD] select_cache MixedDevice result: k_sbh.shape={k_sbh.shape}")
+            else:
+                # Non-MixedDevice: use original smart_copy path
+                k_sel, _ = k_cache.smart_copy(compute_dst, idx_all)
+                v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
+                k_sbh = _as_torch(k_sel)
+                v_sbh = _as_torch(v_sel)
+            # logger.info(f\"k_cache: {k_cache.shape}, k_sbh: {k_sbh.shape}\")
 
         elif path == 1:
             # Use compute_dst workspace to carry (S, BH, D)
@@ -308,6 +384,218 @@ class KVCacheManager:
         except Exception as e:
             logger.warning(f"OFFLOAD: delete_cache failed for handles={handles}: {e}")
     
+    # ==================== [KVCACHE_OFFLOAD] Micro-batch Offloading ====================
+    
+    def _ensure_streams_initialized(self, device=None):
+        """
+        Lazily initialize CUDA streams on the correct device.
+        
+        This ensures streams are created in the proper device context, avoiding
+        CUDA initialization errors on multi-GPU setups.
+        """
+        if not torch.cuda.is_available():
+            return
+            
+        # Determine device from input or current CUDA context
+        if device is None:
+            device = torch.cuda.current_device()
+        elif hasattr(device, 'index'):
+            device = device.index
+        elif isinstance(device, torch.device) and device.type == 'cuda':
+            device = device.index if device.index is not None else 0
+        
+        # Create streams if not already created for this device
+        if self._offload_stream is None or self._streams_device != device:
+            with torch.cuda.device(device):
+                self._offload_stream = torch.cuda.Stream()
+                self._prefetch_stream = torch.cuda.Stream()
+                self._streams_device = device
+                logger.debug(f"[KVCACHE_OFFLOAD] Created CUDA streams on device {device}")
+    
+    def offload_microbatch_kv(self, mb_index: int, prefix_length: int = 0):
+        """
+        Offload current micro-batch's entire KV cache from GPU to CPU using CUDA stream.
+        
+        With micro-batch level memory reuse, GPU cache holds ONE micro-batch at a time.
+        This function saves the entire GPU cache content to a per-micro-batch CPU buffer
+        asynchronously, allowing GPU memory to be reused by the next micro-batch while
+        the offload is still in progress.
+        
+        Args:
+            mb_index: Index of the micro-batch (0, 1, 2, ...) to identify which staging buffer
+            prefix_length: Sequence length to offload (0 = full sequence)
+        """
+        if not self._offload_enabled:
+            return
+        if not self._active_cache_tensors_stack:
+            logger.debug("[KVCACHE_OFFLOAD] No active cache, skipping offload")
+            return
+            
+        cache_tensors = self._active_cache_tensors_stack[-1]
+        (k_cache, v_cache), = cache_tensors
+        
+        try:
+            # Get underlying torch tensors
+            k_data = k_cache.data if hasattr(k_cache, 'data') else k_cache
+            v_data = v_cache.data if hasattr(v_cache, 'data') else v_cache
+            
+            # Check if data is on GPU
+            if not k_data.is_cuda:
+                logger.debug(f"[KVCACHE_OFFLOAD] Cache not on GPU (device={k_data.device}), skipping offload")
+                return
+            
+            # Initialize streams on the correct device
+            self._ensure_streams_initialized(k_data.device)
+            
+            S_total, BH_mb, D = k_data.shape  # BH_mb = micro_batch_size * num_heads
+            
+            # Use full sequence if not specified
+            if prefix_length <= 0:
+                prefix_length = S_total
+            
+            # Create or reuse CPU staging buffer for this micro-batch
+            if mb_index not in self._mb_cpu_staging:
+                k_cpu = torch.empty((S_total, BH_mb, D), dtype=k_data.dtype, device='cpu', pin_memory=True)
+                v_cpu = torch.empty((S_total, BH_mb, D), dtype=v_data.dtype, device='cpu', pin_memory=True)
+                self._mb_cpu_staging[mb_index] = (k_cpu, v_cpu, 0)  # (k, v, prefix_len)
+                logger.info(f"[KVCACHE_OFFLOAD] Created CPU staging for mb_index={mb_index}, shape=({S_total}, {BH_mb}, {D})")
+            
+            k_cpu, v_cpu, prev_len = self._mb_cpu_staging[mb_index]
+            
+            # [ASYNC OFFLOAD] Use CUDA stream for async GPU->CPU transfer
+            # This allows the next micro-batch to start computing while offload runs
+            if self._offload_stream is not None:
+                with torch.cuda.stream(self._offload_stream):
+                    k_cpu[:prefix_length].copy_(k_data[:prefix_length], non_blocking=True)
+                    v_cpu[:prefix_length].copy_(v_data[:prefix_length], non_blocking=True)
+            else:
+                # Fallback: synchronous copy
+                k_cpu[:prefix_length].copy_(k_data[:prefix_length], non_blocking=True)
+                v_cpu[:prefix_length].copy_(v_data[:prefix_length], non_blocking=True)
+            
+            # Update tracking
+            self._mb_cpu_staging[mb_index] = (k_cpu, v_cpu, prefix_length)
+            self._current_gpu_mb = None  # GPU is now free for reuse
+            
+            # Calculate memory
+            bytes_offloaded = k_data[:prefix_length].numel() * k_data.element_size() * 2
+            mb_offloaded = bytes_offloaded / (1024 * 1024)
+            
+            logger.info(f"[KVCACHE_OFFLOAD] Offloaded mb_index={mb_index}, S={prefix_length}, MB={mb_offloaded:.2f} (async)")
+            
+        except Exception as e:
+            logger.warning(f"[KVCACHE_OFFLOAD] Offload failed: {e}", exc_info=True)
+    
+    def prefetch_microbatch_kv(self, mb_index: int):
+        """
+        Prefetch specified micro-batch's entire KV cache from CPU back to GPU using CUDA stream.
+        
+        With micro-batch level memory reuse, this restores the specified micro-batch's
+        cache content from its CPU staging buffer to the GPU cache asynchronously,
+        overwriting whatever was previously in GPU memory.
+        
+        Call sync_prefetch() to ensure prefetch completes before using the cache.
+        
+        Args:
+            mb_index: Index of the micro-batch (0, 1, 2, ...) to prefetch
+        """
+        if not self._offload_enabled:
+            return
+            
+        if mb_index not in self._mb_cpu_staging:
+            logger.debug(f"[KVCACHE_OFFLOAD] mb_index={mb_index} not in CPU staging, skipping prefetch")
+            return
+            
+        if not self._active_cache_tensors_stack:
+            logger.debug("[KVCACHE_OFFLOAD] No active cache, skipping prefetch")
+            return
+            
+        cache_tensors = self._active_cache_tensors_stack[-1]
+        (k_cache, v_cache), = cache_tensors
+        
+        try:
+            # Get underlying torch tensors
+            k_data = k_cache.data if hasattr(k_cache, 'data') else k_cache
+            v_data = v_cache.data if hasattr(v_cache, 'data') else v_cache
+            
+            # Check if data is on GPU
+            if not k_data.is_cuda:
+                logger.debug(f"[KVCACHE_OFFLOAD] Cache not on GPU (device={k_data.device}), skipping prefetch")
+                return
+            
+            # Initialize streams on the correct device
+            self._ensure_streams_initialized(k_data.device)
+            
+            # Get CPU staging data
+            k_cpu, v_cpu, prefix_length = self._mb_cpu_staging[mb_index]
+            
+            if prefix_length <= 0:
+                logger.warning(f"[KVCACHE_OFFLOAD] mb_index={mb_index} has zero prefix_length, skipping")
+                return
+            
+            # [ASYNC PREFETCH] Use CUDA stream for async CPU->GPU transfer
+            if self._prefetch_stream is not None:
+                with torch.cuda.stream(self._prefetch_stream):
+                    k_data[:prefix_length].copy_(k_cpu[:prefix_length], non_blocking=True)
+                    v_data[:prefix_length].copy_(v_cpu[:prefix_length], non_blocking=True)
+                    # Record event for synchronization
+                    self._prefetch_event = torch.cuda.Event()
+                    self._prefetch_event.record(self._prefetch_stream)
+            else:
+                # Fallback: synchronous copy
+                k_data[:prefix_length].copy_(k_cpu[:prefix_length], non_blocking=True)
+                v_data[:prefix_length].copy_(v_cpu[:prefix_length], non_blocking=True)
+            
+            # Update tracking - this micro-batch now owns GPU
+            self._current_gpu_mb = mb_index
+            
+            bytes_prefetched = k_cpu[:prefix_length].numel() * k_cpu.element_size() * 2
+            mb_prefetched = bytes_prefetched / (1024 * 1024)
+            
+            logger.info(f"[KVCACHE_OFFLOAD] Prefetched mb_index={mb_index}, S={prefix_length}, MB={mb_prefetched:.2f} (async)")
+            
+        except Exception as e:
+            logger.warning(f"[KVCACHE_OFFLOAD] Prefetch failed: {e}", exc_info=True)
+    
+    def sync_prefetch(self):
+        """
+        Wait for async prefetch to complete.
+        
+        Call this after prefetch_microbatch_kv() and before using the cache
+        to ensure the CPU->GPU transfer has finished.
+        """
+        if self._prefetch_event is not None:
+            self._prefetch_event.synchronize()
+            self._prefetch_event = None
+            logger.debug("[KVCACHE_OFFLOAD] Prefetch sync complete")
+    
+    def sync_offload(self):
+        """
+        Wait for async offload to complete.
+        
+        Call this to ensure GPU->CPU transfer has finished before freeing GPU memory
+        or before prefetching a new micro-batch that would overwrite the cache.
+        """
+        if self._offload_stream is not None and self._streams_device is not None:
+            try:
+                with torch.cuda.device(self._streams_device):
+                    self._offload_stream.synchronize()
+                logger.debug("[KVCACHE_OFFLOAD] Offload sync complete")
+            except Exception as e:
+                logger.warning(f"[KVCACHE_OFFLOAD] Offload sync failed: {e}")
+    
+    def clear_offload_state(self):
+        """Clear all offload tracking state and free CPU staging buffers."""
+        # Ensure any pending offload completes (only if streams were used)
+        if self._offload_stream is not None and self._mb_cpu_staging:
+            self.sync_offload()
+        num_cleared = len(self._mb_cpu_staging)
+        self._mb_cpu_staging.clear()
+        self._current_gpu_mb = None
+        self._prefetch_event = None
+        if num_cleared > 0:
+            logger.info(f"[KVCACHE_OFFLOAD] Cleared offload state: {num_cleared} micro-batches")
+    
     def _write_kvs(self, kvs, start_position: int, batch_offset: int = 0, full_batch_size: int = 0, micro_batch_size: int = 0) -> None:
         """
         Write new_kvs to current active cache:
@@ -357,23 +645,51 @@ class KVCacheManager:
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
         
         # [MBPIPE] Debug log source shape
-        logger.debug(f"[MBPIPE] _write_kvs SRC: key={key_t.shape}, BH_src={BH_src}, s_new={s_new}")
+        H = getattr(self.block_config, "num_attention_heads", 32)  # Default to 32 heads for LLaMA-7B
+        actual_batch_src = BH_src // H if H > 0 else 1
+        actual_batch_dst = BH_dst // H if H > 0 else 1
+        logger.info(f"[MBPIPE_DEBUG] _write_kvs: BH_src={BH_src}, BH_dst={BH_dst}, H={H}, "
+                    f"batch_src={actual_batch_src}, batch_dst={actual_batch_dst}, "
+                    f"full_batch_size={full_batch_size}, batch_offset={batch_offset}, micro_batch_size={micro_batch_size}")
 
         # Micro-batch support: compute BH offset for batch slicing
-        H = getattr(self.block_config, "num_attention_heads", BH_dst)
+        # [MBPIPE_MULTIPLEX] Check if GPU memory multiplexing is enabled
+        from bloombee.utils.microbatch_config import get_micro_batch_config
+        mb_config = get_micro_batch_config()
+        gpu_multiplexing = mb_config['enabled'] and (BH_dst == mb_config['micro_batch_size'] * H)
+        
         if full_batch_size > 0:
-            # Micro-batch mode: BH_src is for micro-batch, BH_dst is for full batch
+            # Micro-batch mode: BH_src is for micro-batch, BH_dst is for full batch or just micro_batch
             micro_batch_size = BH_src // H
-            BH_offset_start = batch_offset * H
-            BH_offset_end = BH_offset_start + BH_src
-            assert BH_offset_end <= BH_dst, f"BH offset out of bounds: {BH_offset_end} > {BH_dst}"
+            
+            if gpu_multiplexing:
+                # [MBPIPE_MULTIPLEX] GPU memory multiplexing: cache only holds micro_batch_size slots
+                # Always write to [0:BH_src], offload/prefetch handles data swapping
+                BH_offset_start = 0
+                BH_offset_end = BH_src
+                logger.debug(f"[MBPIPE_MULTIPLEX] _write_kvs: GPU multiplexing active, writing to [0:{BH_src}] "
+                            f"(batch_offset={batch_offset} ignored, gpu_cache_batch={mb_config['micro_batch_size']})")
+            else:
+                # Standard micro-batch mode: cache holds full batch, use batch_offset
+                BH_offset_start = batch_offset * H
+                BH_offset_end = BH_offset_start + BH_src
+                if BH_offset_end > BH_dst:
+                    logger.error(f"[MBPIPE_DEBUG] BH offset out of bounds: {BH_offset_end} > {BH_dst}, "
+                                f"clamping to BH_dst={BH_dst}")
+                    BH_offset_end = BH_dst
             logger.debug(f"[MBPIPE] _write_kvs MICRO: BH_slice=[{BH_offset_start}:{BH_offset_end}]")
         else:
-            # Full batch mode: BH_src should match BH_dst
-            assert BH_src == BH_dst, f"BH mismatch: src {BH_src} vs dst {BH_dst}"
-            BH_offset_start = 0
-            BH_offset_end = BH_src
-            logger.debug(f"[MBPIPE] _write_kvs FULL: BH_slice=[0:{BH_src}]")
+            # Full batch mode: if BH_src < BH_dst, auto-adapt by writing to first BH_src entries
+            # This handles the case where request batch_size < server cache batch_size
+            if BH_src <= BH_dst:
+                BH_offset_start = 0
+                BH_offset_end = BH_src
+                if BH_src < BH_dst:
+                    logger.info(f"[MBPIPE_DEBUG] Auto-adapting: writing first {BH_src} of {BH_dst} BH entries (batch {actual_batch_src} of {actual_batch_dst})")
+                logger.debug(f"[MBPIPE] _write_kvs FULL: BH_slice=[0:{BH_src}]")
+            else:
+                # This should not happen - source is larger than destination
+                raise AssertionError(f"BH mismatch: src {BH_src} > dst {BH_dst}, cannot write")
 
         end_position = start_position + s_new
         if not (0 <= start_position < S_total and end_position <= S_total):
@@ -407,9 +723,68 @@ class KVCacheManager:
         k_src_tt = TorchTensor.create_from_torch(k_write, self.attention_compute)
         v_src_tt = TorchTensor.create_from_torch(v_write, self.attention_compute)
 
-        # Actual write
-        general_copy(k_cache, dst_idx, k_src_tt, None)
-        general_copy(v_cache, dst_idx, v_src_tt, None)
+        # [KVCACHE_OFFLOAD] Handle TorchMixedDevice (GPU+CPU split) properly for micro-batch slicing
+        # The issue: general_copy's cut_indices uses segment boundaries on BOTH src and dst,
+        # but for micro-batch, src size != dst slice size (e.g., src=128 but dst_idx spans [128:256])
+        from bloombee.flexgen_utils.pytorch_backend import DeviceType
+        
+        def _write_to_cache(cache, src_tt, dst_idx, cache_name):
+            """Write source tensor to cache, handling TorchMixedDevice segment splitting."""
+            if hasattr(cache, 'device') and getattr(cache.device, 'device_type', None) == DeviceType.MIXED:
+                # TorchMixedDevice: manually split writes across segments
+                tensors, seg_points = cache.data  # ([gpu_tensor, cpu_tensor, ...], [0, seg1, seg2, ...])
+                s_slice, bh_slice, d_slice = dst_idx
+                bh_start, bh_end = bh_slice.start, bh_slice.stop
+                
+                logger.debug(f"[KVCACHE_OFFLOAD] {cache_name} is MixedDevice, seg_points={seg_points}, "
+                            f"bh_range=[{bh_start}:{bh_end}]")
+                
+                # Track position in source tensor
+                src_offset = 0
+                
+                for i, seg_tensor in enumerate(tensors):
+                    if seg_tensor is None:
+                        continue
+                    seg_start = seg_points[i]
+                    seg_end = seg_points[i + 1]
+                    
+                    # Calculate overlap between dst BH range and this segment
+                    overlap_start = max(bh_start, seg_start)
+                    overlap_end = min(bh_end, seg_end)
+                    
+                    if overlap_start < overlap_end:
+                        # There is overlap, need to write to this segment
+                        overlap_len = overlap_end - overlap_start
+                        
+                        # Source: take next overlap_len elements
+                        src_slice_start = src_offset
+                        src_slice_end = src_offset + overlap_len
+                        
+                        # Destination: offset within this segment
+                        dst_bh_start = overlap_start - seg_start
+                        dst_bh_end = dst_bh_start + overlap_len
+                        
+                        logger.debug(f"[KVCACHE_OFFLOAD] {cache_name} seg[{i}]: src_bh=[{src_slice_start}:{src_slice_end}], "
+                                    f"dst_bh=[{dst_bh_start}:{dst_bh_end}]")
+                        
+                        # Slice source data
+                        src_data = src_tt.data[:, src_slice_start:src_slice_end, :]
+                        
+                        # Get destination tensor data and write
+                        if hasattr(seg_tensor, 'data'):
+                            dst_data = seg_tensor.data[s_slice, dst_bh_start:dst_bh_end, d_slice]
+                            dst_data.copy_(src_data, non_blocking=True)
+                        else:
+                            seg_tensor[s_slice, dst_bh_start:dst_bh_end, d_slice].copy_(src_data, non_blocking=True)
+                        
+                        src_offset += overlap_len
+            else:
+                # Non-MixedDevice: use regular general_copy
+                general_copy(cache, dst_idx, src_tt, None)
+        
+        # Actual write with MixedDevice handling
+        _write_to_cache(k_cache, k_src_tt, dst_idx, "k_cache")
+        _write_to_cache(v_cache, v_src_tt, dst_idx, "v_cache")
     
     def write_pkv_cache(self, k_pkv: torch.Tensor, v_pkv: torch.Tensor, start_position: int = 0) -> None:
         assert self._active_cache_tensors_stack, "write_pkv_cache called outside of use_cache context"
