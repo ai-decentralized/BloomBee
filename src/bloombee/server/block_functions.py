@@ -303,6 +303,9 @@ async def iterate_rpc_inference(
         # Handle cross-stage micro-batches with 2-tensor format
         # Process each immediately (for pipeline overlap) but accumulate results
         if step_metadata.get("type") == "micro_batch":
+            import time as _time
+            receive_timestamp_us = int(_time.time() * 1_000_000)  # Absolute timestamp for correlation
+            
             mb_idx = step_metadata.get("mb_idx", 0)
             expected_num_mb = step_metadata.get("expected_num_mb", 1)
             mb_offset = step_metadata.get("offset", 0)
@@ -310,6 +313,39 @@ async def iterate_rpc_inference(
             full_batch_size = step_metadata.get("full_batch_size", mb_size)
             step_id = step_metadata.get("step_id")
             
+            # [CROSS_STAGE] Calculate overlap metrics
+            push_timestamp_us = step_metadata.get("stage_push_timestamp_us", 0)
+            compute_start_timestamp_us = step_metadata.get("stage_compute_start_timestamp_us", 0)
+            transfer_latency_us = receive_timestamp_us - push_timestamp_us if push_timestamp_us > 0 else 0
+            
+            # [CROSS_STAGE] Pipeline overlap: If previous stage started MB1 compute before we receive MB0,
+            # there's potential for overlap (prev stage works on MB1 while we work on MB0)
+            logger.info(
+                f"[CROSS_STAGE] Stage receives MB{mb_idx} at t={receive_timestamp_us}, "
+                f"push_at={push_timestamp_us}, transfer_latency={transfer_latency_us/1000:.2f}ms"
+            )
+            
+            # [CROSS_STAGE_OVERLAP] Track timing data for overlap calculation
+            # Key insight: True cross-stage overlap means Stage1 processes MB_{n+1} while Stage2 processes MB_n
+            # We store: prev_stage_compute_start (when prev stage STARTED computing this MB)
+            #           this_stage_receive_time (when we received this MB)
+            overlap_tracking_key = (step_metadata.get("session_id", "unknown"), step_metadata.get("step_id"))
+            if not hasattr(iterate_rpc_inference, '_cross_stage_overlap_data'):
+                iterate_rpc_inference._cross_stage_overlap_data = {}
+            if overlap_tracking_key not in iterate_rpc_inference._cross_stage_overlap_data:
+                iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key] = {}
+            
+            iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key][mb_idx] = {
+                'prev_stage_compute_start_us': compute_start_timestamp_us,
+                'this_stage_receive_us': receive_timestamp_us,
+                'transfer_latency_us': transfer_latency_us,
+            }
+            
+            if compute_start_timestamp_us > 0:
+                logger.info(
+                    f"[CROSS_STAGE] Prev stage started MB{mb_idx} compute at t={compute_start_timestamp_us}, "
+                    f"we can now start processing (overlap opportunity exists!)"
+                )
             logger.info(
                 f"{MBPIPE_LOG_PREFIX} iterate_rpc_inference: processing micro-batch "
                 f"mb_idx={mb_idx}/{expected_num_mb}, offset={mb_offset}, size={mb_size}, full_batch={full_batch_size}"
@@ -447,6 +483,53 @@ async def iterate_rpc_inference(
                         )
             
             process_time_ms = (perf_counter() - process_start_time) * 1000
+            compute_done_timestamp_us = int(_time.time() * 1_000_000)
+            compute_start_timestamp_us_this = int((perf_counter() - (process_time_ms / 1000)) * 1_000_000)  # Approximate
+            
+            # [CROSS_STAGE] Log compute completion for overlap analysis
+            # This shows when Stage i+1 finishes computing MB n
+            # Overlap = (Stage i starts MB n+1) while (Stage i+1 still processing MB n)
+            logger.info(
+                f"[CROSS_STAGE] Stage completes MB{mb_idx} at t={compute_done_timestamp_us}, "
+                f"process_time={process_time_ms:.1f}ms"
+            )
+            
+            # [CROSS_STAGE_OVERLAP] Record this stage's compute times and calculate overlap
+            overlap_tracking_key = (step_metadata.get("session_id", "unknown"), step_metadata.get("step_id"))
+            if hasattr(iterate_rpc_inference, '_cross_stage_overlap_data') and \
+               overlap_tracking_key in iterate_rpc_inference._cross_stage_overlap_data and \
+               mb_idx in iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]:
+                
+                overlap_data = iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key][mb_idx]
+                overlap_data['this_stage_compute_start_us'] = compute_done_timestamp_us - int(process_time_ms * 1000)
+                overlap_data['this_stage_compute_end_us'] = compute_done_timestamp_us
+                overlap_data['this_stage_process_time_ms'] = process_time_ms
+                
+                # Calculate cross-stage overlap for THIS micro-batch:
+                # True overlap happens when: prev_stage was still computing THIS MB's successor (MB_n+1)
+                # while this stage was computing THIS MB (MB_n)
+                # 
+                # For MB_n:
+                #   - Prev stage started computing MB_n at: prev_stage_compute_start_us
+                #   - Prev stage sent MB_n and started MB_{n+1}: we can infer from next MB's data
+                #   - This stage received MB_n at: this_stage_receive_us
+                #   - This stage completed MB_n at: this_stage_compute_end_us
+                #
+                # Overlap = max(0, min(this_stage_compute_end, prev_stage_next_mb_compute_end) - max(this_stage_compute_start, prev_stage_next_mb_compute_start))
+                # 
+                # Simplified: If prev stage started MB_n+1 BEFORE this stage finished MB_n, there's overlap
+                
+                prev_compute_start = overlap_data['prev_stage_compute_start_us']
+                this_receive = overlap_data['this_stage_receive_us']
+                this_compute_end = overlap_data['this_stage_compute_end_us']
+                
+                # Log per-MB cross-stage timing
+                latency_to_receive = (this_receive - prev_compute_start) / 1000 if prev_compute_start > 0 else 0
+                logger.info(
+                    f"[CROSS_STAGE_OVERLAP] MB{mb_idx}: prev_stage_started={prev_compute_start}, "
+                    f"this_stage_received={this_receive} (+{latency_to_receive:.1f}ms from prev compute start), "
+                    f"this_stage_done={this_compute_end} (compute={process_time_ms:.1f}ms)"
+                )
             logger.info(
                 f"{MBPIPE_LOG_PREFIX} Micro-batch {mb_idx} processed in {process_time_ms:.1f}ms, "
                 f"output shape: {hidden_states.shape}"
@@ -496,6 +579,61 @@ async def iterate_rpc_inference(
                 logger.info(
                     f"{MBPIPE_LOG_PREFIX} Merged output shape: {merged_hidden_states.shape}"
                 )
+                
+                # [CROSS_STAGE_OVERLAP] Calculate and log final overlap summary
+                if hasattr(iterate_rpc_inference, '_cross_stage_overlap_data') and \
+                   overlap_tracking_key in iterate_rpc_inference._cross_stage_overlap_data:
+                    
+                    overlap_summary = iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]
+                    total_overlap_ms = 0.0
+                    total_stage2_compute_ms = 0.0
+                    
+                    # For each MB pair (MB_n and MB_{n+1}), calculate overlap
+                    # Overlap happens when: Stage1 starts MB_{n+1} BEFORE Stage2 finishes MB_n
+                    sorted_mb_indices = sorted(overlap_summary.keys())
+                    
+                    for i, mb_n in enumerate(sorted_mb_indices):
+                        mb_data = overlap_summary[mb_n]
+                        this_compute_ms = mb_data.get('this_stage_process_time_ms', 0)
+                        total_stage2_compute_ms += this_compute_ms
+                        
+                        # Check overlap with next MB
+                        if i + 1 < len(sorted_mb_indices):
+                            mb_n_plus_1 = sorted_mb_indices[i + 1]
+                            next_mb_data = overlap_summary.get(mb_n_plus_1, {})
+                            
+                            # Stage1 started MB_{n+1} at prev_stage_compute_start of MB_{n+1}
+                            # Stage2 finished MB_n at this_stage_compute_end of MB_n
+                            stage1_next_start = next_mb_data.get('prev_stage_compute_start_us', 0)
+                            stage2_current_end = mb_data.get('this_stage_compute_end_us', 0)
+                            
+                            if stage1_next_start > 0 and stage2_current_end > 0:
+                                # Overlap = how much time Stage2 was computing while Stage1 already started
+                                # If stage1_next_start < stage2_current_end, there IS overlap
+                                if stage1_next_start < stage2_current_end:
+                                    overlap_time_us = stage2_current_end - stage1_next_start
+                                    overlap_time_ms = overlap_time_us / 1000.0
+                                    total_overlap_ms += overlap_time_ms
+                                    logger.info(
+                                        f"[CROSS_STAGE_OVERLAP] MB{mb_n}→MB{mb_n_plus_1}: Stage1 started MB{mb_n_plus_1} {overlap_time_ms:.1f}ms BEFORE Stage2 finished MB{mb_n} ✓ OVERLAP!"
+                                    )
+                                else:
+                                    gap_ms = (stage1_next_start - stage2_current_end) / 1000.0
+                                    logger.info(
+                                        f"[CROSS_STAGE_OVERLAP] MB{mb_n}→MB{mb_n_plus_1}: Stage2 finished MB{mb_n} {gap_ms:.1f}ms BEFORE Stage1 started MB{mb_n_plus_1} → NO overlap"
+                                    )
+                    
+                    # Calculate overlap efficiency
+                    if total_stage2_compute_ms > 0:
+                        overlap_efficiency = (total_overlap_ms / total_stage2_compute_ms) * 100
+                        logger.info(
+                            f"[CROSS_STAGE_OVERLAP_SUMMARY] Total overlap={total_overlap_ms:.1f}ms, "
+                            f"Stage2 compute={total_stage2_compute_ms:.1f}ms, "
+                            f"Overlap efficiency={overlap_efficiency:.1f}%"
+                        )
+                    
+                    # Cleanup overlap tracking data
+                    del iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]
                 
                 # Cleanup accumulator
                 del iterate_rpc_inference._mb_accumulators[mb_accum_key]
@@ -688,13 +826,21 @@ async def iterate_rpc_inference(
                         # [KVCACHE_OFFLOAD] STEP 1: Prefetch this micro-batch's KV cache from CPU
                         # For mb_idx=0, there's nothing to prefetch yet (first run)
                         # For mb_idx>0, restore the cached KV from CPU staging buffer
+                        prefetch_start = _perf_counter()
+                        prefetch_time_ms = 0.0
                         if mb_idx > 0 and cache_manager is not None:
                             if hasattr(cache_manager, 'prefetch_microbatch_kv'):
                                 cache_manager.prefetch_microbatch_kv(mb_idx)
                             # [CRITICAL] Sync prefetch before compute to ensure data is ready
                             if hasattr(cache_manager, 'sync_prefetch'):
                                 cache_manager.sync_prefetch()
-                            logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: prefetch+sync complete, starting compute")
+                            prefetch_time_ms = (_perf_counter() - prefetch_start) * 1000
+                            logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: prefetch+sync complete ({prefetch_time_ms:.2f}ms), starting compute")
+                        
+                        # [CROSS_STAGE] Record absolute timestamp when compute starts for overlap analysis
+                        import time as _time
+                        compute_start_timestamp_us = int(_time.time() * 1_000_000)
+                        logger.info(f"[CROSS_STAGE] Stage starts MB{mb_idx} compute at t={compute_start_timestamp_us}")
                         
                         mb_hidden = hidden_states[mb_start:mb_end].clone()
                         mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
@@ -734,9 +880,11 @@ async def iterate_rpc_inference(
                         )
                         
                         # [KVCACHE_OFFLOAD] STEP 2: Compute - forward pass through model
+                        compute_start = _perf_counter()
                         (mb_out_hidden, mb_out_keep) = await requested_backends[0].inference_pool.submit_task(
                             mb_hidden, mb_hypo, mb_inference_infos, *prompts, priority=priority
                         )
+                        compute_time_ms = (_perf_counter() - compute_start) * 1000
                         
                         mb_end_time = _perf_counter()
                         mb_timings.append((mb_idx, mb_start_time, mb_end_time))
@@ -744,28 +892,53 @@ async def iterate_rpc_inference(
                         # [KVCACHE_OFFLOAD] STEP 3: Offload this micro-batch's KV cache to CPU (async)
                         # This frees GPU memory for the next micro-batch to reuse
                         # Don't offload the last micro-batch (we'll clear state instead)
+                        offload_start = _perf_counter()
+                        offload_time_ms = 0.0
                         if cache_manager is not None and mb_idx < total_mb - 1:
                             if hasattr(cache_manager, 'offload_microbatch_kv'):
                                 current_prefix = prefix_length + length_increment
                                 cache_manager.offload_microbatch_kv(mb_idx, current_prefix)
-                                logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: offload started (async)")
+                                offload_time_ms = (_perf_counter() - offload_start) * 1000
+                                logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: offload started ({offload_time_ms:.2f}ms async)")
+                        
+                        # [KVCACHE_OFFLOAD] Log detailed timing breakdown for this micro-batch
+                        total_mb_time_ms = (mb_end_time - mb_start_time) * 1000
+                        logger.info(f"[KVCACHE_TIMING] MB{mb_idx}: prefetch={prefetch_time_ms:.2f}ms, "
+                                   f"compute={compute_time_ms:.2f}ms, offload_launch={offload_time_ms:.2f}ms, "
+                                   f"total={total_mb_time_ms:.2f}ms")
+                        
+                        # Store timing in list for later analysis
+                        kv_timing_stats.append({
+                            'mb_idx': mb_idx,
+                            'prefetch_ms': prefetch_time_ms,
+                            'compute_ms': compute_time_ms,
+                            'offload_ms': offload_time_ms,
+                            'total_ms': total_mb_time_ms
+                        })
                         
                         # [MBPIPE] Cross-stage streaming: push ALL micro-batches to next stage immediately
                         # This enables Server2 to start processing before Server1 finishes all micro-batches
                         if enable_cross_stage:
+                            push_timestamp_us = int(_time.time() * 1_000_000)  # Absolute timestamp for cross-server correlation
                             push_metadata = step_metadata.copy()
                             push_metadata["micro_batch_idx"] = mb_idx
                             push_metadata["micro_batch_offset"] = mb_start
                             push_metadata["micro_batch_size"] = mb_size
                             push_metadata["full_batch_size"] = batch_size
                             push_metadata["total_micro_batches"] = len(micro_ranges)
+                            push_metadata["stage_push_timestamp_us"] = push_timestamp_us  # For overlap analysis
+                            push_metadata["stage_compute_start_timestamp_us"] = compute_start_timestamp_us  # When this MB started computing
                             push_task = asyncio.create_task(
                                 cross_stage_push_fn(mb_out_hidden, mb_out_keep, push_metadata)
                             )
                             cross_stage_push_tasks.append(push_task)
-                            logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
+                            logger.info(f"[CROSS_STAGE] Stage sends MB{mb_idx} at t={push_timestamp_us}, "
+                                       f"compute_started_at={compute_start_timestamp_us}, compute_time={compute_time_ms:.2f}ms")
                         
                         return mb_out_hidden, mb_out_keep
+                    
+                    # [KVCACHE_OFFLOAD] Track timing statistics for overlap analysis
+                    kv_timing_stats = []
                     
                     # [KVCACHE_OFFLOAD] Process micro-batches SEQUENTIALLY for GPU memory reuse
                     # Parallel processing won't work because GPU only has space for ONE micro-batch
@@ -805,6 +978,38 @@ async def iterate_rpc_inference(
                     
                     logger.info(f"{MBPIPE_LOG_PREFIX} Overlap stats: total={total_pipeline_time:.1f}ms, "
                                f"sum_mb={sum_mb_times:.1f}ms, overlap={overlap_time:.1f}ms ({overlap_ratio:.1f}%)")
+                    
+                    # [KVCACHE_OFFLOAD] Calculate and log detailed KV cache overlap statistics
+                    if kv_timing_stats:
+                        total_prefetch = sum(s['prefetch_ms'] for s in kv_timing_stats)
+                        total_compute = sum(s['compute_ms'] for s in kv_timing_stats)
+                        total_offload = sum(s['offload_ms'] for s in kv_timing_stats)
+                        
+                        # The "ideal" time would be compute-only if prefetch/offload were fully overlapped
+                        # Actual overhead = (prefetch + offload) that couldn't be hidden
+                        # Since we do: prefetch -> compute -> offload sequentially per MB,
+                        # the overlap potential is limited to:
+                        # - offload(MB_n) overlaps with prefetch(MB_n+1) via async stream
+                        # 
+                        # Key insight: with async offload, offload_launch_time is just the time to
+                        # start the async operation, NOT the actual transfer time
+                        overhead_time = total_prefetch + total_offload
+                        total_elapsed = sum(s['total_ms'] for s in kv_timing_stats)
+                        
+                        # Calculate theoretical overlap:
+                        # If offload/prefetch were zero, we'd only have compute time
+                        # The difference shows how much overhead the data movement adds
+                        compute_efficiency = (total_compute / total_elapsed * 100) if total_elapsed > 0 else 0
+                        
+                        logger.info(f"[KVCACHE_OVERLAP] Summary: prefetch={total_prefetch:.1f}ms, "
+                                   f"compute={total_compute:.1f}ms, offload_launch={total_offload:.1f}ms")
+                        logger.info(f"[KVCACHE_OVERLAP] Efficiency: compute_time/total_time = {compute_efficiency:.1f}% "
+                                   f"(higher=better, overhead hidden)")
+                        
+                        # Per-phase breakdown
+                        for stat in kv_timing_stats:
+                            mb_eff = (stat['compute_ms'] / stat['total_ms'] * 100) if stat['total_ms'] > 0 else 0
+                            logger.info(f"[KVCACHE_OVERLAP] MB{stat['mb_idx']}: efficiency={mb_eff:.1f}%")
                     
                     log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.merged_pools")
                     

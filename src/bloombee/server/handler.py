@@ -1062,28 +1062,83 @@ class TransformerConnectionHandler(ConnectionHandler):
             }
             
             # Copy other relevant metadata
-            for key in ["step_id", "max_length", "args_structure"]:
+            # [CROSS_STAGE] Include timestamps for cross-stage overlap analysis
+            for key in ["step_id", "max_length", "args_structure", "stage_push_timestamp_us", "total_micro_batches", "stage_compute_start_timestamp_us"]:
                 if key in metadata:
                     push_metadata[key] = metadata[key]
             
             stub = self.get_stub(self._p2p, next_peer_id)
-            await stub.rpc_push(
-                runtime_pb2.ExpertRequest(
-                    uid=next_uid,
-                    tensors=[serialized_hidden, serialized_keep],
-                    metadata=MSGPackSerializer.dumps(push_metadata),
-                ),
-                timeout=self.request_timeout,
+            
+            # [ASYNC_PUSH] Fire-and-forget: don't await RPC response
+            # This allows Stage 1 compute to continue immediately while data is sent in background
+            rpc_request = runtime_pb2.ExpertRequest(
+                uid=next_uid,
+                tensors=[serialized_hidden, serialized_keep],
+                metadata=MSGPackSerializer.dumps(push_metadata),
             )
             
-            push_time = (perf_counter() - push_start_time) * 1000
-            logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch push completed in {push_time:.1f}ms")
+            # [PHASE2] Flow control: limit concurrent pending pushes to prevent queue buildup
+            # Initialize semaphore lazily (max 4 concurrent pushes)
+            if not hasattr(self, '_push_semaphore'):
+                self._push_semaphore = asyncio.Semaphore(4)
+            
+            # Acquire semaphore before queueing (non-blocking check for logging)
+            sem_wait_start = perf_counter()
+            await self._push_semaphore.acquire()
+            sem_wait_time = (perf_counter() - sem_wait_start) * 1000
+            if sem_wait_time > 1.0:  # Only log if we had to wait
+                logger.info(f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB{mb_idx} waited {sem_wait_time:.1f}ms for push slot")
+            
+            # Create task for background sending - don't await
+            send_task = asyncio.create_task(
+                self._do_rpc_push_async(stub, rpc_request, mb_idx, push_start_time)
+            )
+            
+            # Track task to prevent garbage collection
+            if not hasattr(self, '_background_push_tasks'):
+                self._background_push_tasks = set()
+            self._background_push_tasks.add(send_task)
+            send_task.add_done_callback(self._background_push_tasks.discard)
+            
+            queue_time = (perf_counter() - push_start_time) * 1000
+            logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch push queued in {queue_time:.1f}ms (sending in background)")
             
         except Exception as e:
             logger.warning(
                 f"{MBPIPE_LOG_PREFIX} Failed to push micro-batch: {e}",
                 exc_info=True
             )
+
+    async def _do_rpc_push_async(
+        self,
+        stub,
+        request: runtime_pb2.ExpertRequest,
+        mb_idx: int,
+        queue_start_time: float,
+    ) -> None:
+        """
+        [ASYNC_PUSH] Actually perform the RPC push in background.
+        
+        This runs as a fire-and-forget task, allowing the main compute loop
+        to continue without waiting for the network round-trip.
+        """
+        send_start = perf_counter()
+        try:
+            await stub.rpc_push(request, timeout=self.request_timeout)
+            total_time = (perf_counter() - queue_start_time) * 1000
+            send_time = (perf_counter() - send_start) * 1000
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} sent: "
+                f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms"
+            )
+        except Exception as e:
+            logger.warning(
+                f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send failed: {e}"
+            )
+        finally:
+            # [PHASE2] Release semaphore to allow next push
+            if hasattr(self, '_push_semaphore'):
+                self._push_semaphore.release()
 
     async def rpc_forward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
         async with timeout(self.request_timeout):
