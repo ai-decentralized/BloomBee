@@ -116,14 +116,16 @@ class _ServerInferenceSession:
         """
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
-
-        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids.numel() # get the number of token
+        if is_spec_dec:
+            n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids.numel()
+        else:
+            n_input_tokens = inputs.shape[1]
         # print('client step() n_input_tokens', n_input_tokens)
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # 将当前输入的最后n_input_tokens个token拼接到历史记录中
-        # history can cat input if it's spec decoding and pruning happened, need  back
+        # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
         #     f"Broken input cache: span={self.span} shape={self.history.shape} "
         #     f"position={self._position} n_input_tokens={n_input_tokens}"
@@ -151,8 +153,11 @@ class _ServerInferenceSession:
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
-        if self._position is not None:
-            request_metadata["start_from_position"] = self._position
+        if is_spec_dec:
+            request_metadata["start_from_position"] = self._position + n_input_tokens
+        else:
+            if self._position is not None:
+                request_metadata["start_from_position"] = self._position
         # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
         if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
@@ -262,6 +267,7 @@ class InferenceSession:
         self.past_key_values = None
         self.keep_indices = None
         self.prefill_length = 0
+        self.first_inference = True
 
     @property
     def num_blocks(self) -> int:
@@ -364,7 +370,8 @@ class InferenceSession:
         server_idx = 0
         block_idx = 0
         inference_step_start = time.perf_counter()
-        self.prefill_length = inputs.shape[1] - tree_attention_mask.shape[1] if tree_attention_mask is not None else 0
+        self.prefill_length = inputs.shape[1] - tree_attention_mask.shape[1] if tree_attention_mask is not None and self.first_inference else 0
+        # self.first_inference = False
         keep_indices = torch.arange(
                 inputs.shape[1],
                 dtype=torch.int64,

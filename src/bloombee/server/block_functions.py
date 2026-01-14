@@ -19,7 +19,7 @@ from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
-from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 
 from time import perf_counter
 from datetime import datetime, timezone  
@@ -228,28 +228,13 @@ async def run_rpc_backward(
     grad_prompts = torch.cat(grad_prompts_reversed[::-1], dim=0) if grad_prompts_reversed else DUMMY
     return [grad_outputs] if is_dummy(grad_prompts) else [grad_outputs, grad_prompts]  # TODO un-duct-tape
 
-def _update_kv_cache_position_ids(kv_cache_position_ids, keep_indices):
-    if kv_cache_position_ids is None:
-        return
-    
-    if not torch.is_tensor(keep_indices):
-        keep_indices = torch.tensor(keep_indices, device=kv_cache_position_ids.device)
-
-    mapping = {int(k.item()): i for i, k in enumerate(keep_indices)}
-    new_ids = torch.tensor(
-        [mapping.get(int(x.item()), -1) for x in kv_cache_position_ids],
-        device=kv_cache_position_ids.device
-    )
-    return new_ids
-
-
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
     requested_backends: Sequence[TransformerBackend],
     active_adapter: Optional[str],
     input_iterator: AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]],
     cache_handles: Sequence[Sequence[Handle]],
-    pruner_manager: BloombeePrunerManager,
+    pruner_manager: SpeculativePrunerManager,
     *,
     max_length: int,
     prioritizer: TaskPrioritizerBase,
@@ -310,8 +295,8 @@ async def iterate_rpc_inference(
         is_spec_dec = is_spec_dec1 == 1 if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
         
         if is_spec_dec and not need_pruning:
-            kv_cache_position_ids = _update_kv_cache_position_ids(kv_cache_position_ids, keep_indices)
             attention_mask_indices = keep_indices[prefill_length:] - prefill_length
+            logger.info(f"prefill_length: {prefill_length}, attention_mask_indices: {attention_mask_indices}")
             idx = attention_mask_indices
             tree_attention_mask = tree_attention_mask[:, idx][:, :, idx]
             

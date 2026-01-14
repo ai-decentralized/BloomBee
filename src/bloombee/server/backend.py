@@ -18,7 +18,7 @@ from transformers import PretrainedConfig
 from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
-from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
 from pynvml import *
@@ -73,7 +73,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         *args,
         config: PretrainedConfig,
         cache_manager: KVCacheManager,
-        pruner_manager: BloombeePrunerManager,
+        pruner_manager: SpeculativePrunerManager,
         is_last_block: bool,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
@@ -173,13 +173,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # Record original devices for restoration when needed (after potential override)
         self.original_devices = self.module.devices
         self.original_output_device_index = getattr(self.module, 'output_device_index', 0)
-        self._tree_mask_cache: Dict[int, torch.Tensor] = {}  # key: hash of packed mask, value: unpacked tree mask
         self._need_pruning = False
         self._first_get_need_pruning = True
         self._is_spec_decoding = False
         self._is_last_block = is_last_block
         if is_last_block:
             self.module.load_lm_head()
+        self._last_keep_indices = None
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""
@@ -194,16 +194,18 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             cache_tensors.append(keys)
         return cache_tensors
     
-    def prune_draft_tree(self, original_hidden_states: torch.Tensor, logits: torch.Tensor,  draft_tokens: torch.Tensor, tree_attention_mask):
+    def prune_draft_tree(self, original_hidden_states: torch.Tensor, norm_hidden_states: torch.Tensor,  draft_tokens: torch.Tensor, tree_attention_mask):
         results = self.pruner_manager.prune_speculation_tree(
-            logits,
+            norm_hidden_states,
             draft_tokens,
             tree_attention_mask
         )
         
         keep_indices = results['keep_indices']
+        logger.info(f"keep_indices: {keep_indices}")
         self.pruner_manager.middle_keep_indices = keep_indices
         new_hidden_states = original_hidden_states[:, keep_indices, :]
+        keep_indices = torch.tensor(keep_indices, dtype=torch.int64, device=original_hidden_states.device)
         return new_hidden_states, keep_indices
 
     def forward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
@@ -273,13 +275,25 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # Initialize output states
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
                 # Centralized select: aggregate + reorder + slice
+                kv_cache_position_ids = inference_info.kv_cache_position_ids
+                logger.info(f"_last_keep_indices: {self._last_keep_indices}")
+                logger.info(f"keep_indices: {inference_info.keep_indices}")
+                logger.info(f"before format kv_cache_position_ids: {kv_cache_position_ids}")
+                # if self._is_spec_decoding and not self._need_pruning:
+                #     kv_cache_position_ids = self._update_kv_cache_position_ids(kv_cache_position_ids, self._last_keep_indices)
+                logger.info(f"after format kv_cache_position_ids: {kv_cache_position_ids}")
                 k_pkv, v_pkv, need_reorder = self.cache_manager.select_cache(
                     prefix_length=inference_info.prefix_length,
                     hypo_ids=hypo_ids,
-                    kv_cache_position_ids=inference_info.kv_cache_position_ids
+                    kv_cache_position_ids=kv_cache_position_ids
                 )
+                if k_pkv is not None:
+                    logger.info(f"kv cache size: {k_pkv.shape}, prefix_length: {inference_info.prefix_length}")
+                else:
+                    logger.info(f"kv cache is None, prefix_length: {inference_info.prefix_length}")
                 layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
                 if need_reorder:
+                    # In speculative decoding mode, inference is not squential so that kv-cache need to be reordered.
                     self.cache_manager.write_pkv_cache(
                         k_pkv=k_pkv,
                         v_pkv=v_pkv,
@@ -287,7 +301,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     )
                 
                 past_key_values_length = k_pkv.shape[2] if k_pkv is not None else 0
-                
+                logger.info(f"past_key_values_length: {past_key_values_length}")
+                logger.info(f"inference_info.tree_attention_mask: {inference_info.tree_attention_mask}")
+                full_mask = None
                 if self._is_spec_decoding:
                     full_mask = self._create_attention_mask(
                         tree_attention_mask=inference_info.tree_attention_mask,
@@ -296,9 +312,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         device=hidden_states.device,
                     )
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
-                else:
+                if full_mask == None:
                     full_mask = self._create_causal_attention_mask(batch_size, (seq_len + past_key_values_length), past_key_values_length, hidden_states.device)
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                logger.info(f"full_mask: {full_mask}")
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
                     # print('transformer backend inference step() offset ', offset )
@@ -322,6 +339,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     else:
                         rotary_position_ids = None
                     rotary_position_ids = rotary_position_ids[inference_info.keep_indices] if rotary_position_ids is not None and inference_info.keep_indices is not None else rotary_position_ids
+                    logger.info(f"rotary_position_ids: {rotary_position_ids}")
+                    logger.info(f"position_ids: {position_ids}")
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
                         # print(f' About to call module.forward with position_ids...')
@@ -336,7 +355,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         # print(f' module.forward returned: {type(forward_result)}, length: {len(forward_result) if forward_result else "None"}')
                         
                         if forward_result is None:
-                            # print(f' ERROR: module.forward returned None!')
+                            logger.info(f" ERROR: module.forward returned None!")
                             return (hidden_states, None)  # Return original input as fallback
                         
                         output_hidden_states_chunk, new_kvs = forward_result
@@ -351,7 +370,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         #     offload_logger.info(f"   - new_kvs[0] device: {new_kvs[0].device}")
                         
                     except Exception as e:
-                        # print(f' ERROR in module.forward: {type(e).__name__}: {e}')
+                        print(f' ERROR in module.forward: {type(e).__name__}: {e}')
                         # import traceback
                         # traceback.print_exc()
                         return (hidden_states, None)  # Return original input as fallback
@@ -362,11 +381,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         output_hidden_states = output_hidden_states_chunk  # saves one memcopy # Copy memory only once
                     # layer_past = new_kvs # Update cache state
 
-                # Fixed: Restore cache update logic  
-                past_key_values_length = 0
-                if layer_past is not None and len(layer_past) > 0:
-                    past_key_values_length = layer_past[0].shape[2]
-
                 # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
                 self.cache_manager.update_cache(new_kvs, past_key_values_length)
@@ -374,11 +388,21 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 if self._is_spec_decoding and self._need_pruning and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, norm_hidden_states, inference_info.draft_tokens, full_mask)
+
+                self._last_keep_indices = keep_indices + past_key_values_length
+                logger.info(f"update _last_keep_indices: {self._last_keep_indices}")
+                
+                # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
+                training_mode = False
+                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.15':
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     self.pruner_manager.middle_states = norm_hidden_states
-                    
-                    logits = self.module.lm_head_forward(norm_hidden_states)
-                    
-                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, logits, inference_info.draft_tokens, full_mask)
+                
+                if training_mode and self._is_spec_decoding and self._is_last_block:
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    final_logits = self.module.lm_head_forward(norm_hidden_states)
+                    self.pruner_manager.train_model(final_logits, full_mask, inference_info.draft_tokens)
                 
                 return (output_hidden_states, keep_indices) # Return output hidden states
                 
@@ -426,6 +450,20 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         full_position_ids = torch.cat([prefill_ids, tree_position_ids], dim=0)
 
         return full_position_ids
+    
+    def _update_kv_cache_position_ids(self, kv_cache_position_ids, keep_indices):
+        if kv_cache_position_ids is None or keep_indices is None:
+            return None
+        
+        if not torch.is_tensor(keep_indices):
+            keep_indices = torch.tensor(keep_indices, device=kv_cache_position_ids.device)
+
+        mapping = {int(k.item()): i for i, k in enumerate(keep_indices)}
+        new_ids = torch.tensor(
+            [mapping.get(int(x.item()), -1) for x in kv_cache_position_ids],
+            device=kv_cache_position_ids.device
+        )
+        return new_ids
 
     def _create_attention_mask(
         self,
