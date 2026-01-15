@@ -588,13 +588,28 @@ async def iterate_rpc_inference(
                     total_overlap_ms = 0.0
                     total_stage2_compute_ms = 0.0
                     
-                    # For each MB pair (MB_n and MB_{n+1}), calculate overlap
-                    # Overlap happens when: Stage1 starts MB_{n+1} BEFORE Stage2 finishes MB_n
+                    # For each MB pair (MB_n and MB_{n+1}), calculate ACTUAL concurrent overlap
+                    # True overlap = time when BOTH stages are computing simultaneously:
+                    #   - Stage 1 is computing MB_{n+1}
+                    #   - Stage 2 is computing MB_n
+                    # 
+                    # We have:
+                    #   - Stage2's compute window for MB_n: [this_stage_compute_start_us, this_stage_compute_end_us]
+                    #   - Stage1's compute start for MB_{n+1}: prev_stage_compute_start_us (from MB_{n+1}'s data)
+                    #   - Stage2's receive time for MB_{n+1}: this_stage_receive_us (from MB_{n+1}'s data)
+                    #     This is approximately when Stage1 finished MB_{n+1} (after serialization/transfer)
+                    #
+                    # Overlap = max(0, min(stage2_end_MB_n, stage1_end_MB_{n+1}) - max(stage2_start_MB_n, stage1_start_MB_{n+1}))
+                    # Simplified: overlap ≈ max(0, stage2_end_MB_n - stage1_start_MB_{n+1})
+                    #             capped by stage2's compute time for MB_n
+                    
                     sorted_mb_indices = sorted(overlap_summary.keys())
                     
                     for i, mb_n in enumerate(sorted_mb_indices):
                         mb_data = overlap_summary[mb_n]
                         this_compute_ms = mb_data.get('this_stage_process_time_ms', 0)
+                        this_compute_start_us = mb_data.get('this_stage_compute_start_us', 0)
+                        this_compute_end_us = mb_data.get('this_stage_compute_end_us', 0)
                         total_stage2_compute_ms += this_compute_ms
                         
                         # Check overlap with next MB
@@ -602,34 +617,49 @@ async def iterate_rpc_inference(
                             mb_n_plus_1 = sorted_mb_indices[i + 1]
                             next_mb_data = overlap_summary.get(mb_n_plus_1, {})
                             
-                            # Stage1 started MB_{n+1} at prev_stage_compute_start of MB_{n+1}
-                            # Stage2 finished MB_n at this_stage_compute_end of MB_n
-                            stage1_next_start = next_mb_data.get('prev_stage_compute_start_us', 0)
-                            stage2_current_end = mb_data.get('this_stage_compute_end_us', 0)
+                            # Stage1 started computing MB_{n+1} at this timestamp
+                            stage1_next_start_us = next_mb_data.get('prev_stage_compute_start_us', 0)
+                            # Stage2 was computing MB_n during [this_compute_start_us, this_compute_end_us]
                             
-                            if stage1_next_start > 0 and stage2_current_end > 0:
-                                # Overlap = how much time Stage2 was computing while Stage1 already started
-                                # If stage1_next_start < stage2_current_end, there IS overlap
-                                if stage1_next_start < stage2_current_end:
-                                    overlap_time_us = stage2_current_end - stage1_next_start
-                                    overlap_time_ms = overlap_time_us / 1000.0
-                                    total_overlap_ms += overlap_time_ms
+                            if stage1_next_start_us > 0 and this_compute_end_us > 0 and this_compute_start_us > 0:
+                                # Calculate actual overlap window
+                                # Overlap starts: max(stage2 starts MB_n, stage1 starts MB_{n+1})
+                                # Overlap ends: min(stage2 ends MB_n, stage1 ends MB_{n+1})
+                                # Since we don't know when stage1 ends MB_{n+1}, we use stage2's receive time as proxy
+                                
+                                overlap_start_us = max(this_compute_start_us, stage1_next_start_us)
+                                overlap_end_us = this_compute_end_us  # Stage2's compute end for MB_n
+                                
+                                if overlap_end_us > overlap_start_us:
+                                    # There IS actual concurrent overlap
+                                    actual_overlap_us = overlap_end_us - overlap_start_us
+                                    # Cap at stage2's compute time (can't overlap more than we computed)
+                                    actual_overlap_us = min(actual_overlap_us, int(this_compute_ms * 1000))
+                                    actual_overlap_ms = actual_overlap_us / 1000.0
+                                    total_overlap_ms += actual_overlap_ms
+                                    
+                                    # Calculate what percentage of Stage2's MB_n compute was overlapped
+                                    mb_overlap_pct = (actual_overlap_ms / this_compute_ms * 100) if this_compute_ms > 0 else 0
+                                    
                                     logger.info(
-                                        f"[CROSS_STAGE_OVERLAP] MB{mb_n}→MB{mb_n_plus_1}: Stage1 started MB{mb_n_plus_1} {overlap_time_ms:.1f}ms BEFORE Stage2 finished MB{mb_n} ✓ OVERLAP!"
+                                        f"[CROSS_STAGE_OVERLAP] step={overlap_tracking_key[1]} MB{mb_n}→MB{mb_n_plus_1}: "
+                                        f"actual_overlap={actual_overlap_ms:.1f}ms ({mb_overlap_pct:.0f}% of MB{mb_n} compute) ✓"
                                     )
                                 else:
-                                    gap_ms = (stage1_next_start - stage2_current_end) / 1000.0
+                                    # Stage1 started MB_{n+1} AFTER Stage2 finished MB_n: no overlap
+                                    gap_ms = (overlap_start_us - overlap_end_us) / 1000.0
                                     logger.info(
-                                        f"[CROSS_STAGE_OVERLAP] MB{mb_n}→MB{mb_n_plus_1}: Stage2 finished MB{mb_n} {gap_ms:.1f}ms BEFORE Stage1 started MB{mb_n_plus_1} → NO overlap"
+                                        f"[CROSS_STAGE_OVERLAP] step={overlap_tracking_key[1]} MB{mb_n}→MB{mb_n_plus_1}: "
+                                        f"no_overlap (gap={gap_ms:.1f}ms between Stage2 finish and Stage1 start)"
                                     )
                     
                     # Calculate overlap efficiency
                     if total_stage2_compute_ms > 0:
                         overlap_efficiency = (total_overlap_ms / total_stage2_compute_ms) * 100
                         logger.info(
-                            f"[CROSS_STAGE_OVERLAP_SUMMARY] Total overlap={total_overlap_ms:.1f}ms, "
-                            f"Stage2 compute={total_stage2_compute_ms:.1f}ms, "
-                            f"Overlap efficiency={overlap_efficiency:.1f}%"
+                            f"[CROSS_STAGE_OVERLAP_SUMMARY] step={overlap_tracking_key[1]} overlap={total_overlap_ms:.1f}ms, "
+                            f"Stage2_compute={total_stage2_compute_ms:.1f}ms, "
+                            f"efficiency={overlap_efficiency:.1f}%"
                         )
                     
                     # Cleanup overlap tracking data
@@ -823,19 +853,16 @@ async def iterate_rpc_inference(
                         # [KVCACHE_OFFLOAD] Get cache manager for offload/prefetch operations
                         cache_manager = requested_backends[0].cache_manager if requested_backends else None
                         
-                        # [KVCACHE_OFFLOAD] STEP 1: Prefetch this micro-batch's KV cache from CPU
-                        # For mb_idx=0, there's nothing to prefetch yet (first run)
-                        # For mb_idx>0, restore the cached KV from CPU staging buffer
+                        # [PHASE3_PREFETCH] STEP 1a: Sync previous MB's prefetch (started during last MB's compute)
+                        # For mb_idx=0, nothing to sync
+                        # For mb_idx>0, we need to sync the prefetch that was started during MB_{n-1}'s compute
                         prefetch_start = _perf_counter()
-                        prefetch_time_ms = 0.0
+                        prefetch_sync_time_ms = 0.0
                         if mb_idx > 0 and cache_manager is not None:
-                            if hasattr(cache_manager, 'prefetch_microbatch_kv'):
-                                cache_manager.prefetch_microbatch_kv(mb_idx)
-                            # [CRITICAL] Sync prefetch before compute to ensure data is ready
                             if hasattr(cache_manager, 'sync_prefetch'):
                                 cache_manager.sync_prefetch()
-                            prefetch_time_ms = (_perf_counter() - prefetch_start) * 1000
-                            logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: prefetch+sync complete ({prefetch_time_ms:.2f}ms), starting compute")
+                            prefetch_sync_time_ms = (_perf_counter() - prefetch_start) * 1000
+                            logger.info(f"[PHASE3_PREFETCH] MB{mb_idx}: sync complete ({prefetch_sync_time_ms:.2f}ms, overlapped with prev compute)")
                         
                         # [CROSS_STAGE] Record absolute timestamp when compute starts for overlap analysis
                         import time as _time
@@ -901,18 +928,30 @@ async def iterate_rpc_inference(
                                 offload_time_ms = (_perf_counter() - offload_start) * 1000
                                 logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: offload started ({offload_time_ms:.2f}ms async)")
                         
+                        # [PHASE3_PREFETCH] STEP 4: Start prefetching NEXT micro-batch's KV cache while
+                        # current MB is being pushed. This overlaps prefetch with push/transfer latency.
+                        # The sync will happen at the START of processing the next MB.
+                        prefetch_start_time_ms = 0.0
+                        if cache_manager is not None and mb_idx < total_mb - 1:
+                            if hasattr(cache_manager, 'prefetch_microbatch_kv'):
+                                prefetch_start = _perf_counter()
+                                cache_manager.prefetch_microbatch_kv(mb_idx + 1)
+                                prefetch_start_time_ms = (_perf_counter() - prefetch_start) * 1000
+                                logger.info(f"[PHASE3_PREFETCH] MB{mb_idx}: started prefetch of MB{mb_idx + 1} ({prefetch_start_time_ms:.2f}ms async, will sync later)")
+                        
                         # [KVCACHE_OFFLOAD] Log detailed timing breakdown for this micro-batch
                         total_mb_time_ms = (mb_end_time - mb_start_time) * 1000
-                        logger.info(f"[KVCACHE_TIMING] MB{mb_idx}: prefetch={prefetch_time_ms:.2f}ms, "
+                        logger.info(f"[KVCACHE_TIMING] MB{mb_idx}: prefetch_sync={prefetch_sync_time_ms:.2f}ms, "
                                    f"compute={compute_time_ms:.2f}ms, offload_launch={offload_time_ms:.2f}ms, "
-                                   f"total={total_mb_time_ms:.2f}ms")
+                                   f"next_prefetch_start={prefetch_start_time_ms:.2f}ms, total={total_mb_time_ms:.2f}ms")
                         
                         # Store timing in list for later analysis
                         kv_timing_stats.append({
                             'mb_idx': mb_idx,
-                            'prefetch_ms': prefetch_time_ms,
+                            'prefetch_sync_ms': prefetch_sync_time_ms,
                             'compute_ms': compute_time_ms,
                             'offload_ms': offload_time_ms,
+                            'next_prefetch_start_ms': prefetch_start_time_ms,
                             'total_ms': total_mb_time_ms
                         })
                         
@@ -981,7 +1020,7 @@ async def iterate_rpc_inference(
                     
                     # [KVCACHE_OFFLOAD] Calculate and log detailed KV cache overlap statistics
                     if kv_timing_stats:
-                        total_prefetch = sum(s['prefetch_ms'] for s in kv_timing_stats)
+                        total_prefetch = sum(s['prefetch_sync_ms'] for s in kv_timing_stats)
                         total_compute = sum(s['compute_ms'] for s in kv_timing_stats)
                         total_offload = sum(s['offload_ms'] for s in kv_timing_stats)
                         
