@@ -204,6 +204,10 @@ class MemoryCache:
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
                     seq_len = descr.shape[-1] if descr.shape else 0
+                    # [MBPIPE] Extract batch_size from descriptor (first dim)
+                    # descriptor shape: (batch_size, num_heads, head_dim, max_length)
+                    descr_batch_size = descr.shape[0] if descr.shape else 1
+                    
                     self.mocked_task = Task(
                         inputs=None,
                         prompt_len=1,
@@ -214,8 +218,15 @@ class MemoryCache:
                         stop=None,
                         top_p=None,
                     )
+                    # [MBPIPE] Override policy.gpu_batch_size with descriptor's batch_size
+                    # This ensures KV cache is allocated for full batch, not micro-batch
+                    from dataclasses import replace as dataclass_replace
+                    override_policy = dataclass_replace(self.allocation_policy, gpu_batch_size=descr_batch_size)
+                    logger.info(f"[MB_CACHE_ALLOC] Allocating cache: descr_batch_size={descr_batch_size}, "
+                               f"seq_len={seq_len}, shape={descr.shape}")
+                    
                     self._allocated_tensors[handle] = self.device.init_cache_one_gpu_batch(
-                        self.block_config, self.mocked_task, self.allocation_policy
+                        self.block_config, self.mocked_task, override_policy
                     )
             else:  # delete tensors by handle
                 for handle in recv_handles:

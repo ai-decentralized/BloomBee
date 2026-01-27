@@ -1375,10 +1375,12 @@ class TransformerConnectionHandler(ConnectionHandler):
         max_supported_batch = policy.gpu_batch_size
         
         if mb_config['enabled']:
-            # Micro-batching enabled: GPU allocates for micro_batch_size, client can request larger batches
-            alloc_batch_size = get_micro_batch_size()
-            logger.info(f"[MB_MULTIPLEX_ALLOC] client batch_size={batch_size}, GPU alloc_batch_size={alloc_batch_size} "
-                       f"(micro-batch multiplexing enabled)")
+            # Micro-batching enabled: still need full KV cache for all batch items
+            # Micro-batching only reduces peak GPU compute, not KV cache requirements
+            # Each batch item needs independent KV cache storage
+            alloc_batch_size = batch_size  # FIXED: allocate for full batch, not micro_batch
+            logger.info(f"[MB_KV_ALLOC] client batch_size={batch_size}, GPU alloc_batch_size={alloc_batch_size} "
+                       f"(micro-batch enabled, but KV cache needs full batch)")
         else:
             # Micro-batching disabled: enforce strict batch limit
             alloc_batch_size = batch_size

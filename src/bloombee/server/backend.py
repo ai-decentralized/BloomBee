@@ -29,6 +29,7 @@ from bloombee.utils.microbatch_config import (
     log_path_entry as mbpipe_log_path_entry,
     MBPIPE_LOG_PREFIX,
 )
+from bloombee.utils.real_activation_dumper import capture_activation
 from pynvml import *
 import logging
 import hashlib
@@ -200,6 +201,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             keys = TensorDescriptor((batch_size, num_heads, head_dim, max_length), dtype=self.dtype, device=device)
             # values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
             cache_tensors.append(keys)
+            # [DEBUG] Log descriptor shape
+            logger.info(f"[MB_DEBUG] get_inference_cache_descriptors: batch_size={batch_size}, num_heads={num_heads}, "
+                       f"head_dim={head_dim}, max_length={max_length}, shape={(batch_size, num_heads, head_dim, max_length)}")
         return cache_tensors
     
     def prune_draft_tree(self, original_hidden_states: torch.Tensor, logits: torch.Tensor,  draft_tokens: torch.Tensor, tree_attention_mask):
@@ -261,6 +265,15 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         try:
             assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]" # Ensure hidden states are 3-dimensional
             batch_size, seq_len, hidden_size = hidden_states.shape
+            
+            # [ACTIVATION_DUMP] Capture real hidden_states for compression analysis
+            # Enabled by: export BLOOMBEE_DUMP_ACTIVATIONS=1
+            capture_activation(
+                hidden_states,
+                block_uid=self.name,
+                layer_idx=0,
+                inference_info=inference_info
+            )
             
             self._ensure_model_on_device()
             
