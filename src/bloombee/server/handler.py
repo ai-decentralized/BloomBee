@@ -1399,22 +1399,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"alloc_batch={alloc_batch_size}, client_batch={batch_size}, max_length={max_length}"
         )
         
-        # [SANITY_CHECK] Log GPU memory before/after allocation
-        if torch.cuda.is_available():
-            allocated_mb = torch.cuda.memory_allocated() / 1024**2
-            reserved_mb = torch.cuda.memory_reserved() / 1024**2
-            logger.info(f"[GPU_MEM] Before KV alloc: allocated={allocated_mb:.1f}MB, reserved={reserved_mb:.1f}MB")
-        
         async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as raw_handles:
-            # [SANITY_CHECK] Log GPU memory after allocation
-            if torch.cuda.is_available():
-                allocated_mb = torch.cuda.memory_allocated() / 1024**2
-                reserved_mb = torch.cuda.memory_reserved() / 1024**2
-                logger.info(f"[GPU_MEM] After KV alloc: allocated={allocated_mb:.1f}MB, reserved={reserved_mb:.1f}MB")
-            
-            # [SANITY_CHECK] Verify handle count matches descriptor count
-            total_descriptors = sum(len(d) for d in descriptors)
-            logger.info(f"[SANITY_CHECK] KV alloc: {len(raw_handles)} handles for {total_descriptors} descriptors")
             
             logger.info("OFFLOAD: allocation completed; entering use_cache region")
             yield nested_pack(raw_handles, descriptors)

@@ -613,16 +613,6 @@ class KVCacheManager:
         (k_cache, v_cache), = cache_tensors
         S_total, BH_dst, D_dst = k_cache.shape
         
-        # [SANITY_CHECK] Verify cache tensor properties
-        if hasattr(k_cache, 'data'):
-            k_data = k_cache.data if not isinstance(k_cache.data, tuple) else k_cache.data[0][0]
-            k_device = str(k_data.device) if hasattr(k_data, 'device') else 'unknown'
-            k_dtype = str(k_data.dtype) if hasattr(k_data, 'dtype') else 'unknown'
-        else:
-            k_device, k_dtype = 'N/A', 'N/A'
-        
-        logger.info(f"[SANITY_CHECK] _write_kvs: cache_shape=(S={S_total}, BH={BH_dst}, D={D_dst}), "
-                   f"device={k_device}, dtype={k_dtype}, start_pos={start_position}")
 
         # Extract (key, value)
         new_kvs = kvs.kvs if hasattr(kvs, "kvs") else kvs
@@ -651,23 +641,7 @@ class KVCacheManager:
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
         
-        # [MBPIPE] Debug log source shape
         H = getattr(self.block_config, "num_attention_heads", 32)  # Default to 32 heads for LLaMA-7B
-        actual_batch_src = BH_src // H if H > 0 else 1
-        actual_batch_dst = BH_dst // H if H > 0 else 1
-        
-        # [SANITY_CHECK] Validate batch dimensions consistency
-        if full_batch_size > 0:
-            expected_batch_dst = full_batch_size
-            if actual_batch_dst != expected_batch_dst:
-                logger.warning(f"[SANITY_CHECK] BATCH MISMATCH: cache has {actual_batch_dst} batch slots, "
-                              f"but expected {expected_batch_dst} for full_batch_size={full_batch_size}")
-            else:
-                logger.info(f"[SANITY_CHECK] BATCH OK: cache={actual_batch_dst}, expected={expected_batch_dst}")
-        
-        logger.info(f"[MBPIPE_DEBUG] _write_kvs: BH_src={BH_src}, BH_dst={BH_dst}, H={H}, "
-                    f"batch_src={actual_batch_src}, batch_dst={actual_batch_dst}, "
-                    f"full_batch_size={full_batch_size}, batch_offset={batch_offset}, micro_batch_size={micro_batch_size}")
 
         # Micro-batch support: compute BH offset for batch slicing
         # [MBPIPE_MULTIPLEX] Check if GPU memory multiplexing is enabled
