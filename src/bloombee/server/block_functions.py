@@ -874,22 +874,14 @@ async def iterate_rpc_inference(
                         mb_tree_mask = tree_attention_mask[mb_start:mb_end] if tree_attention_mask is not None and not is_dummy(tree_attention_mask) else tree_attention_mask
                         mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
                         
-                        # [TRUE MICRO-BATCH MULTIPLEXING]
-                        # When GPU cache is sized for micro_batch_size only:
-                        # - Each micro-batch uses cache slots [0:mb_size] (same slots, recycled)
-                        # - batch_offset=0 because GPU only has mb_size slots
-                        # - full_batch_size=mb_size because that's all GPU can hold
-                        # - offload/prefetch swaps the data in/out of these fixed slots
-                        from bloombee.utils.microbatch_config import get_micro_batch_config
-                        mb_multiplex_config = get_micro_batch_config()
-                        if mb_multiplex_config['enabled']:
-                            # GPU memory multiplexing: reuse same cache slots [0:mb_size]
-                            cache_batch_offset = 0
-                            cache_full_batch_size = mb_size
-                        else:
-                            # No multiplexing: use original offsets
-                            cache_batch_offset = mb_start
-                            cache_full_batch_size = batch_size
+                        # [MBPIPE] KV CACHE FIX: Since we allocate KV cache for FULL batch (not micro-batch),
+                        # we must use the full batch_size and proper batch_offset for correct slicing.
+                        # The earlier code incorrectly assumed GPU-multiplexing mode where cache holds only micro_batch_size.
+                        # After the KV cache allocation fix, cache holds full batch, so we always use:
+                        # - batch_offset = mb_start (the micro-batch's position in full batch)
+                        # - full_batch_size = batch_size (the actual full batch size)
+                        cache_batch_offset = mb_start
+                        cache_full_batch_size = batch_size
                         
                         mb_inference_infos = tuple(
                             InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,

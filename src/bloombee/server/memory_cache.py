@@ -225,9 +225,33 @@ class MemoryCache:
                     logger.info(f"[MB_CACHE_ALLOC] Allocating cache: descr_batch_size={descr_batch_size}, "
                                f"seq_len={seq_len}, shape={descr.shape}")
                     
-                    self._allocated_tensors[handle] = self.device.init_cache_one_gpu_batch(
+                    allocated_cache = self.device.init_cache_one_gpu_batch(
                         self.block_config, self.mocked_task, override_policy
                     )
+                    self._allocated_tensors[handle] = allocated_cache
+                    
+                    # [SANITY_CHECK] Verify allocated cache tensor shape
+                    try:
+                        if allocated_cache and len(allocated_cache) > 0:
+                            layer_cache = allocated_cache[0]
+                            if hasattr(layer_cache, '__len__') and len(layer_cache) >= 2:
+                                k_cache, v_cache = layer_cache[0], layer_cache[1]
+                                k_shape = k_cache.shape if hasattr(k_cache, 'shape') else 'N/A'
+                                v_shape = v_cache.shape if hasattr(v_cache, 'shape') else 'N/A'
+                                logger.info(f"[SANITY_CHECK] Cache allocated: handle={handle}, k_shape={k_shape}, v_shape={v_shape}")
+                                
+                                # [SANITY_CHECK] Verify batch dimension matches descriptor
+                                if hasattr(k_cache, 'shape') and len(k_cache.shape) >= 2:
+                                    # KV cache shape: (S, B*H, D) - extract batch from B*H
+                                    S_alloc, BH_alloc, D_alloc = k_cache.shape
+                                    num_heads = descr.shape[1] if len(descr.shape) > 1 else 32
+                                    batch_alloc = BH_alloc // num_heads
+                                    if batch_alloc != descr_batch_size:
+                                        logger.error(f"[SANITY_CHECK] CACHE BATCH MISMATCH! allocated={batch_alloc}, expected={descr_batch_size}")
+                                    else:
+                                        logger.info(f"[SANITY_CHECK] Cache batch verified: {batch_alloc} == {descr_batch_size} ✓")
+                    except Exception as e:
+                        logger.debug(f"[SANITY_CHECK] Could not verify cache shape: {e}")
             else:  # delete tensors by handle
                 for handle in recv_handles:
                     if handle not in self._allocated_tensors:

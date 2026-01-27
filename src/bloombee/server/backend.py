@@ -401,6 +401,24 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     full_batch_size=inference_info.full_batch_size,
                     micro_batch_size=inference_info.micro_batch_size,
                 )
+                
+                # [SANITY_CHECK] Verify output tensor integrity
+                if output_hidden_states is not None:
+                    output_stats = {
+                        'shape': tuple(output_hidden_states.shape),
+                        'dtype': str(output_hidden_states.dtype),
+                        'has_nan': bool(torch.isnan(output_hidden_states).any().item()),
+                        'has_inf': bool(torch.isinf(output_hidden_states).any().item()),
+                        'mean': float(output_hidden_states.mean().item()),
+                        'std': float(output_hidden_states.std().item()),
+                    }
+                    if output_stats['has_nan'] or output_stats['has_inf']:
+                        logger.error(f"[SANITY_CHECK] OUTPUT CORRUPT! block={self.name}, "
+                                    f"batch_offset={inference_info.batch_offset}, stats={output_stats}")
+                    else:
+                        logger.debug(f"[SANITY_CHECK] Output OK: block={self.name}, "
+                                   f"shape={output_stats['shape']}, mean={output_stats['mean']:.4f}, std={output_stats['std']:.4f}")
+                
                 keep_indices = inference_info.keep_indices
                 
                 if self._is_spec_decoding and self._need_pruning and self._is_last_block:
