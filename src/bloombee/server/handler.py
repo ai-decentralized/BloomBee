@@ -96,6 +96,25 @@ import pickle
 import fcntl
 import os
 import tempfile
+from dataclasses import dataclass, field
+from typing import Set as TypingSet
+
+
+# [MBPIPE] Streaming decode state for cross-stage overlap
+# Tracks state when processing micro-batches as they arrive from upstream
+@dataclass
+class StreamingDecodeState:
+    """State for a streaming decode session where micro-batches are processed as they arrive."""
+    session_id: str
+    step_id: str
+    total_mbs: int                          # Expected total micro-batches
+    full_batch_size: int                    # Full batch size across all MBs
+    received_mbs: TypingSet[int] = field(default_factory=set)  # Set of received MB indices
+    results: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)  # mb_idx -> (hidden, keep_indices)
+    cache_allocated: bool = False           # Whether KV cache is allocated
+    cache_handles: Optional[List] = None    # KV cache handles
+    first_mb_metadata: Optional[Dict] = None  # Metadata from first MB for context
+    start_time: float = 0.0                 # Start time for timing
 
 # Directory for storing micro-batch accumulator data
 _MB_ACCUMULATOR_DIR = os.path.join(tempfile.gettempdir(), "bloombee_mb_accumulator")
@@ -236,6 +255,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         ) == "1"
         
         logger.info(f"{MBPIPE_LOG_PREFIX} Immediate micro-batch queuing: {'ENABLED' if self._enable_immediate_mb_queue else 'disabled'}")
+        
+        # [MBPIPE] Streaming decode: process micro-batches as they arrive for cross-stage overlap
+        # Key: (session_id, step_id) -> StreamingDecodeState
+        self._streaming_decode_sessions: Dict[tuple, StreamingDecodeState] = {}
+
 
 
         self.inference_max_length = inference_max_length
@@ -334,26 +358,59 @@ class TransformerConnectionHandler(ConnectionHandler):
                         f"Cannot allocate KV cache for {max_length} tokens, max = {self.inference_max_length}"
                     )
 
-                batch_size = request.tensors[0].size[0] if request.tensors else 1
+                original_batch_size = request.tensors[0].size[0] if request.tensors else 1
+                batch_size = original_batch_size
+                
+                # [MB_DEBUG] Log initial batch size detection
+                logger.info(f"[MB_DEBUG] === BATCH SIZE DETECTION ===")
+                logger.info(f"[MB_DEBUG] Original batch_size from tensor[0]: {original_batch_size}")
+                logger.info(f"[MB_DEBUG] Metadata keys: {list(metadata.keys())}")
+                logger.info(f"[MB_DEBUG] metadata.type={metadata.get('type')}, metadata.full_batch_size={metadata.get('full_batch_size')}")
+                
+                # [MBPIPE_STREAMING] For cross-stage micro-batch streaming, use full_batch_size for KV cache allocation
+                # This is critical for decode overlap: Stage 2 must allocate cache for full batch on first MB arrival
+                is_streaming_decode = is_microbatch_queue_item(request) or metadata.get("type") == "micro_batch"
+                logger.info(f"[MB_DEBUG] is_streaming_decode={is_streaming_decode}, is_microbatch_queue_item={is_microbatch_queue_item(request)}")
+                
+                if is_streaming_decode:
+                    streaming_full_batch_size = metadata.get("full_batch_size", batch_size)
+                    logger.info(f"[MB_DEBUG] Streaming decode detected! streaming_full_batch_size={streaming_full_batch_size}")
+                    if streaming_full_batch_size > batch_size:
+                        logger.info(f"{MBPIPE_LOG_PREFIX} [STREAMING_DECODE] Detected streaming micro-batch, "
+                                   f"using full_batch_size={streaming_full_batch_size} for KV cache (actual MB size={batch_size})")
+                        batch_size = streaming_full_batch_size
+                        logger.info(f"[MB_DEBUG] KV cache will use batch_size={batch_size} (overridden from {original_batch_size})")
+                else:
+                    logger.info(f"[MB_DEBUG] NOT streaming decode, using original batch_size={batch_size}")
+                
                 end_batch_size_time = perf_counter()
+                logger.info(f"[MB_DEBUG] Batch size detection completed in {(end_batch_size_time - perf_counter())*1000:.2f}ms, final batch_size={batch_size}")
                 # print_time_now('')
                 
                 # [MBPIPE] Log current path at rpc_inference entry
                 mbpipe_log_path_entry(logger, "handler.rpc_inference", batch_size=batch_size)
+
                 
                 push_time = []
-                # offload_logger.info(f" Inference parameters:")
-                # offload_logger.info(f"   - batch size: {batch_size}")
-                # offload_logger.info(f"   - max length: {max_length}")
-                # offload_logger.info(f"   - allocation timeout: {alloc_timeout}")
-                # offload_logger.info(f"   - requested UIDs: {requested_uids}")
+                
+                # [KVCACHE_DEBUG] Log before cache allocation
+                cache_alloc_start = perf_counter()
+                logger.info(f"[KVCACHE_DEBUG] === KV CACHE ALLOCATION ===")
+                logger.info(f"[KVCACHE_DEBUG] Allocating cache: batch_size={batch_size}, max_length={max_length}, timeout={alloc_timeout}")
+                logger.info(f"[KVCACHE_DEBUG] Requested backends: {len(requested_backends)}, UIDs: {requested_uids}")
                 
                 async with self._allocate_cache(
                     requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
                 ) as cache_handles:
                     end_cache_time = perf_counter()
-                    # offload_logger.info(f" Cache allocation completed - time: {end_cache_time- end_batch_size_time:.3f}s")
-                    # print('cache allocate time ', end_cache_time- end_batch_size_time)
+                    cache_alloc_ms = (end_cache_time - cache_alloc_start) * 1000
+                    
+                    # [KVCACHE_DEBUG] Log cache allocation result
+                    logger.info(f"[KVCACHE_DEBUG] Cache allocated in {cache_alloc_ms:.2f}ms")
+                    logger.info(f"[KVCACHE_DEBUG] cache_handles count: {len(cache_handles) if cache_handles else 0}")
+                    if cache_handles:
+                        for i, handles in enumerate(cache_handles):
+                            logger.info(f"[KVCACHE_DEBUG] cache_handles[{i}]: {len(handles) if handles else 0} handles")
                     
                     background_tasks = set()
                     step_=0
