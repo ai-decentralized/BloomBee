@@ -1427,26 +1427,69 @@ class TransformerConnectionHandler(ConnectionHandler):
         # - Client can request larger batch_size (handled via offload/prefetch)
         # - Each micro-batch reuses the same GPU cache slots
         from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
+        from bloombee.utils.memory_usage import log_mbpipe_memory, log_kv_cache_allocation, MemoryTracker
+        
         mb_config = get_micro_batch_config()
         policy = cache_manager.offloading_policy
         max_supported_batch = policy.gpu_batch_size
+        micro_batch_size = mb_config['micro_batch_size']
         
-        if mb_config['enabled']:
-            # Micro-batching enabled: still need full KV cache for all batch items
-            # Micro-batching only reduces peak GPU compute, not KV cache requirements
-            # Each batch item needs independent KV cache storage
-            alloc_batch_size = batch_size  # FIXED: allocate for full batch, not micro_batch
-            logger.info(f"[MB_KV_ALLOC] client batch_size={batch_size}, GPU alloc_batch_size={alloc_batch_size} "
-                       f"(micro-batch enabled, but KV cache needs full batch)")
+        # [MBPIPE_DEBUG] Log the critical allocation decision
+        logger.info(f"[MBPIPE_ALLOC_DEBUG] ========================================")
+        logger.info(f"[MBPIPE_ALLOC_DEBUG] KV CACHE ALLOCATION DECISION POINT")
+        logger.info(f"[MBPIPE_ALLOC_DEBUG] ========================================")
+        logger.info(f"[MBPIPE_ALLOC_DEBUG] Input: batch_size={batch_size}, max_length={max_length}")
+        logger.info(f"[MBPIPE_ALLOC_DEBUG] Config: mb_enabled={mb_config['enabled']}, micro_batch_size={micro_batch_size}")
+        logger.info(f"[MBPIPE_ALLOC_DEBUG] Policy: gpu_batch_size={max_supported_batch}")
+        
+        if mb_config['enabled'] and micro_batch_size < batch_size:
+            # [MBPIPE_FIX] GPU Memory Multiplexing:
+            # - Allocate GPU cache for micro_batch_size ONLY (not full batch)
+            # - All micro-batches reuse the same GPU cache slots (offset=0)
+            # - offload() saves current micro-batch's KV to CPU after compute
+            # - prefetch() loads next micro-batch's KV from CPU before compute
+            # This achieves true GPU memory savings!
+            alloc_batch_size = micro_batch_size  # FIX: allocate for micro-batch only!
+            
+            logger.info(f"[MBPIPE_ALLOC_DEBUG] !!! GPU MEMORY MULTIPLEXING ENABLED !!!")
+            logger.info(f"[MBPIPE_ALLOC_DEBUG] alloc_batch_size = {alloc_batch_size} (MICRO-BATCH)")
+            logger.info(f"[MBPIPE_ALLOC_DEBUG] Full batch ({batch_size}) will be processed in {(batch_size + micro_batch_size - 1) // micro_batch_size} micro-batches")
+            logger.info(f"[MBPIPE_ALLOC_DEBUG] Each micro-batch reuses the same GPU cache slots")
+            
+            # [MBPIPE_DEBUG] Calculate and log expected memory usage
+            try:
+                block_config = cache_manager.block_config
+                log_kv_cache_allocation(
+                    batch_size=batch_size,
+                    micro_batch_size=micro_batch_size,
+                    max_length=max_length,
+                    num_blocks=len(backends),
+                    hidden_size=getattr(block_config, 'hidden_size', 4096),
+                    num_heads=getattr(block_config, 'num_attention_heads', 32),
+                    dtype_bytes=2  # fp16
+                )
+            except Exception as e:
+                logger.debug(f"[MBPIPE_ALLOC_DEBUG] log_kv_cache_allocation failed: {e}")
+            
         else:
             # Micro-batching disabled: enforce strict batch limit
             alloc_batch_size = batch_size
+            logger.info(f"[MBPIPE_ALLOC_DEBUG] Micro-batching disabled, alloc_batch_size={alloc_batch_size}")
             if batch_size > max_supported_batch:
                 raise AllocationFailed(
                     f"Requested batch size {batch_size} exceeds server capacity "
                     f"{max_supported_batch}. Reduce client batch size or restart the "
                     f"server with a larger --batch_size value."
                 )
+        
+        logger.info(f"[MBPIPE_ALLOC_DEBUG] ========================================")
+        
+        # [MBPIPE_DEBUG] Call the memory savings diagnosis to explain current behavior
+        try:
+            from bloombee.utils.microbatch_config import log_memory_savings_diagnosis
+            log_memory_savings_diagnosis(logger, batch_size)
+        except Exception as e:
+            logger.debug(f"[MBPIPE_ALLOC_DEBUG] log_memory_savings_diagnosis failed: {e}")
 
         # Allocate cache descriptors for alloc_batch_size (= micro_batch_size when MB enabled)
         descriptors = [backend.get_inference_cache_descriptors(alloc_batch_size, max_length) for backend in backends]

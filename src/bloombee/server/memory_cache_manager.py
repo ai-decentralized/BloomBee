@@ -197,14 +197,22 @@ class KVCacheManager:
         full_batch_in_cache = BH_full // H  # Actual batch size in allocated cache
         
         if full_batch_size > 0 and micro_batch_size > 0:
-            # Micro-batch mode: read only the slice for this micro-batch
-            # Use explicit micro_batch_size from caller
-            BH_offset_start = batch_offset * H
-            BH_offset_end = BH_offset_start + micro_batch_size * H
-            BH_offset_end = min(BH_offset_end, BH_full)  # Safety clamp
-            BH = BH_offset_end - BH_offset_start
-            logger.debug(f"[MBPIPE] select_cache MICRO: H={H}, micro_batch_size={micro_batch_size}, "
-                        f"BH_slice=[{BH_offset_start}:{BH_offset_end}]")
+            # [MBPIPE_MULTIPLEX] Detect GPU multiplexing based on actual cache size
+            # GPU multiplexing: cache is sized for micro-batch only (full_batch_in_cache == micro_batch_size)
+            if full_batch_in_cache == micro_batch_size:
+                # GPU multiplexing: all micro-batches read from offset=0
+                BH_offset_start = 0
+                BH_offset_end = micro_batch_size * H
+                BH = BH_offset_end
+                logger.debug(f"[MBPIPE_MULTIPLEX] select_cache: GPU multiplexing ACTIVE, reading from [0:{BH_offset_end}]")
+            else:
+                # Legacy mode: cache holds full batch, use batch_offset for slicing
+                BH_offset_start = batch_offset * H
+                BH_offset_end = BH_offset_start + micro_batch_size * H
+                BH_offset_end = min(BH_offset_end, BH_full)  # Safety clamp
+                BH = BH_offset_end - BH_offset_start
+                logger.debug(f"[MBPIPE] select_cache LEGACY: H={H}, micro_batch_size={micro_batch_size}, "
+                            f"BH_slice=[{BH_offset_start}:{BH_offset_end}]")
         else:
             # Full batch mode
             BH_offset_start = 0
@@ -425,10 +433,13 @@ class KVCacheManager:
             mb_index: Index of the micro-batch (0, 1, 2, ...) to identify which staging buffer
             prefix_length: Sequence length to offload (0 = full sequence)
         """
+        logger.info(f"[MBPIPE_OFFLOAD_DEBUG] offload_microbatch_kv called: mb_index={mb_index}, prefix_length={prefix_length}")
+        
         if not self._offload_enabled:
+            logger.info(f"[MBPIPE_OFFLOAD_DEBUG] offload DISABLED, returning early")
             return
         if not self._active_cache_tensors_stack:
-            logger.debug("[KVCACHE_OFFLOAD] No active cache, skipping offload")
+            logger.info("[MBPIPE_OFFLOAD_DEBUG] No active cache, skipping offload")
             return
             
         cache_tensors = self._active_cache_tensors_stack[-1]
@@ -439,15 +450,33 @@ class KVCacheManager:
             k_data = k_cache.data if hasattr(k_cache, 'data') else k_cache
             v_data = v_cache.data if hasattr(v_cache, 'data') else v_cache
             
+            # [MBPIPE_OFFLOAD_DEBUG] Log the cache shape - THIS IS THE KEY!
+            # If k_data.shape[1] == full_batch_size * num_heads, then NO GPU memory savings!
+            logger.info(f"[MBPIPE_OFFLOAD_DEBUG] Cache shape: k_data.shape={k_data.shape if hasattr(k_data, 'shape') else 'N/A'}")
+            logger.info(f"[MBPIPE_OFFLOAD_DEBUG] This shape tells us if cache is for FULL batch or MICRO batch")
+            
             # Check if data is on GPU
-            if not k_data.is_cuda:
-                logger.debug(f"[KVCACHE_OFFLOAD] Cache not on GPU (device={k_data.device}), skipping offload")
+            if hasattr(k_data, 'is_cuda') and not k_data.is_cuda:
+                logger.info(f"[MBPIPE_OFFLOAD_DEBUG] Cache not on GPU (device={k_data.device}), skipping offload")
+                return
+            elif hasattr(k_data, 'device') and str(k_data.device) == 'cpu':
+                logger.info(f"[MBPIPE_OFFLOAD_DEBUG] Cache on CPU, skipping offload")
+                return
+            elif isinstance(k_data, tuple):
+                # TorchMixedDevice case
+                logger.info(f"[MBPIPE_OFFLOAD_DEBUG] Cache is TorchMixedDevice (tuple), skipping standard offload")
                 return
             
             # Initialize streams on the correct device
             self._ensure_streams_initialized(k_data.device)
             
             S_total, BH_mb, D = k_data.shape  # BH_mb = micro_batch_size * num_heads
+            
+            # [MBPIPE_OFFLOAD_DEBUG] Log the key insight
+            H = getattr(self.block_config, "num_attention_heads", 32)
+            implied_batch = BH_mb // H
+            logger.info(f"[MBPIPE_OFFLOAD_DEBUG] BH_mb={BH_mb}, num_heads={H}, implied_batch_size={implied_batch}")
+            logger.info(f"[MBPIPE_OFFLOAD_DEBUG] If implied_batch_size > micro_batch_size, cache holds FULL batch = NO memory savings!")
             
             # Use full sequence if not specified
             if prefix_length <= 0:
@@ -499,11 +528,15 @@ class KVCacheManager:
         Args:
             mb_index: Index of the micro-batch (0, 1, 2, ...) to prefetch
         """
+        logger.info(f"[MBPIPE_PREFETCH_DEBUG] prefetch_microbatch_kv called: mb_index={mb_index}")
+        
         if not self._offload_enabled:
+            logger.info(f"[MBPIPE_PREFETCH_DEBUG] prefetch DISABLED, returning early")
             return
             
         if mb_index not in self._mb_cpu_staging:
-            logger.debug(f"[KVCACHE_OFFLOAD] mb_index={mb_index} not in CPU staging, skipping prefetch")
+            logger.info(f"[MBPIPE_PREFETCH_DEBUG] mb_index={mb_index} not in CPU staging (existing keys: {list(self._mb_cpu_staging.keys())}), skipping prefetch")
+            logger.info(f"[MBPIPE_PREFETCH_DEBUG] NOTE: This means offload_microbatch_kv never completed for this MB!")
             return
             
         if not self._active_cache_tensors_stack:
@@ -613,6 +646,24 @@ class KVCacheManager:
         (k_cache, v_cache), = cache_tensors
         S_total, BH_dst, D_dst = k_cache.shape
         
+        # [MBPIPE_WRITE_DEBUG] Log the cache shape and write parameters
+        H = getattr(self.block_config, "num_attention_heads", 32)
+        cache_batch_size = BH_dst // H
+        
+        logger.debug(f"[MBPIPE_WRITE_DEBUG] _write_kvs called:")
+        logger.debug(f"[MBPIPE_WRITE_DEBUG]   Cache shape: (S={S_total}, BH={BH_dst}, D={D_dst})")
+        logger.debug(f"[MBPIPE_WRITE_DEBUG]   Params: start_position={start_position}, batch_offset={batch_offset}, "
+                    f"full_batch_size={full_batch_size}, micro_batch_size={micro_batch_size}")
+        logger.debug(f"[MBPIPE_WRITE_DEBUG]   Cache holds {cache_batch_size} batch items (BH={BH_dst} / H={H})")
+        
+        # [MBPIPE_MULTIPLEX] Detect GPU multiplexing mode
+        # When cache_batch_size == micro_batch_size < full_batch_size, we're in multiplexing mode
+        gpu_multiplexing = (micro_batch_size > 0 and cache_batch_size == micro_batch_size)
+        if gpu_multiplexing:
+            logger.debug(f"[MBPIPE_WRITE_DEBUG]   GPU MULTIPLEXING: cache sized for micro-batch ({cache_batch_size})")
+        elif full_batch_size > 0 and cache_batch_size == full_batch_size:
+            logger.debug(f"[MBPIPE_WRITE_DEBUG]   LEGACY: cache sized for full batch ({full_batch_size})")
+        
 
         # Extract (key, value)
         new_kvs = kvs.kvs if hasattr(kvs, "kvs") else kvs
@@ -641,34 +692,32 @@ class KVCacheManager:
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
         
-        H = getattr(self.block_config, "num_attention_heads", 32)  # Default to 32 heads for LLaMA-7B
-
         # Micro-batch support: compute BH offset for batch slicing
-        # [MBPIPE_MULTIPLEX] Check if GPU memory multiplexing is enabled
-        from bloombee.utils.microbatch_config import get_micro_batch_config
-        mb_config = get_micro_batch_config()
-        gpu_multiplexing = mb_config['enabled'] and (BH_dst == mb_config['micro_batch_size'] * H)
+        # [MBPIPE_MULTIPLEX] Detect GPU multiplexing based on actual cache size vs source size
+        # GPU multiplexing is active when cache holds exactly micro_batch_size (BH_dst == BH_src)
         
         if full_batch_size > 0:
-            # Micro-batch mode: BH_src is for micro-batch, BH_dst is for full batch or just micro_batch
-            micro_batch_size = BH_src // H
+            # Micro-batch mode: BH_src is for micro-batch, BH_dst might be full or micro
+            actual_micro_batch_size = BH_src // H
             
-            if gpu_multiplexing:
+            # GPU multiplexing: cache is sized for micro-batch only (BH_dst == BH_src)
+            # In this mode, all micro-batches write to offset=0
+            if BH_dst == BH_src:
                 # [MBPIPE_MULTIPLEX] GPU memory multiplexing: cache only holds micro_batch_size slots
                 # Always write to [0:BH_src], offload/prefetch handles data swapping
                 BH_offset_start = 0
                 BH_offset_end = BH_src
-                logger.debug(f"[MBPIPE_MULTIPLEX] _write_kvs: GPU multiplexing active, writing to [0:{BH_src}] "
-                            f"(batch_offset={batch_offset} ignored, gpu_cache_batch={mb_config['micro_batch_size']})")
+                logger.info(f"[MBPIPE_MULTIPLEX] _write_kvs: GPU multiplexing ACTIVE, writing to [0:{BH_src}] "
+                           f"(all micro-batches reuse same GPU slots)")
             else:
-                # Standard micro-batch mode: cache holds full batch, use batch_offset
+                # Legacy mode: cache holds full batch, use batch_offset for slicing
                 BH_offset_start = batch_offset * H
                 BH_offset_end = BH_offset_start + BH_src
                 if BH_offset_end > BH_dst:
                     logger.error(f"[MBPIPE_DEBUG] BH offset out of bounds: {BH_offset_end} > {BH_dst}, "
                                 f"clamping to BH_dst={BH_dst}")
                     BH_offset_end = BH_dst
-            logger.debug(f"[MBPIPE] _write_kvs MICRO: BH_slice=[{BH_offset_start}:{BH_offset_end}]")
+                logger.debug(f"[MBPIPE] _write_kvs LEGACY: BH_slice=[{BH_offset_start}:{BH_offset_end}]")
         else:
             # Full batch mode: if BH_src < BH_dst, auto-adapt by writing to first BH_src entries
             # This handles the case where request batch_size < server cache batch_size

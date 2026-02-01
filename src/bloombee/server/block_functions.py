@@ -933,6 +933,16 @@ async def iterate_rpc_inference(
                         
                         mb_size = mb_end - mb_start
                         
+                        # [MBPIPE_MEM_DEBUG] Log memory at start of each micro-batch
+                        try:
+                            from bloombee.utils.memory_usage import log_mbpipe_memory, get_gpu_memory_mb
+                            mem_before = get_gpu_memory_mb()
+                            logger.info(f"[MBPIPE_MEM_DEBUG] ===== MB{mb_idx} START (size={mb_size}, offset={mb_start}) =====")
+                            log_mbpipe_memory(f"MB{mb_idx}_START", f"size={mb_size}, total_mb={total_mb}")
+                        except Exception as e:
+                            mem_before = 0
+                            logger.debug(f"[MBPIPE_MEM_DEBUG] Memory logging failed: {e}")
+                        
                         # [KVCACHE_OFFLOAD] Get cache manager for offload/prefetch operations
                         cache_manager = requested_backends[0].cache_manager if requested_backends else None
                         
@@ -946,6 +956,12 @@ async def iterate_rpc_inference(
                                 cache_manager.sync_prefetch()
                             prefetch_sync_time_ms = (_perf_counter() - prefetch_start) * 1000
                             logger.info(f"[PHASE3_PREFETCH] MB{mb_idx}: sync complete ({prefetch_sync_time_ms:.2f}ms, overlapped with prev compute)")
+                            
+                            # [MBPIPE_MEM_DEBUG] Log memory after prefetch sync
+                            try:
+                                log_mbpipe_memory(f"MB{mb_idx}_AFTER_PREFETCH_SYNC", "")
+                            except Exception:
+                                pass
                         
                         # [CROSS_STAGE] Record absolute timestamp when compute starts for overlap analysis
                         import time as _time
@@ -957,14 +973,28 @@ async def iterate_rpc_inference(
                         mb_tree_mask = tree_attention_mask[mb_start:mb_end] if tree_attention_mask is not None and not is_dummy(tree_attention_mask) else tree_attention_mask
                         mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
                         
-                        # [MBPIPE] KV CACHE FIX: Since we allocate KV cache for FULL batch (not micro-batch),
-                        # we must use the full batch_size and proper batch_offset for correct slicing.
-                        # The earlier code incorrectly assumed GPU-multiplexing mode where cache holds only micro_batch_size.
-                        # After the KV cache allocation fix, cache holds full batch, so we always use:
-                        # - batch_offset = mb_start (the micro-batch's position in full batch)
-                        # - full_batch_size = batch_size (the actual full batch size)
-                        cache_batch_offset = mb_start
-                        cache_full_batch_size = batch_size
+                        # [MBPIPE_MULTIPLEX] GPU Memory Multiplexing Mode:
+                        # When micro-batching is enabled, GPU cache is sized for micro_batch_size only.
+                        # All micro-batches REUSE the same GPU cache slots (offset=0).
+                        # This achieves true GPU memory savings!
+                        #
+                        # Key insight: 
+                        # - GPU cache shape: (S, micro_batch_size * H, D)
+                        # - Each micro-batch writes to offset=0 (not mb_start)
+                        # - offload() saves data to CPU after compute
+                        # - prefetch() loads data from CPU before compute
+                        from bloombee.utils.microbatch_config import is_microbatch_enabled, get_micro_batch_size
+                        
+                        if is_microbatch_enabled() and total_mb > 1:
+                            # GPU multiplexing: all micro-batches use offset=0
+                            cache_batch_offset = 0
+                            cache_full_batch_size = mb_size  # Cache only holds micro_batch_size
+                            logger.info(f"[MBPIPE_MULTIPLEX] MB{mb_idx}: GPU multiplexing active, "
+                                       f"cache_batch_offset=0 (reusing GPU cache), cache_size={mb_size}")
+                        else:
+                            # Legacy mode or single micro-batch: use actual offsets
+                            cache_batch_offset = mb_start
+                            cache_full_batch_size = batch_size
                         
                         mb_inference_infos = tuple(
                             InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,
@@ -991,6 +1021,12 @@ async def iterate_rpc_inference(
                         mb_end_time = _perf_counter()
                         mb_timings.append((mb_idx, mb_start_time, mb_end_time))
                         
+                        # [MBPIPE_MEM_DEBUG] Log memory after compute
+                        try:
+                            log_mbpipe_memory(f"MB{mb_idx}_AFTER_COMPUTE", f"compute_time={compute_time_ms:.1f}ms")
+                        except Exception:
+                            pass
+                        
                         # [KVCACHE_OFFLOAD] STEP 3: Offload this micro-batch's KV cache to CPU (async)
                         # This frees GPU memory for the next micro-batch to reuse
                         # Don't offload the last micro-batch (we'll clear state instead)
@@ -1002,6 +1038,12 @@ async def iterate_rpc_inference(
                                 cache_manager.offload_microbatch_kv(mb_idx, current_prefix)
                                 offload_time_ms = (_perf_counter() - offload_start) * 1000
                                 logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: offload started ({offload_time_ms:.2f}ms async)")
+                                
+                                # [MBPIPE_MEM_DEBUG] Log memory after offload
+                                try:
+                                    log_mbpipe_memory(f"MB{mb_idx}_AFTER_OFFLOAD", "async, may not reflect immediately")
+                                except Exception:
+                                    pass
                         
                         # [PHASE3_PREFETCH] STEP 4: Start prefetching NEXT micro-batch's KV cache while
                         # current MB is being pushed. This overlaps prefetch with push/transfer latency.
@@ -1013,6 +1055,17 @@ async def iterate_rpc_inference(
                                 cache_manager.prefetch_microbatch_kv(mb_idx + 1)
                                 prefetch_start_time_ms = (_perf_counter() - prefetch_start) * 1000
                                 logger.info(f"[PHASE3_PREFETCH] MB{mb_idx}: started prefetch of MB{mb_idx + 1} ({prefetch_start_time_ms:.2f}ms async, will sync later)")
+                        
+                        # [MBPIPE_MEM_DEBUG] Log memory at END of micro-batch with summary
+                        try:
+                            mem_after = get_gpu_memory_mb()
+                            mem_delta = mem_after - mem_before
+                            logger.info(f"[MBPIPE_MEM_DEBUG] ===== MB{mb_idx} END =====")
+                            logger.info(f"[MBPIPE_MEM_DEBUG] MB{mb_idx} Memory Delta: {mem_delta:+.1f}MB (before={mem_before:.1f}MB, after={mem_after:.1f}MB)")
+                            if abs(mem_delta) < 1.0:
+                                logger.info(f"[MBPIPE_MEM_DEBUG] NOTE: No significant memory change - offload/prefetch NOT reducing GPU memory!")
+                        except Exception:
+                            pass
                         
                         # [KVCACHE_OFFLOAD] Log detailed timing breakdown for this micro-batch
                         total_mb_time_ms = (mb_end_time - mb_start_time) * 1000

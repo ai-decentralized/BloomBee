@@ -125,6 +125,57 @@ def log_config(logger: logging.Logger, context: str = "") -> None:
     )
 
 
+def log_memory_savings_diagnosis(logger: logging.Logger, batch_size: int = 8) -> None:
+    """
+    Log a diagnosis of whether micro-batching will actually reduce GPU memory.
+    
+    This function helps debug why micro-batching may not be reducing memory as expected.
+    
+    Args:
+        logger: The logger to use for output.
+        batch_size: The client's batch size for analysis.
+    """
+    enabled = is_microbatch_enabled()
+    micro_batch_size = get_micro_batch_size()
+    
+    logger.info(f"{MBPIPE_LOG_PREFIX} ===== MEMORY SAVINGS DIAGNOSIS =====")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Client batch_size: {batch_size}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch enabled: {enabled}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch size: {micro_batch_size}")
+    
+    if not enabled:
+        logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro-batching disabled)")
+        return
+    
+    if micro_batch_size >= batch_size:
+        logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro_batch_size >= batch_size)")
+        return
+    
+    # The key issue: current implementation allocates KV cache for FULL batch
+    logger.info(f"{MBPIPE_LOG_PREFIX} ")
+    logger.info(f"{MBPIPE_LOG_PREFIX} !!! CURRENT IMPLEMENTATION LIMITATION !!!")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Current behavior:")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   1. KV cache is allocated for FULL batch ({batch_size} items)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   2. Each micro-batch SLICES into this cache (batch_offset={0}, {micro_batch_size}, ...)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   3. offload/prefetch operates on FULL cache, not individual slices")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   4. GPU memory usage = FULL batch, NOT micro-batch")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Expected memory (if implemented correctly):")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - GPU cache for {micro_batch_size} items (micro-batch)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - CPU staging for {batch_size} items (all micro-batches)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - Savings: {(1 - micro_batch_size/batch_size)*100:.1f}% GPU memory reduction")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Actual memory (current implementation):")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - GPU cache for {batch_size} items (FULL batch)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - CPU staging is mostly unused")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - Savings: 0% (no GPU memory reduction)")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ")
+    logger.info(f"{MBPIPE_LOG_PREFIX} To fix: Modify _allocate_cache() to use alloc_batch_size=micro_batch_size")
+    logger.info(f"{MBPIPE_LOG_PREFIX}         and implement proper micro-batch KV cache multiplexing")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ===== END DIAGNOSIS =====")
+
+
 def log_path_entry(logger: logging.Logger, component: str, batch_size: int = 0) -> None:
     """
     Log entry into a specific path (legacy or microbatch).
