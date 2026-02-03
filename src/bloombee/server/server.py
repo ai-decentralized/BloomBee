@@ -237,7 +237,7 @@ class Server:
         if max_batch_size is None:
             max_batch_size = 8192 if is_multiquery_attn else 2048
         if inference_max_length is None:
-            inference_max_length = 8192 if is_multiquery_attn else 2048
+            inference_max_length = 8192 if is_multiquery_attn else 4096
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
         self.inference_max_length = inference_max_length
         self.max_chunk_size_bytes = max_chunk_size_bytes
@@ -300,7 +300,7 @@ class Server:
         
         # Create configuration
         config = PruningConfig(
-            method=PruningMethod.ADAPTIVE_NEURAL,
+            method=PruningMethod.SIMPLE_PROBABILITY,
             neural_threshold=0.5,
             simple_threshold=0.1
         )

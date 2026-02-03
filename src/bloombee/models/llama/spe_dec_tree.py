@@ -185,8 +185,24 @@ def prepare_incremental_tree_batch(
     trees: List[SpeculativeTree], 
     input_ids: torch.LongTensor,
     device: torch.device,
-    pad_token_id: int = 0
+    pad_token_id: int = 0,
+    seq_lengths: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
+    """
+    准备增量 tree batch，支持不同序列长度
+    
+    Args:
+        trees: speculative trees 列表
+        input_ids: [batch_size, max_seq_len] 输入 token ids（可能包含 padding）
+        device: 设备
+        pad_token_id: padding token id
+        seq_lengths: [batch_size] 每个序列的真实长度，如果为 None 则假设所有序列长度相同
+    
+    Returns:
+        tree_tokens: [batch_size, max_tree_size]
+        attention_mask: [batch_size, max_tree_size, past_len + max_tree_size]
+        batch_node_paths: 每个 batch 的节点路径列表
+    """
     batch_size = len(trees)
 
     if not trees or all(tree.total_nodes <= 1 for tree in trees):
@@ -237,10 +253,11 @@ def prepare_tree_attention_batch(
     trees: List[SpeculativeTree], 
     prefix_tokens: torch.Tensor,
     device: torch.device,
-    pad_token_id: int = 0
+    pad_token_id: int = 0,
+    seq_lengths: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
     tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tree_batch(
-        trees, prefix_tokens, device, pad_token_id
+        trees, prefix_tokens, device, pad_token_id, seq_lengths
     )
     if tree_tokens.shape[1] > 0:
         full_sequence = torch.cat([prefix_tokens, tree_tokens], dim=-1)

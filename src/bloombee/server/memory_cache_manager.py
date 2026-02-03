@@ -342,3 +342,193 @@ class KVCacheManager:
             kvs=(k_write, v_write),
             start_position=start_position
         )
+        
+    def update_cache_batched(
+        self,
+        new_kvs: AdaptedKVCache,
+        kv_valid_lengths: torch.Tensor,
+    ) -> None:
+        """
+        Batch speculative decoding 专用：每个 batch 从不同位置写入 KV cache
+        """
+        # 快速路径：所有 batch 的 start_position 相同
+        if (kv_valid_lengths == kv_valid_lengths[0]).all():
+            self._write_kvs(new_kvs, kv_valid_lengths[0].item())
+            return
+        
+        # 慢速路径：逐 batch 写入
+        assert self._active_cache_tensors_stack, "write called outside of use_cache context"
+        cache_tensors = self._active_cache_tensors_stack[-1]
+        (k_cache, v_cache), = cache_tensors
+        S_total, BH_dst, D_dst = k_cache.shape
+        
+        new_kvs_data = new_kvs.kvs if hasattr(new_kvs, "kvs") else new_kvs
+        key, value = new_kvs_data
+        
+        def _to_torch(x):
+            if hasattr(x, 'device') and (
+                getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
+                or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
+            ):
+                return x.device.decompress(x)
+            return getattr(x, 'data', x)
+        
+        key_t = _to_torch(key)       # (B*H, D, s_new)
+        value_t = _to_torch(value)   # (B*H, s_new, D)
+        
+        BH_src, D_src, s_new = key_t.shape
+        H = getattr(self.block_config, "num_attention_heads", None)
+        B = BH_src // H
+        
+        if key_t.dtype != k_cache.dtype:
+            key_t = key_t.to(dtype=k_cache.dtype)
+        if value_t.dtype != v_cache.dtype:
+            value_t = value_t.to(dtype=v_cache.dtype)
+        
+        # (B*H, D, s_new) -> (s_new, B*H, D)
+        k_write = key_t.permute(2, 0, 1)
+        v_write = value_t.permute(1, 0, 2)
+        
+        for i in range(B):
+            start_pos = kv_valid_lengths[i].item()
+            end_pos = min(start_pos + s_new, S_total)
+            actual_len = end_pos - start_pos
+            
+            if actual_len <= 0:
+                continue
+            
+            head_start = i * H
+            head_end = (i + 1) * H
+            
+            # 提取第 i 个 batch 的数据并写入
+            k_batch = k_write[:actual_len, head_start:head_end, :].contiguous()
+            v_batch = v_write[:actual_len, head_start:head_end, :].contiguous()
+            
+            dst_idx = (slice(start_pos, end_pos), slice(head_start, head_end), slice(0, D_src))
+            
+            k_src_tt = TorchTensor.create_from_torch(k_batch, self.attention_compute)
+            v_src_tt = TorchTensor.create_from_torch(v_batch, self.attention_compute)
+            
+            general_copy(k_cache, dst_idx, k_src_tt, None)
+            general_copy(v_cache, dst_idx, v_src_tt, None)
+        
+    def reorder_and_write_cache(
+        self,
+        k_pkv: torch.Tensor,
+        v_pkv: torch.Tensor,
+        kv_cache_position_ids: torch.Tensor,
+    ) -> Tuple[int, torch.Tensor]:
+        """
+        将分散的 positions 重排到连续位置 [0, N)
+        
+        Args:
+            k_pkv, v_pkv: [B, H, S_old, D] 原始取出的 cache
+            kv_cache_position_ids: [B, pos_len] 每个 batch 需要保留的 positions（-1 为无效）
+        
+        Returns:
+            max_new_length: 重排后的最大有效长度（用于 select_cache）
+            valid_lengths: [B] 每个 batch 的实际有效长度（用于 attention mask）
+        """
+        assert self._active_cache_tensors_stack, "write called outside of use_cache"
+    
+        B, H, S_old, D = k_pkv.shape
+        device = k_pkv.device
+        
+        if kv_cache_position_ids.dim() == 1:
+            kv_cache_position_ids = kv_cache_position_ids.unsqueeze(0)
+        
+        # 计算每个 batch 的完整索引（prefix + valid tree positions）
+        batch_all_positions = []
+        valid_lengths_list = []
+        
+        for i in range(B):
+            positions = kv_cache_position_ids[i]
+            valid_mask = positions >= 0
+            valid_positions = positions[valid_mask].tolist()
+            
+            if len(valid_positions) > 0:
+                # root_position 是第一个有效位置
+                root_position = valid_positions[0]
+                # prefix: [0, 1, ..., root_position - 1]
+                prefix_positions = list(range(root_position))
+                # 完整序列: prefix + valid tree positions
+                all_positions = prefix_positions + valid_positions
+            else:
+                # 没有有效的 tree positions，保持原样
+                all_positions = list(range(S_old))
+            
+            batch_all_positions.append(all_positions)
+            valid_lengths_list.append(len(all_positions))
+        
+        valid_lengths = torch.tensor(valid_lengths_list, dtype=torch.long, device=device)
+        max_new_length = valid_lengths.max().item()
+        
+        # 创建新的 reordered cache
+        k_new = torch.zeros(B, H, max_new_length, D, dtype=k_pkv.dtype, device=device)
+        v_new = torch.zeros(B, H, max_new_length, D, dtype=v_pkv.dtype, device=device)
+        
+        for i in range(B):
+            all_positions = batch_all_positions[i]
+            valid_len = len(all_positions)
+            
+            if valid_len > 0:
+                positions_tensor = torch.tensor(all_positions, dtype=torch.long, device=device)
+                # 从原 cache 的 all_positions 位置取出，写入新 cache 的 [0, valid_len)
+                k_new[i, :, :valid_len, :] = k_pkv[i, :, positions_tensor, :]
+                v_new[i, :, :valid_len, :] = v_pkv[i, :, positions_tensor, :]
+        
+        # 写回 cache（从 position 0 开始）
+        self.write_pkv_cache(k_new, v_new, start_position=0)
+        
+        return max_new_length, valid_lengths
+    
+    def select_cache_for_reorder(
+        self,
+        kv_cache_position_ids: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], bool]:
+        """
+        为 reorder 准备：取出所有 batch 需要的 positions 的并集
+        """
+        assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
+        
+        cache_tensors = self._active_cache_tensors_stack[-1]
+        (k_cache, v_cache), = cache_tensors
+        S_full, BH, D = k_cache.shape
+        
+        compute_dst = self.attention_compute
+        
+        H = getattr(self.block_config, "num_attention_heads", None)
+        B = BH // H
+        
+        def _as_torch(x):
+            return x.data if hasattr(x, "data") else x
+        
+        if kv_cache_position_ids.dim() == 1:
+            kv_cache_position_ids = kv_cache_position_ids.unsqueeze(0)
+        
+        # 找出需要的最大 position
+        valid_mask = kv_cache_position_ids >= 0
+        if not valid_mask.any():
+            return None, None, False
+        
+        max_position = kv_cache_position_ids[valid_mask].max().item()
+        
+        # 取 [0, max_position] 范围
+        prefix_length = int(max_position) + 1
+        idx_all = (slice(0, prefix_length), slice(0, BH))
+        
+        k_sel, _ = k_cache.smart_copy(compute_dst, idx_all)
+        v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
+        k_sbh = _as_torch(k_sel)
+        v_sbh = _as_torch(v_sel)
+        
+        def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:
+            return x_sbh.view(prefix_length, B, H, D).permute(1, 2, 0, 3)
+        
+        k_pkv = _to_pkv(k_sbh)
+        v_pkv = _to_pkv(v_sbh)
+        
+        # 判断是否需要 reorder
+        need_reorder = True  # 只要有 kv_cache_position_ids 就需要
+        
+        return k_pkv, v_pkv, need_reorder

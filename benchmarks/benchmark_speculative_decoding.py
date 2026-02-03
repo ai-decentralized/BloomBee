@@ -60,35 +60,59 @@ def benchmark_inference(process_idx, args, result_pipe):
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
+    batch_size = 4
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
-    indices = random.sample(range(len(dataset)), 1)
+    indices = random.sample(range(len(dataset)), batch_size)
     sampled = dataset.select(indices)
-    
-    for item in sampled:
-    
-        test_prompt = item["instruction"]
-        logger.info(f"test_prompt: {test_prompt}")
-        input_ids = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=False).to(device)
+    test_prompts = []
+    # for item in sampled:
+        # test_prompts.append(item["instruction"])
         
-        test_prompt = ""
-        bos_token_id = tokenizer.bos_token_id
-        if bos_token_id is not None:
-            input_ids = torch.tensor([[bos_token_id]], dtype=torch.long, device=device)
-        else:
-            # 如果tokenizer没有bos_token_id，可能需要手动获取或处理
-            logger.warning("Tokenizer does not have a bos_token_id. Using an empty tensor.")
-            input_ids = torch.tensor([[]], dtype=torch.long, device=device)
-        
+    test_prompts.append("Hi,")
+    test_prompts.append("")
+    test_prompts.append("")
+    test_prompts.append("")
 
-        result = ""
-        start_time = perf_counter()
-        result = model.generate(input_ids=input_ids, ssm=ssm)
-        time = perf_counter() - start_time
-        generated_tokens_num = result.shape[1] - input_ids.shape[1]
-        speed = generated_tokens_num / time
-        decoded_result = tokenizer.decode(result[0], skip_special_tokens=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.padding_side = "left"
+    input_ids = tokenizer(test_prompts, return_tensors="pt", padding=True).to(device)["input_ids"]
+    
+    # test_prompt = ""
+    # bos_token_id = tokenizer.bos_token_id
+    # if bos_token_id is not None:
+    #     input_ids = torch.tensor([[bos_token_id]], dtype=torch.long, device=device)
+    # else:
+    #     # 如果tokenizer没有bos_token_id，可能需要手动获取或处理
+    #     logger.warning("Tokenizer does not have a bos_token_id. Using an empty tensor.")
+    #     input_ids = torch.tensor([[]], dtype=torch.long, device=device)
+    
 
-        logger.info(f"benchmark_inference, result: {result}, generated_tokens_num: {generated_tokens_num}, time: {time} speed: {speed}, decoded_result: {decoded_result}")
+    result = ""
+    start_time = perf_counter()
+    result = model.generate(input_ids=input_ids, ssm=ssm)
+    time = perf_counter() - start_time
+    generated_tokens_nums = []
+    for i in range(batch_size):
+        prompt_length = input_ids[i].ne(tokenizer.pad_token_id).sum().item()
+        result_length = result[i].ne(tokenizer.pad_token_id).sum().item()
+        generated_tokens_num = result_length - prompt_length
+        generated_tokens_nums.append(generated_tokens_num)
+    
+    avg_generated_tokens = sum(generated_tokens_nums) / batch_size
+    speed = avg_generated_tokens / time
+
+    # 解码所有结果
+    decoded_results = tokenizer.batch_decode(result, skip_special_tokens=True)
+
+    logger.info(f"benchmark_inference batch size: {batch_size}")
+    logger.info(f"Total time: {time:.4f}s, Average speed: {speed:.2f} tokens/s")
+    logger.info(f"Generated tokens per sample: {generated_tokens_nums}")
+
+    for i, (prompt, decoded_result) in enumerate(zip(test_prompts, decoded_results)):
+        logger.info(f"Sample {i}:")
+        logger.info(f"  Prompt: {prompt}")
+        logger.info(f"  Result: {decoded_result}")
+        logger.info(f"  Generated tokens: {generated_tokens_nums[i]}")
     
     
     result_pipe.send(speed)

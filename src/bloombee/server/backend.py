@@ -140,7 +140,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     1, 128, dtype=self.dtype
                 ), # draft_tokens
                 BatchTensorDescriptor(
-                    1, dtype=torch.int64
+                    128, dtype=torch.int64
                 ), # prefill_length
                 BatchTensorDescriptor(
                     1, dtype=torch.int64
@@ -194,19 +194,22 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             cache_tensors.append(keys)
         return cache_tensors
     
-    def prune_draft_tree(self, original_hidden_states: torch.Tensor, norm_hidden_states: torch.Tensor,  draft_tokens: torch.Tensor, tree_attention_mask):
+    def prune_draft_tree(
+        self, 
+        norm_hidden_states: torch.Tensor, 
+        draft_tokens: torch.Tensor, 
+        tree_attention_mask: torch.Tensor
+    ):
         results = self.pruner_manager.prune_speculation_tree(
             norm_hidden_states,
             draft_tokens,
             tree_attention_mask
         )
         
-        keep_indices = results['keep_indices']
-        logger.info(f"keep_indices: {keep_indices}")
+        keep_indices = results['keep_indices']  # [B, max_keep_len]，padding 为 -1
+        # logger.info(f"keep_indices: {keep_indices}")
         self.pruner_manager.middle_keep_indices = keep_indices
-        new_hidden_states = original_hidden_states[:, keep_indices, :]
-        keep_indices = torch.tensor(keep_indices, dtype=torch.int64, device=original_hidden_states.device)
-        return new_hidden_states, keep_indices
+        return keep_indices
 
     def forward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
         *inputs, active_adapter = inputs
@@ -276,46 +279,71 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
                 # Centralized select: aggregate + reorder + slice
                 kv_cache_position_ids = inference_info.kv_cache_position_ids
-                logger.info(f"_last_keep_indices: {self._last_keep_indices}")
-                logger.info(f"keep_indices: {inference_info.keep_indices}")
-                logger.info(f"before format kv_cache_position_ids: {kv_cache_position_ids}")
+                # logger.info(f"_last_keep_indices: {self._last_keep_indices}")
+                # logger.info(f"keep_indices: {inference_info.keep_indices}")
+                # logger.info(f"before format kv_cache_position_ids: {kv_cache_position_ids}")
                 # if self._is_spec_decoding and not self._need_pruning:
                 #     kv_cache_position_ids = self._update_kv_cache_position_ids(kv_cache_position_ids, self._last_keep_indices)
-                logger.info(f"after format kv_cache_position_ids: {kv_cache_position_ids}")
-                k_pkv, v_pkv, need_reorder = self.cache_manager.select_cache(
-                    prefix_length=inference_info.prefix_length,
-                    hypo_ids=hypo_ids,
-                    kv_cache_position_ids=kv_cache_position_ids
-                )
-                if k_pkv is not None:
-                    logger.info(f"kv cache size: {k_pkv.shape}, prefix_length: {inference_info.prefix_length}")
-                else:
-                    logger.info(f"kv cache is None, prefix_length: {inference_info.prefix_length}")
-                layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
-                if need_reorder:
-                    # In speculative decoding mode, inference is not squential so that kv-cache need to be reordered.
-                    self.cache_manager.write_pkv_cache(
-                        k_pkv=k_pkv,
-                        v_pkv=v_pkv,
-                        start_position=0
+                # logger.info(f"after format kv_cache_position_ids: {kv_cache_position_ids}")
+                if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
+                    # 1. 取出需要 reorder 的 cache
+                    k_pkv_old, v_pkv_old, need_reorder = self.cache_manager.select_cache_for_reorder(
+                        kv_cache_position_ids=kv_cache_position_ids
                     )
-                
-                past_key_values_length = k_pkv.shape[2] if k_pkv is not None else 0
-                logger.info(f"past_key_values_length: {past_key_values_length}")
-                logger.info(f"inference_info.tree_attention_mask: {inference_info.tree_attention_mask}")
+                    
+                    if need_reorder and k_pkv_old is not None:
+                        # 2. 重排并写回，获取每个 batch 的有效长度
+                        new_prefix_length, kv_valid_lengths = self.cache_manager.reorder_and_write_cache(
+                            k_pkv=k_pkv_old,
+                            v_pkv=v_pkv_old,
+                            kv_cache_position_ids=kv_cache_position_ids,
+                        )
+                    else:
+                        new_prefix_length = inference_info.prefix_length
+                        kv_valid_lengths = torch.full((batch_size,), new_prefix_length, device=hidden_states.device)
+                    
+                    # 3. 取连续的 cache
+                    k_pkv, v_pkv, _ = self.cache_manager.select_cache(
+                        prefix_length=new_prefix_length,
+                        hypo_ids=hypo_ids,
+                        kv_cache_position_ids=None,
+                    )
+                else:
+                    k_pkv, v_pkv, _ = self.cache_manager.select_cache(
+                        prefix_length=inference_info.prefix_length,
+                        hypo_ids=hypo_ids,
+                        kv_cache_position_ids=None
+                    )
+                    new_prefix_length = k_pkv.shape[2] if k_pkv is not None else 0
+                    kv_valid_lengths = torch.full((batch_size,), inference_info.prefix_length, device=hidden_states.device)
+
+                layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
+                # if k_pkv is not None:
+                #     logger.info(f"kv cache size: {k_pkv.shape}, prefix_length: {inference_info.prefix_length}")
+                # else:
+                #     logger.info(f"kv cache is None, prefix_length: {inference_info.prefix_length}")
+
+                # logger.info(f"past_key_values_length: {new_prefix_length}, hidden_states.device: {hidden_states.device}")
+                # logger.info(f"inference_info.tree_attention_mask, shape: {inference_info.tree_attention_mask.shape}")
                 full_mask = None
+                device = hidden_states.device
+                # logger.info(f"kv_valid_lengths: {kv_valid_lengths}")
+                
                 if self._is_spec_decoding:
                     full_mask = self._create_attention_mask(
-                        tree_attention_mask=inference_info.tree_attention_mask,
-                        src_len=seq_len + past_key_values_length,
-                        past_key_values_length=past_key_values_length,
+                        tree_attention_mask=inference_info.tree_attention_mask.to(device),
+                        src_len=seq_len + new_prefix_length,
+                        past_key_values_length=new_prefix_length,
+                        kv_valid_lengths=kv_valid_lengths.to(device),  # 新增参数
+                        prefill_lengths=inference_info.prefill_length.to(device),
                         device=hidden_states.device,
                     )
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
                 if full_mask == None:
-                    full_mask = self._create_causal_attention_mask(batch_size, (seq_len + past_key_values_length), past_key_values_length, hidden_states.device)
+                    full_mask = self._create_causal_attention_mask(batch_size, (seq_len + new_prefix_length), new_prefix_length, hidden_states.device)
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
-                logger.info(f"full_mask: {full_mask}")
+                # logger.info(f"full_mask, shape: {full_mask.shape},  {full_mask}")
+                # logger.info(f"hidden states in backend before compute: {hidden_states}")
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
                     # print('transformer backend inference step() offset ', offset )
@@ -331,16 +359,21 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         self._position_ids_cache[cache_key] = base_ids.unsqueeze(0).expand(batch_size, -1)
                     
                     # Add offset to cached base tensor (avoids creating new tensor)
-                    position_ids = self._position_ids_cache[cache_key] + (past_key_values_length + offset)
+                    position_ids = self._position_ids_cache[cache_key] + (new_prefix_length + offset)
+                    # logger.info(f"position_ids: {position_ids}")
+                    # logger.info(f"prefill_length: {inference_info.prefill_length}, kv_valid_lengths: {kv_valid_lengths}")
                     if self._is_spec_decoding:
                         rotary_position_ids = self._create_tree_position_ids(
-                            2, 4, inference_info.prefill_length - 1, past_key_values_length, device='cuda:0'
+                            2, 4, inference_info.prefill_length - 1, kv_valid_lengths, device='cuda'
                         )
                     else:
                         rotary_position_ids = None
-                    rotary_position_ids = rotary_position_ids[inference_info.keep_indices] if rotary_position_ids is not None and inference_info.keep_indices is not None else rotary_position_ids
-                    logger.info(f"rotary_position_ids: {rotary_position_ids}")
-                    logger.info(f"position_ids: {position_ids}")
+                        
+                    # logger.info(f"before gather rotary_position_ids: {rotary_position_ids}")
+                    # logger.info(f"keep_indices: {inference_info.keep_indices}")
+                    # logger.info(f"hidden_states: {hidden_states.shape}")
+                    # rotary_position_ids = rotary_position_ids = torch.gather(rotary_position_ids, 1, inference_info.keep_indices.to("cuda")) if rotary_position_ids is not None and inference_info.keep_indices is not None else rotary_position_ids
+                    # logger.info(f"after gather rotary_position_ids: {rotary_position_ids}")
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
                         # print(f' About to call module.forward with position_ids...')
@@ -371,8 +404,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         
                     except Exception as e:
                         print(f' ERROR in module.forward: {type(e).__name__}: {e}')
-                        # import traceback
-                        # traceback.print_exc()
+                        import traceback
+                        traceback.print_exc()
                         return (hidden_states, None)  # Return original input as fallback
                     
                     if seq_len > max_chunk_length:
@@ -383,15 +416,27 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
                 # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
                 # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
-                self.cache_manager.update_cache(new_kvs, past_key_values_length)
+                if self._is_spec_decoding:
+                    self.cache_manager.update_cache_batched(new_kvs, kv_valid_lengths)
+                else:
+                    self.cache_manager.update_cache(new_kvs, new_prefix_length)
                 keep_indices = inference_info.keep_indices
                 
                 if self._is_spec_decoding and self._need_pruning and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    
+                if self._is_spec_decoding and self._is_last_block:
+                    original_hidden_states = output_hidden_states
+                    batch_size, seq_len, hidden_size = original_hidden_states.shape
+                    device = original_hidden_states.device
+                    valid_mask = keep_indices >= 0
+                    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
+                    valid_hidden_states = original_hidden_states[batch_idx[valid_mask], keep_indices[valid_mask], :]
+                    output_hidden_states = valid_hidden_states.unsqueeze(0)
 
-                self._last_keep_indices = keep_indices + past_key_values_length
-                logger.info(f"update _last_keep_indices: {self._last_keep_indices}")
+                self._last_keep_indices = keep_indices + new_prefix_length
+                # logger.info(f"update _last_keep_indices: {self._last_keep_indices}")
                 
                 # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
                 training_mode = False
@@ -432,24 +477,60 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
 
     def _create_tree_position_ids(
-        self, width: int, depth: int, prefill_length: int, past_len: int, device: torch.device
+        self, 
+        width: int, 
+        depth: int, 
+        prefill_length: torch.Tensor,  # 每个 batch 样本当前的有效总长度（已包含在该样本在 KV cache 中的位置）
+        kv_valid_lengths: torch.Tensor,                  # KV cache 的统一起始偏移量（通常是所有样本对齐后的基准）
+        device: torch.device
     ) -> torch.Tensor:
-        position_ids = []
-        depth = depth + 1
-
+    
+        batch_size = prefill_length.shape[0]
+        
+        # 1. 生成 Tree 模板（相对偏移，根节点为 0）
+        tree_position_ids_list = []
         def dfs_generate(node_depth, current_depth):
-            position_ids.append(node_depth)
-            if current_depth < depth - 1:
+            tree_position_ids_list.append(node_depth)
+            if current_depth < depth:
                 for _ in range(width):
                     dfs_generate(node_depth + 1, current_depth + 1)
-
         dfs_generate(0, 0)
+        tree_len = len(tree_position_ids_list)
+        tree_position_ids = torch.tensor(tree_position_ids_list, device=device)
 
-        tree_position_ids = torch.tensor(position_ids, device=device) + past_len + prefill_length
-        prefill_ids = torch.arange(prefill_length, device=device) + past_len
-        full_position_ids = torch.cat([prefill_ids, tree_position_ids], dim=0)
+        # 判断是否为 Prefill 阶段 (根据输入长度或 past_len 判断)
+        # 假设如果 past_len == 0 且输入包含 prefill 部分
+        is_prefill = (kv_valid_lengths.max().item() == 0) 
 
-        return full_position_ids
+        if is_prefill:
+            # --- Prefill 阶段逻辑 ---
+            max_prefill_len = prefill_length.max().item()
+            total_len = max_prefill_len + tree_len
+            full_position_ids = torch.zeros(batch_size, total_len, dtype=torch.long, device=device)
+            
+            for i in range(batch_size):
+                pl = prefill_length[i].item()
+                # Prefill 部分: [0, 1, ..., pl-1]
+                full_position_ids[i, :pl] = torch.arange(pl, device=device)
+                # Tree 部分: 接在有效 Prefill 长度 pl 之后，并推到 total_len 的末尾
+                full_position_ids[i, max_prefill_len:] = tree_position_ids + pl
+                
+            return full_position_ids
+
+        else:
+            # --- Generation / Verify 阶段逻辑 ---
+            # 此时 input_ids 只有 Tree 部分，长度为 tree_len
+            full_position_ids = torch.zeros(batch_size, tree_len, dtype=torch.long, device=device)
+            
+            for i in range(batch_size):
+                # 重点：这里的 pl 应该是该样本在上一轮结束时已经确认的 token 总数
+                past_len = kv_valid_lengths[i]
+                # 这里的 ID 必须累加 past_len 和 pl
+                # 如果你的 prefill_length[i] 已经包含了 past_len，则直接加 tree_position_ids
+                # 如果 prefill_length[i] 只是当前请求的长度，则需要 past_len + pl + tree_position_ids
+                full_position_ids[i, :] = tree_position_ids + past_len
+                
+            return full_position_ids
     
     def _update_kv_cache_position_ids(self, kv_cache_position_ids, keep_indices):
         if kv_cache_position_ids is None or keep_indices is None:
@@ -471,36 +552,69 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         *,
         src_len: int,                # prefix_len + tree_len
         past_key_values_length: int,
+        kv_valid_lengths: Optional[torch.Tensor] = None,  # [B] 每个 batch 的有效 KV 长度（后续轮次用）
+        prefill_lengths: Optional[torch.Tensor] = None,   # [B] 每个 batch 的实际 prefill 长度（首轮用）
         device: torch.device,
     ) -> Optional[torch.Tensor]:
         if tree_attention_mask is None or is_dummy(tree_attention_mask):
             return None
+        
+        # logger.info(f"tree_attention_mask: {tree_attention_mask.shape}")
+        # logger.info(f"src_len: {src_len}")
+        # logger.info(f"past_key_values_length: {past_key_values_length}")
+        # logger.info(f"kv_valid_lengths: {kv_valid_lengths}")
+        # logger.info(f"prefill_lengths: {prefill_lengths}")
 
         tree_mask = tree_attention_mask
         tree_len = tree_mask.size(1)
         B = tree_mask.size(0)
-        prefix_len = src_len - tree_len
+        prefix_len = src_len - tree_len  # 最大 prefix 长度（包含 padding）
         current_token_count = src_len - past_key_values_length
         
         if current_token_count <= 0:
             return None
         
         if past_key_values_length == 0:
+            # ============ 首轮：处理 prefill_lengths ============
             full_mask = torch.zeros(B, src_len, src_len, dtype=torch.bool, device=device)
+            
+            # 如果没有提供 prefill_lengths，假设所有 batch 的 prefill 长度相同
+            if prefill_lengths is None:
+                prefill_lengths = torch.full((B,), prefix_len, dtype=torch.long, device=device)
+            
             if prefix_len > 0:
-                causal_indices = torch.tril_indices(prefix_len, prefix_len, device=device)
-                full_mask[:, causal_indices[0], causal_indices[1]] = True
+                # 位置索引
+                row_idx = torch.arange(prefix_len, device=device).view(1, -1, 1)   # [1, prefix_len, 1]
+                col_idx = torch.arange(prefix_len, device=device).view(1, 1, -1)   # [1, 1, prefix_len]
+                prefill_lens = prefill_lengths.view(B, 1, 1)  # [B, 1, 1]
+                
+                # causal mask: row >= col
+                # 有效 mask: row < prefill_lengths AND col < prefill_lengths
+                causal_mask = row_idx >= col_idx  # [1, prefix_len, prefix_len]
+                row_valid = row_idx < prefill_lens  # [B, prefix_len, 1]
+                col_valid = col_idx < prefill_lens  # [B, 1, prefix_len]
+                
+                prefix_mask = causal_mask & row_valid & col_valid  # [B, prefix_len, prefix_len]
+                full_mask[:, :prefix_len, :prefix_len] = prefix_mask
             
             if prefix_len > 0 and tree_len > 0:
-                full_mask[:, prefix_len:, :prefix_len] = True
+                # tree tokens attend to prefix（只到有效 prefill 位置）
+                col_idx = torch.arange(prefix_len, device=device).view(1, 1, -1)  # [1, 1, prefix_len]
+                prefill_lens = prefill_lengths.view(B, 1, 1)  # [B, 1, 1]
+                col_valid = col_idx < prefill_lens  # [B, 1, prefix_len]
+                col_valid = col_valid.expand(B, tree_len, prefix_len)  # [B, tree_len, prefix_len]
+                full_mask[:, prefix_len:, :prefix_len] = col_valid
 
             if tree_len > 0:
                 full_mask[:, prefix_len:, prefix_len:] = tree_mask
+            
             return full_mask
         
         else:
+            # ============ 后续轮次：处理 kv_valid_lengths ============
             current_mask = torch.zeros(B, current_token_count, src_len, dtype=torch.bool, device=device)
             start_pos = past_key_values_length
+            
             if start_pos < prefix_len:
                 prefix_tokens = min(current_token_count, prefix_len - start_pos)
                 for i in range(prefix_tokens):
@@ -515,7 +629,40 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if prefix_len > 0:
                     current_mask[:, :, :prefix_len] = True
                 current_mask[:, :, prefix_len:] = tree_mask[:, tree_start:tree_start + current_token_count, :]
+            
+            # 应用 kv_valid_lengths mask
+            if kv_valid_lengths is not None:
+                current_mask = self._apply_kv_valid_mask(current_mask, kv_valid_lengths, past_key_values_length, device)
+            
             return current_mask
+
+
+    def _apply_kv_valid_mask(
+        self,
+        mask: torch.Tensor,
+        kv_valid_lengths: torch.Tensor,
+        kv_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        将 kv_valid_lengths 应用到 mask 上，屏蔽每个 batch 超出有效长度的 KV 位置
+        """
+        if kv_len <= 0:
+            return mask
+        
+        B = mask.shape[0]
+        key_len = mask.shape[2]
+        actual_kv_len = min(kv_len, key_len)
+        
+        # [1, actual_kv_len]
+        kv_positions = torch.arange(actual_kv_len, device=device).unsqueeze(0)
+        
+        # [B, actual_kv_len] -> [B, 1, actual_kv_len]
+        kv_valid_mask = (kv_positions < kv_valid_lengths.unsqueeze(1)).unsqueeze(1)
+        
+        mask[:, :, :actual_kv_len] = mask[:, :, :actual_kv_len] & kv_valid_mask
+        
+        return mask
         
     def _create_causal_attention_mask(
         self,
