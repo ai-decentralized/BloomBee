@@ -989,12 +989,18 @@ async def iterate_rpc_inference(
                             # GPU multiplexing: all micro-batches use offset=0
                             cache_batch_offset = 0
                             cache_full_batch_size = mb_size  # Cache only holds micro_batch_size
-                            logger.info(f"[MBPIPE_MULTIPLEX] MB{mb_idx}: GPU multiplexing active, "
-                                       f"cache_batch_offset=0 (reusing GPU cache), cache_size={mb_size}")
+                            
+                            # [MBPIPE_DEBUG] Detailed micro-batch info
+                            logger.info(f"[MBPIPE_DEBUG] ===== MICRO-BATCH {mb_idx}/{total_mb-1} =====")
+                            logger.info(f"[MBPIPE_DEBUG] Global batch range: [{mb_start}:{mb_end}] (size={mb_size})")
+                            logger.info(f"[MBPIPE_DEBUG] GPU cache mode: MULTIPLEXING (all MBs use offset=0)")
+                            logger.info(f"[MBPIPE_DEBUG] cache_batch_offset={cache_batch_offset}, cache_full_batch_size={cache_full_batch_size}")
+                            logger.info(f"[MBPIPE_DEBUG] hidden_states slice: [{mb_start}:{mb_end}], shape={mb_hidden.shape}")
                         else:
                             # Legacy mode or single micro-batch: use actual offsets
                             cache_batch_offset = mb_start
                             cache_full_batch_size = batch_size
+                            logger.info(f"[MBPIPE_DEBUG] MB{mb_idx}: Legacy mode, cache_batch_offset={cache_batch_offset}")
                         
                         mb_inference_infos = tuple(
                             InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,
@@ -1168,15 +1174,24 @@ async def iterate_rpc_inference(
                         # The difference shows how much overhead the data movement adds
                         compute_efficiency = (total_compute / total_elapsed * 100) if total_elapsed > 0 else 0
                         
-                        logger.info(f"[KVCACHE_OVERLAP] Summary: prefetch={total_prefetch:.1f}ms, "
-                                   f"compute={total_compute:.1f}ms, offload_launch={total_offload:.1f}ms")
-                        logger.info(f"[KVCACHE_OVERLAP] Efficiency: compute_time/total_time = {compute_efficiency:.1f}% "
-                                   f"(higher=better, overhead hidden)")
+                        logger.info(f"[MBPIPE_SUMMARY] ===== MICRO-BATCH PROCESSING COMPLETE =====")
+                        logger.info(f"[MBPIPE_SUMMARY] Total micro-batches: {len(kv_timing_stats)}")
+                        logger.info(f"[MBPIPE_SUMMARY] Total prefetch time: {total_prefetch:.1f}ms")
+                        logger.info(f"[MBPIPE_SUMMARY] Total compute time: {total_compute:.1f}ms")
+                        logger.info(f"[MBPIPE_SUMMARY] Total offload time: {total_offload:.1f}ms")
+                        logger.info(f"[MBPIPE_SUMMARY] Total elapsed: {total_elapsed:.1f}ms")
+                        logger.info(f"[MBPIPE_SUMMARY] Compute efficiency: {compute_efficiency:.1f}%")
                         
-                        # Per-phase breakdown
+                        # Per-micro-batch breakdown
+                        logger.info(f"[MBPIPE_SUMMARY] ----- Per Micro-Batch Breakdown -----")
                         for stat in kv_timing_stats:
                             mb_eff = (stat['compute_ms'] / stat['total_ms'] * 100) if stat['total_ms'] > 0 else 0
-                            logger.info(f"[KVCACHE_OVERLAP] MB{stat['mb_idx']}: efficiency={mb_eff:.1f}%")
+                            logger.info(f"[MBPIPE_SUMMARY] MB{stat['mb_idx']}: "
+                                       f"compute={stat['compute_ms']:.1f}ms, "
+                                       f"prefetch={stat['prefetch_sync_ms']:.1f}ms, "
+                                       f"offload={stat['offload_ms']:.1f}ms, "
+                                       f"efficiency={mb_eff:.1f}%")
+                        logger.info(f"[MBPIPE_SUMMARY] ==========================================")
                     
                     log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.merged_pools")
                     

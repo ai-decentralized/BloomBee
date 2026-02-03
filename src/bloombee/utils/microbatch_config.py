@@ -25,7 +25,7 @@ ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
-DEFAULT_MICRO_BATCH_SIZE = 4  # Default micro-batch size for pipeline overlap
+DEFAULT_MICRO_BATCH_SIZE = 8  # Default micro-batch size for pipeline overlap
 
 
 def is_microbatch_enabled() -> bool:
@@ -193,6 +193,58 @@ def log_path_entry(logger: logging.Logger, component: str, batch_size: int = 0) 
         f"{MBPIPE_LOG_PREFIX} {component}: entering {path} path, "
         f"micro_batch_size={micro_batch_size}{batch_info}"
     )
+
+
+def log_microbatch_runtime_info(
+    logger: logging.Logger,
+    batch_size: int,
+    seq_len: int,
+    num_blocks: int,
+    context: str = ""
+) -> None:
+    """
+    Log comprehensive micro-batch runtime information.
+    
+    Args:
+        logger: The logger to use.
+        batch_size: Total batch size from client.
+        seq_len: Sequence length.
+        num_blocks: Number of transformer blocks.
+        context: Optional context string.
+    """
+    enabled = is_microbatch_enabled()
+    micro_batch_size = get_micro_batch_size()
+    
+    context_str = f" ({context})" if context else ""
+    
+    logger.info(f"{MBPIPE_LOG_PREFIX} ===== MICRO-BATCH RUNTIME INFO{context_str} =====")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Enabled: {enabled}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Global batch_size: {batch_size}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch size: {micro_batch_size}")
+    
+    if enabled and micro_batch_size < batch_size:
+        num_microbatches = (batch_size + micro_batch_size - 1) // micro_batch_size
+        logger.info(f"{MBPIPE_LOG_PREFIX} Number of micro-batches: {num_microbatches}")
+        logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: MULTIPLEXING (cache sized for {micro_batch_size})")
+        
+        # Estimate memory
+        # KV cache per block: 2 * seq_len * batch * heads * head_dim * dtype_size
+        # Assuming LLaMA-7B: hidden=4096, heads=32, head_dim=128, dtype=fp16 (2 bytes)
+        kv_per_block_full = 2 * seq_len * batch_size * 32 * 128 * 2 / (1024 * 1024)  # MB
+        kv_per_block_micro = 2 * seq_len * micro_batch_size * 32 * 128 * 2 / (1024 * 1024)  # MB
+        
+        total_kv_full = kv_per_block_full * num_blocks
+        total_kv_micro = kv_per_block_micro * num_blocks
+        savings = total_kv_full - total_kv_micro
+        savings_pct = (savings / total_kv_full * 100) if total_kv_full > 0 else 0
+        
+        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated KV cache (full batch): {total_kv_full:.1f} MB")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated KV cache (micro-batch): {total_kv_micro:.1f} MB")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated savings: {savings:.1f} MB ({savings_pct:.1f}%)")
+    else:
+        logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: LEGACY (no multiplexing)")
+    
+    logger.info(f"{MBPIPE_LOG_PREFIX} ===========================================")
 
 
 # =============================================================================

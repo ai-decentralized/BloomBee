@@ -389,6 +389,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                 
                 # [MBPIPE] Log current path at rpc_inference entry
                 mbpipe_log_path_entry(logger, "handler.rpc_inference", batch_size=batch_size)
+                
+                # [MBPIPE] Log comprehensive runtime info
+                from bloombee.utils.microbatch_config import log_microbatch_runtime_info
+                log_microbatch_runtime_info(
+                    logger,
+                    batch_size=batch_size,
+                    seq_len=max_length,
+                    num_blocks=len(requested_backends),
+                    context="rpc_inference entry"
+                )
 
                 
                 push_time = []
