@@ -42,15 +42,23 @@ class SimpleProbabilityPruner(PrunerInterface):
         self.correct_prunes = 0
         
     def _get_parent_postion(self, i, mask, prefix):
+        """单个序列的 parent position 查找"""
         for j in range(i-1, -1, -1):
-            if mask[0, i, j + prefix] == True:
+            if mask[i, j + prefix] == True:
+                return j
+        return i
+    
+    def _get_parent_postion_batched(self, i, mask, prefix, batch_idx):
+        """batch 版本的 parent position 查找"""
+        for j in range(i-1, -1, -1):
+            if mask[batch_idx, i, j + prefix] == True:
                 return j
         return i
     
     def prune_branches(
         self,
         middle_hidden_states: torch.Tensor,
-        draft_tokens: List[int],
+        draft_tokens: Union[List[int], torch.Tensor],
         tree_attention_mask: torch.Tensor,
         **kwargs
     ) -> Dict[str, Any]:
@@ -58,109 +66,162 @@ class SimpleProbabilityPruner(PrunerInterface):
         Prune branches based on probability threshold
         Process nodes sequentially in depth-first order
         
+        支持 batch 处理
+        
         Args:
-            middle_hidden_states: [seq_len, hidden_size] - hidden states in depth-first order
-            draft_tokens: Token IDs in depth-first order  
-            tree_attention_mask: [seq_len, seq_len] - encodes tree structure
+            middle_hidden_states: [B, seq_len, hidden_size] - hidden states in depth-first order
+            draft_tokens: [B, seq_len] Token IDs in depth-first order  
+            tree_attention_mask: [B, seq_len, total_len] - encodes tree structure
+            
+        Returns:
+            keep_indices: [B, max_keep_len] 保留的索引，padding 用 -1
+            其他元数据
         """
         
+        # 处理输入维度
+        if middle_hidden_states.dim() == 2:
+            # 单序列情况，扩展为 batch
+            middle_hidden_states = middle_hidden_states.unsqueeze(0)
+            tree_attention_mask = tree_attention_mask.unsqueeze(0) if tree_attention_mask.dim() == 2 else tree_attention_mask
+            if isinstance(draft_tokens, list):
+                draft_tokens = [draft_tokens]
+            elif isinstance(draft_tokens, torch.Tensor) and draft_tokens.dim() == 1:
+                draft_tokens = draft_tokens.unsqueeze(0)
+        
+        batch_size = middle_hidden_states.shape[0]
         seq_len = middle_hidden_states.shape[1]
-        # logger.info(f"middle_hidden_states: {middle_hidden_states.shape}")
+        device = middle_hidden_states.device
         
         prefix_len = tree_attention_mask.shape[2] - seq_len
         
-        # Get middle layer logits and probabilities
+        # Get middle layer logits and probabilities: [B, seq_len, vocab_size]
         middle_logits = self.lm_head(middle_hidden_states)
-        # probs = F.softmax(middle_logits, dim=-1)
         
-        # Initialize keep mask (all True initially)
-        keep_mask = torch.ones(seq_len, dtype=torch.bool)
+        # 转换 draft_tokens 为 tensor
+        if isinstance(draft_tokens, list):
+            if isinstance(draft_tokens[0], list):
+                # List of lists
+                draft_tokens = torch.tensor(draft_tokens, device=device)
+            else:
+                # Single list
+                draft_tokens = torch.tensor(draft_tokens, device=device).unsqueeze(0)
         
-        # Track which nodes are discarded (for skipping descendants)
-        discarded = torch.zeros(seq_len, dtype=torch.bool)
+        # 存储每个 batch 的结果
+        batch_keep_indices = []
+        batch_prune_indices = []
+        batch_scores = []
+        batch_keep_masks = []
         
-        # Store scores for all nodes (for statistics and fallback)
-        scores = torch.zeros(seq_len)
-        
-        # Process each node in depth-first order
-        for i in range(seq_len):
-            if i == 0:
-                keep_mask[0] = True
-                scores[i] = 1.0
-                continue
+        for b in range(batch_size):
+            # Initialize keep mask (all True initially)
+            keep_mask = torch.ones(seq_len, dtype=torch.bool, device=device)
             
-            # Skip if already discarded by ancestor
-            if discarded[i]:
-                keep_mask[i] = False
-                scores[i] = 0.0  # Set score to 0 for discarded nodes
-                continue
+            # Track which nodes are discarded (for skipping descendants)
+            discarded = torch.zeros(seq_len, dtype=torch.bool, device=device)
             
-            # logger.info(f"draft_tokens[i]: {draft_tokens[i]}")
+            # Store scores for all nodes
+            scores = torch.zeros(seq_len, device=device)
             
-            # Get token probability
-            parent_postion = self._get_parent_postion(i, tree_attention_mask, prefix_len)
-            # logger.info(f"xiongxu i : {i}, parent_postion: {parent_postion}")
-            logits_at_pos = middle_logits[0, parent_postion]
-            # logger.info(f"xiongxu i : {i}, logits_at_pos: {logits_at_pos}")
-            probs = F.softmax(logits_at_pos, dim=-1)
-            # logger.info(f"xiongxu i : {i}, probs: {probs}")
-            topk = 50
-
-            # 取 top-50 token ids（在 parent 的分布上）
-            topk_ids = torch.topk(
-                probs,
-                k=min(topk, self.vocab_size),
-                dim=-1
-            ).indices  # shape: [topk]
-
-            # 判断 draft token 是否在 topk
-            label = 1.0 if draft_tokens[i] in topk_ids.tolist() else 0.0
-            
-            draft_id = draft_tokens[i]        # int
-            draft_prob = probs[draft_id].item()
-            # logger.info(f"xiongxu [node {i}] draft_token={draft_id}, prob={draft_prob:.6f}")
-            
-            # Check if score meets threshold
-            if label == 0.0:
-                keep_mask[i] = False
-                discarded[i] = True
+            # Process each node in depth-first order
+            for i in range(seq_len):
+                if i == 0:
+                    keep_mask[0] = True
+                    scores[i] = 1.0
+                    continue
                 
-                # Mark all descendants as discarded
-                # Descendants are nodes j > i where j can attend to i
-                for j in range(i + 1, seq_len):
-                    if tree_attention_mask[0, j, i + prefix_len] == 1:
-                        discarded[j] = True
-                        keep_mask[j] = False
+                # Skip if already discarded by ancestor
+                if discarded[i]:
+                    keep_mask[i] = False
+                    scores[i] = 0.0
+                    continue
+                
+                # Get token probability
+                parent_position = self._get_parent_postion_batched(i, tree_attention_mask, prefix_len, b)
+                logits_at_pos = middle_logits[b, parent_position]
+                probs = F.softmax(logits_at_pos, dim=-1)
+                topk = 50
+
+                # 取 top-50 token ids
+                topk_ids = torch.topk(
+                    probs,
+                    k=min(topk, self.vocab_size),
+                    dim=-1
+                ).indices
+
+                # 判断 draft token 是否在 topk
+                draft_id = draft_tokens[b, i].item()
+                label = 1.0 if draft_id in topk_ids.tolist() else 0.0
+                
+                draft_prob = probs[draft_id].item()
+                scores[i] = draft_prob
+                
+                # Check if score meets threshold
+                if label == 0.0:
+                    keep_mask[i] = False
+                    discarded[i] = True
+                    
+                    # Mark all descendants as discarded
+                    for j in range(i + 1, seq_len):
+                        if tree_attention_mask[b, j, i + prefix_len] == 1:
+                            discarded[j] = True
+                            keep_mask[j] = False
+            
+            # Get final indices for this batch
+            keep_indices = torch.where(keep_mask)[0].tolist()
+            prune_indices = torch.where(~keep_mask)[0].tolist()
+            
+            batch_keep_indices.append(keep_indices)
+            batch_prune_indices.append(prune_indices)
+            batch_scores.append(scores)
+            batch_keep_masks.append(keep_mask)
         
-        # Get final indices
-        keep_indices = torch.where(keep_mask)[0].tolist()
-        prune_indices = torch.where(~keep_mask)[0].tolist()
+        # Padding keep_indices to same length with -1
+        max_keep_len = max(len(indices) for indices in batch_keep_indices)
+        
+        padded_keep_indices = torch.full(
+            (batch_size, max_keep_len), 
+            -1, 
+            dtype=torch.long, 
+            device=device
+        )
+        
+        for b, indices in enumerate(batch_keep_indices):
+            if len(indices) > 0:
+                padded_keep_indices[b, :len(indices)] = torch.tensor(indices, device=device)
+        
+        # Padding prune_indices
+        max_prune_len = max(len(indices) for indices in batch_prune_indices) if batch_prune_indices else 0
+        if max_prune_len > 0:
+            padded_prune_indices = torch.full(
+                (batch_size, max_prune_len), 
+                -1, 
+                dtype=torch.long, 
+                device=device
+            )
+            for b, indices in enumerate(batch_prune_indices):
+                if len(indices) > 0:
+                    padded_prune_indices[b, :len(indices)] = torch.tensor(indices, device=device)
+        else:
+            padded_prune_indices = torch.empty((batch_size, 0), dtype=torch.long, device=device)
+        
+        # Stack scores and masks
+        stacked_scores = torch.stack(batch_scores, dim=0)  # [B, seq_len]
+        stacked_keep_masks = torch.stack(batch_keep_masks, dim=0)  # [B, seq_len]
+        
+        # 计算有效长度
+        valid_lengths = (padded_keep_indices >= 0).sum(dim=1)  # [B]
         
         return {
-            'keep_indices': keep_indices,
-            'prune_indices': prune_indices,
-            'keep_probs': scores.tolist(),
-            'keep_mask': keep_mask,
+            'keep_indices': padded_keep_indices,  # [B, max_keep_len]，padding 为 -1
+            'prune_indices': padded_prune_indices,  # [B, max_prune_len]，padding 为 -1
+            'keep_probs': stacked_scores,  # [B, seq_len]
+            'keep_mask': stacked_keep_masks,  # [B, seq_len]
+            'valid_lengths': valid_lengths,  # [B] 每个 batch 的有效 keep 数量
             'metadata': {
                 'middle_logits': middle_logits,
-                'avg_score': scores[keep_mask].mean().item() if keep_mask.any() else 0.0,
+                'avg_score': stacked_scores[stacked_keep_masks].mean().item() if stacked_keep_masks.any() else 0.0,
             }
         }
-    
-    def _create_pruned_attention_mask(
-        self,
-        original_mask: torch.Tensor,
-        keep_indices: List[int]
-    ) -> torch.Tensor:
-        """Create new attention mask for kept nodes only"""
-        new_len = len(keep_indices)
-        new_mask = torch.zeros(new_len, new_len, dtype=original_mask.dtype)
-        
-        for new_i, old_i in enumerate(keep_indices):
-            for new_j, old_j in enumerate(keep_indices):
-                new_mask[new_i, new_j] = original_mask[old_i, old_j]
-        
-        return new_mask
     
     def get_metrics(self) -> Dict[str, float]:
         """Get pruning metrics"""

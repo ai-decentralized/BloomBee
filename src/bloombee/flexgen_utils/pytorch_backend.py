@@ -100,8 +100,8 @@ def precompute_freqs_cis(
         freqs = torch.outer(t, freqs).float()  # type: ignore
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     else:
-        t = position_ids.float().to(inv_freq.device)
-        freqs = torch.outer(t, inv_freq).float()
+        t = position_ids.float().to(inv_freq.device) # [B, S]
+        freqs = t.unsqueeze(-1) * inv_freq.reshape(1, 1, -1)
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
@@ -723,6 +723,8 @@ class TorchDevice:
 
         hidden = rms_norm(inputs.data, input_layernorm.data)
         
+        # logger.info(f"after norm, hidden states: {hidden}")
+        
         # shape: (b, 1, h)
         q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
@@ -733,12 +735,25 @@ class TorchDevice:
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
         
+        # logger.info(f"after projection, query_states: {q}")
+        # logger.info(f"after projection, key_states: {k}")
+        # logger.info(f"after projection, value_states: {v}")
+        
+        # logger.info(f"attention_mask: {attention_mask.shape}")
+        # logger.info(f"inputs: {inputs.shape}")
+        # logger.info(f"freq_cis: {freq_cis.shape}")
+        # logger.info(f"src_s: {src_s}")
+        # logger.info(f"tgt_s: {tgt_s}")
+        
         if rotary_position_ids is not None:
             freqs_slice = freq_cis[-tgt_s:]
         else:
             freqs_slice = freq_cis[src_s - tgt_s: src_s]
         
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
+        
+        # logger.info(f"after rotary, query_states: {q}")
+        # logger.info(f"after rotary, key_states: {k}")
         
         # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)

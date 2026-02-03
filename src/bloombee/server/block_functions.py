@@ -228,6 +228,49 @@ async def run_rpc_backward(
     grad_prompts = torch.cat(grad_prompts_reversed[::-1], dim=0) if grad_prompts_reversed else DUMMY
     return [grad_outputs] if is_dummy(grad_prompts) else [grad_outputs, grad_prompts]  # TODO un-duct-tape
 
+    
+def restore_hidden_states(
+    flattened_hidden_states: torch.Tensor,  # [N_total_valid, hidden_size]
+    keep_indices: torch.Tensor,  # [B, max_keep_len]，padding 为 -1
+    original_seq_len: int,  # 原始序列长度
+) -> torch.Tensor:
+    """
+    将铺平的 hidden states 还原为 [B, original_seq_len, hidden_size]
+    
+    Args:
+        flattened_hidden_states: [N_total_valid, hidden_size] 铺平后的有效 hidden states
+        keep_indices: [B, max_keep_len] 每个 batch 的 keep indices，padding 为 -1
+        original_seq_len: 原始序列长度
+    
+    Returns:
+        restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
+    """
+    batch_size, max_keep_len = keep_indices.shape
+    hidden_size = flattened_hidden_states.shape[-1]
+    device = flattened_hidden_states.device
+    dtype = flattened_hidden_states.dtype
+    
+    # 创建输出 tensor，用 0 填充
+    restored_hidden_states = torch.zeros(
+        batch_size, original_seq_len, hidden_size,
+        dtype=dtype, device=device
+    )
+    
+    # 创建有效 mask: [B, max_keep_len]
+    valid_mask = keep_indices >= 0
+    
+    # 创建 batch 索引: [B, max_keep_len]
+    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
+    
+    # 取出有效部分的索引
+    valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
+    valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
+    
+    # 写入还原位置
+    restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flattened_hidden_states
+    
+    return restored_hidden_states
+
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
     requested_backends: Sequence[TransformerBackend],
@@ -255,9 +298,9 @@ async def iterate_rpc_inference(
         step_receive_time = perf_counter()
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
-            assert (
-                prefix_length >= start_from_position,
-            ), f"prefix_length={prefix_length}, start_from_position={start_from_position}"
+            # assert (
+            #     prefix_length >= start_from_position,
+            # ), f"prefix_length={prefix_length}, start_from_position={start_from_position}"
             prefix_length = start_from_position
 
         flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
@@ -266,7 +309,7 @@ async def iterate_rpc_inference(
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
         hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
-        draft_tokens = draft_tokens[0] if draft_tokens is not None and not is_dummy(draft_tokens) else None
+        draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
         batch_size, length_increment, _ = hidden_states.shape
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
@@ -294,12 +337,23 @@ async def iterate_rpc_inference(
         need_pruning = need_pruning1 == 1 if need_pruning1 is not None and not is_dummy(need_pruning1) else False
         is_spec_dec = is_spec_dec1 == 1 if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
         
-        if is_spec_dec and not need_pruning:
-            attention_mask_indices = keep_indices[prefill_length:] - prefill_length
-            logger.info(f"prefill_length: {prefill_length}, attention_mask_indices: {attention_mask_indices}")
-            idx = attention_mask_indices
-            tree_attention_mask = tree_attention_mask[:, idx][:, :, idx]
+        if is_spec_dec and draft_tokens.shape[0] != hidden_states.shape[0]:
+            hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
+        
+        # if is_spec_dec and not need_pruning:
             
+        #     prefill_len = draft_tokens.shape[-1] - tree_attention_mask.shape[-1]
+        #     attention_mask_indices = keep_indices[:, prefill_len:] - prefill_len
+        #     logger.info(f"keep_indices: {keep_indices}")
+        #     logger.info(f"draft_tokens: {draft_tokens}, tree_attention_mask: {tree_attention_mask.shape}")
+        #     logger.info(f"prefill_length: {prefill_length}, attention_mask_indices: {attention_mask_indices}")
+        #     idx = attention_mask_indices
+        #     idx_2d = idx.unsqueeze(-1).expand(-1, -1, tree_attention_mask.size(-1))
+        #     tree_attention_mask = torch.gather(tree_attention_mask, dim=1, index=idx_2d)
+        #     idx_3d = idx.unsqueeze(1).expand(-1, tree_attention_mask.size(1), -1)
+        #     tree_attention_mask = torch.gather(tree_attention_mask, dim=2, index=idx_3d)
+        #     logger.info(f"tree_attention_mask: {tree_attention_mask.shape}")
+
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
@@ -459,7 +513,7 @@ async def iterate_rpc_inference(
                 hidden_states.shape[1],
                 dtype=torch.int64,
                 device=hidden_states.device
-            )
+            ).unsqueeze(0).expand(hidden_states.shape[0], -1)
         
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)

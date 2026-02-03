@@ -17,7 +17,7 @@ class NodePruner(nn.Module):
         super().__init__()
 
         self.quality_path = nn.Sequential(
-            nn.Linear(3, hidden_size),  # prob(3) + acceptance(1)
+            nn.Linear(3, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
@@ -25,17 +25,18 @@ class NodePruner(nn.Module):
         )
         
         self.threshold_path = nn.Sequential(
-            nn.Linear(4, hidden_size // 2),  # network features(4)
+            nn.Linear(4, hidden_size // 2),
             nn.ReLU(),
             nn.Linear(hidden_size // 2, 1)
         )
     
     def forward(self, prob_features):
-        quality_score = self.quality_path(prob_features).squeeze(-1)  # [batch]
+        quality_score = self.quality_path(prob_features).squeeze(-1)
         decision_score = quality_score
         decision_prob = torch.sigmoid(decision_score)
         
         return decision_prob, quality_score
+
 
 class AdaptiveNeuralPruner:
     def __init__(
@@ -80,7 +81,7 @@ class AdaptiveNeuralPruner:
         self.g_ite = 0
         
         self.temp_ite_count = 0
-        self.atc = 0 # accept_tokens_count
+        self.atc = 0
         self.after_pruing_atc = 0
         self.keep_count = 0
         
@@ -101,87 +102,179 @@ class AdaptiveNeuralPruner:
         if 'g_ite' in checkpoint:
             self.g_ite = checkpoint['g_ite']
 
-    def _get_parent_postion(self, i, mask, prefix):
-        for j in range(i-1, -1, -1):
-            if mask[0, i, j + prefix] == True:
+    def _get_parent_position(self, i, mask, prefix, batch_idx=0):
+        """获取 parent position，支持 batch"""
+        for j in range(i - 1, -1, -1):
+            if mask[batch_idx, i, j + prefix] == True:
                 return j
         return i
     
     def prune_branches(
         self,
         norm_hidden_states: torch.Tensor,
-        draft_tokens: Optional[List[int]] = None,
+        draft_tokens: Union[List[int], torch.Tensor] = None,
         tree_attention_mask: torch.Tensor = None,
         network_condition = None,
     ) -> Dict:
-        seq_len = len(draft_tokens)
+        """
+        支持 batch 的 prune_branches
+        
+        Args:
+            norm_hidden_states: [B, seq_len, hidden_size]
+            draft_tokens: [B, seq_len] 或 List[List[int]]
+            tree_attention_mask: [B, seq_len, total_len]
+            network_condition: 网络条件
+        
+        Returns:
+            keep_indices: [B, max_keep_len]，padding 为 -1
+            等其他信息
+        """
+        # 处理输入维度
+        if norm_hidden_states.dim() == 2:
+            norm_hidden_states = norm_hidden_states.unsqueeze(0)
+            tree_attention_mask = tree_attention_mask.unsqueeze(0) if tree_attention_mask.dim() == 2 else tree_attention_mask
+            if isinstance(draft_tokens, list):
+                draft_tokens = [draft_tokens]
+            elif isinstance(draft_tokens, torch.Tensor) and draft_tokens.dim() == 1:
+                draft_tokens = draft_tokens.unsqueeze(0)
+        
+        batch_size = norm_hidden_states.shape[0]
+        seq_len = norm_hidden_states.shape[1]
+        device = norm_hidden_states.device
+        
         prefix_len = tree_attention_mask.shape[2] - seq_len
+        
         if network_condition is None:
             network_condition = self.get_network_condition() or NetworkCondition.mock()
-            
+        
+        # 获取 logits: [B, seq_len, vocab_size]
         logits = self.lm_head(norm_hidden_states)
         
-        # Initialize masks
-        keep_mask = torch.ones(seq_len, dtype=torch.bool)
-        discarded = torch.zeros(seq_len, dtype=torch.bool)
-        decision_probs = torch.zeros(seq_len)
-        quality_scores = torch.zeros(seq_len)
-        threshold_adjusts = torch.zeros(seq_len)
-        prob_features_list, _ = self.collect_training_data(
-                logits, 
-                tree_attention_mask,
-                draft_tokens
+        # 转换 draft_tokens 为 tensor
+        if isinstance(draft_tokens, list):
+            if isinstance(draft_tokens[0], list):
+                draft_tokens = torch.tensor(draft_tokens, device=device)
+            else:
+                draft_tokens = torch.tensor(draft_tokens, device=device).unsqueeze(0)
+        
+        # 存储每个 batch 的结果
+        batch_keep_indices = []
+        batch_prune_indices = []
+        batch_decision_probs = []
+        batch_quality_scores = []
+        
+        for b in range(batch_size):
+            # 收集该 batch 的训练数据
+            prob_features_list, _ = self.collect_training_data_single(
+                logits[b:b+1],
+                tree_attention_mask[b:b+1],
+                draft_tokens[b]
             )
-        for i in range(seq_len):
-            if i == 0:
-                keep_mask[0] = True
-                decision_probs[0] = 1.0
-                continue
             
-            if discarded[i]:
-                keep_mask[i] = False
-                decision_probs[i] = 0.0
-                continue
+            # 初始化 masks
+            keep_mask = torch.ones(seq_len, dtype=torch.bool, device=device)
+            discarded = torch.zeros(seq_len, dtype=torch.bool, device=device)
+            decision_probs = torch.zeros(seq_len, device=device)
+            quality_scores = torch.zeros(seq_len, device=device)
             
-            prob_features = prob_features_list[i-1]
-            with torch.no_grad():
-                prob, quality = self.decision_net(prob_features.unsqueeze(0))
+            for i in range(seq_len):
+                if i == 0:
+                    keep_mask[0] = True
+                    decision_probs[0] = 1.0
+                    continue
                 
-                decision_probs[i] = prob.item()
-                quality_scores[i] = quality.item()
-                threshold_adjusts[i] = 0
-                keep = prob.item() > self.config.neural_threshold
+                if discarded[i]:
+                    keep_mask[i] = False
+                    decision_probs[i] = 0.0
+                    continue
                 
-            if not keep:
-                keep_mask[i] = False
-                discarded[i] = True
+                prob_features = prob_features_list[i - 1]
+                with torch.no_grad():
+                    prob, quality = self.decision_net(prob_features.unsqueeze(0))
+                    
+                    decision_probs[i] = prob.item()
+                    quality_scores[i] = quality.item()
+                    keep = prob.item() > self.config.neural_threshold
                 
-                # Discard descendants
-                for j in range(i + 1, seq_len):
-                    if tree_attention_mask[0, j, i + prefix_len] == 1:
-                        discarded[j] = True
-                        keep_mask[j] = False
-
-        keep_indices = torch.where(keep_mask)[0].tolist()
-        prune_indices = torch.where(~keep_mask)[0].tolist()
+                if not keep:
+                    keep_mask[i] = False
+                    discarded[i] = True
+                    
+                    # Discard descendants
+                    for j in range(i + 1, seq_len):
+                        if tree_attention_mask[b, j, i + prefix_len] == 1:
+                            discarded[j] = True
+                            keep_mask[j] = False
+            
+            keep_indices = torch.where(keep_mask)[0].tolist()
+            prune_indices = torch.where(~keep_mask)[0].tolist()
+            
+            batch_keep_indices.append(keep_indices)
+            batch_prune_indices.append(prune_indices)
+            batch_decision_probs.append(decision_probs)
+            batch_quality_scores.append(quality_scores)
+        
+        # Padding keep_indices to same length with -1
+        max_keep_len = max(len(indices) for indices in batch_keep_indices)
+        
+        padded_keep_indices = torch.full(
+            (batch_size, max_keep_len),
+            -1,
+            dtype=torch.long,
+            device=device
+        )
+        
+        for b, indices in enumerate(batch_keep_indices):
+            if len(indices) > 0:
+                padded_keep_indices[b, :len(indices)] = torch.tensor(indices, device=device)
+        
+        # Padding prune_indices
+        max_prune_len = max(len(indices) for indices in batch_prune_indices) if batch_prune_indices else 0
+        if max_prune_len > 0:
+            padded_prune_indices = torch.full(
+                (batch_size, max_prune_len),
+                -1,
+                dtype=torch.long,
+                device=device
+            )
+            for b, indices in enumerate(batch_prune_indices):
+                if len(indices) > 0:
+                    padded_prune_indices[b, :len(indices)] = torch.tensor(indices, device=device)
+        else:
+            padded_prune_indices = torch.empty((batch_size, 0), dtype=torch.long, device=device)
+        
+        # Stack decision_probs and quality_scores
+        stacked_decision_probs = torch.stack(batch_decision_probs, dim=0)  # [B, seq_len]
+        stacked_quality_scores = torch.stack(batch_quality_scores, dim=0)  # [B, seq_len]
+        
+        # 计算有效长度
+        valid_lengths = (padded_keep_indices >= 0).sum(dim=1)  # [B]
         
         return {
-            'keep_indices': keep_indices,
-            'prune_indices': prune_indices,
-            'decision_probs': decision_probs.cpu().tolist(),
-            'quality_scores': quality_scores.cpu().tolist(),
+            'keep_indices': padded_keep_indices,  # [B, max_keep_len]
+            'prune_indices': padded_prune_indices,  # [B, max_prune_len]
+            'decision_probs': stacked_decision_probs,  # [B, seq_len]
+            'quality_scores': stacked_quality_scores,  # [B, seq_len]
             'threshold_adjusts': 0,
             'network_condition': network_condition,
+            'valid_lengths': valid_lengths,  # [B]
         }
     
-    def collect_training_data(
+    def collect_training_data_single(
         self,
         logits: torch.Tensor,
         tree_attention_mask: torch.Tensor,
-        draft_tokens: Optional[List[int]] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        draft_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        为单个 batch 收集训练数据
         
-        seq_len = len(draft_tokens)
+        Args:
+            logits: [1, seq_len, vocab_size]
+            tree_attention_mask: [1, seq_len, total_len]
+            draft_tokens: [seq_len]
+        """
+        seq_len = draft_tokens.shape[0]
         prefix_len = tree_attention_mask.shape[2] - seq_len
 
         with torch.no_grad():
@@ -189,9 +282,9 @@ class AdaptiveNeuralPruner:
             labels_list = []
 
             for i in range(1, seq_len):
-                parent_postion = self._get_parent_postion(i, tree_attention_mask, prefix_len)
+                parent_position = self._get_parent_position(i, tree_attention_mask, prefix_len, batch_idx=0)
                 
-                logits_at_pos = logits[0, parent_postion]
+                logits_at_pos = logits[0, parent_position]
                 probs = F.softmax(logits_at_pos, dim=-1)
     
                 max_prob = torch.max(probs).item()
@@ -208,14 +301,11 @@ class AdaptiveNeuralPruner:
                 else:
                     normalized_entropy = 0.0
                 
-                if draft_tokens is not None:
-                    token_prob = probs[draft_tokens[i]].item()
-                else:
-                    token_prob = torch.topk(probs, k=min(5, self.vocab_size)).values.sum().item()
+                token_prob = probs[draft_tokens[i]].item()
                     
                 eps = 1e-10
                 logp_draft = math.log(token_prob + eps)
-                log_ratio  = logp_draft
+                log_ratio = logp_draft
                 log_ratio = max(log_ratio, -10.0) / 10.0
                 log_ratio = -log_ratio
 
@@ -250,13 +340,27 @@ class AdaptiveNeuralPruner:
         )
         
         return prob_features, labels
+    
+    def collect_training_data(
+        self,
+        logits: torch.Tensor,
+        tree_attention_mask: torch.Tensor,
+        draft_tokens: Union[List[int], torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        原有接口，保持兼容
+        """
+        if isinstance(draft_tokens, list):
+            draft_tokens = torch.tensor(draft_tokens, device=self.device)
+        
+        return self.collect_training_data_single(logits, tree_attention_mask, draft_tokens)
         
     def _get_current_accepted_tokens_indices(
-            self, 
-            final_logits: torch.Tensor,
-            attention_mask: torch.Tensor,
-            draft_tokens: torch.Tensor,
-        ):
+        self, 
+        final_logits: torch.Tensor,
+        attention_mask: torch.Tensor,
+        draft_tokens: torch.Tensor,
+    ):
         seq_len = len(draft_tokens)
         prefix_len = attention_mask.shape[2] - seq_len
 
@@ -297,8 +401,6 @@ class AdaptiveNeuralPruner:
                 best_path = path[:validated]
                 
         last_index = best_path[-1]
-        next_token = probs[0, last_index].argmax().item()
-        logger.info(f"next token: {next_token}")
 
         return best_path, best_validated
     
