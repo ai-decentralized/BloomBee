@@ -319,15 +319,24 @@ class TransformerConnectionHandler(ConnectionHandler):
         async with timeout(self.session_timeout):
             
             try:
+                recv_start = perf_counter()
                 request = await asyncio.wait_for(anext(requests), self.step_timeout)
+                recv_end = perf_counter()
             except asyncio.TimeoutError:
                 self._log_request("rpc_inference.open", None, context, warning="timed out")
                 return
 
-            # RPC Debug: Log received request size
+            # [NETWORK_TIMING] Log received request size and timing
             request_tensor_sizes = [len(tensor.buffer) for tensor in request.tensors]
             request_metadata_size = len(request.metadata) if request.metadata else 0
             total_request_size = sum(request_tensor_sizes) + request_metadata_size
+            recv_time_ms = (recv_end - recv_start) * 1000
+            
+            logger.info(f"[NETWORK_RX] SERVER_RECV | "
+                       f"tensor_size={sum(request_tensor_sizes)/1024:.2f}KB | "
+                       f"metadata_size={request_metadata_size}B | "
+                       f"total={total_request_size/1024:.2f}KB | "
+                       f"recv_time={recv_time_ms:.2f}ms")
             
 
             requested_uids = self._check_uids(request.uid)
@@ -1025,6 +1034,11 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             stub = self.get_stub(self._p2p, next_peer_id)
             transfer_start = perf_counter()
+            
+            # [NETWORK_TIMING] Measure data size being pushed
+            push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
+            push_metadata_bytes = len(MSGPackSerializer.dumps(next_metadata))
+            
             await stub.rpc_push(
                 runtime_pb2.ExpertRequest(
                     uid=next_uid,
@@ -1033,6 +1047,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                 ),
                 timeout=self.request_timeout,
             )
+            
+            transfer_end = perf_counter()
+            transfer_time_ms = (transfer_end - transfer_start) * 1000
+            
+            # [NETWORK_TIMING] Log server-to-server transfer
+            logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "
+                       f"from_blocks={self.dht_prefix} | to_blocks={next_start}:{next_end} | "
+                       f"tensor_size={push_tensor_bytes/1024:.2f}KB | "
+                       f"metadata_size={push_metadata_bytes}B | "
+                       f"transfer_time={transfer_time_ms:.2f}ms")
+            
         except Exception:
             logger.debug(
                 f"Failed to push outputs to peer_id={next_peer_id}, session_id={next_session_id}, blocks={next_start}:{next_end}:",

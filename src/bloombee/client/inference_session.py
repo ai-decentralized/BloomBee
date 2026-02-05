@@ -179,6 +179,9 @@ class _ServerInferenceSession:
         #     server_side_inference_schema
         # ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
+        # [NETWORK_TIMING] Measure serialization time
+        serialize_start = time.perf_counter()
+        
         # Serialize and send data (debug output removed for performance)
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
         serialized_tensors = [
@@ -190,6 +193,23 @@ class _ServerInferenceSession:
         ]
         serialized_metadata = MSGPackSerializer.dumps(request_metadata)
         
+        serialize_end = time.perf_counter()
+        serialize_time_ms = (serialize_end - serialize_start) * 1000
+        
+        # [NETWORK_TIMING] Measure serialized data size
+        total_tensor_bytes = sum(len(t.buffer) for t in serialized_tensors)
+        metadata_bytes = len(serialized_metadata)
+        total_send_bytes = total_tensor_bytes + metadata_bytes
+        
+        logger.info(f"[NETWORK_TX] SEND_START | step_id={step_id} | "
+                   f"tensor_size={total_tensor_bytes/1024:.2f}KB | "
+                   f"metadata_size={metadata_bytes}B | "
+                   f"total={total_send_bytes/1024:.2f}KB | "
+                   f"serialize_time={serialize_time_ms:.2f}ms")
+        
+        # [NETWORK_TIMING] Measure network round-trip time
+        network_start = time.perf_counter()
+        
         outputs_serialized = RemoteExpertWorker.run_coroutine(
             self._step(
                 runtime_pb2.ExpertRequest(
@@ -200,7 +220,29 @@ class _ServerInferenceSession:
             )
         )
         
+        network_end = time.perf_counter()
+        network_rtt_ms = (network_end - network_start) * 1000
+        
+        # [NETWORK_TIMING] Measure deserialization time
+        deserialize_start = time.perf_counter()
         outputs = list(map(deserialize_torch_tensor, outputs_serialized.tensors))
+        deserialize_end = time.perf_counter()
+        deserialize_time_ms = (deserialize_end - deserialize_start) * 1000
+        
+        # [NETWORK_TIMING] Measure received data size
+        total_recv_bytes = sum(len(t.buffer) for t in outputs_serialized.tensors)
+        
+        logger.info(f"[NETWORK_TX] RECV_END | step_id={step_id} | "
+                   f"recv_size={total_recv_bytes/1024:.2f}KB | "
+                   f"network_rtt={network_rtt_ms:.2f}ms | "
+                   f"deserialize_time={deserialize_time_ms:.2f}ms")
+        
+        # [NETWORK_TIMING] Summary log
+        total_time_ms = serialize_time_ms + network_rtt_ms + deserialize_time_ms
+        logger.info(f"[NETWORK_TX] SUMMARY | step_id={step_id} | "
+                   f"send={total_send_bytes/1024:.2f}KB | recv={total_recv_bytes/1024:.2f}KB | "
+                   f"serialize={serialize_time_ms:.2f}ms | network={network_rtt_ms:.2f}ms | "
+                   f"deserialize={deserialize_time_ms:.2f}ms | total={total_time_ms:.2f}ms")
         # assert (
         #     outputs[0].shape == inputs.shape
         # ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"
