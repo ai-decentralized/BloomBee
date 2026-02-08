@@ -75,29 +75,9 @@ def benchmark_inference(process_idx, args, result_pipe):
     # Prepare batch of prompts for benchmarking
     batch_size = getattr(args, 'batch_size', 1)
     
-    # Create different prompts for each batch to verify independent generation
-    if batch_size == 1:
-        prompts = [""]
-    elif batch_size == 2:
-        prompts = ["Once upon a time", "In a galaxy far away"]
-    elif batch_size == 3:
-        prompts = ["Once upon a time", "In a galaxy far away", "The quick brown fox"]
-    else:
-        base_prompt = (
-            "Quantum mechanics explains the behavior of particles at very small scales. "
-            "Neural networks learn patterns by adjusting weights through backpropagation. "
-            "Distributed systems require robust consensus mechanisms to maintain state. "
-            "Optimization algorithms like gradient descent are fundamental to machine learning. "
-            "Transformer architectures rely on attention mechanisms to capture dependencies. "
-            "Reinforcement learning optimizes actions by maximizing cumulative rewards. "
-            "Bayesian inference updates beliefs based on observed evidence and prior knowledge. "
-            "Convex optimization problems guarantee global minima under certain conditions. "
-            "Signal processing extracts meaningful information from noisy measurements. "
-        )
-        prompts = [
-            f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
-            for i in range(batch_size)
-        ]
+    # Use different prompts for each batch item to verify micro-batch correctness
+    # Each batch item gets a unique number as prefix to ensure different outputs
+    prompts = [f"Number {i}: " for i in range(batch_size)]
     
     if args.prompt_len is None:
         encodings = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=True)

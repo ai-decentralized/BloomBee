@@ -1,7 +1,7 @@
 import contextlib
 import dataclasses
 from contextvars import ContextVar
-from typing import Any, ContextManager, Dict, List, Optional, Tuple
+from typing import Any, ContextManager, Dict, List, Optional, Tuple, Union
 
 import torch
 import transformers
@@ -22,22 +22,38 @@ class RemotePastKeyValues(Cache):
 
     def __init__(self) -> None:
         super().__init__()
-        self._seen_tokens = 0
+        self._seen_tokens: Optional[torch.Tensor] = None
         self.hypo_ids: Optional[torch.LongTensor] = None
         self.kv_cache_position_ids: Optional[torch.LongTensor] = None
         self.is_spec_decoding: Optional[torch.LongTensor] = None
+        self.prefill_length: Optional[torch.LongTensor] = None
 
     def __getitem__(self, _index: int) -> List[torch.Tensor]:
         return [DUMMY]  # For compatibility with BloomForCausalLM.prepare_inputs_for_generation()
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        if self._seen_tokens is None:
+            return 0
+        if self._seen_tokens.dim() == 0:
+            return self._seen_tokens.item()
+        return self._seen_tokens[0].item()
+    
+    def get_seq_length_batch(self) -> Optional[torch.Tensor]:
         return self._seen_tokens
 
     def get_max_length(self) -> Optional[int]:
         return None
 
-    def update_seen(self, new_seen: int) -> None:
-        self._seen_tokens += new_seen
+    def update_seen(self, new_seen: Union[int, torch.Tensor]) -> None:
+        if isinstance(new_seen, int):
+            self._seen_tokens = torch.tensor([new_seen])
+        elif isinstance(new_seen, torch.Tensor):
+            if new_seen.dim() == 0:
+                new_seen = new_seen.unsqueeze(0)
+            self._seen_tokens = new_seen
+        else:
+            raise TypeError(f"new_seen must be int or torch.Tensor, got {type(new_seen)}")
+
 
     def reorder_cache(self, beam_idx):
         raise NotImplementedError("Beam search reordering is not implemented yet")
@@ -47,6 +63,9 @@ class RemotePastKeyValues(Cache):
         
     def set_is_spec_decoding(self, is_spec_decoding: Optional[torch.LongTensor]):
         self.is_spec_decoding = is_spec_decoding
+        
+    def set_prefill_length(self, prefill_length: Optional[torch.LongTensor]):
+        self.prefill_length = prefill_length
 
 
 _skipped_tokens = ContextVar("skipped_tokens", default=0)

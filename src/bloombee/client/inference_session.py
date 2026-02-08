@@ -124,14 +124,16 @@ class _ServerInferenceSession:
         """
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
-
-        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids.numel() # get the number of token
+        if is_spec_dec:
+            n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids.numel()
+        else:
+            n_input_tokens = inputs.shape[1]
         # print('client step() n_input_tokens', n_input_tokens)
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # 将当前输入的最后n_input_tokens个token拼接到历史记录中
-        # history can cat input if it's spec decoding and pruning happened, need  back
+        # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
         #     f"Broken input cache: span={self.span} shape={self.history.shape} "
         #     f"position={self._position} n_input_tokens={n_input_tokens}"
@@ -152,15 +154,18 @@ class _ServerInferenceSession:
             normalize_arg(tree_attention_mask),
             normalize_arg(kv_cache_position_ids),
             normalize_arg(draft_tokens),
-            normalize_arg(torch.tensor(prefill_length)),
+            normalize_arg(prefill_length),
             normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
         )
         logger.info(f"_ServerInferenceSession  step id {step_id}")
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
-        if self._position is not None:
-            request_metadata["start_from_position"] = self._position
+        if is_spec_dec:
+            request_metadata["start_from_position"] = self._position + n_input_tokens
+        else:
+            if self._position is not None:
+                request_metadata["start_from_position"] = self._position
         # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
         if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
@@ -316,6 +321,7 @@ class InferenceSession:
         
         # [MBPIPE] Log micro-batch pipeline configuration at client session creation
         mbpipe_log_config(logger, context="InferenceSession.__init__")
+        self.first_inference = True
 
     @property
     def num_blocks(self) -> int:
@@ -376,6 +382,7 @@ class InferenceSession:
         kv_cache_position_ids: Optional[torch.Tensor] = None,
         draft_tokens: Optional[torch.Tensor] = None,
         is_spec_decoding: Optional[torch.Tensor] = None,
+        prefill_length: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -424,12 +431,16 @@ class InferenceSession:
         server_idx = 0
         block_idx = 0
         inference_step_start = time.perf_counter()
-        self.prefill_length = inputs.shape[1] - tree_attention_mask.shape[1] if tree_attention_mask is not None else 0
+        batch_size = inputs.shape[0] if inputs.ndim >= 1 else 1
+        if tree_attention_mask is not None and prefill_length is not None:
+            self.prefill_length = prefill_length.to(inputs.device)
+        else:
+            self.prefill_length = torch.zeros(batch_size, device=inputs.device)
         keep_indices = torch.arange(
-                inputs.shape[1],
-                dtype=torch.int64,
-                device=inputs.device
-            )
+            inputs.shape[1],
+            dtype=torch.int64,
+            device=inputs.device
+        ).unsqueeze(0).expand(inputs.shape[0], -1)
         self.keep_indices = keep_indices
         if is_spec_decoding is not None and is_spec_decoding.item() == 1:
             is_spec_dec = True
@@ -493,8 +504,11 @@ class InferenceSession:
                     time.sleep(delay) 
 
         self._position += n_input_tokens
+        # logger.info(f"keep_indices: {keep_indices}")
+        # logger.info(f"before _recover_hidden_states: {inputs}")
         if draft_tokens is not None and is_spec_dec:
-            inputs = self._recover_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
+            inputs = self._restore_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
+        # logger.info(f"after _recover_hidden_states: {inputs}")
         outputs = inputs 
         
         # 🔍 CLIENT DEBUG: Log inference step end
@@ -507,28 +521,48 @@ class InferenceSession:
         # print('client inference session outputs ', outputs.shape)
         return outputs
     
-    def _recover_hidden_states(self, hidden_states, keep_indices, original_length):
-        if not torch.is_tensor(keep_indices):
-            keep_indices = torch.tensor(keep_indices, device=hidden_states.device, dtype=torch.long)
-
-        if hidden_states.dim() == 2:
-            # [S_kept, H]
-            recovered = hidden_states.new_zeros((original_length, hidden_states.size(-1)))
-            recovered[keep_indices] = hidden_states
-
-        elif hidden_states.dim() == 3:
-            # [B, S_kept, H]
-            B, _, H = hidden_states.shape
-            recovered = hidden_states.new_zeros((B, original_length, H))
-            recovered[:, keep_indices, :] = hidden_states
-
-        else:
-            raise ValueError(f"Unexpected hidden_states dim {hidden_states.dim()}, expected 2 or 3")
-        mask = torch.ones(original_length, dtype=torch.bool, device=hidden_states.device)
-        mask[keep_indices] = False
-        self._last_padded_mask = mask
-
-        return recovered
+    def _restore_hidden_states(
+        self,
+        flattened_hidden_states: torch.Tensor,  # [N_total_valid, hidden_size]
+        keep_indices: torch.Tensor,  # [B, max_keep_len]，padding 为 -1
+        original_seq_len: int,  # 原始序列长度
+    ) -> torch.Tensor:
+        """
+        将铺平的 hidden states 还原为 [B, original_seq_len, hidden_size]
+        
+        Args:
+            flattened_hidden_states: [N_total_valid, hidden_size] 铺平后的有效 hidden states
+            keep_indices: [B, max_keep_len] 每个 batch 的 keep indices，padding 为 -1
+            original_seq_len: 原始序列长度
+        
+        Returns:
+            restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
+        """
+        batch_size, max_keep_len = keep_indices.shape
+        hidden_size = flattened_hidden_states.shape[-1]
+        device = flattened_hidden_states.device
+        dtype = flattened_hidden_states.dtype
+        
+        # 创建输出 tensor，用 0 填充
+        restored_hidden_states = torch.zeros(
+            batch_size, original_seq_len, hidden_size,
+            dtype=dtype, device=device
+        )
+        
+        # 创建有效 mask: [B, max_keep_len]
+        valid_mask = keep_indices >= 0
+        
+        # 创建 batch 索引: [B, max_keep_len]
+        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
+        
+        # 取出有效部分的索引
+        valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
+        valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
+        
+        # 写入还原位置
+        restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flattened_hidden_states
+        
+        return restored_hidden_states
     
     def _update_sequence(self, server_idx: int, block_idx: int, attempt_no: int) -> int:
         # If there is a failed server session, this code closes it

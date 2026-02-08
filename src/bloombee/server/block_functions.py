@@ -19,7 +19,7 @@ from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
-from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -251,20 +251,48 @@ async def run_rpc_backward(
     grad_prompts = torch.cat(grad_prompts_reversed[::-1], dim=0) if grad_prompts_reversed else DUMMY
     return [grad_outputs] if is_dummy(grad_prompts) else [grad_outputs, grad_prompts]  # TODO un-duct-tape
 
-def _update_kv_cache_position_ids(kv_cache_position_ids, keep_indices):
-    if kv_cache_position_ids is None:
-        return
     
-    if not torch.is_tensor(keep_indices):
-        keep_indices = torch.tensor(keep_indices, device=kv_cache_position_ids.device)
-
-    mapping = {int(k.item()): i for i, k in enumerate(keep_indices)}
-    new_ids = torch.tensor(
-        [mapping.get(int(x.item()), -1) for x in kv_cache_position_ids],
-        device=kv_cache_position_ids.device
+def restore_hidden_states(
+    flattened_hidden_states: torch.Tensor,  # [N_total_valid, hidden_size]
+    keep_indices: torch.Tensor,  # [B, max_keep_len]，padding 为 -1
+    original_seq_len: int,  # 原始序列长度
+) -> torch.Tensor:
+    """
+    将铺平的 hidden states 还原为 [B, original_seq_len, hidden_size]
+    
+    Args:
+        flattened_hidden_states: [N_total_valid, hidden_size] 铺平后的有效 hidden states
+        keep_indices: [B, max_keep_len] 每个 batch 的 keep indices，padding 为 -1
+        original_seq_len: 原始序列长度
+    
+    Returns:
+        restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
+    """
+    batch_size, max_keep_len = keep_indices.shape
+    hidden_size = flattened_hidden_states.shape[-1]
+    device = flattened_hidden_states.device
+    dtype = flattened_hidden_states.dtype
+    
+    # 创建输出 tensor，用 0 填充
+    restored_hidden_states = torch.zeros(
+        batch_size, original_seq_len, hidden_size,
+        dtype=dtype, device=device
     )
-    return new_ids
-
+    
+    # 创建有效 mask: [B, max_keep_len]
+    valid_mask = keep_indices >= 0
+    
+    # 创建 batch 索引: [B, max_keep_len]
+    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
+    
+    # 取出有效部分的索引
+    valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
+    valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
+    
+    # 写入还原位置
+    restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flattened_hidden_states
+    
+    return restored_hidden_states
 
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
@@ -272,7 +300,7 @@ async def iterate_rpc_inference(
     active_adapter: Optional[str],
     input_iterator: AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]],
     cache_handles: Sequence[Sequence[Handle]],
-    pruner_manager: BloombeePrunerManager,
+    pruner_manager: SpeculativePrunerManager,
     *,
     max_length: int,
     prioritizer: TaskPrioritizerBase,
@@ -294,10 +322,11 @@ async def iterate_rpc_inference(
         step_receive_time = perf_counter()
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
-            assert (
-                prefix_length >= start_from_position,
-            ), f"prefix_length={prefix_length}, start_from_position={start_from_position}"
+            # assert (
+            #     prefix_length >= start_from_position,
+            # ), f"prefix_length={prefix_length}, start_from_position={start_from_position}"
             prefix_length = start_from_position
+
 
         # ========== [MBPIPE] MICRO-BATCH BRANCH ==========
         # Handle cross-stage micro-batches with 2-tensor format
@@ -312,6 +341,12 @@ async def iterate_rpc_inference(
             mb_size = step_metadata.get("size", 1)
             full_batch_size = step_metadata.get("full_batch_size", mb_size)
             step_id = step_metadata.get("step_id")
+            session_id = step_metadata.get("session_id", "unknown")
+            start_from_position = step_metadata.get("start_from_position")
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} micro-batch metadata: step_id={step_id}, mb_idx={mb_idx}, "
+                f"start_from_position={start_from_position}"
+            )
             
             # [CROSS_STAGE] Calculate overlap metrics
             push_timestamp_us = step_metadata.get("stage_push_timestamp_us", 0)
@@ -352,20 +387,20 @@ async def iterate_rpc_inference(
             )
             
             # [MB_DEBUG] Log micro-batch state
-            logger.info(f"[MB_DEBUG] === MICRO-BATCH {mb_idx} PROCESSING ===")
-            logger.info(f"[MB_DEBUG] mb_offset={mb_offset}, mb_size={mb_size}, full_batch_size={full_batch_size}")
-            logger.info(f"[MB_DEBUG] step_id={step_id}, session_id={session_id}")
+            logger.debug(f"[MB_DEBUG] === MICRO-BATCH {mb_idx} PROCESSING ===")
+            logger.debug(f"[MB_DEBUG] mb_offset={mb_offset}, mb_size={mb_size}, full_batch_size={full_batch_size}")
+            logger.debug(f"[MB_DEBUG] step_id={step_id}, session_id={session_id}")
             
             # Deserialize only the 2 tensors from micro-batch push
             flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
             
             # [MB_DEBUG] Log deserialized tensors
-            logger.info(f"[MB_DEBUG] Deserialized {len(flat_tensors)} tensors from request")
+            logger.debug(f"[MB_DEBUG] Deserialized {len(flat_tensors)} tensors from request")
             for i, t in enumerate(flat_tensors):
                 if hasattr(t, 'shape'):
-                    logger.info(f"[MB_DEBUG] flat_tensors[{i}]: shape={t.shape}, dtype={t.dtype}, device={t.device}")
+                    logger.debug(f"[MB_DEBUG] flat_tensors[{i}]: shape={t.shape}, dtype={t.dtype}, device={t.device}")
                 else:
-                    logger.info(f"[MB_DEBUG] flat_tensors[{i}]: type={type(t)}")
+                    logger.debug(f"[MB_DEBUG] flat_tensors[{i}]: type={type(t)}")
             
             if len(flat_tensors) >= 2:
                 mb_hidden_states = flat_tensors[0]
@@ -375,8 +410,8 @@ async def iterate_rpc_inference(
                 mb_keep_indices = None
             
             # [MB_DEBUG] Log extracted tensors
-            logger.info(f"[MB_DEBUG] mb_hidden_states: shape={mb_hidden_states.shape if mb_hidden_states is not None else 'None'}")
-            logger.info(f"[MB_DEBUG] mb_keep_indices: shape={mb_keep_indices.shape if mb_keep_indices is not None and hasattr(mb_keep_indices, 'shape') else 'None'}")
+            logger.debug(f"[MB_DEBUG] mb_hidden_states: shape={mb_hidden_states.shape if mb_hidden_states is not None else 'None'}")
+            logger.debug(f"[MB_DEBUG] mb_keep_indices: shape={mb_keep_indices.shape if mb_keep_indices is not None and hasattr(mb_keep_indices, 'shape') else 'None'}")
             
             if mb_hidden_states is None:
                 logger.warning(f"{MBPIPE_SCHEMA_PREFIX} Empty micro-batch received, skipping")
@@ -385,23 +420,29 @@ async def iterate_rpc_inference(
             # Ensure contiguous
             if not mb_hidden_states.is_contiguous():
                 mb_hidden_states = mb_hidden_states.contiguous()
-                logger.info(f"[MB_DEBUG] Made mb_hidden_states contiguous")
+                logger.debug(f"[MB_DEBUG] Made mb_hidden_states contiguous")
             if mb_keep_indices is not None and not mb_keep_indices.is_contiguous():
                 mb_keep_indices = mb_keep_indices.contiguous()
-                logger.info(f"[MB_DEBUG] Made mb_keep_indices contiguous")
+                logger.debug(f"[MB_DEBUG] Made mb_keep_indices contiguous")
             
-            # Initialize or reuse request context
-            session_id = step_metadata.get("session_id", "unknown")
-            
-            if request_context is None:
+            # [MBPIPE_FIX] RequestContext must be scoped by (session_id, step_id).
+            # Reusing context across steps can leak stale fields (e.g. prefill_length/hypo_ids).
+            if (
+                request_context is None
+                or request_context.request_id != session_id
+                or request_context.step_id != step_id
+            ):
                 request_context = RequestContext(session_id, step_id)
-                logger.info(f"[MB_DEBUG] Created new RequestContext: session_id={session_id}, step_id={step_id}")
+                logger.info(
+                    f"[MB_DEBUG] Reset RequestContext for micro-batch step: "
+                    f"session_id={session_id}, step_id={step_id}"
+                )
             else:
-                logger.info(f"[MB_DEBUG] Reusing existing RequestContext")
+                logger.debug(f"[MB_DEBUG] Reusing RequestContext for current micro-batch step")
             
             # Fill missing fields using schema defaults
             (
-                hidden_states, keep_indices, _, _,  # Ignore prompts and hypo_ids from defaults
+                hidden_states, keep_indices, prompts, hypo_ids,
                 tree_attention_mask, kv_cache_position_ids, draft_tokens,
                 prefill_length, is_spec_dec, need_pruning
             ) = fill_microbatch_defaults(
@@ -409,27 +450,29 @@ async def iterate_rpc_inference(
             )
             
             # [MB_DEBUG] Log after fill_microbatch_defaults
-            logger.info(f"[MB_DEBUG] After fill_microbatch_defaults:")
-            logger.info(f"[MB_DEBUG]   hidden_states.shape={hidden_states.shape}")
-            logger.info(f"[MB_DEBUG]   keep_indices={keep_indices}")
-            logger.info(f"[MB_DEBUG]   tree_attention_mask={tree_attention_mask is not None}")
-            logger.info(f"[MB_DEBUG]   kv_cache_position_ids={kv_cache_position_ids}")
-            logger.info(f"[MB_DEBUG]   prefill_length={prefill_length}, is_spec_dec={is_spec_dec}, need_pruning={need_pruning}")
+            logger.debug(f"[MB_DEBUG] After fill_microbatch_defaults:")
+            logger.debug(f"[MB_DEBUG]   hidden_states.shape={hidden_states.shape}")
+            if hidden_states.numel() > 0:
+                logger.debug(f"[MB_DEBUG]   hidden_states.abs().mean()={hidden_states.abs().mean().item():.6f}")
+            logger.debug(f"[MB_DEBUG]   keep_indices={keep_indices}")
+            logger.debug(f"[MB_DEBUG]   tree_attention_mask={tree_attention_mask is not None}")
+            logger.debug(f"[MB_DEBUG]   kv_cache_position_ids={kv_cache_position_ids}")
+            logger.debug(f"[MB_DEBUG]   prefill_length={prefill_length}, is_spec_dec={is_spec_dec}, need_pruning={need_pruning}")
             
-            # [CRITICAL FIX] For cross-stage micro-batches, always generate correct prompts and hypo_ids
-            # The cached prompts from full-batch path may be a tensor, not a list
-            # prompts must be a list of length num_backends, where each element is None or a tensor
-            prompts = [None] * len(requested_backends)
-            
-            # hypo_ids must match micro-batch size
-            hypo_ids = torch.arange(mb_size, dtype=torch.int64, device=hidden_states.device)
+            # Ensure prompts/hypo_ids match the current micro-batch.
+            if not isinstance(prompts, list) or len(prompts) != len(requested_backends):
+                prompts = [None] * len(requested_backends)
+            if hypo_ids is None or not torch.is_tensor(hypo_ids) or hypo_ids.numel() != mb_size:
+                hypo_ids = torch.arange(mb_size, dtype=torch.int64, device=hidden_states.device)
+            else:
+                hypo_ids = hypo_ids.to(dtype=torch.int64, device=hidden_states.device)
             
             # [MB_DEBUG] Log prompts and hypo_ids
-            logger.info(f"[MB_DEBUG] Generated prompts: list of {len(prompts)} Nones")
-            logger.info(f"[MB_DEBUG] Generated hypo_ids: shape={hypo_ids.shape}, values={hypo_ids.tolist()}")
+            logger.debug(f"[MB_DEBUG] prompts_count={len(prompts)}")
+            logger.debug(f"[MB_DEBUG] hypo_ids.shape={hypo_ids.shape}, values={hypo_ids.tolist()}")
             
             # [DEBUG] Log prompts info for debugging
-            logger.info(
+            logger.debug(
                 f"{MBPIPE_LOG_PREFIX} [DEBUG] After fix: "
                 f"prompts type={type(prompts)}, len={len(prompts)}, "
                 f"hypo_ids.shape={hypo_ids.shape}, num_backends={len(requested_backends)}"
@@ -458,7 +501,7 @@ async def iterate_rpc_inference(
             )
             
             # [DEBUG] Log before submitting task
-            logger.info(
+            logger.debug(
                 f"{MBPIPE_LOG_PREFIX} [DEBUG] Before submit_task: "
                 f"hidden_states.shape={hidden_states.shape}, "
                 f"hypo_ids.shape={hypo_ids.shape if hasattr(hypo_ids, 'shape') else 'N/A'}, "
@@ -486,22 +529,22 @@ async def iterate_rpc_inference(
                         for uid, handles in zip(requested_uids, cache_handles)
                     )
                     # [MB_DEBUG] Log InferenceMetadata details
-                    logger.info(f"[MB_DEBUG] === INFERENCE METADATA ===")
+                    logger.debug(f"[MB_DEBUG] === INFERENCE METADATA ===")
                     for i, info in enumerate(inference_infos):
-                        logger.info(f"[MB_DEBUG] inference_infos[{i}]: uid={info.uid}, prefix_length={info.prefix_length}")
-                        logger.info(f"[MB_DEBUG]   batch_offset={info.batch_offset}, full_batch_size={info.full_batch_size}, micro_batch_size={info.micro_batch_size}")
-                        logger.info(f"[MB_DEBUG]   cache_handles count={len(info.cache_handles) if info.cache_handles else 0}")
+                        logger.debug(f"[MB_DEBUG] inference_infos[{i}]: uid={info.uid}, prefix_length={info.prefix_length}")
+                        logger.debug(f"[MB_DEBUG]   batch_offset={info.batch_offset}, full_batch_size={info.full_batch_size}, micro_batch_size={info.micro_batch_size}")
+                        logger.debug(f"[MB_DEBUG]   cache_handles count={len(info.cache_handles) if info.cache_handles else 0}")
                     
                     # [DEBUG] Log inference_infos
-                    logger.info(
+                    logger.debug(
                         f"{MBPIPE_LOG_PREFIX} [DEBUG] inference_infos count={len(inference_infos)}, "
                         f"submitting with {len(prompts)} prompts"
                     )
                     
                     # [MB_DEBUG] Log before submit_task
-                    logger.info(f"[MB_DEBUG] === SUBMIT TASK ===")
-                    logger.info(f"[MB_DEBUG] hidden_states.shape={hidden_states.shape}")
-                    logger.info(f"[MB_DEBUG] hypo_ids.shape={hypo_ids.shape}, values={hypo_ids.tolist()}")
+                    logger.debug(f"[MB_DEBUG] === SUBMIT TASK ===")
+                    logger.debug(f"[MB_DEBUG] hidden_states.shape={hidden_states.shape}")
+                    logger.debug(f"[MB_DEBUG] hypo_ids.shape={hypo_ids.shape}, values={hypo_ids.tolist()}")
                     
                     submit_start = perf_counter()
                     (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
@@ -510,9 +553,9 @@ async def iterate_rpc_inference(
                     submit_time_ms = (perf_counter() - submit_start) * 1000
                     
                     # [MB_DEBUG] Log after submit_task
-                    logger.info(f"[MB_DEBUG] submit_task completed in {submit_time_ms:.2f}ms")
-                    logger.info(f"[MB_DEBUG] output hidden_states.shape={hidden_states.shape}")
-                    logger.info(f"[MB_DEBUG] output keep_indices={keep_indices}")
+                    logger.debug(f"[MB_DEBUG] submit_task completed in {submit_time_ms:.2f}ms")
+                    logger.debug(f"[MB_DEBUG] output hidden_states.shape={hidden_states.shape}")
+                    logger.debug(f"[MB_DEBUG] output keep_indices={keep_indices}")
 
                 else:
                     # Process through backends sequentially
@@ -588,6 +631,8 @@ async def iterate_rpc_inference(
                 f"{MBPIPE_LOG_PREFIX} Micro-batch {mb_idx} processed in {process_time_ms:.1f}ms, "
                 f"output shape: {hidden_states.shape}"
             )
+            if hidden_states.numel() > 0:
+                logger.debug(f"[MB_DEBUG] Output hidden_states.abs().mean()={hidden_states.abs().mean().item():.6f} for mb_idx={mb_idx}")
             
             # ========== [MBPIPE_STREAMING] CROSS-STAGE PUSH FOR DECODE OVERLAP ==========
             # Push this micro-batch to downstream stage IMMEDIATELY after processing
@@ -607,9 +652,14 @@ async def iterate_rpc_inference(
                 push_metadata["stage_compute_start_timestamp_us"] = int(process_start_time * 1_000_000)
                 push_metadata["is_streaming_decode"] = True  # Mark as streaming decode
                 
+                # [MBPIPE_FIX] Clone tensors before fire-and-forget async push.
+                # Without cloning, underlying buffers may be mutated/reused before serialization finishes.
+                push_hidden = hidden_states.detach().clone()
+                push_keep = keep_indices.detach().clone() if torch.is_tensor(keep_indices) else keep_indices
+
                 # Fire-and-forget async push - don't wait for completion
                 asyncio.create_task(
-                    cross_stage_push_fn(hidden_states, keep_indices, push_metadata)
+                    cross_stage_push_fn(push_hidden, push_keep, push_metadata)
                 )
                 
                 logger.info(
@@ -662,6 +712,8 @@ async def iterate_rpc_inference(
                 logger.info(
                     f"{MBPIPE_LOG_PREFIX} Merged output shape: {merged_hidden_states.shape}"
                 )
+                if merged_hidden_states.numel() > 0:
+                     logger.debug(f"[MB_DEBUG] Merged hidden_states.abs().mean()={merged_hidden_states.abs().mean().item():.6f}")
                 
                 # [CROSS_STAGE_OVERLAP] Calculate and log final overlap summary
                 if hasattr(iterate_rpc_inference, '_cross_stage_overlap_data') and \
@@ -837,7 +889,56 @@ async def iterate_rpc_inference(
                 idx = attention_mask_indices
                 tree_attention_mask = tree_attention_mask[:, idx][:, :, idx]
 
+
+        # [MERGED] Use upstream's standard tensor unpacking for full-batch path
+        flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+        if args_structure is not None:
+            flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
+
+        hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
+        draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
+        batch_size, length_increment, _ = hidden_states.shape
+
+        # Fix for bus error in cross-machine setups: ensure tensors are contiguous
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
+            prompts = prompts.contiguous()
+        if not hypo_ids.is_contiguous():
+            hypo_ids = hypo_ids.contiguous()
+        if tree_attention_mask is not None and not is_dummy(tree_attention_mask) and not tree_attention_mask.is_contiguous():
+            tree_attention_mask = tree_attention_mask.contiguous()
+        if kv_cache_position_ids is not None and not is_dummy(kv_cache_position_ids) and not kv_cache_position_ids.is_contiguous():
+            kv_cache_position_ids = kv_cache_position_ids.contiguous()
+        if draft_tokens is not None and not is_dummy(draft_tokens) and not draft_tokens.is_contiguous():
+            draft_tokens = draft_tokens.contiguous()
+        if keep_indices is not None and not is_dummy(keep_indices) and not keep_indices.is_contiguous():
+            keep_indices = keep_indices.contiguous()
+        if need_pruning1 is not None and not is_dummy(need_pruning1) and not need_pruning1.is_contiguous():
+            need_pruning1 = need_pruning1.contiguous()
+        if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) and not is_spec_dec1.is_contiguous():
+            is_spec_dec1 = is_spec_dec1.contiguous()
             
+        need_pruning = need_pruning1 == 1 if need_pruning1 is not None and not is_dummy(need_pruning1) else False
+        is_spec_dec = is_spec_dec1 == 1 if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
+        
+        if is_spec_dec and draft_tokens.shape[0] != hidden_states.shape[0]:
+            hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
+        
+        # if is_spec_dec and not need_pruning:
+            
+        #     prefill_len = draft_tokens.shape[-1] - tree_attention_mask.shape[-1]
+        #     attention_mask_indices = keep_indices[:, prefill_len:] - prefill_len
+        #     logger.info(f"keep_indices: {keep_indices}")
+        #     logger.info(f"draft_tokens: {draft_tokens}, tree_attention_mask: {tree_attention_mask.shape}")
+        #     logger.info(f"prefill_length: {prefill_length}, attention_mask_indices: {attention_mask_indices}")
+        #     idx = attention_mask_indices
+        #     idx_2d = idx.unsqueeze(-1).expand(-1, -1, tree_attention_mask.size(-1))
+        #     tree_attention_mask = torch.gather(tree_attention_mask, dim=1, index=idx_2d)
+        #     idx_3d = idx.unsqueeze(1).expand(-1, tree_attention_mask.size(1), -1)
+        #     tree_attention_mask = torch.gather(tree_attention_mask, dim=2, index=idx_3d)
+        #     logger.info(f"tree_attention_mask: {tree_attention_mask.shape}")
+
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
@@ -937,31 +1038,15 @@ async def iterate_rpc_inference(
                         try:
                             from bloombee.utils.memory_usage import log_mbpipe_memory, get_gpu_memory_mb
                             mem_before = get_gpu_memory_mb()
-                            logger.info(f"[MBPIPE_MEM_DEBUG] ===== MB{mb_idx} START (size={mb_size}, offset={mb_start}) =====")
+                            logger.debug(f"[MBPIPE_MEM_DEBUG] ===== MB{mb_idx} START (size={mb_size}, offset={mb_start}) =====")
                             log_mbpipe_memory(f"MB{mb_idx}_START", f"size={mb_size}, total_mb={total_mb}")
                         except Exception as e:
                             mem_before = 0
                             logger.debug(f"[MBPIPE_MEM_DEBUG] Memory logging failed: {e}")
                         
-                        # [KVCACHE_OFFLOAD] Get cache manager for offload/prefetch operations
-                        cache_manager = requested_backends[0].cache_manager if requested_backends else None
-                        
-                        # [PHASE3_PREFETCH] STEP 1a: Sync previous MB's prefetch (started during last MB's compute)
-                        # For mb_idx=0, nothing to sync
-                        # For mb_idx>0, we need to sync the prefetch that was started during MB_{n-1}'s compute
-                        prefetch_start = _perf_counter()
+                        # Offload/prefetch is now executed inside cache_manager.select_cache/_write_kvs,
+                        # i.e. inside use_cache context where cache tensors are active.
                         prefetch_sync_time_ms = 0.0
-                        if mb_idx > 0 and cache_manager is not None:
-                            if hasattr(cache_manager, 'sync_prefetch'):
-                                cache_manager.sync_prefetch()
-                            prefetch_sync_time_ms = (_perf_counter() - prefetch_start) * 1000
-                            logger.info(f"[PHASE3_PREFETCH] MB{mb_idx}: sync complete ({prefetch_sync_time_ms:.2f}ms, overlapped with prev compute)")
-                            
-                            # [MBPIPE_MEM_DEBUG] Log memory after prefetch sync
-                            try:
-                                log_mbpipe_memory(f"MB{mb_idx}_AFTER_PREFETCH_SYNC", "")
-                            except Exception:
-                                pass
                         
                         # [CROSS_STAGE] Record absolute timestamp when compute starts for overlap analysis
                         import time as _time
@@ -985,22 +1070,19 @@ async def iterate_rpc_inference(
                         # - prefetch() loads data from CPU before compute
                         from bloombee.utils.microbatch_config import is_microbatch_enabled, get_micro_batch_size
                         
+                        # [MBPIPE_FIX] Always pass logical offsets to cache manager
+                        # The cache manager will detect if we are in Multiplexing Mode (cache_size == mb_size)
+                        # or Legacy Mode (cache_size == full_batch_size) and handle the physical offset mapping internally.
+                        #
+                        # Previously, we forced offset=0 here, which broke Legacy Mode where the cache 
+                        # is large enough for the full batch.
+                        cache_batch_offset = mb_start
+                        cache_full_batch_size = batch_size
+                        
                         if is_microbatch_enabled() and total_mb > 1:
-                            # GPU multiplexing: all micro-batches use offset=0
-                            cache_batch_offset = 0
-                            cache_full_batch_size = mb_size  # Cache only holds micro_batch_size
-                            
-                            # [MBPIPE_DEBUG] Detailed micro-batch info
-                            logger.info(f"[MBPIPE_DEBUG] ===== MICRO-BATCH {mb_idx}/{total_mb-1} =====")
-                            logger.info(f"[MBPIPE_DEBUG] Global batch range: [{mb_start}:{mb_end}] (size={mb_size})")
-                            logger.info(f"[MBPIPE_DEBUG] GPU cache mode: MULTIPLEXING (all MBs use offset=0)")
-                            logger.info(f"[MBPIPE_DEBUG] cache_batch_offset={cache_batch_offset}, cache_full_batch_size={cache_full_batch_size}")
-                            logger.info(f"[MBPIPE_DEBUG] hidden_states slice: [{mb_start}:{mb_end}], shape={mb_hidden.shape}")
+                            logger.debug(f"[MBPIPE_DEBUG] Micro-batch enabled: MB{mb_idx}/{total_mb} uses logical offset={cache_batch_offset}")
                         else:
-                            # Legacy mode or single micro-batch: use actual offsets
-                            cache_batch_offset = mb_start
-                            cache_full_batch_size = batch_size
-                            logger.info(f"[MBPIPE_DEBUG] MB{mb_idx}: Legacy mode, cache_batch_offset={cache_batch_offset}")
+                            logger.debug(f"[MBPIPE_DEBUG] MB{mb_idx}: Legacy/Single mode, cache_batch_offset={cache_batch_offset}")
                         
                         mb_inference_infos = tuple(
                             InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,
@@ -1033,43 +1115,18 @@ async def iterate_rpc_inference(
                         except Exception:
                             pass
                         
-                        # [KVCACHE_OFFLOAD] STEP 3: Offload this micro-batch's KV cache to CPU (async)
-                        # This frees GPU memory for the next micro-batch to reuse
-                        # Don't offload the last micro-batch (we'll clear state instead)
-                        offload_start = _perf_counter()
+                        # Offload/prefetch timing is handled inside cache manager now.
                         offload_time_ms = 0.0
-                        if cache_manager is not None and mb_idx < total_mb - 1:
-                            if hasattr(cache_manager, 'offload_microbatch_kv'):
-                                current_prefix = prefix_length + length_increment
-                                cache_manager.offload_microbatch_kv(mb_idx, current_prefix)
-                                offload_time_ms = (_perf_counter() - offload_start) * 1000
-                                logger.info(f"[KVCACHE_OFFLOAD] MB{mb_idx}: offload started ({offload_time_ms:.2f}ms async)")
-                                
-                                # [MBPIPE_MEM_DEBUG] Log memory after offload
-                                try:
-                                    log_mbpipe_memory(f"MB{mb_idx}_AFTER_OFFLOAD", "async, may not reflect immediately")
-                                except Exception:
-                                    pass
-                        
-                        # [PHASE3_PREFETCH] STEP 4: Start prefetching NEXT micro-batch's KV cache while
-                        # current MB is being pushed. This overlaps prefetch with push/transfer latency.
-                        # The sync will happen at the START of processing the next MB.
                         prefetch_start_time_ms = 0.0
-                        if cache_manager is not None and mb_idx < total_mb - 1:
-                            if hasattr(cache_manager, 'prefetch_microbatch_kv'):
-                                prefetch_start = _perf_counter()
-                                cache_manager.prefetch_microbatch_kv(mb_idx + 1)
-                                prefetch_start_time_ms = (_perf_counter() - prefetch_start) * 1000
-                                logger.info(f"[PHASE3_PREFETCH] MB{mb_idx}: started prefetch of MB{mb_idx + 1} ({prefetch_start_time_ms:.2f}ms async, will sync later)")
                         
                         # [MBPIPE_MEM_DEBUG] Log memory at END of micro-batch with summary
                         try:
                             mem_after = get_gpu_memory_mb()
                             mem_delta = mem_after - mem_before
-                            logger.info(f"[MBPIPE_MEM_DEBUG] ===== MB{mb_idx} END =====")
-                            logger.info(f"[MBPIPE_MEM_DEBUG] MB{mb_idx} Memory Delta: {mem_delta:+.1f}MB (before={mem_before:.1f}MB, after={mem_after:.1f}MB)")
+                            logger.debug(f"[MBPIPE_MEM_DEBUG] ===== MB{mb_idx} END =====")
+                            logger.debug(f"[MBPIPE_MEM_DEBUG] MB{mb_idx} Memory Delta: {mem_delta:+.1f}MB (before={mem_before:.1f}MB, after={mem_after:.1f}MB)")
                             if abs(mem_delta) < 1.0:
-                                logger.info(f"[MBPIPE_MEM_DEBUG] NOTE: No significant memory change - offload/prefetch NOT reducing GPU memory!")
+                                logger.debug(f"[MBPIPE_MEM_DEBUG] NOTE: No significant memory change - offload/prefetch NOT reducing GPU memory!")
                         except Exception:
                             pass
                         
@@ -1101,8 +1158,13 @@ async def iterate_rpc_inference(
                             push_metadata["total_micro_batches"] = len(micro_ranges)
                             push_metadata["stage_push_timestamp_us"] = push_timestamp_us  # For overlap analysis
                             push_metadata["stage_compute_start_timestamp_us"] = compute_start_timestamp_us  # When this MB started computing
+
+                            # [MBPIPE_FIX] Clone tensors before async push to avoid buffer reuse races.
+                            push_hidden = mb_out_hidden.detach().clone()
+                            push_keep = mb_out_keep.detach().clone() if torch.is_tensor(mb_out_keep) else mb_out_keep
+
                             push_task = asyncio.create_task(
-                                cross_stage_push_fn(mb_out_hidden, mb_out_keep, push_metadata)
+                                cross_stage_push_fn(push_hidden, push_keep, push_metadata)
                             )
                             cross_stage_push_tasks.append(push_task)
                             logger.info(f"[CROSS_STAGE] Stage sends MB{mb_idx} at t={push_timestamp_us}, "
@@ -1121,10 +1183,10 @@ async def iterate_rpc_inference(
                         result = await process_microbatch_merged(mb_idx, mb_start, mb_end, total_mb)
                         results.append(result)
                     
-                    # [KVCACHE_OFFLOAD] Clear offload state after processing all micro-batches
-                    cache_manager = requested_backends[0].cache_manager if requested_backends else None
-                    if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
-                        cache_manager.clear_offload_state()
+                    # [KVCACHE_OFFLOAD] State clearing moved to handler.py to persist across streaming steps
+                    # cache_manager = requested_backends[0].cache_manager if requested_backends else None
+                    # if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
+                    #     cache_manager.clear_offload_state()
                     
                     pipeline_end_time = _perf_counter()
                     
@@ -1270,25 +1332,28 @@ async def iterate_rpc_inference(
                             push_metadata["micro_batch_size"] = mb_size
                             push_metadata["full_batch_size"] = batch_size
                             push_metadata["total_micro_batches"] = len(micro_ranges)
+                            # [MBPIPE_FIX] Clone tensors before async push to avoid buffer reuse races.
+                            push_hidden = mb_hidden.detach().clone()
+                            push_keep = mb_keep_idx.detach().clone() if torch.is_tensor(mb_keep_idx) else mb_keep_idx
                             push_task = asyncio.create_task(
-                                cross_stage_push_fn(mb_hidden, mb_keep_idx, push_metadata)
+                                cross_stage_push_fn(push_hidden, push_keep, push_metadata)
                             )
                             cross_stage_push_tasks.append(push_task)
                             logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
                         
                         return mb_hidden, mb_keep_idx
                     
-                    # Create tasks for all micro-batches (pipeline overlap)
-                    tasks = []
+                    # Run sequentially for KV cache correctness.
+                    # In separate_pools mode, backends still share multiplexed KV slots per step;
+                    # concurrent micro-batches can race on cache prefetch/write/offload.
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} separate_pools micro-batches run sequentially for KV safety"
+                    )
+                    results = []
                     for mb_idx, (mb_start, mb_end) in enumerate(micro_ranges):
-                        task = asyncio.create_task(process_microbatch(mb_idx, mb_start, mb_end))
-                        tasks.append(task)
-                        # Small delay to stagger pipeline stages
-                        if mb_idx < len(micro_ranges) - 1:
-                            await asyncio.sleep(0.001)  # 1ms stagger for pipeline effect
-                    
-                    # Wait for all micro-batches to complete
-                    results = await asyncio.gather(*tasks)
+                        result = await process_microbatch(mb_idx, mb_start, mb_end)
+                        results.append(result)
+
                     pipeline_end_time = _perf_counter()
                     
                     # [MBPIPE] Wait for cross-stage push tasks (fire-and-forget style)
@@ -1384,7 +1449,7 @@ async def iterate_rpc_inference(
                 hidden_states.shape[1],
                 dtype=torch.int64,
                 device=hidden_states.device
-            )
+            ).unsqueeze(0).expand(hidden_states.shape[0], -1)
         
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)

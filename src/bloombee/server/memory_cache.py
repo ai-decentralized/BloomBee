@@ -225,7 +225,7 @@ class MemoryCache:
                         top_p=None,
                     )
                     # [MBPIPE] Override policy.gpu_batch_size with descriptor's batch_size
-                    # This ensures KV cache is allocated for full batch, not micro-batch
+                    # so actual allocation strictly follows descriptor shape (full or micro).
                     from dataclasses import replace as dataclass_replace
                     override_policy = dataclass_replace(self.allocation_policy, gpu_batch_size=descr_batch_size)
                     

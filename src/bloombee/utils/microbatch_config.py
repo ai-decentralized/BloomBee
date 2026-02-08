@@ -5,7 +5,7 @@ This module provides configuration and utilities for the micro-batch pipeline fe
 The feature is controlled via environment variables:
 
 - BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: Set to "1" to enable (default), "0" to disable
-- BLOOMBEE_MICRO_BATCH_SIZE: Set the micro-batch size, default is 1 (no splitting)
+- BLOOMBEE_MICRO_BATCH_SIZE: Set the micro-batch size, default is 4
 
 All logs from this feature use the prefix [MBPIPE] for easy filtering.
 """
@@ -25,7 +25,7 @@ ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
-DEFAULT_MICRO_BATCH_SIZE = 8  # Default micro-batch size for pipeline overlap
+DEFAULT_MICRO_BATCH_SIZE = 4  # Default micro-batch size for pipeline overlap
 
 
 def is_microbatch_enabled() -> bool:
@@ -151,28 +151,17 @@ def log_memory_savings_diagnosis(logger: logging.Logger, batch_size: int = 8) ->
         logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro_batch_size >= batch_size)")
         return
     
-    # The key issue: current implementation allocates KV cache for FULL batch
     logger.info(f"{MBPIPE_LOG_PREFIX} ")
-    logger.info(f"{MBPIPE_LOG_PREFIX} !!! CURRENT IMPLEMENTATION LIMITATION !!!")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Current behavior (GPU multiplexing):")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   1. KV cache is allocated for MICRO batch ({micro_batch_size} items)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   2. Each micro-batch reuses the same GPU slots (offset=0)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   3. offload/prefetch swaps micro-batch KV state via CPU staging")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   4. GPU KV memory is controlled by micro_batch_size")
     logger.info(f"{MBPIPE_LOG_PREFIX} ")
-    logger.info(f"{MBPIPE_LOG_PREFIX} Current behavior:")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   1. KV cache is allocated for FULL batch ({batch_size} items)")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   2. Each micro-batch SLICES into this cache (batch_offset={0}, {micro_batch_size}, ...)")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   3. offload/prefetch operates on FULL cache, not individual slices")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   4. GPU memory usage = FULL batch, NOT micro-batch")
-    logger.info(f"{MBPIPE_LOG_PREFIX} ")
-    logger.info(f"{MBPIPE_LOG_PREFIX} Expected memory (if implemented correctly):")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Expected memory:")
     logger.info(f"{MBPIPE_LOG_PREFIX}   - GPU cache for {micro_batch_size} items (micro-batch)")
     logger.info(f"{MBPIPE_LOG_PREFIX}   - CPU staging for {batch_size} items (all micro-batches)")
     logger.info(f"{MBPIPE_LOG_PREFIX}   - Savings: {(1 - micro_batch_size/batch_size)*100:.1f}% GPU memory reduction")
-    logger.info(f"{MBPIPE_LOG_PREFIX} ")
-    logger.info(f"{MBPIPE_LOG_PREFIX} Actual memory (current implementation):")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   - GPU cache for {batch_size} items (FULL batch)")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   - CPU staging is mostly unused")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   - Savings: 0% (no GPU memory reduction)")
-    logger.info(f"{MBPIPE_LOG_PREFIX} ")
-    logger.info(f"{MBPIPE_LOG_PREFIX} To fix: Modify _allocate_cache() to use alloc_batch_size=micro_batch_size")
-    logger.info(f"{MBPIPE_LOG_PREFIX}         and implement proper micro-batch KV cache multiplexing")
     logger.info(f"{MBPIPE_LOG_PREFIX} ===== END DIAGNOSIS =====")
 
 
@@ -917,4 +906,3 @@ def get_buffer_manager(logger: Optional[logging.Logger] = None) -> BufferedPipel
     if _buffer_manager is None:
         _buffer_manager = BufferedPipelineManager(logger=logger)
     return _buffer_manager
-

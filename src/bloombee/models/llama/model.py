@@ -88,7 +88,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         # print('model.py llama model inputs_embeds, ', inputs_embeds)  # Temporarily commented for cleaner debug output
         output_shape = input_shape + (hidden_states.size(-1),)
         
-        # logger.info(f"hidden_states: {hidden_states}")
+        # logger.info(f"input_ids: {input_ids}")
 
         hidden_states = self.layers(
             hidden_states,
@@ -98,6 +98,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
             kv_cache_position_ids=past_key_values.kv_cache_position_ids if past_key_values is not None else None,
             draft_tokens = input_ids,
             is_spec_decoding = past_key_values.is_spec_decoding if past_key_values is not None else None,
+            prefill_length = past_key_values.prefill_length if past_key_values is not None else None,
         )
 
         if past_key_values is None:

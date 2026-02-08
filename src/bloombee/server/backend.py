@@ -19,7 +19,7 @@ from transformers import PretrainedConfig
 from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
-from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
 from bloombee.utils.microbatch_config import (
@@ -82,7 +82,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         *args,
         config: PretrainedConfig,
         cache_manager: KVCacheManager,
-        pruner_manager: BloombeePrunerManager,
+        pruner_manager: SpeculativePrunerManager,
         is_last_block: bool,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
@@ -149,7 +149,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     1, 128, dtype=self.dtype
                 ), # draft_tokens
                 BatchTensorDescriptor(
-                    1, dtype=torch.int64
+                    128, dtype=torch.int64
                 ), # prefill_length
                 BatchTensorDescriptor(
                     1, dtype=torch.int64
@@ -182,13 +182,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # Record original devices for restoration when needed (after potential override)
         self.original_devices = self.module.devices
         self.original_output_device_index = getattr(self.module, 'output_device_index', 0)
-        self._tree_mask_cache: Dict[int, torch.Tensor] = {}  # key: hash of packed mask, value: unpacked tree mask
         self._need_pruning = False
         self._first_get_need_pruning = True
         self._is_spec_decoding = False
         self._is_last_block = is_last_block
         if is_last_block:
             self.module.load_lm_head()
+        self._last_keep_indices = None
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""
@@ -202,21 +202,26 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             # values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
             cache_tensors.append(keys)
             # [DEBUG] Log descriptor shape
-            logger.info(f"[MB_DEBUG] get_inference_cache_descriptors: batch_size={batch_size}, num_heads={num_heads}, "
+            logger.debug(f"[MB_DEBUG] get_inference_cache_descriptors: batch_size={batch_size}, num_heads={num_heads}, "
                        f"head_dim={head_dim}, max_length={max_length}, shape={(batch_size, num_heads, head_dim, max_length)}")
         return cache_tensors
     
-    def prune_draft_tree(self, original_hidden_states: torch.Tensor, logits: torch.Tensor,  draft_tokens: torch.Tensor, tree_attention_mask):
+    def prune_draft_tree(
+        self, 
+        norm_hidden_states: torch.Tensor, 
+        draft_tokens: torch.Tensor, 
+        tree_attention_mask: torch.Tensor
+    ):
         results = self.pruner_manager.prune_speculation_tree(
-            logits,
+            norm_hidden_states,
             draft_tokens,
             tree_attention_mask
         )
         
-        keep_indices = results['keep_indices']
+        keep_indices = results['keep_indices']  # [B, max_keep_len]，padding 为 -1
+        # logger.info(f"keep_indices: {keep_indices}")
         self.pruner_manager.middle_keep_indices = keep_indices
-        new_hidden_states = original_hidden_states[:, keep_indices, :]
-        return new_hidden_states, keep_indices
+        return keep_indices
 
     def forward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
         *inputs, active_adapter = inputs
@@ -294,59 +299,100 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # Initialize output states
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
                 # Centralized select: aggregate + reorder + slice
-                # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for micro-batch support
-                k_pkv, v_pkv, need_reorder = self.cache_manager.select_cache(
-                    prefix_length=inference_info.prefix_length,
-                    hypo_ids=hypo_ids,
-                    kv_cache_position_ids=inference_info.kv_cache_position_ids,
-                    batch_offset=inference_info.batch_offset,
-                    full_batch_size=inference_info.full_batch_size,
-                    micro_batch_size=inference_info.micro_batch_size,
-                )
-                layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
-                if need_reorder:
-                    self.cache_manager.write_pkv_cache(
-                        k_pkv=k_pkv,
-                        v_pkv=v_pkv,
-                        start_position=0
-                    )
+                # [MERGED] Speculative decoding flow with micro-batch support
+                kv_cache_position_ids = inference_info.kv_cache_position_ids
                 
-                past_key_values_length = k_pkv.shape[2] if k_pkv is not None else 0
+                logger.debug(f"[MB_DEBUG] backend.inference_step: uid={inference_info.uid}, "
+                            f"batch_offset={inference_info.batch_offset}, "
+                            f"micro_batch_size={inference_info.micro_batch_size}, "
+                            f"full_batch_size={inference_info.full_batch_size}")
+                if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
+                    # [Speculative Decoding path] Reorder cache based on position IDs
+                    # 1. Get cache for reorder
+                    k_pkv_old, v_pkv_old, need_reorder = self.cache_manager.select_cache_for_reorder(
+                        kv_cache_position_ids=kv_cache_position_ids
+                    )
+                    
+                    if need_reorder and k_pkv_old is not None:
+                        # 2. Reorder and write back, get valid lengths per batch
+                        new_prefix_length, kv_valid_lengths = self.cache_manager.reorder_and_write_cache(
+                            k_pkv=k_pkv_old,
+                            v_pkv=v_pkv_old,
+                            kv_cache_position_ids=kv_cache_position_ids,
+                        )
+                    else:
+                        new_prefix_length = inference_info.prefix_length
+                        kv_valid_lengths = torch.full((batch_size,), new_prefix_length, device=hidden_states.device)
+                    
+                    # 3. Select contiguous cache with micro-batch support
+                    # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size
+                    k_pkv, v_pkv, _ = self.cache_manager.select_cache(
+                        prefix_length=new_prefix_length,
+                        hypo_ids=hypo_ids,
+                        kv_cache_position_ids=None,
+                        batch_offset=inference_info.batch_offset,
+                        full_batch_size=inference_info.full_batch_size,
+                        micro_batch_size=inference_info.micro_batch_size,
+                    )
+                else:
+                    # [Standard path] Direct cache selection with micro-batch support
+                    # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size
+                    k_pkv, v_pkv, _ = self.cache_manager.select_cache(
+                        prefix_length=inference_info.prefix_length,
+                        hypo_ids=hypo_ids,
+                        kv_cache_position_ids=None,
+                        batch_offset=inference_info.batch_offset,
+                        full_batch_size=inference_info.full_batch_size,
+                        micro_batch_size=inference_info.micro_batch_size,
+                    )
+                    new_prefix_length = k_pkv.shape[2] if k_pkv is not None else 0
+                    kv_valid_lengths = torch.full((batch_size,), inference_info.prefix_length, device=hidden_states.device)
+                
+                if k_pkv is not None:
+                     logger.debug(f"[MB_DEBUG] Cache selected: k_pkv.shape={k_pkv.shape}")
+
+                layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
+
+                full_mask = None
+                device = hidden_states.device
                 
                 if self._is_spec_decoding:
                     full_mask = self._create_attention_mask(
-                        tree_attention_mask=inference_info.tree_attention_mask,
-                        src_len=seq_len + past_key_values_length,
-                        past_key_values_length=past_key_values_length,
+                        tree_attention_mask=inference_info.tree_attention_mask.to(device),
+                        src_len=seq_len + new_prefix_length,
+                        past_key_values_length=new_prefix_length,
+                        kv_valid_lengths=kv_valid_lengths.to(device),
+                        prefill_lengths=inference_info.prefill_length.to(device),
                         device=hidden_states.device,
                     )
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
-                else:
-                    full_mask = self._create_causal_attention_mask(batch_size, (seq_len + past_key_values_length), past_key_values_length, hidden_states.device)
+                if full_mask == None:
+                    full_mask = self._create_causal_attention_mask(batch_size, (seq_len + new_prefix_length), new_prefix_length, hidden_states.device)
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
-                for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
-                    hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
-                    # print('transformer backend inference step() offset ', offset )
-                    # print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
+
+                for offset in range(0, seq_len, max_chunk_length):
+                    hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :]
                     
-                    #  Generate correct position_ids for this chunk
                     chunk_length = min(max_chunk_length, seq_len - offset)
-                    # Optimized: Reuse cached position_ids base tensor
                     cache_key = (chunk_length, batch_size, hidden_states.device)
                     if cache_key not in self._position_ids_cache:
-                        # Create base position_ids (0 to chunk_length-1)
                         base_ids = torch.arange(0, chunk_length, device=hidden_states.device, dtype=torch.long)
                         self._position_ids_cache[cache_key] = base_ids.unsqueeze(0).expand(batch_size, -1)
                     
-                    # Add offset to cached base tensor (avoids creating new tensor)
-                    position_ids = self._position_ids_cache[cache_key] + (past_key_values_length + offset)
+                    position_ids = self._position_ids_cache[cache_key] + (new_prefix_length + offset)
+
                     if self._is_spec_decoding:
                         rotary_position_ids = self._create_tree_position_ids(
-                            2, 4, inference_info.prefill_length - 1, past_key_values_length, device='cuda:0'
+                            2, 4, inference_info.prefill_length - 1, kv_valid_lengths, device='cuda'
                         )
                     else:
                         rotary_position_ids = None
-                    rotary_position_ids = rotary_position_ids[inference_info.keep_indices] if rotary_position_ids is not None and inference_info.keep_indices is not None else rotary_position_ids
+
+                    # logger.info(f"before gather rotary_position_ids: {rotary_position_ids}")
+                    # logger.info(f"keep_indices: {inference_info.keep_indices}")
+                    # logger.info(f"hidden_states: {hidden_states.shape}")
+                    # rotary_position_ids = rotary_position_ids = torch.gather(rotary_position_ids, 1, inference_info.keep_indices.to("cuda")) if rotary_position_ids is not None and inference_info.keep_indices is not None else rotary_position_ids
+                    # logger.info(f"after gather rotary_position_ids: {rotary_position_ids}")
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
                         # print(f' About to call module.forward with position_ids...')
@@ -354,15 +400,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             hidden_states_chunk, 
                             layer_past=layer_past,
                             attention_mask=attention_mask, 
-                            use_cache=True,  #  Keep use_cache=True to get cache tensors
-                            position_ids=position_ids,  #  Pass the generated position_ids
+                            use_cache=True,
+                            position_ids=position_ids,
                             rotary_position_ids=rotary_position_ids,
                         )
-                        # print(f' module.forward returned: {type(forward_result)}, length: {len(forward_result) if forward_result else "None"}')
                         
                         if forward_result is None:
-                            # print(f' ERROR: module.forward returned None!')
-                            return (hidden_states, None)  # Return original input as fallback
+                            logger.info(f" ERROR: module.forward returned None!")
+                            return (hidden_states, None)
                         
                         output_hidden_states_chunk, new_kvs = forward_result
                         # print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
@@ -376,42 +421,57 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         #     offload_logger.info(f"   - new_kvs[0] device: {new_kvs[0].device}")
                         
                     except Exception as e:
-                        # print(f' ERROR in module.forward: {type(e).__name__}: {e}')
-                        # import traceback
-                        # traceback.print_exc()
-                        return (hidden_states, None)  # Return original input as fallback
+                        print(f' ERROR in module.forward: {type(e).__name__}: {e}')
+                        import traceback
+                        traceback.print_exc()
+                        return (hidden_states, None)
                     
                     if seq_len > max_chunk_length:
-                        output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk # Store output
+                        output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
                     else:
-                        output_hidden_states = output_hidden_states_chunk  # saves one memcopy # Copy memory only once
-                    # layer_past = new_kvs # Update cache state
+                        output_hidden_states = output_hidden_states_chunk
 
-                # Fixed: Restore cache update logic  
-                past_key_values_length = 0
-                if layer_past is not None and len(layer_past) > 0:
-                    past_key_values_length = layer_past[0].shape[2]
+                # Centralized KV update via KVCacheManager
+                # [MERGED] Speculative decoding batched update with micro-batch support
+                if self._is_spec_decoding:
+                    self.cache_manager.update_cache_batched(new_kvs, kv_valid_lengths)
+                else:
+                    # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for micro-batch support
+                    self.cache_manager.update_cache(
+                        new_kvs, new_prefix_length,
+                        batch_offset=inference_info.batch_offset,
+                        full_batch_size=inference_info.full_batch_size,
+                        micro_batch_size=inference_info.micro_batch_size,
+                    )
 
-                # logger.info(f"inference_step, output_hidden_states: {output_hidden_states}")
-                # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
-                # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for micro-batch support
-                self.cache_manager.update_cache(
-                    new_kvs, past_key_values_length,
-                    batch_offset=inference_info.batch_offset,
-                    full_batch_size=inference_info.full_batch_size,
-                    micro_batch_size=inference_info.micro_batch_size,
-                )
-                
-                
                 keep_indices = inference_info.keep_indices
                 
                 if self._is_spec_decoding and self._need_pruning and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    
+                if self._is_spec_decoding and self._is_last_block:
+                    original_hidden_states = output_hidden_states
+                    batch_size, seq_len, hidden_size = original_hidden_states.shape
+                    device = original_hidden_states.device
+                    valid_mask = keep_indices >= 0
+                    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
+                    valid_hidden_states = original_hidden_states[batch_idx[valid_mask], keep_indices[valid_mask], :]
+                    output_hidden_states = valid_hidden_states.unsqueeze(0)
+
+                self._last_keep_indices = keep_indices + new_prefix_length
+                # logger.info(f"update _last_keep_indices: {self._last_keep_indices}")
+                
+                # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
+                training_mode = False
+                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.15':
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     self.pruner_manager.middle_states = norm_hidden_states
-                    
-                    logits = self.module.lm_head_forward(norm_hidden_states)
-                    
-                    output_hidden_states, keep_indices = self.prune_draft_tree(output_hidden_states, logits, inference_info.draft_tokens, full_mask)
+                
+                if training_mode and self._is_spec_decoding and self._is_last_block:
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    final_logits = self.module.lm_head_forward(norm_hidden_states)
+                    self.pruner_manager.train_model(final_logits, full_mask, inference_info.draft_tokens)
                 
                 return (output_hidden_states, keep_indices) # Return output hidden states
                 
@@ -441,24 +501,74 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
 
     def _create_tree_position_ids(
-        self, width: int, depth: int, prefill_length: int, past_len: int, device: torch.device
+        self, 
+        width: int, 
+        depth: int, 
+        prefill_length: torch.Tensor,  # 每个 batch 样本当前的有效总长度（已包含在该样本在 KV cache 中的位置）
+        kv_valid_lengths: torch.Tensor,                  # KV cache 的统一起始偏移量（通常是所有样本对齐后的基准）
+        device: torch.device
     ) -> torch.Tensor:
-        position_ids = []
-        depth = depth + 1
-
+    
+        batch_size = prefill_length.shape[0]
+        
+        # 1. 生成 Tree 模板（相对偏移，根节点为 0）
+        tree_position_ids_list = []
         def dfs_generate(node_depth, current_depth):
-            position_ids.append(node_depth)
-            if current_depth < depth - 1:
+            tree_position_ids_list.append(node_depth)
+            if current_depth < depth:
                 for _ in range(width):
                     dfs_generate(node_depth + 1, current_depth + 1)
-
         dfs_generate(0, 0)
+        tree_len = len(tree_position_ids_list)
+        tree_position_ids = torch.tensor(tree_position_ids_list, device=device)
 
-        tree_position_ids = torch.tensor(position_ids, device=device) + past_len + prefill_length
-        prefill_ids = torch.arange(prefill_length, device=device) + past_len
-        full_position_ids = torch.cat([prefill_ids, tree_position_ids], dim=0)
+        # 判断是否为 Prefill 阶段 (根据输入长度或 past_len 判断)
+        # 假设如果 past_len == 0 且输入包含 prefill 部分
+        is_prefill = (kv_valid_lengths.max().item() == 0) 
 
-        return full_position_ids
+        if is_prefill:
+            # --- Prefill 阶段逻辑 ---
+            max_prefill_len = prefill_length.max().item()
+            total_len = max_prefill_len + tree_len
+            full_position_ids = torch.zeros(batch_size, total_len, dtype=torch.long, device=device)
+            
+            for i in range(batch_size):
+                pl = prefill_length[i].item()
+                # Prefill 部分: [0, 1, ..., pl-1]
+                full_position_ids[i, :pl] = torch.arange(pl, device=device)
+                # Tree 部分: 接在有效 Prefill 长度 pl 之后，并推到 total_len 的末尾
+                full_position_ids[i, max_prefill_len:] = tree_position_ids + pl
+                
+            return full_position_ids
+
+        else:
+            # --- Generation / Verify 阶段逻辑 ---
+            # 此时 input_ids 只有 Tree 部分，长度为 tree_len
+            full_position_ids = torch.zeros(batch_size, tree_len, dtype=torch.long, device=device)
+            
+            for i in range(batch_size):
+                # 重点：这里的 pl 应该是该样本在上一轮结束时已经确认的 token 总数
+                past_len = kv_valid_lengths[i]
+                # 这里的 ID 必须累加 past_len 和 pl
+                # 如果你的 prefill_length[i] 已经包含了 past_len，则直接加 tree_position_ids
+                # 如果 prefill_length[i] 只是当前请求的长度，则需要 past_len + pl + tree_position_ids
+                full_position_ids[i, :] = tree_position_ids + past_len
+                
+            return full_position_ids
+    
+    def _update_kv_cache_position_ids(self, kv_cache_position_ids, keep_indices):
+        if kv_cache_position_ids is None or keep_indices is None:
+            return None
+        
+        if not torch.is_tensor(keep_indices):
+            keep_indices = torch.tensor(keep_indices, device=kv_cache_position_ids.device)
+
+        mapping = {int(k.item()): i for i, k in enumerate(keep_indices)}
+        new_ids = torch.tensor(
+            [mapping.get(int(x.item()), -1) for x in kv_cache_position_ids],
+            device=kv_cache_position_ids.device
+        )
+        return new_ids
 
     def _create_attention_mask(
         self,
@@ -466,36 +576,69 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         *,
         src_len: int,                # prefix_len + tree_len
         past_key_values_length: int,
+        kv_valid_lengths: Optional[torch.Tensor] = None,  # [B] 每个 batch 的有效 KV 长度（后续轮次用）
+        prefill_lengths: Optional[torch.Tensor] = None,   # [B] 每个 batch 的实际 prefill 长度（首轮用）
         device: torch.device,
     ) -> Optional[torch.Tensor]:
         if tree_attention_mask is None or is_dummy(tree_attention_mask):
             return None
+        
+        # logger.info(f"tree_attention_mask: {tree_attention_mask.shape}")
+        # logger.info(f"src_len: {src_len}")
+        # logger.info(f"past_key_values_length: {past_key_values_length}")
+        # logger.info(f"kv_valid_lengths: {kv_valid_lengths}")
+        # logger.info(f"prefill_lengths: {prefill_lengths}")
 
         tree_mask = tree_attention_mask
         tree_len = tree_mask.size(1)
         B = tree_mask.size(0)
-        prefix_len = src_len - tree_len
+        prefix_len = src_len - tree_len  # 最大 prefix 长度（包含 padding）
         current_token_count = src_len - past_key_values_length
         
         if current_token_count <= 0:
             return None
         
         if past_key_values_length == 0:
+            # ============ 首轮：处理 prefill_lengths ============
             full_mask = torch.zeros(B, src_len, src_len, dtype=torch.bool, device=device)
+            
+            # 如果没有提供 prefill_lengths，假设所有 batch 的 prefill 长度相同
+            if prefill_lengths is None:
+                prefill_lengths = torch.full((B,), prefix_len, dtype=torch.long, device=device)
+            
             if prefix_len > 0:
-                causal_indices = torch.tril_indices(prefix_len, prefix_len, device=device)
-                full_mask[:, causal_indices[0], causal_indices[1]] = True
+                # 位置索引
+                row_idx = torch.arange(prefix_len, device=device).view(1, -1, 1)   # [1, prefix_len, 1]
+                col_idx = torch.arange(prefix_len, device=device).view(1, 1, -1)   # [1, 1, prefix_len]
+                prefill_lens = prefill_lengths.view(B, 1, 1)  # [B, 1, 1]
+                
+                # causal mask: row >= col
+                # 有效 mask: row < prefill_lengths AND col < prefill_lengths
+                causal_mask = row_idx >= col_idx  # [1, prefix_len, prefix_len]
+                row_valid = row_idx < prefill_lens  # [B, prefix_len, 1]
+                col_valid = col_idx < prefill_lens  # [B, 1, prefix_len]
+                
+                prefix_mask = causal_mask & row_valid & col_valid  # [B, prefix_len, prefix_len]
+                full_mask[:, :prefix_len, :prefix_len] = prefix_mask
             
             if prefix_len > 0 and tree_len > 0:
-                full_mask[:, prefix_len:, :prefix_len] = True
+                # tree tokens attend to prefix（只到有效 prefill 位置）
+                col_idx = torch.arange(prefix_len, device=device).view(1, 1, -1)  # [1, 1, prefix_len]
+                prefill_lens = prefill_lengths.view(B, 1, 1)  # [B, 1, 1]
+                col_valid = col_idx < prefill_lens  # [B, 1, prefix_len]
+                col_valid = col_valid.expand(B, tree_len, prefix_len)  # [B, tree_len, prefix_len]
+                full_mask[:, prefix_len:, :prefix_len] = col_valid
 
             if tree_len > 0:
                 full_mask[:, prefix_len:, prefix_len:] = tree_mask
+            
             return full_mask
         
         else:
+            # ============ 后续轮次：处理 kv_valid_lengths ============
             current_mask = torch.zeros(B, current_token_count, src_len, dtype=torch.bool, device=device)
             start_pos = past_key_values_length
+            
             if start_pos < prefix_len:
                 prefix_tokens = min(current_token_count, prefix_len - start_pos)
                 for i in range(prefix_tokens):
@@ -510,7 +653,40 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if prefix_len > 0:
                     current_mask[:, :, :prefix_len] = True
                 current_mask[:, :, prefix_len:] = tree_mask[:, tree_start:tree_start + current_token_count, :]
+            
+            # 应用 kv_valid_lengths mask
+            if kv_valid_lengths is not None:
+                current_mask = self._apply_kv_valid_mask(current_mask, kv_valid_lengths, past_key_values_length, device)
+            
             return current_mask
+
+
+    def _apply_kv_valid_mask(
+        self,
+        mask: torch.Tensor,
+        kv_valid_lengths: torch.Tensor,
+        kv_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        将 kv_valid_lengths 应用到 mask 上，屏蔽每个 batch 超出有效长度的 KV 位置
+        """
+        if kv_len <= 0:
+            return mask
+        
+        B = mask.shape[0]
+        key_len = mask.shape[2]
+        actual_kv_len = min(kv_len, key_len)
+        
+        # [1, actual_kv_len]
+        kv_positions = torch.arange(actual_kv_len, device=device).unsqueeze(0)
+        
+        # [B, actual_kv_len] -> [B, 1, actual_kv_len]
+        kv_valid_mask = (kv_positions < kv_valid_lengths.unsqueeze(1)).unsqueeze(1)
+        
+        mask[:, :, :actual_kv_len] = mask[:, :, :actual_kv_len] & kv_valid_mask
+        
+        return mask
         
     def _create_causal_attention_mask(
         self,
@@ -682,28 +858,6 @@ class _MergedInferenceStep:
             batch_size = hidden_states.shape[0] if hidden_states.ndim >= 1 else 1
             mbpipe_log_path_entry(logger, "backend._MergedInferenceStep", batch_size=batch_size)
         
-        # [KVCACHE_OFFLOAD] Get micro-batch info from first inference_info
-        mb_info = inference_infos[0] if inference_infos else None
-        mb_offset = getattr(mb_info, 'batch_offset', None) if mb_info else None
-        mb_size = getattr(mb_info, 'micro_batch_size', None) if mb_info else None
-        full_batch_size = getattr(mb_info, 'full_batch_size', None) if mb_info else None
-        
-        # Determine if this is a micro-batch run (not full batch)
-        is_microbatch_run = (mb_offset is not None and mb_size is not None and 
-                            full_batch_size is not None and mb_size < full_batch_size)
-        
-        # Get num_heads from first backend for BH calculation
-        first_backend = next(iter(self.backends.values()))
-        num_heads = sum(first_backend.shard_num_heads)
-        
-        # [KVCACHE_OFFLOAD] Prefetch if this micro-batch was previously offloaded
-        # This happens when we're cycling through micro-batches in a generate loop
-        if is_microbatch_run and self._cache_manager and self._cache_manager._active_cache_tensors_stack:
-            k_cache, v_cache = self._cache_manager._active_cache_tensors_stack[-1]
-            if hasattr(k_cache, 'data'):  # AdaptedKVCache wrapper
-                k_cache, v_cache = k_cache.data, v_cache.data
-            self._prefetch_if_needed(k_cache, v_cache, mb_offset, mb_size, num_heads)
-        
         # Process all blocks for this micro-batch
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:
@@ -711,13 +865,5 @@ class _MergedInferenceStep:
             (hidden_states, keep_indices) = self.backends[inference_info.uid].inference_step(
                 hidden_states, hypo_ids, inference_info
             )
-        
-        # [KVCACHE_OFFLOAD] After all blocks complete, offload this micro-batch's KV to CPU
-        # This frees GPU memory for the next micro-batch to use
-        if is_microbatch_run and self._cache_manager and self._cache_manager._active_cache_tensors_stack:
-            k_cache, v_cache = self._cache_manager._active_cache_tensors_stack[-1]
-            if hasattr(k_cache, 'data'):
-                k_cache, v_cache = k_cache.data, v_cache.data
-            self._offload_completed_microbatch(k_cache, v_cache, mb_offset, mb_size, num_heads)
         
         return (hidden_states, keep_indices)

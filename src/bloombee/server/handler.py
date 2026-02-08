@@ -37,7 +37,7 @@ from bloombee.server.backend import TransformerBackend
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
-from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -223,7 +223,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         step_timeout: float,
         task_prioritizer: TaskPrioritizerBase = DummyTaskPrioritizer(),
         quant_type: QuantType,
-        pruner_manager: BloombeePrunerManager,
+        pruner_manager: SpeculativePrunerManager,
     ):
         super().__init__(dht, module_backends)
         for module_backend in self.module_backends.values():
@@ -371,29 +371,43 @@ class TransformerConnectionHandler(ConnectionHandler):
                 batch_size = original_batch_size
                 
                 # [MB_DEBUG] Log initial batch size detection
-                logger.info(f"[MB_DEBUG] === BATCH SIZE DETECTION ===")
-                logger.info(f"[MB_DEBUG] Original batch_size from tensor[0]: {original_batch_size}")
-                logger.info(f"[MB_DEBUG] Metadata keys: {list(metadata.keys())}")
-                logger.info(f"[MB_DEBUG] metadata.type={metadata.get('type')}, metadata.full_batch_size={metadata.get('full_batch_size')}")
+                logger.debug(f"[MB_DEBUG] === BATCH SIZE DETECTION ===")
+                logger.debug(f"[MB_DEBUG] Original batch_size from tensor[0]: {original_batch_size}")
+                logger.debug(f"[MB_DEBUG] Metadata keys: {list(metadata.keys())}")
+                logger.debug(f"[MB_DEBUG] metadata.type={metadata.get('type')}, metadata.full_batch_size={metadata.get('full_batch_size')}")
                 
                 # [MBPIPE_STREAMING] For cross-stage micro-batch streaming, use full_batch_size for KV cache allocation
                 # This is critical for decode overlap: Stage 2 must allocate cache for full batch on first MB arrival
                 is_streaming_decode = is_microbatch_queue_item(request) or metadata.get("type") == "micro_batch"
-                logger.info(f"[MB_DEBUG] is_streaming_decode={is_streaming_decode}, is_microbatch_queue_item={is_microbatch_queue_item(request)}")
+                logger.debug(f"[MB_DEBUG] is_streaming_decode={is_streaming_decode}, is_microbatch_queue_item={is_microbatch_queue_item(request)}")
                 
                 if is_streaming_decode:
                     streaming_full_batch_size = metadata.get("full_batch_size", batch_size)
-                    logger.info(f"[MB_DEBUG] Streaming decode detected! streaming_full_batch_size={streaming_full_batch_size}")
-                    if streaming_full_batch_size > batch_size:
-                        logger.info(f"{MBPIPE_LOG_PREFIX} [STREAMING_DECODE] Detected streaming micro-batch, "
-                                   f"using full_batch_size={streaming_full_batch_size} for KV cache (actual MB size={batch_size})")
+                    logger.debug(f"[MB_DEBUG] Streaming decode detected! streaming_full_batch_size={streaming_full_batch_size}")
+                    
+                    # [MBPIPE_FIX] If using micro-batch pipeline, DO NOT override batch_size with full_batch_size
+                    # We want to allocate cache ONLY for the micro-batch size to enable GPU multiplexing
+                    if is_microbatch_enabled() and streaming_full_batch_size > batch_size:
+                        logger.info(f"[MBPIPE_FIX] Micro-batch enabled: Keeping batch_size={batch_size} (micro-batch size) "
+                                    f"instead of full_batch_size={streaming_full_batch_size} to enable GPU multiplexing")
+                    elif streaming_full_batch_size > batch_size:
+                        logger.info(f"{MBPIPE_LOG_PREFIX} [STREAMING_DECODE] Detected streaming micro-batch (LEGACY), "
+                                    f"using full_batch_size={streaming_full_batch_size} for KV cache (actual MB size={batch_size})")
                         batch_size = streaming_full_batch_size
-                        logger.info(f"[MB_DEBUG] KV cache will use batch_size={batch_size} (overridden from {original_batch_size})")
+                        logger.debug(f"[MB_DEBUG] KV cache will use batch_size={batch_size} (overridden from {original_batch_size})")
                 else:
-                    logger.info(f"[MB_DEBUG] NOT streaming decode, using original batch_size={batch_size}")
+                    # Non-streaming RPC path keeps logical full batch size here.
+                    # Physical KV cache allocation is decided in _allocate_cache():
+                    # when micro-batching is enabled and batch_size > micro_batch_size,
+                    # we allocate only micro_batch_size slots and multiplex on GPU.
+                    if is_microbatch_enabled():
+                        micro_batch_size = get_micro_batch_size()
+                        logger.info(f"[MBPIPE_FIX] Non-streaming: logical batch_size={batch_size}, "
+                                    f"physical alloc will use micro_batch_size={micro_batch_size} in _allocate_cache")
+                    else:
+                        logger.debug(f"[MB_DEBUG] NOT streaming decode, using original batch_size={batch_size}")
                 
-                end_batch_size_time = perf_counter()
-                logger.info(f"[MB_DEBUG] Batch size detection completed in {(end_batch_size_time - perf_counter())*1000:.2f}ms, final batch_size={batch_size}")
+                logger.debug(f"[MB_DEBUG] Batch size detection completed, final batch_size={batch_size}")
                 # print_time_now('')
                 
                 # [MBPIPE] Log current path at rpc_inference entry
@@ -414,9 +428,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 
                 # [KVCACHE_DEBUG] Log before cache allocation
                 cache_alloc_start = perf_counter()
-                logger.info(f"[KVCACHE_DEBUG] === KV CACHE ALLOCATION ===")
-                logger.info(f"[KVCACHE_DEBUG] Allocating cache: batch_size={batch_size}, max_length={max_length}, timeout={alloc_timeout}")
-                logger.info(f"[KVCACHE_DEBUG] Requested backends: {len(requested_backends)}, UIDs: {requested_uids}")
+                logger.debug(f"[KVCACHE_DEBUG] === KV CACHE ALLOCATION ===")
+                logger.debug(f"[KVCACHE_DEBUG] Allocating cache: batch_size={batch_size}, max_length={max_length}, timeout={alloc_timeout}")
+                logger.debug(f"[KVCACHE_DEBUG] Requested backends: {len(requested_backends)}, UIDs: {requested_uids}")
                 
                 async with self._allocate_cache(
                     requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
@@ -425,11 +439,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                     cache_alloc_ms = (end_cache_time - cache_alloc_start) * 1000
                     
                     # [KVCACHE_DEBUG] Log cache allocation result
-                    logger.info(f"[KVCACHE_DEBUG] Cache allocated in {cache_alloc_ms:.2f}ms")
-                    logger.info(f"[KVCACHE_DEBUG] cache_handles count: {len(cache_handles) if cache_handles else 0}")
+                    logger.debug(f"[KVCACHE_DEBUG] Cache allocated in {cache_alloc_ms:.2f}ms")
+                    logger.debug(f"[KVCACHE_DEBUG] cache_handles count: {len(cache_handles) if cache_handles else 0}")
                     if cache_handles:
                         for i, handles in enumerate(cache_handles):
-                            logger.info(f"[KVCACHE_DEBUG] cache_handles[{i}]: {len(handles) if handles else 0} handles")
+                            logger.debug(f"[KVCACHE_DEBUG] cache_handles[{i}]: {len(handles) if handles else 0} handles")
                     
                     background_tasks = set()
                     step_=0
@@ -560,6 +574,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                             logger.warning(f"{MBPIPE_LOG_PREFIX} Buffer cleanup failed: {e}")
             
             finally:
+                # [MBPIPE_FIX] Clear offload state (CPU staging buffers) ONLY after the entire
+                # request is complete. This ensures history is preserved during streaming.
+                try:
+                    if requested_backends:
+                        cache_manager = requested_backends[0].cache_manager
+                        if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
+                            cache_manager.clear_offload_state()
+                            logger.info(f"[MBPIPE_FIX] Cleared offload state after request completion")
+                except Exception as e:
+                    logger.warning(f"[MBPIPE_FIX] Failed to clear offload state: {e}")
+
                 self._log_request("rpc_inference.close", requested_uids, context)
                 # print_time_now('')
                 # print('end of  rpc_inference ..........')  ###
@@ -683,6 +708,10 @@ class TransformerConnectionHandler(ConnectionHandler):
         context: P2PContext,
     ) -> AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]]:
         processed_step_ids = set()
+        # [MBPIPE_FIX] Track step routing to avoid double-processing the same step through
+        # both micro-batch queue path and direct request path.
+        microbatch_step_ids = set()
+        processed_microbatch_ids = set()
         n_pushes = n_late_pushes = 0
         request = first_request
         anext_task = get_push_task = None
@@ -696,47 +725,87 @@ class TransformerConnectionHandler(ConnectionHandler):
                         # Yield micro-batch directly with type marker
                         mb_item = request
                         mb_metadata = mb_item.get("metadata", {}).copy()
-                        mb_metadata["type"] = "micro_batch"
-                        mb_metadata["mb_idx"] = mb_item.get("mb_idx", 0)
-                        mb_metadata["expected_num_mb"] = mb_item.get("expected_num_mb", 1)
-                        mb_metadata["offset"] = mb_item.get("offset", 0)
-                        mb_metadata["size"] = mb_item.get("size", 1)
-                        mb_metadata["full_batch_size"] = mb_item.get("full_batch_size", 1)
-                        mb_metadata["pushed"] = True
-                        
-                        logger.info(
-                            f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
-                            f"mb_idx={mb_item.get('mb_idx')} for immediate processing"
-                        )
-                        
-                        yield mb_item.get("payload"), mb_metadata
-                        
-                        # Continue to next item from queue
-                        request = None
+                        mb_step_id = mb_metadata.get("step_id")
+                        mb_idx = mb_item.get("mb_idx", 0)
+                        skip_mb_item = False
+
+                        # If this step was already processed through full-batch path, ignore late micro-batch pushes.
+                        if mb_step_id is not None and mb_step_id in processed_step_ids and mb_step_id not in microbatch_step_ids:
+                            logger.info(
+                                f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping late micro-batch "
+                                f"(step_id={mb_step_id}, mb_idx={mb_idx}) because full-batch path already processed it"
+                            )
+                            request = None
+                            skip_mb_item = True
+
+                        # Idempotency at consume side: prevent duplicate enqueue/replay from being processed twice.
+                        if not skip_mb_item:
+                            mb_dedup_key = (mb_step_id, mb_idx)
+                            if mb_dedup_key in processed_microbatch_ids:
+                                logger.info(
+                                    f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping duplicate micro-batch "
+                                    f"(step_id={mb_step_id}, mb_idx={mb_idx})"
+                                )
+                                request = None
+                                skip_mb_item = True
+                            else:
+                                processed_microbatch_ids.add(mb_dedup_key)
+                                if mb_step_id is not None:
+                                    microbatch_step_ids.add(mb_step_id)
+
+                        if not skip_mb_item:
+                            mb_metadata["type"] = "micro_batch"
+                            mb_metadata["mb_idx"] = mb_idx
+                            mb_metadata["expected_num_mb"] = mb_item.get("expected_num_mb", 1)
+                            mb_metadata["offset"] = mb_item.get("offset", 0)
+                            mb_metadata["size"] = mb_item.get("size", 1)
+                            mb_metadata["full_batch_size"] = mb_item.get("full_batch_size", 1)
+                            mb_metadata["pushed"] = True
+                            
+                            logger.info(
+                                f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
+                                f"mb_idx={mb_item.get('mb_idx')} for immediate processing"
+                            )
+                            
+                            yield mb_item.get("payload"), mb_metadata
+                            
+                            # Continue to next item from queue
+                            request = None
                     elif hasattr(request, 'tensors') and (request.tensors or (request.metadata and not request.tensors)):
                         # Original full-batch request path
                         start_meta_time = perf_counter()
                         metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
                         step_id = metadata.get("step_id")
                         pushed = metadata.get("pushed")
+                        skip_direct_request = False
                         
                         # [MBPIPE] Note: Micro-batch signal handling removed.
                         if metadata.get("is_mb_start_signal"):
                             logger.info(
                                 f"{MBPIPE_LOG_PREFIX} iterate_steps: ignoring mb_start_signal (incompatible format)"
                             )
-                            request = runtime_pb2.ExpertRequest()
-                            continue
+                            request = None
+                            skip_direct_request = True
                         
-                        if pushed:
+                        if pushed and not skip_direct_request:
                             n_pushes += 1
                             self._log_request("rpc_inference.push", requested_uids, context, debug=f"session received push")
 
-                        if step_id is None or step_id not in processed_step_ids:
+                        # [MBPIPE_FIX] If this step is already being handled via micro-batch queue,
+                        # skip direct/full-batch request to avoid double compute and KV corruption.
+                        if (not skip_direct_request) and step_id is not None and step_id in microbatch_step_ids:
+                            logger.info(
+                                f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping direct request for step_id={step_id} "
+                                f"because micro-batch path is active"
+                            )
+                            request = None
+                            skip_direct_request = True
+
+                        if (not skip_direct_request) and (step_id is None or step_id not in processed_step_ids):
                             yield request, metadata
                             if step_id is not None:
                                 processed_step_ids.add(step_id)
-                        elif pushed:
+                        elif (not skip_direct_request) and pushed:
                             n_late_pushes += 1
                             self._log_request(
                                 "rpc_inference.push",
@@ -819,6 +888,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         mb_offset = metadata.get("micro_batch_offset", 0)
         mb_size = metadata.get("micro_batch_size", 1)
         full_batch_size = metadata.get("full_batch_size", mb_size)
+        start_from_position = metadata.get("start_from_position", None)
         
         # Use total_micro_batches from metadata if available, otherwise calculate
         expected_num_mb = metadata.get("total_micro_batches")
@@ -853,6 +923,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         
         self._mb_received[mb_key] = self._mb_received.get(mb_key, 0) + 1
         received_count = self._mb_received[mb_key]
+
+        logger.info(
+            f"{MBPIPE_LOG_PREFIX} rpc_push: step_id={step_id}, mb_idx={mb_idx}, "
+            f"start_from_position={start_from_position}, received={received_count}/{expected_num_mb}"
+        )
         
         # Store to file for cross-handler communication (needed even with immediate queue)
         acc_key = f"{session_id}|{step_id}"
@@ -1017,7 +1092,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         try:
             next_servers = metadata.get("next_servers")
             if not next_servers:
-                print(f"[DEBUG] _push_outputs: No next_servers, returning early")
+                logger.debug("[DEBUG] _push_outputs: No next_servers, returning early")
                 return
 
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]
@@ -1155,7 +1230,17 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # Copy other relevant metadata
             # [CROSS_STAGE] Include timestamps for cross-stage overlap analysis
-            for key in ["step_id", "max_length", "args_structure", "stage_push_timestamp_us", "total_micro_batches", "stage_compute_start_timestamp_us"]:
+            for key in [
+                "step_id",
+                "max_length",
+                "args_structure",
+                "stage_push_timestamp_us",
+                "total_micro_batches",
+                "stage_compute_start_timestamp_us",
+                # [MBPIPE_FIX] Critical for KV correctness on downstream stage:
+                # ensures each micro-batch of a step uses the same logical prefix.
+                "start_from_position",
+            ]:
                 if key in metadata:
                     push_metadata[key] = metadata[key]
             
@@ -1470,26 +1555,24 @@ class TransformerConnectionHandler(ConnectionHandler):
         micro_batch_size = mb_config['micro_batch_size']
         
         # [MBPIPE_DEBUG] Log the critical allocation decision
-        logger.info(f"[MBPIPE_ALLOC_DEBUG] ========================================")
-        logger.info(f"[MBPIPE_ALLOC_DEBUG] KV CACHE ALLOCATION DECISION POINT")
-        logger.info(f"[MBPIPE_ALLOC_DEBUG] ========================================")
-        logger.info(f"[MBPIPE_ALLOC_DEBUG] Input: batch_size={batch_size}, max_length={max_length}")
-        logger.info(f"[MBPIPE_ALLOC_DEBUG] Config: mb_enabled={mb_config['enabled']}, micro_batch_size={micro_batch_size}")
-        logger.info(f"[MBPIPE_ALLOC_DEBUG] Policy: gpu_batch_size={max_supported_batch}")
+        logger.debug(f"[MBPIPE_ALLOC_DEBUG] ========================================")
+        logger.debug(f"[MBPIPE_ALLOC_DEBUG] KV CACHE ALLOCATION DECISION POINT")
+        logger.debug(f"[MBPIPE_ALLOC_DEBUG] ========================================")
+        logger.debug(f"[MBPIPE_ALLOC_DEBUG] Input: batch_size={batch_size}, max_length={max_length}")
+        logger.debug(f"[MBPIPE_ALLOC_DEBUG] Config: mb_enabled={mb_config['enabled']}, micro_batch_size={micro_batch_size}")
+        logger.debug(f"[MBPIPE_ALLOC_DEBUG] Policy: gpu_batch_size={max_supported_batch}")
         
         if mb_config['enabled'] and micro_batch_size < batch_size:
-            # [MBPIPE_FIX] GPU Memory Multiplexing:
-            # - Allocate GPU cache for micro_batch_size ONLY (not full batch)
-            # - All micro-batches reuse the same GPU cache slots (offset=0)
-            # - offload() saves current micro-batch's KV to CPU after compute
-            # - prefetch() loads next micro-batch's KV from CPU before compute
-            # This achieves true GPU memory savings!
-            alloc_batch_size = micro_batch_size  # FIX: allocate for micro-batch only!
+            # True GPU multiplexing:
+            # - Keep logical full batch for scheduling
+            # - Allocate KV cache only for one micro-batch on GPU
+            # - Offload/prefetch swaps per-micro-batch cache data between CPU and GPU
+            alloc_batch_size = micro_batch_size
             
-            logger.info(f"[MBPIPE_ALLOC_DEBUG] !!! GPU MEMORY MULTIPLEXING ENABLED !!!")
-            logger.info(f"[MBPIPE_ALLOC_DEBUG] alloc_batch_size = {alloc_batch_size} (MICRO-BATCH)")
-            logger.info(f"[MBPIPE_ALLOC_DEBUG] Full batch ({batch_size}) will be processed in {(batch_size + micro_batch_size - 1) // micro_batch_size} micro-batches")
-            logger.info(f"[MBPIPE_ALLOC_DEBUG] Each micro-batch reuses the same GPU cache slots")
+            logger.debug(f"[MBPIPE_ALLOC_DEBUG] !!! MICRO-BATCHING ENABLED (GPU MULTIPLEXING) !!!")
+            logger.debug(f"[MBPIPE_ALLOC_DEBUG] alloc_batch_size = {alloc_batch_size} (MICRO BATCH)")
+            logger.debug(f"[MBPIPE_ALLOC_DEBUG] Full batch ({batch_size}) will be processed in {(batch_size + micro_batch_size - 1) // micro_batch_size} micro-batches")
+            logger.debug(f"[MBPIPE_ALLOC_DEBUG] Micro-batches reuse the same GPU cache slots (offset=0)")
             
             # [MBPIPE_DEBUG] Calculate and log expected memory usage
             try:
@@ -1509,7 +1592,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         else:
             # Micro-batching disabled: enforce strict batch limit
             alloc_batch_size = batch_size
-            logger.info(f"[MBPIPE_ALLOC_DEBUG] Micro-batching disabled, alloc_batch_size={alloc_batch_size}")
+            logger.debug(f"[MBPIPE_ALLOC_DEBUG] Micro-batching disabled, alloc_batch_size={alloc_batch_size}")
             if batch_size > max_supported_batch:
                 raise AllocationFailed(
                     f"Requested batch size {batch_size} exceeds server capacity "
@@ -1517,7 +1600,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     f"server with a larger --batch_size value."
                 )
         
-        logger.info(f"[MBPIPE_ALLOC_DEBUG] ========================================")
+        logger.debug(f"[MBPIPE_ALLOC_DEBUG] ========================================")
         
         # [MBPIPE_DEBUG] Call the memory savings diagnosis to explain current behavior
         try:

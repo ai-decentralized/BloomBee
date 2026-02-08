@@ -41,7 +41,9 @@ from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
-from bloombee.server.speculativeTreePruner import PruningMethod, PruningConfig, BloombeePrunerManager
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+from bloombee.server.speculative_pruner.utils import PruningMethod
+from bloombee.server.speculative_pruner.utils import PruningConfig
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
@@ -243,7 +245,7 @@ class Server:
         if max_batch_size is None:
             max_batch_size = 8192 if is_multiquery_attn else 2048
         if inference_max_length is None:
-            inference_max_length = 8192 if is_multiquery_attn else 2048
+            inference_max_length = 8192 if is_multiquery_attn else 4096
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
         self.inference_max_length = inference_max_length
         self.max_chunk_size_bytes = max_chunk_size_bytes
@@ -326,7 +328,7 @@ class Server:
             simple_threshold=0.1
         )
         
-        self.pruner_manager = BloombeePrunerManager(
+        self.pruner_manager = SpeculativePrunerManager(
             hidden_size=hidden_size,
             vocab_size=vocab_size,
             config=config
