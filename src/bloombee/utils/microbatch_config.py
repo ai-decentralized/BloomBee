@@ -25,7 +25,7 @@ ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
-DEFAULT_MICRO_BATCH_SIZE = 4  # Default micro-batch size for pipeline overlap
+DEFAULT_MICRO_BATCH_SIZE = 2  # Default micro-batch size for pipeline overlap
 
 
 def is_microbatch_enabled() -> bool:

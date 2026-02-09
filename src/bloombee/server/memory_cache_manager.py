@@ -4,6 +4,7 @@ import contextlib
 import asyncio
 import torch
 import os
+import time
 from typing import Optional, Tuple, AsyncContextManager, Sequence
 
 from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata
@@ -46,17 +47,26 @@ class KVCacheManager:
         self._mb_cpu_staging = {}  # {(slot_id, mb_index): (k_cpu, v_cpu, prefix_len)}
         self._current_gpu_mb = {}  # {slot_id: mb_index} currently materialized on GPU
         self._offload_enabled = True  # Enable/disable offloading
-        # Correctness-first default:
-        # keep KV transfer synchronous unless explicitly enabled via env.
-        self._async_kv_transfer = os.environ.get("BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER", "0") == "1"
+        # Async KV transfer mode:
+        # - explicit override via BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER=0/1
+        # - otherwise default to enabled when micro-batching is enabled
+        async_kv_env = os.environ.get("BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER")
+        if async_kv_env is None:
+            microbatch_enabled = os.environ.get("BLOOMBEE_ENABLE_MICROBATCH_PIPELINE", "1") == "1"
+            self._async_kv_transfer = microbatch_enabled
+            async_mode_source = f"auto(microbatch_enabled={int(microbatch_enabled)})"
+        else:
+            self._async_kv_transfer = async_kv_env == "1"
+            async_mode_source = f"env(BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER={async_kv_env})"
         # Logging control:
         # - default keeps high-frequency KV/offload/prefetch traces at DEBUG
         # - set BLOOMBEE_VERBOSE_KV_LOGS=1 to restore verbose INFO traces
         self._verbose_kv_logs = os.environ.get("BLOOMBEE_VERBOSE_KV_LOGS", "0") == "1"
         self._kv_log_once_keys = set()
         logger.info(
-            "[KVCACHE_OFFLOAD] KV transfer mode: %s (set BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER=1 to enable async)",
+            "[KVCACHE_OFFLOAD] KV transfer mode: %s (%s; set BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER=0/1 to override)",
             "ASYNC" if self._async_kv_transfer else "SYNC",
+            async_mode_source,
         )
         logger.info(
             "[KVCACHE_OFFLOAD] KV verbose logs: %s (set BLOOMBEE_VERBOSE_KV_LOGS=1 for per-layer KV traces)",
@@ -69,8 +79,28 @@ class KVCacheManager:
         # NOTE: Streams are created lazily to ensure correct device context
         self._offload_stream = None
         self._prefetch_stream = None
-        self._prefetch_event = None  # Event to sync prefetch completion
         self._streams_device = None  # Track which device streams were created on
+        # Per-(slot, mb) transfer completion events for fine-grained synchronization.
+        self._mb_offload_events = {}   # {(slot_id, mb_index): torch.cuda.Event}
+        self._mb_prefetch_events = {}  # {(slot_id, mb_index): torch.cuda.Event}
+        # Track prefetch launched but not yet synchronized into _current_gpu_mb.
+        self._pending_gpu_mb = {}      # {slot_id: mb_index}
+        # Lightweight KV transfer timing counters (for overlap effectiveness analysis).
+        self._enable_kv_wait_timing = os.environ.get("BLOOMBEE_ENABLE_KV_WAIT_TIMING", "1") == "1"
+        logger.info(
+            "[KVCACHE_OFFLOAD] KV wait timing: %s (set BLOOMBEE_ENABLE_KV_WAIT_TIMING=0 to disable)",
+            "ON" if self._enable_kv_wait_timing else "OFF",
+        )
+        self._kv_timing = {
+            "prefetch_wait_ms": 0.0,
+            "offload_wait_ms": 0.0,
+            "prefetch_wait_calls": 0,
+            "offload_wait_calls": 0,
+            "prefetch_launch_ms": 0.0,
+            "offload_launch_ms": 0.0,
+            "prefetch_launch_calls": 0,
+            "offload_launch_calls": 0,
+        }
         
     def _get_active_cache_slot_id(self) -> Optional[int]:
         """Return a stable identifier for currently active cache tensors."""
@@ -111,6 +141,26 @@ class KVCacheManager:
             return
         self._kv_log_once_keys.add(key)
         logger.info(message, *args)
+
+    def _record_kv_timing(self, key: str, delta_ms: float, call_key: Optional[str] = None):
+        if not self._enable_kv_wait_timing:
+            return
+        self._kv_timing[key] = self._kv_timing.get(key, 0.0) + max(0.0, float(delta_ms))
+        if call_key is not None:
+            self._kv_timing[call_key] = self._kv_timing.get(call_key, 0) + 1
+
+    def get_kv_timing_snapshot(self, reset: bool = False) -> dict:
+        """
+        Return cumulative KV timing counters used to quantify overlap effectiveness.
+
+        Args:
+            reset: If True, clear counters after snapshot.
+        """
+        snapshot = dict(self._kv_timing)
+        if reset:
+            for k in list(self._kv_timing.keys()):
+                self._kv_timing[k] = 0 if k.endswith("_calls") else 0.0
+        return snapshot
         
         
     def get_cache_device(self, policy):
@@ -268,13 +318,19 @@ class KVCacheManager:
                 mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size)
                 slot_id = self._get_active_cache_slot_id()
                 current_mb = self._current_gpu_mb.get(slot_id) if slot_id is not None else None
+                pending_mb = self._pending_gpu_mb.get(slot_id) if slot_id is not None else None
 
                 # For decode (prefix_length > 0), ensure this micro-batch's KV is on GPU.
                 # This must happen inside use_cache context.
-                if prefix_length > 0 and current_mb != mb_index:
-                    self.sync_offload()
-                    self.prefetch_microbatch_kv(mb_index)
-                    self.sync_prefetch()
+                if prefix_length > 0:
+                    if current_mb != mb_index:
+                        # Avoid relaunching if this micro-batch is already being prefetched.
+                        if pending_mb != mb_index:
+                            self.prefetch_microbatch_kv(mb_index)
+                        self.sync_prefetch(mb_index)
+                    elif pending_mb == mb_index:
+                        # Prefetch may have been launched earlier; ensure it is complete.
+                        self.sync_prefetch(mb_index)
 
                 # GPU multiplexing: all micro-batches map to offset=0.
                 actual_mb_size = micro_batch_size if micro_batch_size > 0 else full_batch_in_cache
@@ -571,21 +627,6 @@ class KVCacheManager:
             # Initialize streams on the correct device
             self._ensure_streams_initialized(k_data.device)
 
-            # Correctness-first guard:
-            # make sure cache writes are fully visible before GPU->CPU offload copy.
-            # Without this, async offload may race with preceding cache writes and
-            # stage incomplete KV snapshots for later prefetch.
-            try:
-                if hasattr(k_data, "is_cuda") and k_data.is_cuda:
-                    torch.cuda.synchronize(k_data.device)
-            except Exception:
-                # Fallback for older torch variants that require current device context
-                try:
-                    with torch.cuda.device(k_data.device):
-                        torch.cuda.synchronize()
-                except Exception:
-                    pass
-            
             S_total, BH_mb, D = k_data.shape  # BH_mb = micro_batch_size * num_heads
             
             # [MBPIPE_OFFLOAD_DEBUG] Log the key insight
@@ -619,13 +660,27 @@ class KVCacheManager:
             
             # Transfer KV to CPU staging.
             # Default is synchronous for correctness; async mode is optional.
+            launch_start = time.perf_counter()
             if self._async_kv_transfer and self._offload_stream is not None:
+                # Stream-ordering guard: offload stream waits for the compute stream writes,
+                # avoiding a full-device synchronize and preserving overlap potential.
+                current_stream = torch.cuda.current_stream(k_data.device)
                 with torch.cuda.stream(self._offload_stream):
+                    self._offload_stream.wait_stream(current_stream)
                     k_cpu[:prefix_length].copy_(k_data[:prefix_length], non_blocking=True)
                     v_cpu[:prefix_length].copy_(v_data[:prefix_length], non_blocking=True)
+                    offload_event = torch.cuda.Event()
+                    offload_event.record(self._offload_stream)
+                    self._mb_offload_events[staging_key] = offload_event
             else:
                 k_cpu[:prefix_length].copy_(k_data[:prefix_length], non_blocking=False)
                 v_cpu[:prefix_length].copy_(v_data[:prefix_length], non_blocking=False)
+                self._mb_offload_events.pop(staging_key, None)
+            self._record_kv_timing(
+                "offload_launch_ms",
+                (time.perf_counter() - launch_start) * 1000.0,
+                "offload_launch_calls",
+            )
             
             # Update tracking
             self._mb_cpu_staging[staging_key] = (k_cpu, v_cpu, prefix_length)
@@ -700,25 +755,34 @@ class KVCacheManager:
                 logger.warning(f"[KVCACHE_OFFLOAD] mb_index={mb_index} has zero prefix_length, skipping")
                 return
 
-            # Make sure the previous GPU->CPU offload using this slot has completed,
-            # otherwise CPU staging may still be incomplete.
-            self.sync_offload()
-            
             # Transfer KV back to GPU cache.
             # Default is synchronous for correctness; async mode is optional.
+            launch_start = time.perf_counter()
             if self._async_kv_transfer and self._prefetch_stream is not None:
+                offload_event = self._mb_offload_events.get(staging_key)
                 with torch.cuda.stream(self._prefetch_stream):
+                    if offload_event is not None:
+                        # Wait only for this micro-batch's offload completion (not global stream sync).
+                        self._prefetch_stream.wait_event(offload_event)
                     k_data[:prefix_length].copy_(k_cpu[:prefix_length], non_blocking=True)
                     v_data[:prefix_length].copy_(v_cpu[:prefix_length], non_blocking=True)
                     # Record event for synchronization
-                    self._prefetch_event = torch.cuda.Event()
-                    self._prefetch_event.record(self._prefetch_stream)
+                    prefetch_event = torch.cuda.Event()
+                    prefetch_event.record(self._prefetch_stream)
+                    self._mb_prefetch_events[staging_key] = prefetch_event
+                # Do not mark as current until sync_prefetch(mb_index) confirms completion.
+                self._pending_gpu_mb[slot_id] = mb_index
             else:
                 k_data[:prefix_length].copy_(k_cpu[:prefix_length], non_blocking=False)
                 v_data[:prefix_length].copy_(v_cpu[:prefix_length], non_blocking=False)
-            
-            # Update tracking - this micro-batch now owns GPU
-            self._current_gpu_mb[slot_id] = mb_index
+                self._mb_prefetch_events.pop(staging_key, None)
+                self._pending_gpu_mb.pop(slot_id, None)
+                self._current_gpu_mb[slot_id] = mb_index
+            self._record_kv_timing(
+                "prefetch_launch_ms",
+                (time.perf_counter() - launch_start) * 1000.0,
+                "prefetch_launch_calls",
+            )
             
             bytes_prefetched = k_cpu[:prefix_length].numel() * k_cpu.element_size() * 2
             mb_prefetched = bytes_prefetched / (1024 * 1024)
@@ -736,29 +800,94 @@ class KVCacheManager:
         except Exception as e:
             logger.warning(f"[KVCACHE_OFFLOAD] Prefetch failed: {e}", exc_info=True)
     
-    def sync_prefetch(self):
+    def sync_prefetch(self, mb_index: Optional[int] = None):
         """
         Wait for async prefetch to complete.
         
         Call this after prefetch_microbatch_kv() and before using the cache
         to ensure the CPU->GPU transfer has finished.
+
+        Args:
+            mb_index: Optional micro-batch index. If provided, synchronize only this
+                      micro-batch staging key for the current active slot.
         """
-        if self._prefetch_event is not None:
-            self._prefetch_event.synchronize()
-            self._prefetch_event = None
-            logger.debug("[KVCACHE_OFFLOAD] Prefetch sync complete")
+        if not self._async_kv_transfer:
+            return
+
+        if mb_index is None:
+            if self._mb_prefetch_events:
+                for event in self._mb_prefetch_events.values():
+                    wait_start = time.perf_counter()
+                    event.synchronize()
+                    self._record_kv_timing(
+                        "prefetch_wait_ms",
+                        (time.perf_counter() - wait_start) * 1000.0,
+                        "prefetch_wait_calls",
+                    )
+                self._mb_prefetch_events.clear()
+            if self._pending_gpu_mb:
+                for slot_id, pending_mb in self._pending_gpu_mb.items():
+                    self._current_gpu_mb[slot_id] = pending_mb
+                self._pending_gpu_mb.clear()
+            logger.debug("[KVCACHE_OFFLOAD] Prefetch sync complete (all)")
+            return
+
+        staging_key = self._get_staging_key(mb_index)
+        if staging_key is not None:
+            event = self._mb_prefetch_events.pop(staging_key, None)
+            if event is not None:
+                wait_start = time.perf_counter()
+                event.synchronize()
+                self._record_kv_timing(
+                    "prefetch_wait_ms",
+                    (time.perf_counter() - wait_start) * 1000.0,
+                    "prefetch_wait_calls",
+                )
+            slot_id, _ = staging_key
+            if self._pending_gpu_mb.get(slot_id) == mb_index:
+                self._current_gpu_mb[slot_id] = mb_index
+                self._pending_gpu_mb.pop(slot_id, None)
+            logger.debug("[KVCACHE_OFFLOAD] Prefetch sync complete for mb_index=%s", mb_index)
     
-    def sync_offload(self):
+    def sync_offload(self, mb_index: Optional[int] = None):
         """
         Wait for async offload to complete.
         
         Call this to ensure GPU->CPU transfer has finished before freeing GPU memory
         or before prefetching a new micro-batch that would overwrite the cache.
+
+        Args:
+            mb_index: Optional micro-batch index. If provided, synchronize only this
+                      micro-batch staging key for the current active slot.
         """
+        if not self._async_kv_transfer:
+            return
+
+        if mb_index is not None:
+            staging_key = self._get_staging_key(mb_index)
+            if staging_key is not None:
+                event = self._mb_offload_events.get(staging_key)
+                if event is not None:
+                    wait_start = time.perf_counter()
+                    event.synchronize()
+                    self._record_kv_timing(
+                        "offload_wait_ms",
+                        (time.perf_counter() - wait_start) * 1000.0,
+                        "offload_wait_calls",
+                    )
+                    logger.debug("[KVCACHE_OFFLOAD] Offload sync complete for mb_index=%s", mb_index)
+            return
+
         if self._offload_stream is not None and self._streams_device is not None:
             try:
                 with torch.cuda.device(self._streams_device):
+                    wait_start = time.perf_counter()
                     self._offload_stream.synchronize()
+                self._record_kv_timing(
+                    "offload_wait_ms",
+                    (time.perf_counter() - wait_start) * 1000.0,
+                    "offload_wait_calls",
+                )
                 logger.debug("[KVCACHE_OFFLOAD] Offload sync complete")
             except Exception as e:
                 logger.warning(f"[KVCACHE_OFFLOAD] Offload sync failed: {e}")
@@ -766,12 +895,14 @@ class KVCacheManager:
     def clear_offload_state(self):
         """Clear all offload tracking state and free CPU staging buffers."""
         # Ensure any pending offload completes (only if streams were used)
-        if self._offload_stream is not None and self._mb_cpu_staging:
+        if self._async_kv_transfer and self._offload_stream is not None and self._mb_cpu_staging:
             self.sync_offload()
         num_cleared = len(self._mb_cpu_staging)
         self._mb_cpu_staging.clear()
         self._current_gpu_mb.clear()
-        self._prefetch_event = None
+        self._pending_gpu_mb.clear()
+        self._mb_offload_events.clear()
+        self._mb_prefetch_events.clear()
         if num_cleared > 0:
             logger.info(f"[KVCACHE_OFFLOAD] Cleared offload state: {num_cleared} staged micro-batches")
     

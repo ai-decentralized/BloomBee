@@ -11,6 +11,7 @@ Used by both push side (handler.py) and consume side (block_functions.py)
 to ensure consistent handling of micro-batch data.
 """
 
+import os
 from typing import Any, Dict, Optional, Set, Tuple
 import torch
 from hivemind.utils.logging import get_logger
@@ -18,6 +19,8 @@ from hivemind.utils.logging import get_logger
 logger = get_logger(__name__)
 
 MBPIPE_SCHEMA_PREFIX = "[MBPIPE_SCHEMA]"
+_NO_CONTEXT_WARNING_EMITTED = False
+_STRICT_SCHEMA_WARN = os.environ.get("BLOOMBEE_MBPIPE_SCHEMA_WARN", "0") == "1"
 
 
 # =============================================================================
@@ -218,10 +221,22 @@ def fill_microbatch_defaults(
         is_spec_dec = request_context.get_field("is_spec_dec", get_default_is_spec_dec())
         need_pruning = request_context.get_field("need_pruning", get_default_need_pruning())
     else:
-        # No context available - use all defaults and log warning
-        logger.warning(
-            f"{MBPIPE_SCHEMA_PREFIX} No request context available, using all defaults"
-        )
+        # No context available - use all defaults.
+        # Default to debug-level to avoid noisy WARNs in decode loops;
+        # enable strict warning with BLOOMBEE_MBPIPE_SCHEMA_WARN=1.
+        global _NO_CONTEXT_WARNING_EMITTED
+        if not _NO_CONTEXT_WARNING_EMITTED:
+            msg = (
+                f"{MBPIPE_SCHEMA_PREFIX} No request context available, using all defaults "
+                f"(shown once; set BLOOMBEE_MBPIPE_SCHEMA_WARN=1 for WARN level)"
+            )
+            if _STRICT_SCHEMA_WARN:
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
+            _NO_CONTEXT_WARNING_EMITTED = True
+        else:
+            logger.debug(f"{MBPIPE_SCHEMA_PREFIX} No request context available, using all defaults")
         prompts = get_default_prompts(batch_size, num_backends)
         hypo_ids = get_default_hypo_ids(batch_size, device)
         tree_attention_mask = get_default_tree_attention_mask()

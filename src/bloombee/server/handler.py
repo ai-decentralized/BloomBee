@@ -9,6 +9,7 @@ from itertools import chain
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from time import perf_counter
+import time
 import numpy as np
 
 import torch
@@ -260,6 +261,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         # Key: (session_id, step_id) -> StreamingDecodeState
         self._streaming_decode_sessions: Dict[tuple, StreamingDecodeState] = {}
 
+        # [CLOCK_SYNC] Per-peer clock offset estimator for cross-machine strict overlap.
+        # offset_us is "remote_clock - local_clock" for the target peer.
+        self._clock_sync_state: Dict[str, Dict[str, float]] = {}
+        self._clock_sync_alpha = float(os.environ.get("BLOOMBEE_CLOCK_SYNC_ALPHA", "0.2"))
+        self._clock_sync_max_rtt_us = max(0, int(os.environ.get("BLOOMBEE_CLOCK_SYNC_MAX_RTT_US", "2000000")))
+        self._clock_sync_log_every = max(1, int(os.environ.get("BLOOMBEE_CLOCK_SYNC_LOG_EVERY", "64")))
+        logger.info(
+            f"{MBPIPE_LOG_PREFIX} Clock sync enabled: alpha={self._clock_sync_alpha:.2f}, "
+            f"max_rtt={self._clock_sync_max_rtt_us/1000:.1f}ms, log_every={self._clock_sync_log_every}"
+        )
+
 
 
         self.inference_max_length = inference_max_length
@@ -268,6 +280,112 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._prioritizer = task_prioritizer
         self.quant_type = quant_type
         self.pruner_manager = pruner_manager
+
+    @staticmethod
+    def _now_us() -> int:
+        return int(time.time() * 1_000_000)
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _get_clock_sync_estimate(self, peer_id: str) -> Optional[Dict[str, int]]:
+        state = self._clock_sync_state.get(peer_id)
+        if not state:
+            return None
+        return {
+            "offset_us": int(round(float(state.get("offset_us", 0.0)))),
+            "rtt_us": int(round(float(state.get("rtt_us", 0.0)))),
+            "samples": int(state.get("samples", 0)),
+        }
+
+    def _update_clock_sync_estimate(self, peer_id: str, sample_offset_us: float, sample_rtt_us: float) -> Optional[Dict[str, float]]:
+        """
+        Update per-peer clock offset estimate.
+        sample_offset_us follows NTP convention: remote_clock - local_clock.
+        """
+        if sample_rtt_us < 0:
+            return None
+        if self._clock_sync_max_rtt_us > 0 and sample_rtt_us > self._clock_sync_max_rtt_us:
+            return None
+
+        sample_offset_us = float(sample_offset_us)
+        sample_rtt_us = float(sample_rtt_us)
+        state = self._clock_sync_state.get(peer_id)
+        if state is None:
+            state = {
+                "offset_us": sample_offset_us,
+                "rtt_us": sample_rtt_us,
+                "best_rtt_us": sample_rtt_us,
+                "samples": 1,
+            }
+        else:
+            prev_offset_us = float(state.get("offset_us", sample_offset_us))
+            prev_rtt_us = float(state.get("rtt_us", sample_rtt_us))
+            best_rtt_us = min(float(state.get("best_rtt_us", sample_rtt_us)), sample_rtt_us)
+            # Lower RTT samples are usually more reliable for offset estimation.
+            quality = best_rtt_us / max(sample_rtt_us, 1.0)
+            effective_alpha = min(1.0, max(0.01, self._clock_sync_alpha * quality))
+            state["offset_us"] = prev_offset_us * (1.0 - effective_alpha) + sample_offset_us * effective_alpha
+            state["rtt_us"] = prev_rtt_us * (1.0 - effective_alpha) + sample_rtt_us * effective_alpha
+            state["best_rtt_us"] = best_rtt_us
+            state["samples"] = int(state.get("samples", 0)) + 1
+
+        state["last_raw_offset_us"] = sample_offset_us
+        state["last_raw_rtt_us"] = sample_rtt_us
+        state["updated_at_us"] = self._now_us()
+        self._clock_sync_state[peer_id] = state
+        return state
+
+    def _update_clock_sync_from_rpc_response(
+        self,
+        peer_id: str,
+        sender_send_us: int,
+        sender_ack_us: int,
+        response: Optional[runtime_pb2.ExpertResponse],
+    ) -> None:
+        if response is None or not response.metadata:
+            return
+        try:
+            response_meta = MSGPackSerializer.loads(response.metadata)
+        except Exception:
+            return
+        if not isinstance(response_meta, dict):
+            return
+
+        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
+        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
+        if receiver_recv_us <= 0 or receiver_ack_us <= 0 or sender_ack_us < sender_send_us:
+            return
+
+        # NTP four-timestamp estimator:
+        # t1=sender_send, t2=receiver_recv, t3=receiver_ack, t4=sender_ack.
+        # offset (receiver-local) = ((t2-t1) + (t3-t4))/2
+        receiver_processing_us = max(0, receiver_ack_us - receiver_recv_us)
+        end_to_end_rtt_us = max(0, sender_ack_us - sender_send_us)
+        network_rtt_us = max(0, end_to_end_rtt_us - receiver_processing_us)
+        sample_offset_us = ((receiver_recv_us - sender_send_us) + (receiver_ack_us - sender_ack_us)) / 2.0
+
+        updated = self._update_clock_sync_estimate(peer_id, sample_offset_us, network_rtt_us)
+        if not updated:
+            return
+        samples = int(updated.get("samples", 0))
+        if samples <= 3 or (samples % self._clock_sync_log_every == 0):
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} [CLOCK_SYNC] peer={peer_id[:10]} "
+                f"offset={updated['offset_us']/1000:.2f}ms "
+                f"rtt={updated['rtt_us']/1000:.2f}ms samples={samples}"
+            )
+
+    def _build_rpc_push_ack_response(self, receive_us: int) -> runtime_pb2.ExpertResponse:
+        ack_metadata = {
+            "clock_sync_receiver_recv_us": int(receive_us),
+            "clock_sync_receiver_ack_us": int(self._now_us()),
+        }
+        return runtime_pb2.ExpertResponse(metadata=MSGPackSerializer.dumps(ack_metadata))
 
 
     async def add_p2p_handlers(self, *args, **kwargs) -> None:
@@ -762,7 +880,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             mb_metadata["full_batch_size"] = mb_item.get("full_batch_size", 1)
                             mb_metadata["pushed"] = True
                             
-                            logger.info(
+                            logger.debug(
                                 f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
                                 f"mb_idx={mb_item.get('mb_idx')} for immediate processing"
                             )
@@ -851,6 +969,7 @@ class TransformerConnectionHandler(ConnectionHandler):
 
         requested_uids = self._check_uids(request.uid)
         metadata = MSGPackSerializer.loads(request.metadata)
+        receive_us = self._now_us()
         session_id = metadata["session_id"]
         
         # [MBPIPE] Check if this is a micro-batch push from cross-stage streaming
@@ -858,12 +977,13 @@ class TransformerConnectionHandler(ConnectionHandler):
         
         if is_microbatch_push:
             # Handle micro-batch push: accumulate until we have all micro-batches
-            return await self._handle_microbatch_push(request, metadata, requested_uids, context)
+            await self._handle_microbatch_push(request, metadata, requested_uids, context)
+            return self._build_rpc_push_ack_response(receive_us)
         
         # Original flow: put into session queue for normal processing
         self._log_request("rpc_push", requested_uids, context, debug=f"session_id={session_id}")
         self._put_into_session_queue(session_id, request)
-        return runtime_pb2.ExpertResponse()
+        return self._build_rpc_push_ack_response(receive_us)
     
     async def _handle_microbatch_push(
         self,
@@ -924,7 +1044,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._mb_received[mb_key] = self._mb_received.get(mb_key, 0) + 1
         received_count = self._mb_received[mb_key]
 
-        logger.info(
+        logger.debug(
             f"{MBPIPE_LOG_PREFIX} rpc_push: step_id={step_id}, mb_idx={mb_idx}, "
             f"start_from_position={start_from_position}, received={received_count}/{expected_num_mb}"
         )
@@ -953,7 +1073,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             # Put into session queue immediately (wrapped in dict to distinguish from regular requests)
             self._put_into_session_queue(session_id, mb_queue_item)
             
-            logger.info(
+            logger.debug(
                 f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} IMMEDIATELY queued to session "
                 f"(received={received_count}/{expected_num_mb})"
             )
@@ -1096,6 +1216,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 return
 
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]
+            next_peer_id_str = str(next_peer_id)
             next_peer_id = PeerID.from_base58(next_peer_id)
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
 
@@ -1106,6 +1227,8 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_tensors = [serialized_outputs] + request.tensors[2:]
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
+            sender_send_us = self._now_us()
+            next_metadata["clock_sync_sender_send_us"] = sender_send_us
 
             stub = self.get_stub(self._p2p, next_peer_id)
             transfer_start = perf_counter()
@@ -1114,13 +1237,20 @@ class TransformerConnectionHandler(ConnectionHandler):
             push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
             push_metadata_bytes = len(MSGPackSerializer.dumps(next_metadata))
             
-            await stub.rpc_push(
+            response = await stub.rpc_push(
                 runtime_pb2.ExpertRequest(
                     uid=next_uid,
                     tensors=next_tensors,
                     metadata=MSGPackSerializer.dumps(next_metadata),
                 ),
                 timeout=self.request_timeout,
+            )
+            sender_ack_us = self._now_us()
+            self._update_clock_sync_from_rpc_response(
+                peer_id=next_peer_id_str,
+                sender_send_us=sender_send_us,
+                sender_ack_us=sender_ack_us,
+                response=response,
             )
             
             transfer_end = perf_counter()
@@ -1177,9 +1307,10 @@ class TransformerConnectionHandler(ConnectionHandler):
             full_batch_size = metadata.get("full_batch_size", mb_size)
             
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]
+            next_peer_id_str = str(next_peer_id)
             
             # Log the push intent
-            logger.info(
+            logger.debug(
                 f"{MBPIPE_LOG_PREFIX} Cross-stage push: mb_idx={mb_idx}, "
                 f"offset={mb_offset}, size={mb_size}, to={next_start}:{next_end}"
                 f"{'' if enable_actual_push else ' (dry-run, set BLOOMBEE_ENABLE_CROSS_STAGE_PUSH=1 to enable)'}"
@@ -1227,6 +1358,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "micro_batch_size": mb_size,
                 "full_batch_size": full_batch_size,
             }
+
+            # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
+            # on downstream stage: downstream_local_time ~= upstream_time + offset_us.
+            clock_sync_estimate = self._get_clock_sync_estimate(next_peer_id_str)
+            if clock_sync_estimate is not None:
+                push_metadata["sender_to_receiver_clock_offset_us"] = clock_sync_estimate["offset_us"]
+                push_metadata["sender_to_receiver_clock_rtt_us"] = clock_sync_estimate["rtt_us"]
+                push_metadata["sender_to_receiver_clock_samples"] = clock_sync_estimate["samples"]
             
             # Copy other relevant metadata
             # [CROSS_STAGE] Include timestamps for cross-stage overlap analysis
@@ -1237,6 +1376,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "stage_push_timestamp_us",
                 "total_micro_batches",
                 "stage_compute_start_timestamp_us",
+                "stage_compute_end_timestamp_us",
                 # [MBPIPE_FIX] Critical for KV correctness on downstream stage:
                 # ensures each micro-batch of a step uses the same logical prefix.
                 "start_from_position",
@@ -1248,6 +1388,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # [ASYNC_PUSH] Fire-and-forget: don't await RPC response
             # This allows Stage 1 compute to continue immediately while data is sent in background
+            push_metadata["clock_sync_sender_send_us"] = self._now_us()
             rpc_request = runtime_pb2.ExpertRequest(
                 uid=next_uid,
                 tensors=[serialized_hidden, serialized_keep],
@@ -1268,7 +1409,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # Create task for background sending - don't await
             send_task = asyncio.create_task(
-                self._do_rpc_push_async(stub, rpc_request, mb_idx, push_start_time)
+                self._do_rpc_push_async(stub, rpc_request, mb_idx, push_start_time, next_peer_id_str)
             )
             
             # Track task to prevent garbage collection
@@ -1278,7 +1419,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             send_task.add_done_callback(self._background_push_tasks.discard)
             
             queue_time = (perf_counter() - push_start_time) * 1000
-            logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch push queued in {queue_time:.1f}ms (sending in background)")
+            logger.debug(f"{MBPIPE_LOG_PREFIX} Micro-batch push queued in {queue_time:.1f}ms (sending in background)")
             
         except Exception as e:
             logger.warning(
@@ -1292,6 +1433,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         request: runtime_pb2.ExpertRequest,
         mb_idx: int,
         queue_start_time: float,
+        peer_id: str,
     ) -> None:
         """
         [ASYNC_PUSH] Actually perform the RPC push in background.
@@ -1301,10 +1443,27 @@ class TransformerConnectionHandler(ConnectionHandler):
         """
         send_start = perf_counter()
         try:
-            await stub.rpc_push(request, timeout=self.request_timeout)
+            sender_send_us = self._now_us()
+            if request.metadata:
+                try:
+                    request_metadata = MSGPackSerializer.loads(request.metadata)
+                    if isinstance(request_metadata, dict):
+                        request_metadata["clock_sync_sender_send_us"] = sender_send_us
+                        request.metadata = MSGPackSerializer.dumps(request_metadata)
+                except Exception:
+                    pass
+
+            response = await stub.rpc_push(request, timeout=self.request_timeout)
+            sender_ack_us = self._now_us()
+            self._update_clock_sync_from_rpc_response(
+                peer_id=peer_id,
+                sender_send_us=sender_send_us,
+                sender_ack_us=sender_ack_us,
+                response=response,
+            )
             total_time = (perf_counter() - queue_start_time) * 1000
             send_time = (perf_counter() - send_start) * 1000
-            logger.info(
+            logger.debug(
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} sent: "
                 f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms"
             )

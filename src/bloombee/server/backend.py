@@ -769,6 +769,16 @@ class _MergedInferenceStep:
         self._offloaded_slices: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         # Get cache_manager from first backend for offloading operations
         self._cache_manager = next(iter(backends.values())).cache_manager if backends else None
+        self._kv_timing_keys = (
+            "prefetch_wait_ms",
+            "offload_wait_ms",
+            "prefetch_wait_calls",
+            "offload_wait_calls",
+            "prefetch_launch_ms",
+            "offload_launch_ms",
+            "prefetch_launch_calls",
+            "offload_launch_calls",
+        )
 
     def _offload_completed_microbatch(self, k_cache: torch.Tensor, v_cache: torch.Tensor, 
                                        mb_offset: int, mb_size: int, num_heads: int) -> None:
@@ -840,6 +850,39 @@ class _MergedInferenceStep:
         except Exception as e:
             offload_logger.warning(f"[KVCACHE_OFFLOAD] Prefetch failed: {e}")
 
+    def _snapshot_kv_timing(self) -> Optional[Dict[str, float]]:
+        if self._cache_manager is None or not hasattr(self._cache_manager, "get_kv_timing_snapshot"):
+            return None
+        try:
+            snapshot = self._cache_manager.get_kv_timing_snapshot(reset=False)
+        except Exception as e:
+            logger.debug("[KVCACHE_TIMING] runtime snapshot failed: %s", e)
+            return None
+
+        normalized: Dict[str, float] = {}
+        for key in self._kv_timing_keys:
+            try:
+                normalized[key] = float(snapshot.get(key, 0.0))
+            except Exception:
+                normalized[key] = 0.0
+        return normalized
+
+    def _compute_kv_timing_delta(
+        self, before: Optional[Dict[str, float]], after: Optional[Dict[str, float]]
+    ) -> Dict[str, float]:
+        delta: Dict[str, float] = {}
+        for key in self._kv_timing_keys:
+            b = 0.0 if before is None else float(before.get(key, 0.0))
+            a = 0.0 if after is None else float(after.get(key, 0.0))
+            v = max(0.0, a - b)
+            if key.endswith("_calls"):
+                delta[key] = int(v)
+            else:
+                delta[key] = v
+        delta["_source"] = "runtime_kv_timing"
+        delta["_valid"] = 1 if (before is not None and after is not None) else 0
+        return delta
+
     @torch.inference_mode()
     def __call__(
         self,
@@ -858,6 +901,8 @@ class _MergedInferenceStep:
             batch_size = hidden_states.shape[0] if hidden_states.ndim >= 1 else 1
             mbpipe_log_path_entry(logger, "backend._MergedInferenceStep", batch_size=batch_size)
         
+        kv_timing_before = self._snapshot_kv_timing()
+
         # Process all blocks for this micro-batch
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:
@@ -865,5 +910,8 @@ class _MergedInferenceStep:
             (hidden_states, keep_indices) = self.backends[inference_info.uid].inference_step(
                 hidden_states, hypo_ids, inference_info
             )
-        
-        return (hidden_states, keep_indices)
+
+        kv_timing_after = self._snapshot_kv_timing()
+        kv_timing_delta = self._compute_kv_timing_delta(kv_timing_before, kv_timing_after)
+
+        return (hidden_states, keep_indices, kv_timing_delta)
