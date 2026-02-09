@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 import argparse
 import multiprocessing as mp
+import sys
+from pathlib import Path
 from time import perf_counter
 
 import numpy as np
 import torch
 from hivemind.utils.logging import get_logger
-from transformers import AutoTokenizer
+
+# Ensure local source tree is used instead of an older installed package.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _REPO_ROOT / "src"
+_SRC_STR = str(_SRC_ROOT)
+if _SRC_STR in sys.path:
+    sys.path.remove(_SRC_STR)
+sys.path.insert(0, _SRC_STR)
 
 from bloombee import AutoDistributedSpeculativeModel
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
-from datasets import load_dataset
-import random
 
 logger = get_logger()
 
@@ -23,6 +29,7 @@ def main():
     parser.add_argument("--model", type=str, required=True, help="Model")
     parser.add_argument("--initial_peers", type=str, nargs="+", default=PUBLIC_INITIAL_PEERS, help="Initial peers")
     parser.add_argument("--torch_dtype", type=str, default="float32", help="Torch dtype")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--n_processes", type=str, default=1, help="Number of concurrent processes")
     parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length")
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
@@ -60,18 +67,11 @@ def benchmark_inference(process_idx, args, result_pipe):
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
-    batch_size = 4
-    dataset = load_dataset("tatsu-lab/alpaca")["train"]
-    indices = random.sample(range(len(dataset)), batch_size)
-    sampled = dataset.select(indices)
-    test_prompts = []
-    # for item in sampled:
-        # test_prompts.append(item["instruction"])
-        
-    test_prompts.append("Hi,")
-    test_prompts.append("")
-    test_prompts.append("")
-    test_prompts.append("")
+    batch_size = args.batch_size
+    if batch_size < 1:
+        raise ValueError(f"--batch_size must be >= 1, got {batch_size}")
+
+    test_prompts = ["Hi,"] + [""] * (batch_size - 1)
 
     tokenizer.pad_token = tokenizer.eos_token
     # tokenizer.padding_side = "left"

@@ -183,7 +183,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.original_devices = self.module.devices
         self.original_output_device_index = getattr(self.module, 'output_device_index', 0)
         self._need_pruning = False
-        self._first_get_need_pruning = True
         self._is_spec_decoding = False
         self._is_last_block = is_last_block
         if is_last_block:
@@ -195,9 +194,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         head_dim = self.config.hidden_size // self.config.num_attention_heads
         cache_tensors = []
         for device, num_heads in zip(self.module.devices, self.shard_num_heads):
-            num_heads //= self.config.num_key_value_groups
-            if hasattr(self.config, "num_key_value_heads"):
-                num_heads = self.config.num_key_value_heads
+            # IMPORTANT:
+            # Flex decode path (`mha_gen_llama`) uses attention head count when building
+            # K/V updates (BH = batch * num_attention_heads). KV cache descriptors must
+            # match that contract, otherwise we hit BH mismatches (e.g. 32 vs 128).
+            # So keep shard attention heads here; do NOT downscale by key-value groups.
             keys = TensorDescriptor((batch_size, num_heads, head_dim, max_length), dtype=self.dtype, device=device)
             # values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
             cache_tensors.append(keys)
@@ -285,10 +286,19 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             with self.cache_manager.use_cache(
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
-                if self._first_get_need_pruning:
-                    self._need_pruning = inference_info.need_pruning is not None and inference_info.need_pruning.bool().item()
-                    self._is_spec_decoding = inference_info.is_spec_dec is not None and inference_info.is_spec_dec.bool().item()
-                    self._first_get_need_pruning = False
+                def _flag_to_bool(value) -> bool:
+                    if value is None:
+                        return False
+                    if torch.is_tensor(value):
+                        if value.numel() == 0:
+                            return False
+                        return bool(value.bool().any().item())
+                    return bool(value)
+
+                # Parse flags per request (not just first-ever call), otherwise spec/non-spec
+                # mode can get stuck after the first request served by this backend.
+                self._need_pruning = _flag_to_bool(inference_info.need_pruning)
+                self._is_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
                 # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
@@ -366,7 +376,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         device=hidden_states.device,
                     )
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
-                if full_mask == None:
+                if full_mask is None:
                     full_mask = self._create_causal_attention_mask(batch_size, (seq_len + new_prefix_length), new_prefix_length, hidden_states.device)
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
 
@@ -383,7 +393,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
                     if self._is_spec_decoding:
                         rotary_position_ids = self._create_tree_position_ids(
-                            2, 4, inference_info.prefill_length - 1, kv_valid_lengths, device='cuda'
+                            2,
+                            4,
+                            inference_info.prefill_length - 1,
+                            kv_valid_lengths,
+                            device=hidden_states.device,
+                            batch_size=batch_size,
                         )
                     else:
                         rotary_position_ids = None
@@ -444,11 +459,21 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         micro_batch_size=inference_info.micro_batch_size,
                     )
 
-                keep_indices = inference_info.keep_indices
+                keep_indices = self._normalize_keep_indices(
+                    inference_info.keep_indices,
+                    batch_size=output_hidden_states.shape[0],
+                    seq_len=output_hidden_states.shape[1],
+                    device=output_hidden_states.device,
+                )
                 
                 if self._is_spec_decoding and self._need_pruning and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    keep_indices = self._normalize_keep_indices(
+                        self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask),
+                        batch_size=output_hidden_states.shape[0],
+                        seq_len=output_hidden_states.shape[1],
+                        device=output_hidden_states.device,
+                    )
                     
                 if self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states
@@ -486,6 +511,54 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             )
             return (hidden_states, None)  # Return original input as fallback
 
+    def _normalize_keep_indices(
+        self,
+        keep_indices: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Normalize keep_indices to shape [B, L] int64 on target device.
+        Falls back to identity indices when input is missing/invalid.
+        """
+        def _default_keep() -> torch.Tensor:
+            return torch.arange(seq_len, dtype=torch.int64, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        if keep_indices is None or is_dummy(keep_indices):
+            return _default_keep()
+
+        if not torch.is_tensor(keep_indices):
+            keep_indices = torch.as_tensor(keep_indices, device=device)
+        else:
+            keep_indices = keep_indices.to(device)
+
+        if keep_indices.numel() == 0:
+            return _default_keep()
+
+        keep_indices = keep_indices.to(dtype=torch.int64)
+
+        if keep_indices.ndim == 0:
+            keep_indices = keep_indices.view(1, 1).expand(batch_size, 1)
+        elif keep_indices.ndim == 1:
+            keep_indices = keep_indices.view(1, -1).expand(batch_size, -1)
+        elif keep_indices.ndim > 2:
+            keep_indices = keep_indices.reshape(keep_indices.shape[0], -1)
+
+        if keep_indices.shape[0] == 1 and batch_size > 1:
+            keep_indices = keep_indices.expand(batch_size, -1)
+        elif keep_indices.shape[0] != batch_size:
+            logger.debug(
+                "keep_indices batch mismatch in backend %s: got %s, expected %s; using default keep indices",
+                self.name,
+                tuple(keep_indices.shape),
+                batch_size,
+            )
+            return _default_keep()
+
+        return keep_indices
+
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:
         # We assume that attention logit matrices are the main thing that consumes memory, given that
         # the model uses multi-query attention
@@ -506,10 +579,45 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         depth: int, 
         prefill_length: torch.Tensor,  # 每个 batch 样本当前的有效总长度（已包含在该样本在 KV cache 中的位置）
         kv_valid_lengths: torch.Tensor,                  # KV cache 的统一起始偏移量（通常是所有样本对齐后的基准）
-        device: torch.device
+        device: torch.device,
+        batch_size: Optional[int] = None,
     ) -> torch.Tensor:
-    
-        batch_size = prefill_length.shape[0]
+        if not torch.is_tensor(prefill_length):
+            prefill_length = torch.as_tensor(prefill_length, device=device)
+        else:
+            prefill_length = prefill_length.to(device)
+
+        if batch_size is None:
+            if prefill_length.ndim >= 1 and prefill_length.shape[0] > 0:
+                batch_size = int(prefill_length.shape[0])
+            elif torch.is_tensor(kv_valid_lengths) and kv_valid_lengths.ndim >= 1 and kv_valid_lengths.shape[0] > 0:
+                batch_size = int(kv_valid_lengths.shape[0])
+            else:
+                batch_size = 1
+
+        # Normalize lengths to [B] to avoid shape mismatch in micro-batch/spec-dec mixed paths
+        prefill_cap = int(torch.nan_to_num(prefill_length.float(), nan=0.0).max().item()) if prefill_length.numel() > 0 else 0
+        prefill_cap = max(0, prefill_cap)
+        prefill_length = self._normalize_kv_valid_lengths(
+            kv_valid_lengths=prefill_length,
+            batch_size=batch_size,
+            max_kv_len=max(prefill_cap, 1_000_000),
+            device=device,
+        )
+
+        if not torch.is_tensor(kv_valid_lengths):
+            kv_valid_lengths = torch.as_tensor(kv_valid_lengths, device=device)
+        else:
+            kv_valid_lengths = kv_valid_lengths.to(device)
+
+        kv_cap = int(torch.nan_to_num(kv_valid_lengths.float(), nan=0.0).max().item()) if kv_valid_lengths.numel() > 0 else 0
+        kv_cap = max(prefill_cap, kv_cap, 0)
+        kv_valid_lengths = self._normalize_kv_valid_lengths(
+            kv_valid_lengths=kv_valid_lengths,
+            batch_size=batch_size,
+            max_kv_len=max(kv_cap, 1_000_000),
+            device=device,
+        )
         
         # 1. 生成 Tree 模板（相对偏移，根节点为 0）
         tree_position_ids_list = []
@@ -677,16 +785,103 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         B = mask.shape[0]
         key_len = mask.shape[2]
         actual_kv_len = min(kv_len, key_len)
+        if actual_kv_len <= 0:
+            return mask
+
+        kv_valid_lengths = self._normalize_kv_valid_lengths(
+            kv_valid_lengths=kv_valid_lengths,
+            batch_size=B,
+            max_kv_len=actual_kv_len,
+            device=device,
+        )
         
         # [1, actual_kv_len]
         kv_positions = torch.arange(actual_kv_len, device=device).unsqueeze(0)
         
         # [B, actual_kv_len] -> [B, 1, actual_kv_len]
-        kv_valid_mask = (kv_positions < kv_valid_lengths.unsqueeze(1)).unsqueeze(1)
+        kv_valid_mask = (kv_positions < kv_valid_lengths.view(B, 1)).unsqueeze(1)
         
         mask[:, :, :actual_kv_len] = mask[:, :, :actual_kv_len] & kv_valid_mask
         
         return mask
+
+    def _normalize_kv_valid_lengths(
+        self,
+        kv_valid_lengths: torch.Tensor,
+        batch_size: int,
+        max_kv_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Normalize kv_valid_lengths to shape [B] (dtype=torch.long), clamped to [0, max_kv_len].
+        This keeps attention mask logic robust across micro-batch/spec-dec mixed paths.
+        """
+        if not torch.is_tensor(kv_valid_lengths):
+            kv_valid_lengths = torch.as_tensor(kv_valid_lengths, device=device)
+        else:
+            kv_valid_lengths = kv_valid_lengths.to(device)
+
+        def _infer_from_vector(vec: torch.Tensor) -> int:
+            if vec.numel() == 0:
+                return 0
+            if torch.is_floating_point(vec):
+                inferred = int(torch.nan_to_num(vec, nan=0.0).max().item())
+            else:
+                nonneg = vec >= 0
+                if nonneg.any():
+                    masked = torch.where(nonneg, vec, torch.full_like(vec, -1))
+                    max_based = int(masked.max().item()) + 1
+                    count_based = int(nonneg.sum().item())
+                    inferred = max(max_based, count_based)
+                else:
+                    inferred = 0
+            return max(0, min(inferred, max_kv_len))
+
+        if kv_valid_lengths.ndim == 0:
+            kv_valid_lengths = kv_valid_lengths.view(1).expand(batch_size)
+
+        elif kv_valid_lengths.ndim == 1:
+            if kv_valid_lengths.numel() == 1:
+                kv_valid_lengths = kv_valid_lengths.expand(batch_size)
+            elif kv_valid_lengths.numel() != batch_size:
+                inferred = _infer_from_vector(kv_valid_lengths)
+                kv_valid_lengths = torch.full(
+                    (batch_size,), inferred, dtype=torch.long, device=device
+                )
+
+        else:
+            if kv_valid_lengths.shape[0] == batch_size:
+                # Typical accidental shape: [B, L] (e.g. indices table).
+                if kv_valid_lengths.shape[1] == 1:
+                    kv_valid_lengths = kv_valid_lengths[:, 0]
+                else:
+                    if torch.is_floating_point(kv_valid_lengths):
+                        kv_valid_lengths = torch.nan_to_num(kv_valid_lengths, nan=0.0).max(dim=1).values
+                    else:
+                        nonneg = kv_valid_lengths >= 0
+                        masked = torch.where(nonneg, kv_valid_lengths, torch.full_like(kv_valid_lengths, -1))
+                        max_based = masked.max(dim=1).values + 1
+                        count_based = nonneg.sum(dim=1)
+                        kv_valid_lengths = torch.maximum(max_based.to(torch.long), count_based.to(torch.long))
+            else:
+                flat = kv_valid_lengths.reshape(-1)
+                if flat.numel() == batch_size:
+                    kv_valid_lengths = flat
+                elif flat.numel() == 1:
+                    kv_valid_lengths = flat.expand(batch_size)
+                else:
+                    inferred = _infer_from_vector(flat)
+                    kv_valid_lengths = torch.full(
+                        (batch_size,), inferred, dtype=torch.long, device=device
+                    )
+
+        kv_valid_lengths = kv_valid_lengths.to(dtype=torch.long, device=device).contiguous()
+        kv_valid_lengths = kv_valid_lengths.clamp(min=0, max=max_kv_len)
+        if kv_valid_lengths.numel() != batch_size:
+            fallback = int(kv_valid_lengths.max().item()) if kv_valid_lengths.numel() > 0 else 0
+            fallback = max(0, min(fallback, max_kv_len))
+            kv_valid_lengths = torch.full((batch_size,), fallback, dtype=torch.long, device=device)
+        return kv_valid_lengths
         
     def _create_causal_attention_mask(
         self,

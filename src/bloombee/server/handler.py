@@ -40,6 +40,7 @@ from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backw
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.convert_block import QuantType
+from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -472,6 +473,44 @@ class TransformerConnectionHandler(ConnectionHandler):
                 session_id = metadata.get("session_id")
                 alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
                 args_structure = metadata.get("args_structure")
+
+                def _flag_to_bool(value: Any) -> bool:
+                    if value is None:
+                        return False
+                    if torch.is_tensor(value):
+                        if value.numel() == 0:
+                            return False
+                        return bool(value.bool().any().item())
+                    return bool(value)
+
+                raw_is_spec = metadata.get("is_spec_dec", None)
+                if raw_is_spec is not None:
+                    is_spec_request = _flag_to_bool(raw_is_spec)
+                else:
+                    # Backward-compatible robust fallback:
+                    # reconstruct args via args_structure instead of assuming tensor order.
+                    is_spec_request = False
+                    try:
+                        if request.tensors and args_structure is not None:
+                            flat_request_tensors = [deserialize_torch_tensor(t) for t in request.tensors]
+                            unpacked_args, _ = unpack_args_kwargs(flat_request_tensors, args_structure)
+                            # Expected order:
+                            # [hidden, keep_idx, need_pruning, prompts, hypo_ids,
+                            #  tree_mask, kv_pos, draft_tokens, prefill_length, is_spec_dec]
+                            if isinstance(unpacked_args, (tuple, list)) and len(unpacked_args) >= 10:
+                                maybe_tree_mask = unpacked_args[5]
+                                maybe_draft = unpacked_args[7]
+                                maybe_is_spec = unpacked_args[9]
+                                is_spec_request = _flag_to_bool(maybe_is_spec)
+                                # If explicit flag is unavailable/zero, non-empty draft/tree
+                                # strongly implies speculative path.
+                                if not is_spec_request:
+                                    has_draft = torch.is_tensor(maybe_draft) and maybe_draft.numel() > 0
+                                    has_tree = torch.is_tensor(maybe_tree_mask) and maybe_tree_mask.numel() > 0
+                                    is_spec_request = bool(has_draft or has_tree)
+                    except Exception as e:
+                        logger.debug(f"{MBPIPE_LOG_PREFIX} spec detection fallback failed: {e}")
+                        is_spec_request = False
                 if not requested_uids:
                     raise ValueError("User must specify at least one block for inference, but got none")
                 assert isinstance(
@@ -487,6 +526,13 @@ class TransformerConnectionHandler(ConnectionHandler):
 
                 original_batch_size = request.tensors[0].size[0] if request.tensors else 1
                 batch_size = original_batch_size
+                metadata_full_batch_size = metadata.get("full_batch_size")
+                try:
+                    metadata_full_batch_size = int(metadata_full_batch_size) if metadata_full_batch_size is not None else None
+                except Exception:
+                    metadata_full_batch_size = None
+                if metadata_full_batch_size is not None and metadata_full_batch_size <= 0:
+                    metadata_full_batch_size = None
                 
                 # [MB_DEBUG] Log initial batch size detection
                 logger.debug(f"[MB_DEBUG] === BATCH SIZE DETECTION ===")
@@ -500,12 +546,18 @@ class TransformerConnectionHandler(ConnectionHandler):
                 logger.debug(f"[MB_DEBUG] is_streaming_decode={is_streaming_decode}, is_microbatch_queue_item={is_microbatch_queue_item(request)}")
                 
                 if is_streaming_decode:
-                    streaming_full_batch_size = metadata.get("full_batch_size", batch_size)
+                    streaming_full_batch_size = metadata_full_batch_size if metadata_full_batch_size is not None else batch_size
                     logger.debug(f"[MB_DEBUG] Streaming decode detected! streaming_full_batch_size={streaming_full_batch_size}")
                     
+                    if is_spec_request and streaming_full_batch_size > batch_size:
+                        logger.info(
+                            f"{MBPIPE_LOG_PREFIX} Spec streaming request: using full_batch_size={streaming_full_batch_size} "
+                            f"for KV allocation (actual incoming mb={batch_size})"
+                        )
+                        batch_size = streaming_full_batch_size
                     # [MBPIPE_FIX] If using micro-batch pipeline, DO NOT override batch_size with full_batch_size
                     # We want to allocate cache ONLY for the micro-batch size to enable GPU multiplexing
-                    if is_microbatch_enabled() and streaming_full_batch_size > batch_size:
+                    elif is_microbatch_enabled() and streaming_full_batch_size > batch_size:
                         logger.info(f"[MBPIPE_FIX] Micro-batch enabled: Keeping batch_size={batch_size} (micro-batch size) "
                                     f"instead of full_batch_size={streaming_full_batch_size} to enable GPU multiplexing")
                     elif streaming_full_batch_size > batch_size:
@@ -514,6 +566,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                         batch_size = streaming_full_batch_size
                         logger.debug(f"[MB_DEBUG] KV cache will use batch_size={batch_size} (overridden from {original_batch_size})")
                 else:
+                    if is_spec_request and metadata_full_batch_size is not None and metadata_full_batch_size > batch_size:
+                        logger.info(
+                            f"{MBPIPE_LOG_PREFIX} Spec request: override batch_size {batch_size} -> "
+                            f"full_batch_size {metadata_full_batch_size} for stable KV allocation"
+                        )
+                        batch_size = metadata_full_batch_size
                     # Non-streaming RPC path keeps logical full batch size here.
                     # Physical KV cache allocation is decided in _allocate_cache():
                     # when micro-batching is enabled and batch_size > micro_batch_size,
@@ -530,6 +588,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                 
                 # [MBPIPE] Log current path at rpc_inference entry
                 mbpipe_log_path_entry(logger, "handler.rpc_inference", batch_size=batch_size)
+                if is_spec_request:
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} Speculative decoding request detected; "
+                        f"forcing full-batch KV allocation for this session"
+                    )
                 
                 # [MBPIPE] Log comprehensive runtime info
                 from bloombee.utils.microbatch_config import log_microbatch_runtime_info
@@ -551,7 +614,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                 logger.debug(f"[KVCACHE_DEBUG] Requested backends: {len(requested_backends)}, UIDs: {requested_uids}")
                 
                 async with self._allocate_cache(
-                    requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
+                    requested_backends,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    timeout=alloc_timeout,
+                    force_full_batch_alloc=is_spec_request,
                 ) as cache_handles:
                     end_cache_time = perf_counter()
                     cache_alloc_ms = (end_cache_time - cache_alloc_start) * 1000
@@ -1305,6 +1372,16 @@ class TransformerConnectionHandler(ConnectionHandler):
             mb_offset = metadata.get("micro_batch_offset", 0)
             mb_size = metadata.get("micro_batch_size", mb_hidden.shape[0])
             full_batch_size = metadata.get("full_batch_size", mb_size)
+            is_spec_push = bool(metadata.get("is_spec_dec", False))
+
+            # Speculative decoding requires strict full-batch context (tree/draft/kv alignment).
+            # Do not use cross-stage micro-batch push for this mode.
+            if is_spec_push:
+                logger.info(
+                    f"{MBPIPE_LOG_PREFIX} Cross-stage push skipped for speculative decoding "
+                    f"(step_id={metadata.get('step_id')}, mb_idx={mb_idx})"
+                )
+                return
             
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]
             next_peer_id_str = str(next_peer_id)
@@ -1373,6 +1450,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "step_id",
                 "max_length",
                 "args_structure",
+                "is_spec_dec",
+                "need_pruning",
+                "prefill_length",
                 "stage_push_timestamp_us",
                 "total_micro_batches",
                 "stage_compute_start_timestamp_us",
@@ -1686,6 +1766,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         batch_size: int,
         max_length: int,
         timeout: Optional[float],
+        force_full_batch_alloc: bool = False,
     ) -> Sequence[Sequence[Handle]]:
         """
         Allocate memory cache for all transformer blocks, return cache handle
@@ -1721,7 +1802,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         logger.debug(f"[MBPIPE_ALLOC_DEBUG] Config: mb_enabled={mb_config['enabled']}, micro_batch_size={micro_batch_size}")
         logger.debug(f"[MBPIPE_ALLOC_DEBUG] Policy: gpu_batch_size={max_supported_batch}")
         
-        if mb_config['enabled'] and micro_batch_size < batch_size:
+        if force_full_batch_alloc:
+            # Speculative decoding currently requires full-batch KV residency for
+            # correctness in verify path (tree mask/rotary/kv_valid alignment).
+            # Do not multiplex KV cache for this session.
+            alloc_batch_size = batch_size
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} KV alloc mode: SPEC_FULL "
+                f"(alloc_batch={alloc_batch_size}, client_batch={batch_size}, micro_batch={micro_batch_size})"
+            )
+
+        elif mb_config['enabled'] and micro_batch_size < batch_size:
             # True GPU multiplexing:
             # - Keep logical full batch for scheduling
             # - Allocate KV cache only for one micro-batch on GPU

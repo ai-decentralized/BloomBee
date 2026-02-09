@@ -101,6 +101,40 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _as_python_bool(value: Any) -> bool:
+    """Safely normalize scalar/tensor flags to a Python bool."""
+    if value is None:
+        return False
+    if torch.is_tensor(value):
+        if is_dummy(value):
+            return False
+        if value.numel() == 0:
+            return False
+        return bool(value.bool().any().item())
+    return bool(value)
+
+
+def _slice_batch_aligned(
+    value: Any,
+    mb_start: int,
+    mb_end: int,
+    full_batch_size: int,
+) -> Any:
+    """
+    Slice tensor-like request fields only if they are batch-aligned.
+    Non-tensor / scalar / already-global fields are returned as-is.
+    """
+    if value is None or not torch.is_tensor(value):
+        return value
+    if is_dummy(value):
+        return value
+    if value.ndim == 0:
+        return value
+    if value.shape[0] == full_batch_size:
+        return value[mb_start:mb_end].contiguous()
+    return value
+
+
 def _unpack_inference_submit_result(result: Any) -> Tuple[torch.Tensor, Any, Optional[Dict[str, float]]]:
     """
     Backward-compatible unpack for inference_pool.submit_task():
@@ -521,6 +555,8 @@ async def iterate_rpc_inference(
             # Cross-stage micro-batch pushes only carry hidden_states/keep_indices.
             # Seed a per-step context explicitly so schema fallback does not emit warnings.
             if not request_context.is_initialized:
+                spec_from_metadata = _as_python_bool(step_metadata.get("is_spec_dec", 0))
+                pruning_from_metadata = _as_python_bool(step_metadata.get("need_pruning", 0))
                 request_context.cache_from_mb0(
                     prompts=[None] * len(requested_backends),
                     hypo_ids=torch.arange(mb_size, dtype=torch.int64, device=mb_hidden_states.device),
@@ -528,8 +564,8 @@ async def iterate_rpc_inference(
                     kv_cache_position_ids=None,
                     draft_tokens=None,
                     prefill_length=int(step_metadata.get("prefill_length", 0) or 0),
-                    is_spec_dec=False,
-                    need_pruning=False,
+                    is_spec_dec=spec_from_metadata,
+                    need_pruning=pruning_from_metadata,
                     num_backends=len(requested_backends),
                 )
                 logger.debug(
@@ -998,70 +1034,6 @@ async def iterate_rpc_inference(
             # Continue to wait for more micro-batches (don't process normal path)
             continue
 
-            
-        else:
-            # ========== ORIGINAL FULL-BATCH PATH ==========
-            flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
-            if args_structure is not None:
-                flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
-
-            hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
-            draft_tokens = draft_tokens[0] if draft_tokens is not None and not is_dummy(draft_tokens) else None
-            batch_size, length_increment, _ = hidden_states.shape
-
-            # Fix for bus error in cross-machine setups: ensure tensors are contiguous
-            if not hidden_states.is_contiguous():
-                hidden_states = hidden_states.contiguous()
-            if prompts is not None and not is_dummy(prompts) and not prompts.is_contiguous():
-                prompts = prompts.contiguous()
-            if not hypo_ids.is_contiguous():
-                hypo_ids = hypo_ids.contiguous()
-            if tree_attention_mask is not None and not is_dummy(tree_attention_mask) and not tree_attention_mask.is_contiguous():
-                tree_attention_mask = tree_attention_mask.contiguous()
-            if kv_cache_position_ids is not None and not is_dummy(kv_cache_position_ids) and not kv_cache_position_ids.is_contiguous():
-                kv_cache_position_ids = kv_cache_position_ids.contiguous()
-            if draft_tokens is not None and not is_dummy(draft_tokens) and not draft_tokens.is_contiguous():
-                draft_tokens = draft_tokens.contiguous()
-            if keep_indices is not None and not is_dummy(keep_indices) and not keep_indices.is_contiguous():
-                keep_indices = keep_indices.contiguous()
-            if need_pruning1 is not None and not is_dummy(need_pruning1) and not need_pruning1.is_contiguous():
-                need_pruning1 = need_pruning1.contiguous()
-            if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) and not is_spec_dec1.is_contiguous():
-                is_spec_dec1 = is_spec_dec1.contiguous()
-                
-            need_pruning = need_pruning1 == 1 if need_pruning1 is not None and not is_dummy(need_pruning1) else False
-            is_spec_dec = is_spec_dec1 == 1 if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
-            
-            # Cache request fields for this (session_id, step_id).
-            # Scope by step to avoid stale context leaking across decode iterations.
-            session_id = step_metadata.get("session_id", "unknown")
-            step_id = step_metadata.get("step_id")
-            if (
-                request_context is None
-                or request_context.request_id != session_id
-                or request_context.step_id != step_id
-                or not request_context.is_initialized
-            ):
-                request_context = RequestContext(session_id, step_id)
-                request_context.cache_from_mb0(
-                    prompts=prompts,
-                    hypo_ids=hypo_ids,
-                    tree_attention_mask=tree_attention_mask,
-                    kv_cache_position_ids=kv_cache_position_ids,
-                    draft_tokens=draft_tokens,
-                    prefill_length=prefill_length,
-                    is_spec_dec=is_spec_dec,
-                    need_pruning=need_pruning,
-                    num_backends=len(requested_backends),
-                )
-            
-            if is_spec_dec and not need_pruning:
-                kv_cache_position_ids = _update_kv_cache_position_ids(kv_cache_position_ids, keep_indices)
-                attention_mask_indices = keep_indices[prefill_length:] - prefill_length
-                idx = attention_mask_indices
-                tree_attention_mask = tree_attention_mask[:, idx][:, :, idx]
-
-
         # [MERGED] Use upstream's standard tensor unpacking for full-batch path
         flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
         if args_structure is not None:
@@ -1091,10 +1063,17 @@ async def iterate_rpc_inference(
         if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) and not is_spec_dec1.is_contiguous():
             is_spec_dec1 = is_spec_dec1.contiguous()
             
-        need_pruning = need_pruning1 == 1 if need_pruning1 is not None and not is_dummy(need_pruning1) else False
-        is_spec_dec = is_spec_dec1 == 1 if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
+        need_pruning = _as_python_bool(need_pruning1 == 1) if need_pruning1 is not None and not is_dummy(need_pruning1) else False
+        is_spec_dec = _as_python_bool(is_spec_dec1 == 1) if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
+        if not is_spec_dec and _as_python_bool(step_metadata.get("is_spec_dec", 0)):
+            is_spec_dec = True
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} Full-batch spec override from metadata for step_id={step_metadata.get('step_id')}"
+            )
+        if not need_pruning and _as_python_bool(step_metadata.get("need_pruning", 0)):
+            need_pruning = True
         
-        if is_spec_dec and draft_tokens.shape[0] != hidden_states.shape[0]:
+        if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
         
         # if is_spec_dec and not need_pruning:
@@ -1181,7 +1160,7 @@ async def iterate_rpc_inference(
             if can_merge_pools:
                 # Merged pools path: all blocks processed in one call
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
-                if should_split_batch(batch_size):
+                if should_split_batch(batch_size) and not is_spec_dec:
                     # Micro-batch pipeline path: split batch, process with overlap
                     import asyncio
                     from time import perf_counter as _perf_counter
@@ -1198,7 +1177,21 @@ async def iterate_rpc_inference(
                     
                     # [MBPIPE] Get next_servers from step_metadata for cross-stage streaming
                     next_servers = step_metadata.get("next_servers", None) if step_metadata else None
-                    enable_cross_stage = (cross_stage_push_fn is not None and next_servers is not None)
+                    enable_cross_stage = (
+                        cross_stage_push_fn is not None
+                        and next_servers is not None
+                        and not is_spec_dec
+                    )
+                    if (
+                        is_spec_dec
+                        and cross_stage_push_fn is not None
+                        and next_servers is not None
+                        and log_mb_detail
+                    ):
+                        logger.info(
+                            f"{MBPIPE_LOG_PREFIX} Cross-stage streaming disabled for speculative decoding "
+                            f"(preserve full spec context)"
+                        )
                     if enable_cross_stage and log_mb_detail:
                         logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled: {len(next_servers)} downstream stages")
                     
@@ -1229,7 +1222,10 @@ async def iterate_rpc_inference(
                         
                         mb_hidden = hidden_states[mb_start:mb_end].clone()
                         mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
-                        mb_tree_mask = tree_attention_mask[mb_start:mb_end] if tree_attention_mask is not None and not is_dummy(tree_attention_mask) else tree_attention_mask
+                        mb_tree_mask = _slice_batch_aligned(tree_attention_mask, mb_start, mb_end, batch_size)
+                        mb_kv_position_ids = _slice_batch_aligned(kv_cache_position_ids, mb_start, mb_end, batch_size)
+                        mb_draft_tokens = _slice_batch_aligned(draft_tokens, mb_start, mb_end, batch_size)
+                        mb_prefill_length = _slice_batch_aligned(prefill_length, mb_start, mb_end, batch_size)
                         mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
                         
                         # [MBPIPE_MULTIPLEX] GPU Memory Multiplexing Mode:
@@ -1261,9 +1257,9 @@ async def iterate_rpc_inference(
                         mb_inference_infos = tuple(
                             InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,
                                 tree_attention_mask=mb_tree_mask,
-                                kv_cache_position_ids=kv_cache_position_ids,
-                                draft_tokens=draft_tokens,
-                                prefill_length=prefill_length,
+                                kv_cache_position_ids=mb_kv_position_ids,
+                                draft_tokens=mb_draft_tokens,
+                                prefill_length=mb_prefill_length,
                                 keep_indices=mb_keep_idx,
                                 need_pruning=need_pruning,
                                 is_spec_dec=is_spec_dec,
@@ -1487,7 +1483,7 @@ async def iterate_rpc_inference(
             else:
                 # Separate pools path: process backends one by one
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
-                if should_split_batch(batch_size):
+                if should_split_batch(batch_size) and not is_spec_dec:
                     # Micro-batch pipeline path: split batch, process with overlap
                     micro_ranges = compute_micro_batch_ranges(batch_size)
                     log_microbatch_split(logger, batch_size, len(micro_ranges), "iterate_rpc_inference.separate_pools")
@@ -1503,7 +1499,16 @@ async def iterate_rpc_inference(
                     
                     # [MBPIPE] Get next_servers from step_metadata for cross-stage streaming
                     next_servers = step_metadata.get("next_servers", None) if step_metadata else None
-                    enable_cross_stage = (cross_stage_push_fn is not None and next_servers is not None)
+                    enable_cross_stage = (
+                        cross_stage_push_fn is not None
+                        and next_servers is not None
+                        and not is_spec_dec
+                    )
+                    if is_spec_dec and cross_stage_push_fn is not None and next_servers is not None:
+                        logger.info(
+                            f"{MBPIPE_LOG_PREFIX} Cross-stage streaming disabled (separate_pools) for speculative decoding "
+                            f"(preserve full spec context)"
+                        )
                     if enable_cross_stage:
                         logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled (separate_pools): {len(next_servers)} downstream stages")
                     
@@ -1518,7 +1523,10 @@ async def iterate_rpc_inference(
                         
                         mb_hidden = hidden_states[mb_start:mb_end].clone()
                         mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
-                        mb_tree_mask = tree_attention_mask[mb_start:mb_end] if tree_attention_mask is not None and not is_dummy(tree_attention_mask) else tree_attention_mask
+                        mb_tree_mask = _slice_batch_aligned(tree_attention_mask, mb_start, mb_end, batch_size)
+                        mb_kv_position_ids = _slice_batch_aligned(kv_cache_position_ids, mb_start, mb_end, batch_size)
+                        mb_draft_tokens = _slice_batch_aligned(draft_tokens, mb_start, mb_end, batch_size)
+                        mb_prefill_length = _slice_batch_aligned(prefill_length, mb_start, mb_end, batch_size)
                         mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
                         
                         mb_size = mb_end - mb_start
@@ -1528,9 +1536,9 @@ async def iterate_rpc_inference(
                             inference_info = (InferenceMetadata(
                                 uid, prefix_length, tuple(handles), active_adapter,
                                 tree_attention_mask=mb_tree_mask,
-                                kv_cache_position_ids=kv_cache_position_ids,
-                                draft_tokens=draft_tokens,
-                                prefill_length=prefill_length,
+                                kv_cache_position_ids=mb_kv_position_ids,
+                                draft_tokens=mb_draft_tokens,
+                                prefill_length=mb_prefill_length,
                                 keep_indices=mb_keep_idx,
                                 need_pruning=need_pruning,
                                 is_spec_dec=is_spec_dec,

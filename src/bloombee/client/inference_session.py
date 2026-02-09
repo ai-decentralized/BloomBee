@@ -144,6 +144,31 @@ class _ServerInferenceSession:
         else:
             inputs = inputs  # No need to pass prefix further
 
+        def _infer_batch_dim(value) -> int:
+            if value is None or is_dummy(value):
+                return 0
+            if torch.is_tensor(value):
+                if value.ndim == 0:
+                    return 1
+                return int(value.shape[0]) if value.shape else 1
+            try:
+                return int(len(value))
+            except Exception:
+                return 0
+
+        # For speculative decoding, hidden states may be pruned/compressed on some steps.
+        # Derive a stable logical full-batch size from all request tensors and pass it
+        # explicitly so server-side KV allocation stays consistent across the session.
+        logical_full_batch_size = max(
+            _infer_batch_dim(inputs),
+            _infer_batch_dim(hypo_ids),
+            _infer_batch_dim(keep_indices),
+            _infer_batch_dim(prefill_length),
+            _infer_batch_dim(draft_tokens),
+            _infer_batch_dim(tree_attention_mask),
+            1,
+        )
+
         # serialize inputs and put them into the queue
         
         input_tensors, args_structure = pack_args_kwargs(
@@ -161,16 +186,24 @@ class _ServerInferenceSession:
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
+        # Explicitly expose speculative-decoding mode in metadata so the server
+        # can make safe KV allocation decisions before first step processing.
+        request_metadata["is_spec_dec"] = 1 if is_spec_dec else 0
+        request_metadata["full_batch_size"] = int(logical_full_batch_size)
+        request_metadata["micro_batch_size"] = int(inputs.shape[0]) if inputs.ndim >= 1 else 1
         if is_spec_dec:
             request_metadata["start_from_position"] = self._position + n_input_tokens
         else:
             if self._position is not None:
                 request_metadata["start_from_position"] = self._position
         # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
-        if self.config.use_server_to_server:
+        # Speculative decoding keeps strict full-batch semantics; avoid cross-stage push.
+        if self.config.use_server_to_server and not is_spec_dec:
             next_servers = self._collect_next_servers()
             if next_servers:
                 request_metadata["next_servers"] = next_servers
+        elif is_spec_dec:
+            request_metadata["disable_cross_stage_push"] = 1
 
         request_metadata["args_structure"] = args_structure
 
@@ -523,7 +556,7 @@ class InferenceSession:
     
     def _restore_hidden_states(
         self,
-        flattened_hidden_states: torch.Tensor,  # [N_total_valid, hidden_size]
+        flattened_hidden_states: torch.Tensor,  # [N_total_valid, H] or [B, L_keep/full, H]
         keep_indices: torch.Tensor,  # [B, max_keep_len]，padding 为 -1
         original_seq_len: int,  # 原始序列长度
     ) -> torch.Tensor:
@@ -531,37 +564,89 @@ class InferenceSession:
         将铺平的 hidden states 还原为 [B, original_seq_len, hidden_size]
         
         Args:
-            flattened_hidden_states: [N_total_valid, hidden_size] 铺平后的有效 hidden states
+            flattened_hidden_states:
+                - [N_total_valid, hidden_size] 铺平后的有效 hidden states
+                - [B, max_keep_len, hidden_size] 每 batch 的压缩 hidden states
+                - [B, original_seq_len, hidden_size] 已经是完整长度（将原样返回）
             keep_indices: [B, max_keep_len] 每个 batch 的 keep indices，padding 为 -1
             original_seq_len: 原始序列长度
         
         Returns:
             restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
         """
+        if keep_indices is None:
+            return flattened_hidden_states
+
+        if keep_indices.ndim != 2:
+            raise RuntimeError(
+                f"keep_indices must be 2D [B, L_keep], got shape={tuple(keep_indices.shape)}"
+            )
+
         batch_size, max_keep_len = keep_indices.shape
         hidden_size = flattened_hidden_states.shape[-1]
         device = flattened_hidden_states.device
         dtype = flattened_hidden_states.dtype
-        
-        # 创建输出 tensor，用 0 填充
-        restored_hidden_states = torch.zeros(
-            batch_size, original_seq_len, hidden_size,
-            dtype=dtype, device=device
-        )
-        
-        # 创建有效 mask: [B, max_keep_len]
-        valid_mask = keep_indices >= 0
-        
-        # 创建 batch 索引: [B, max_keep_len]
+
+        # only keep legal destination positions; ignore invalid/out-of-range safely
+        valid_mask = (keep_indices >= 0) & (keep_indices < original_seq_len)
         batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
-        
-        # 取出有效部分的索引
-        valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
-        valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
-        
-        # 写入还原位置
-        restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flattened_hidden_states
-        
+        valid_batch_idx = batch_idx[valid_mask]
+        valid_seq_idx = keep_indices[valid_mask].to(torch.int64)
+        n_valid = int(valid_mask.sum().item())
+
+        if flattened_hidden_states.ndim == 3:
+            if flattened_hidden_states.shape[0] != batch_size:
+                # Spec last-block path may return packed valid states as [1, N_valid, H].
+                # Treat it as flattened valid tokens if token count matches n_valid.
+                if flattened_hidden_states.shape[0] == 1 and batch_size > 1:
+                    packed_valid = flattened_hidden_states.squeeze(0)
+                    if packed_valid.shape[0] != n_valid:
+                        raise RuntimeError(
+                            "restore_hidden_states packed valid token count mismatch: "
+                            f"hidden_states.shape={tuple(flattened_hidden_states.shape)}, "
+                            f"expected_valid={n_valid}, "
+                            f"keep_indices.shape={tuple(keep_indices.shape)}"
+                        )
+                    valid_hidden_states = packed_valid
+                else:
+                    raise RuntimeError(
+                        "restore_hidden_states batch mismatch: "
+                        f"hidden_states.shape={tuple(flattened_hidden_states.shape)}, "
+                        f"keep_indices.shape={tuple(keep_indices.shape)}"
+                    )
+            else:
+                # already full-length [B, original_seq_len, H], no restore needed
+                if flattened_hidden_states.shape[1] == original_seq_len:
+                    return flattened_hidden_states
+
+                if flattened_hidden_states.shape[1] != max_keep_len:
+                    raise RuntimeError(
+                        "restore_hidden_states seq mismatch: "
+                        f"hidden_states.shape={tuple(flattened_hidden_states.shape)}, "
+                        f"keep_indices.shape={tuple(keep_indices.shape)}, "
+                        f"original_seq_len={original_seq_len}"
+                    )
+                valid_hidden_states = flattened_hidden_states[valid_mask]
+
+        elif flattened_hidden_states.ndim == 2:
+            valid_hidden_states = flattened_hidden_states
+            if valid_hidden_states.shape[0] != n_valid:
+                raise RuntimeError(
+                    "restore_hidden_states valid token count mismatch: "
+                    f"hidden_states.shape={tuple(valid_hidden_states.shape)}, "
+                    f"expected_valid={n_valid}, "
+                    f"keep_indices.shape={tuple(keep_indices.shape)}"
+                )
+        else:
+            raise RuntimeError(
+                "restore_hidden_states expects hidden_states to be 2D or 3D, "
+                f"got shape={tuple(flattened_hidden_states.shape)}"
+            )
+
+        restored_hidden_states = torch.zeros(
+            batch_size, original_seq_len, hidden_size, dtype=dtype, device=device
+        )
+        restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = valid_hidden_states
         return restored_hidden_states
     
     def _update_sequence(self, server_idx: int, block_idx: int, attempt_no: int) -> int:
