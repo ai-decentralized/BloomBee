@@ -7,7 +7,6 @@ from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
 import os
 
 import torch
-from hivemind.compression.serialization import deserialize_torch_tensor, serialize_torch_tensor
 from hivemind.moe.expert_uid import ExpertUID
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
@@ -18,6 +17,7 @@ from bloombee.server.backend import TransformerBackend
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
+from bloombee.utils.lossless_transport import deserialize_torch_tensor, serialize_torch_tensor
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
@@ -97,6 +97,13 @@ def _should_log_mb_detail(step_metadata: Optional[Dict[str, Any]]) -> bool:
 def _to_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
+    except Exception:
+        return default
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
     except Exception:
         return default
 
@@ -401,6 +408,9 @@ async def iterate_rpc_inference(
 
     async for request, step_metadata in input_iterator:
         step_receive_time = perf_counter()
+        queue_wait_ms = _to_float(step_metadata.get("_queue_wait_ms"), 0.0)
+        queue_source = str(step_metadata.get("_queue_source", "unknown"))
+        step_id_for_log = step_metadata.get("step_id", "unknown")
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
             # assert (
@@ -416,6 +426,8 @@ async def iterate_rpc_inference(
             import time as _time
             receive_timestamp_us = int(_time.time() * 1_000_000)  # Absolute timestamp for correlation
             log_mb_detail = _should_log_mb_detail(step_metadata)
+            queue_wait_ms = _to_float(step_metadata.get("_queue_wait_ms"), 0.0)
+            queue_source = str(step_metadata.get("_queue_source", "unknown"))
             
             mb_idx = step_metadata.get("mb_idx", 0)
             expected_num_mb = step_metadata.get("expected_num_mb", 1)
@@ -498,7 +510,9 @@ async def iterate_rpc_inference(
             logger.debug(f"[MB_DEBUG] step_id={step_id}, session_id={session_id}")
             
             # Deserialize only the 2 tensors from micro-batch push
+            mb_deserialize_start = perf_counter()
             flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+            mb_deserialize_ms = (perf_counter() - mb_deserialize_start) * 1000.0
             
             # [MB_DEBUG] Log deserialized tensors
             logger.debug(f"[MB_DEBUG] Deserialized {len(flat_tensors)} tensors from request")
@@ -826,10 +840,31 @@ async def iterate_rpc_inference(
                     'results': {},  # mb_idx -> (hidden_states, keep_indices, offset)
                     'full_batch_size': full_batch_size,
                     'step_metadata': step_metadata.copy(),
+                    'step_start_time': step_receive_time,
+                    'queue_wait_ms_sum': 0.0,
+                    'queue_wait_pre_ms': 0.0,
+                    'queue_wait_inter_ms': 0.0,
+                    'deserialize_ms_sum': 0.0,
+                    'compute_ms_sum': 0.0,
+                    'queue_source_counts': {},
                 }
             
             accum = iterate_rpc_inference._mb_accumulators[mb_accum_key]
             accum['results'][mb_idx] = (hidden_states.clone(), keep_indices, mb_offset)
+            accum['queue_wait_ms_sum'] += queue_wait_ms
+            if mb_idx == 0:
+                accum['queue_wait_pre_ms'] = queue_wait_ms
+            else:
+                accum['queue_wait_inter_ms'] += queue_wait_ms
+            accum['deserialize_ms_sum'] += mb_deserialize_ms
+            accum['compute_ms_sum'] += process_time_ms
+            accum['queue_source_counts'][queue_source] = accum['queue_source_counts'].get(queue_source, 0) + 1
+            if log_mb_detail:
+                logger.info(
+                    f"[STEP_TIMING_MB] step_id={step_id} mb_idx={mb_idx} "
+                    f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
+                    f"deserialize={mb_deserialize_ms:.2f}ms compute={process_time_ms:.2f}ms"
+                )
             
             if log_mb_detail:
                 logger.info(
@@ -1002,9 +1037,6 @@ async def iterate_rpc_inference(
                     # Cleanup overlap tracking data
                     del iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]
                 
-                # Cleanup accumulator
-                del iterate_rpc_inference._mb_accumulators[mb_accum_key]
-                
                 # Now serialize and yield the merged result
                 if merged_keep_indices is not None:
                     if not torch.is_tensor(merged_keep_indices):
@@ -1019,6 +1051,7 @@ async def iterate_rpc_inference(
                     )
                 
                 need_pruning_next = torch.tensor(0)
+                merge_serialize_start = perf_counter()
                 output_tensors = [
                     serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
                     for result, proto in zip(
@@ -1026,6 +1059,37 @@ async def iterate_rpc_inference(
                         nested_flatten(requested_backends[-1].outputs_schema)
                     )
                 ]
+                merge_serialize_ms = (perf_counter() - merge_serialize_start) * 1000.0
+                merge_total_ms = (perf_counter() - accum.get('step_start_time', step_receive_time)) * 1000.0
+                queue_wait_sum_ms = float(accum.get('queue_wait_ms_sum', 0.0))
+                queue_wait_pre_ms = float(accum.get('queue_wait_pre_ms', 0.0))
+                queue_wait_inter_ms = float(accum.get('queue_wait_inter_ms', 0.0))
+                deserialize_sum_ms = float(accum.get('deserialize_ms_sum', 0.0))
+                compute_sum_ms = float(accum.get('compute_ms_sum', 0.0))
+                merge_residual_ms = merge_total_ms - (
+                    deserialize_sum_ms + compute_sum_ms + merge_serialize_ms
+                )
+                total_with_pre_wait_ms = merge_total_ms + queue_wait_pre_ms
+                queue_source_counts = accum.get("queue_source_counts", {})
+                queue_source_stats = ",".join(
+                    f"{k}:{v}" for k, v in sorted(queue_source_counts.items())
+                ) or "unknown:0"
+                logger.info(
+                    f"[STEP_TIMING_BREAKDOWN_MB] step_id={step_id} mode=micro_batch "
+                    f"expected_mb={accum.get('expected', 0)} recv_mb={len(accum.get('results', {}))} "
+                    f"queue_wait_sum={queue_wait_sum_ms:.2f}ms "
+                    f"deserialize_sum={deserialize_sum_ms:.2f}ms "
+                    f"compute_sum={compute_sum_ms:.2f}ms "
+                    f"serialize={merge_serialize_ms:.2f}ms "
+                    f"residual={merge_residual_ms:.2f}ms "
+                    f"total={merge_total_ms:.2f}ms "
+                    f"queue_sources={queue_source_stats} "
+                    f"queue_wait_pre={queue_wait_pre_ms:.2f}ms "
+                    f"queue_wait_inter={queue_wait_inter_ms:.2f}ms "
+                    f"total_with_pre_wait={total_with_pre_wait_ms:.2f}ms"
+                )
+                # Cleanup accumulator
+                del iterate_rpc_inference._mb_accumulators[mb_accum_key]
                 
                 can_push = True  # Micro-batch results don't have prompts
                 yield output_tensors, can_push, accum['step_metadata']
@@ -1035,7 +1099,9 @@ async def iterate_rpc_inference(
             continue
 
         # [MERGED] Use upstream's standard tensor unpacking for full-batch path
+        deserialize_start = perf_counter()
         flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+        deserialize_time = (perf_counter() - deserialize_start) * 1000.0
         if args_structure is not None:
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
@@ -1094,15 +1160,11 @@ async def iterate_rpc_inference(
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
         
-        # Add deserialize timing
-        deserialize_start = perf_counter()
-        deserialize_end = perf_counter()
-        deserialize_time = (deserialize_end - deserialize_start) * 1000  # ms
-        step_num = step_metadata.get("step", 0)
-        
         # Add Cross-GPU Transfer Latency measurement
         cross_gpu_start_time = perf_counter()
         start_compute_time = perf_counter()  # Initialize compute time tracking
+        compute_time = 0.0
+        execution_mode = "unknown"
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
@@ -1161,6 +1223,7 @@ async def iterate_rpc_inference(
                 # Merged pools path: all blocks processed in one call
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
                 if should_split_batch(batch_size) and not is_spec_dec:
+                    execution_mode = "merged_microbatch"
                     # Micro-batch pipeline path: split batch, process with overlap
                     import asyncio
                     from time import perf_counter as _perf_counter
@@ -1470,6 +1533,7 @@ async def iterate_rpc_inference(
                     log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.merged_pools")
                     
                 else:
+                    execution_mode = "merged_fullbatch"
                     # Legacy path: process entire batch at once
                     inference_infos = tuple(
                         InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec)
@@ -1484,6 +1548,7 @@ async def iterate_rpc_inference(
                 # Separate pools path: process backends one by one
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
                 if should_split_batch(batch_size) and not is_spec_dec:
+                    execution_mode = "separate_microbatch"
                     # Micro-batch pipeline path: split batch, process with overlap
                     micro_ranges = compute_micro_batch_ranges(batch_size)
                     log_microbatch_split(logger, batch_size, len(micro_ranges), "iterate_rpc_inference.separate_pools")
@@ -1622,6 +1687,7 @@ async def iterate_rpc_inference(
                     log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.separate_pools")
                     
                 else:
+                    execution_mode = "separate_fullbatch"
                     # Legacy path: process entire batch through all backends sequentially
                     # Track S1->S2 transfer latency specifically
                     s1_to_s2_transfer_times = []
@@ -1718,6 +1784,17 @@ async def iterate_rpc_inference(
         # Calculate total step time
         step_end_time = perf_counter()
         step_total_time = (step_end_time - step_receive_time) * 1000  # ms
+        step_residual_ms = step_total_time - (deserialize_time + compute_time + serialize_time)
+        step_total_with_queue_ms = step_total_time + queue_wait_ms
+        logger.info(
+            f"[STEP_TIMING_BREAKDOWN] step_id={step_id_for_log} mode={execution_mode} "
+            f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
+            f"deserialize={deserialize_time:.2f}ms compute={compute_time:.2f}ms "
+            f"serialize={serialize_time:.2f}ms residual={step_residual_ms:.2f}ms "
+            f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
+            f"cross_gpu_window={cross_gpu_receive_time:.2f}ms "
+            f"batch={batch_size} seq_inc={length_increment} is_spec_dec={int(bool(is_spec_dec))}"
+        )
         
         # [MBPIPE] Record stage timing for cross-stage overlap decisions
         try:

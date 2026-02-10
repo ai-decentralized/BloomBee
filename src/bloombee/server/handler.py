@@ -19,11 +19,8 @@ from hivemind import (
     MSGPackSerializer,
     P2PContext,
     PeerID,
-    deserialize_tensor_stream,
-    deserialize_torch_tensor,
     nested_flatten,
     nested_pack,
-    serialize_torch_tensor,
 )
 from hivemind.moe.server.connection_handler import ConnectionHandler
 from hivemind.p2p.p2p_daemon import DEFAULT_MAX_MSG_SIZE
@@ -40,6 +37,7 @@ from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backw
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.convert_block import QuantType
+from bloombee.utils.lossless_transport import deserialize_tensor_stream, deserialize_torch_tensor, serialize_torch_tensor
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -255,8 +253,18 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._enable_immediate_mb_queue = os.environ.get(
             "BLOOMBEE_ENABLE_IMMEDIATE_MB_QUEUE", "1"
         ) == "1"
+        # Optional compatibility mode: also write MB payloads to filesystem in immediate mode.
+        # Disabled by default to reduce first-micro-batch latency.
+        self._store_mb_files_in_immediate = os.environ.get(
+            "BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE", "0"
+        ) == "1"
         
         logger.info(f"{MBPIPE_LOG_PREFIX} Immediate micro-batch queuing: {'ENABLED' if self._enable_immediate_mb_queue else 'disabled'}")
+        logger.info(
+            f"{MBPIPE_LOG_PREFIX} Immediate-mode file store: "
+            f"{'ENABLED' if self._store_mb_files_in_immediate else 'disabled'} "
+            f"(set BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE=1 for legacy behavior)"
+        )
         
         # [MBPIPE] Streaming decode: process micro-batches as they arrive for cross-stage overlap
         # Key: (session_id, step_id) -> StreamingDecodeState
@@ -697,6 +705,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                         args_structure=args_structure,
                         cross_stage_push_fn=cross_stage_push_microbatch,  # [MBPIPE] Cross-stage streaming (currently disabled)
                     ):
+                        handler_step_start = perf_counter()
+                        step_id_for_log = (
+                            step_metadata.get("step_id", "unknown")
+                            if isinstance(step_metadata, dict)
+                            else "unknown"
+                        )
                         # offload_logger.info(f" Inference step {step_}: can_push={can_push}")
                         # print('=================================================   server rpc_inference step ',step_) ###
                         # print_time_now('')
@@ -737,11 +751,32 @@ class TransformerConnectionHandler(ConnectionHandler):
                                 background_tasks.add(task)  # Keep reference until it is done to save it from GC
                                 task.add_done_callback(background_tasks.discard)
                         start_ExpertResponse_time=perf_counter() ###
-                        push_time.append(start_ExpertResponse_time-can_push_case_time) ###
+                        push_schedule_ms = (start_ExpertResponse_time - can_push_case_time) * 1000.0
+                        push_time.append(push_schedule_ms) ###
                         # print('current step push outputs task prepare time ', start_ExpertResponse_time-can_push_case_time) ###
                         # print_time_now('')
                         yield runtime_pb2.ExpertResponse(tensors=output_tensors)
                         end_ExpertResponse_time=perf_counter() ###
+                        response_emit_ms = (end_ExpertResponse_time - start_ExpertResponse_time) * 1000.0
+                        handler_step_total_ms = (end_ExpertResponse_time - handler_step_start) * 1000.0
+                        queue_wait_ms = (
+                            float(step_metadata.get("_queue_wait_ms", 0.0))
+                            if isinstance(step_metadata, dict)
+                            else 0.0
+                        )
+                        queue_source = (
+                            str(step_metadata.get("_queue_source", "unknown"))
+                            if isinstance(step_metadata, dict)
+                            else "unknown"
+                        )
+                        logger.info(
+                            f"[HANDLER_STEP_TIMING] step_id={step_id_for_log} "
+                            f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
+                            f"push_schedule={push_schedule_ms:.2f}ms "
+                            f"response_emit={response_emit_ms:.2f}ms "
+                            f"handler_total={handler_step_total_ms:.2f}ms "
+                            f"can_push={int(bool(can_push))}"
+                        )
                         # print('runtime_pb2.ExpertResponse push outputs respond time', end_ExpertResponse_time-start_ExpertResponse_time) ###
                         # print_time_now('')
                         
@@ -900,11 +935,23 @@ class TransformerConnectionHandler(ConnectionHandler):
         n_pushes = n_late_pushes = 0
         request = first_request
         anext_task = get_push_task = None
+        queue_wait_ms = 0.0
+        queue_source = "initial"
         try:
             start_iterate_inference_steps_time = perf_counter()
             
             with self._managed_session(session_id) if session_id is not None else contextlib.nullcontext():
                 while request is not None:
+                    # Start fetching the NEXT request early so network/queue wait can overlap with
+                    # current step processing in iterate_rpc_inference.
+                    if anext_task is None:
+                        anext_task = asyncio.create_task(anext(requests))
+                    if get_push_task is None:
+                        if session_id is not None:
+                            get_push_task = asyncio.create_task(self._get_from_session_queue(session_id))
+                        else:
+                            get_push_task = asyncio.create_task(asyncio.Event().wait())  # Dummy never-ending task
+
                     # [MBPIPE] Check if this is a micro-batch queue item (dict with type="micro_batch")
                     if is_microbatch_queue_item(request):
                         # Yield micro-batch directly with type marker
@@ -946,6 +993,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                             mb_metadata["size"] = mb_item.get("size", 1)
                             mb_metadata["full_batch_size"] = mb_item.get("full_batch_size", 1)
                             mb_metadata["pushed"] = True
+                            mb_metadata["_queue_wait_ms"] = float(queue_wait_ms)
+                            mb_metadata["_queue_source"] = queue_source
                             
                             logger.debug(
                                 f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
@@ -987,6 +1036,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                             skip_direct_request = True
 
                         if (not skip_direct_request) and (step_id is None or step_id not in processed_step_ids):
+                            metadata["_queue_wait_ms"] = float(queue_wait_ms)
+                            metadata["_queue_source"] = queue_source
                             yield request, metadata
                             if step_id is not None:
                                 processed_step_ids.add(step_id)
@@ -1004,24 +1055,22 @@ class TransformerConnectionHandler(ConnectionHandler):
                         # Empty or None request - break out
                         break
                     
-                    # Wait for the next request, coming either from the `requests` iterator or `push_queue`
-                    if anext_task is None:
-                        anext_task = asyncio.create_task(anext(requests))
-                    if get_push_task is None:
-                        if session_id is not None:
-                            get_push_task = asyncio.create_task(self._get_from_session_queue(session_id))
-                        else:
-                            get_push_task = asyncio.create_task(asyncio.Event().wait())  # Dummy never-ending task
+                    # Wait for next request, coming either from stream or push queue.
+                    wait_start_time = perf_counter()
                     done, _ = await asyncio.wait(
                         [anext_task, get_push_task], timeout=self.step_timeout, return_when=asyncio.FIRST_COMPLETED
                     )
+                    queue_wait_ms = (perf_counter() - wait_start_time) * 1000.0
                     
-                    if anext_task in done:
-                        request = await anext_task
-                        anext_task = None
-                    elif get_push_task in done:
+                    # Prefer push_queue when both are ready to keep micro-batch pipeline flowing.
+                    if get_push_task in done:
                         request = await get_push_task
                         get_push_task = None
+                        queue_source = "push_queue"
+                    elif anext_task in done:
+                        request = await anext_task
+                        anext_task = None
+                        queue_source = "stream"
                     else:
                         self._log_request("rpc_inference.step", requested_uids, context, warning="timed out")
                         anext_task.cancel()
@@ -1029,6 +1078,10 @@ class TransformerConnectionHandler(ConnectionHandler):
                         return
         except Exception:
             raise
+        finally:
+            for pending_task in (anext_task, get_push_task):
+                if pending_task is not None and not pending_task.done():
+                    pending_task.cancel()
 
 
     async def rpc_push(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
@@ -1116,10 +1169,14 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"start_from_position={start_from_position}, received={received_count}/{expected_num_mb}"
         )
         
-        # Store to file for cross-handler communication (needed even with immediate queue)
         acc_key = f"{session_id}|{step_id}"
-        tensor_bytes = [t.SerializeToString() for t in request.tensors]
-        file_received_count = _store_microbatch_to_file(acc_key, mb_idx, tensor_bytes, metadata.copy())
+        file_received_count = 0
+        wrote_file = False
+        if (not self._enable_immediate_mb_queue) or self._store_mb_files_in_immediate:
+            # Legacy fallback: keep file-based storage for reconstruction/diagnostics.
+            tensor_bytes = [t.SerializeToString() for t in request.tensors]
+            file_received_count = _store_microbatch_to_file(acc_key, mb_idx, tensor_bytes, metadata.copy())
+            wrote_file = True
         
         if self._enable_immediate_mb_queue:
             # ========== IMMEDIATE QUEUING PATH (Step A) ==========
@@ -1145,13 +1202,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"(received={received_count}/{expected_num_mb})"
             )
             
-            # Cleanup file storage when all micro-batches received
-            if file_received_count >= expected_num_mb:
-                logger.info(
-                    f"{MBPIPE_LOG_PREFIX} rpc_push: all {expected_num_mb} micro-batches queued, "
-                    f"cleaning up file storage"
-                )
-                _cleanup_microbatch_files(acc_key, expected_num_mb)
+            # Cleanup tracking when all micro-batches for this step are queued.
+            if received_count >= expected_num_mb:
+                if wrote_file:
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} rpc_push: all {expected_num_mb} micro-batches queued, "
+                        f"cleaning up file storage"
+                    )
+                    _cleanup_microbatch_files(acc_key, expected_num_mb)
                 # Cleanup tracking data
                 self._mb_queues.pop(mb_key, None)
                 self._mb_expected.pop(mb_key, None)
@@ -1480,16 +1538,34 @@ class TransformerConnectionHandler(ConnectionHandler):
             if not hasattr(self, '_push_semaphore'):
                 self._push_semaphore = asyncio.Semaphore(4)
             
-            # Acquire semaphore before queueing (non-blocking check for logging)
-            sem_wait_start = perf_counter()
-            await self._push_semaphore.acquire()
-            sem_wait_time = (perf_counter() - sem_wait_start) * 1000
-            if sem_wait_time > 1.0:  # Only log if we had to wait
-                logger.info(f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB{mb_idx} waited {sem_wait_time:.1f}ms for push slot")
+            # Prioritize MB0 delivery to reduce per-step startup bubble on downstream stage.
+            mb0_bypass_enabled = os.environ.get("BLOOMBEE_MB0_SEMAPHORE_BYPASS", "1") == "1"
+            bypass_semaphore = mb0_bypass_enabled and int(mb_idx) == 0
+            acquired_semaphore = False
+            if not bypass_semaphore:
+                # Acquire semaphore before queueing (non-blocking check for logging)
+                sem_wait_start = perf_counter()
+                await self._push_semaphore.acquire()
+                acquired_semaphore = True
+                sem_wait_time = (perf_counter() - sem_wait_start) * 1000
+                if sem_wait_time > 1.0:  # Only log if we had to wait
+                    logger.info(f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB{mb_idx} waited {sem_wait_time:.1f}ms for push slot")
+            else:
+                logger.debug(
+                    f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB0 bypassed semaphore "
+                    f"(set BLOOMBEE_MB0_SEMAPHORE_BYPASS=0 to disable)"
+                )
             
             # Create task for background sending - don't await
             send_task = asyncio.create_task(
-                self._do_rpc_push_async(stub, rpc_request, mb_idx, push_start_time, next_peer_id_str)
+                self._do_rpc_push_async(
+                    stub,
+                    rpc_request,
+                    mb_idx,
+                    push_start_time,
+                    next_peer_id_str,
+                    release_semaphore=acquired_semaphore,
+                )
             )
             
             # Track task to prevent garbage collection
@@ -1514,6 +1590,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         mb_idx: int,
         queue_start_time: float,
         peer_id: str,
+        *,
+        release_semaphore: bool = True,
     ) -> None:
         """
         [ASYNC_PUSH] Actually perform the RPC push in background.
@@ -1553,7 +1631,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
         finally:
             # [PHASE2] Release semaphore to allow next push
-            if hasattr(self, '_push_semaphore'):
+            if release_semaphore and hasattr(self, '_push_semaphore'):
                 self._push_semaphore.release()
 
     async def rpc_forward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:

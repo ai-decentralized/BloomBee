@@ -66,7 +66,8 @@ setup(
         "Dijkstar>=2.6.0",
         "numpy<2",
         "attrs",
-        "nvidia-ml-py"
+        "nvidia-ml-py",
+        "zstandard>=0.22.0",
     ],  
     extras_require={  
         "dev": [  
