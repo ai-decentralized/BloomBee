@@ -43,7 +43,7 @@ def main():
     pipe_recv, pipe_send = mp.Pipe(duplex=False)
     processes = [mp.Process(target=benchmark_inference, args=(i, args, pipe_send)) for i in range(args.n_processes)]
     for proc in processes:
-        proc.start()
+        proc.start()  
     for proc in processes:
         proc.join()
 
