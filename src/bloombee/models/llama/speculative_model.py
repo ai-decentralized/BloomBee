@@ -53,7 +53,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # Keep the argument for API compatibility, but ignore runtime overrides.
         if "session_max_length" in model_kwargs:
             model_kwargs.pop("session_max_length", None)
-        session_max_length = 2048
+        session_max_length = 512
         logger.info("Speculative session_max_length=%s (hardcoded)", session_max_length)
 
         # Use inference session for proper distributed caching

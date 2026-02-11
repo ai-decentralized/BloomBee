@@ -126,7 +126,7 @@ class _ServerInferenceSession:
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
         if is_spec_dec:
-            n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids.numel()
+            n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
         else:
             n_input_tokens = inputs.shape[1]
         # print('client step() n_input_tokens', n_input_tokens)
@@ -456,7 +456,7 @@ class InferenceSession:
             batch_size = inputs.shape[0] if inputs.ndim >= 1 else 1
             mbpipe_log_path_entry(logger, "client.InferenceSession.step", batch_size=batch_size)
 
-        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids.numel()
+        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
         if self._position + n_input_tokens > self._max_length:
             raise ValueError(
                 f"Maximum length exceeded: prefix {self._position} + current {n_input_tokens} exceeds pre-allocated maximum {self._max_length}"
