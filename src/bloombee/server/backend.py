@@ -316,7 +316,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             f"batch_offset={inference_info.batch_offset}, "
                             f"micro_batch_size={inference_info.micro_batch_size}, "
                             f"full_batch_size={inference_info.full_batch_size}")
-                if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
+                kv_pos_tokens = 0
+                if kv_cache_position_ids is not None:
+                    if kv_cache_position_ids.ndim >= 2:
+                        kv_pos_tokens = int(kv_cache_position_ids[0].numel())
+                    else:
+                        kv_pos_tokens = int(kv_cache_position_ids.numel())
+                if kv_pos_tokens > 0:
                     # [Speculative Decoding path] Reorder cache based on position IDs
                     # 1. Get cache for reorder
                     k_pkv_old, v_pkv_old, need_reorder = self.cache_manager.select_cache_for_reorder(

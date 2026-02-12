@@ -121,6 +121,33 @@ def _as_python_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _effective_token_increment(
+    hidden_states: torch.Tensor,
+    kv_cache_position_ids: Any,
+    is_spec_dec: Any,
+) -> int:
+    """
+    Compute logical token increment for session position accounting.
+    For speculative decoding, align with client-side logic:
+    use kv_cache_position_ids[0].numel() when available.
+    """
+    default_inc = int(hidden_states.shape[1]) if torch.is_tensor(hidden_states) and hidden_states.ndim >= 2 else 0
+    if not _as_python_bool(is_spec_dec):
+        return default_inc
+    if kv_cache_position_ids is None or is_dummy(kv_cache_position_ids):
+        return default_inc
+    if not torch.is_tensor(kv_cache_position_ids):
+        try:
+            kv_cache_position_ids = torch.as_tensor(kv_cache_position_ids)
+        except Exception:
+            return default_inc
+    if kv_cache_position_ids.numel() == 0:
+        return 0
+    if kv_cache_position_ids.ndim >= 2:
+        return int(kv_cache_position_ids[0].numel())
+    return int(kv_cache_position_ids.numel())
+
+
 def _slice_batch_aligned(
     value: Any,
     mb_start: int,
@@ -628,6 +655,7 @@ async def iterate_rpc_inference(
             # For micro-batch processing
             batch_size = mb_size
             length_increment = hidden_states.shape[1]
+            token_increment = _effective_token_increment(hidden_states, kv_cache_position_ids, is_spec_dec)
             
             # Cast to backend dtype
             hidden_states = hidden_states.to(requested_backends[0].dtype)
@@ -847,9 +875,16 @@ async def iterate_rpc_inference(
                     'deserialize_ms_sum': 0.0,
                     'compute_ms_sum': 0.0,
                     'queue_source_counts': {},
+                    'token_increment': int(token_increment),
                 }
             
             accum = iterate_rpc_inference._mb_accumulators[mb_accum_key]
+            if int(accum.get('token_increment', token_increment)) != int(token_increment):
+                logger.warning(
+                    f"{MBPIPE_LOG_PREFIX} token_increment mismatch within step_id={step_id}: "
+                    f"accum={accum.get('token_increment')} current={token_increment}, using max()"
+                )
+                accum['token_increment'] = max(int(accum.get('token_increment', 0)), int(token_increment))
             accum['results'][mb_idx] = (hidden_states.clone(), keep_indices, mb_offset)
             accum['queue_wait_ms_sum'] += queue_wait_ms
             if mb_idx == 0:
@@ -1093,7 +1128,7 @@ async def iterate_rpc_inference(
                 
                 can_push = True  # Micro-batch results don't have prompts
                 yield output_tensors, can_push, accum['step_metadata']
-                prefix_length += length_increment
+                prefix_length += int(accum.get('token_increment', length_increment))
             
             # Continue to wait for more micro-batches (don't process normal path)
             continue
@@ -1138,6 +1173,7 @@ async def iterate_rpc_inference(
             )
         if not need_pruning and _as_python_bool(step_metadata.get("need_pruning", 0)):
             need_pruning = True
+        token_increment = _effective_token_increment(hidden_states, kv_cache_position_ids, is_spec_dec)
         
         if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
@@ -1178,9 +1214,9 @@ async def iterate_rpc_inference(
         if not (len(requested_backends) == len(prompts)):
             raise ValueError(f"Received {len(prompts)} prompts for {len(requested_backends)} backends")
 
-        if prefix_length + length_increment > max_length:
+        if prefix_length + token_increment > max_length:
             raise ValueError(
-                f"Maximum length exceeded: prefix {prefix_length} + current {length_increment}"
+                f"Maximum length exceeded: prefix {prefix_length} + current {token_increment}"
                 f" exceeds pre-allocated maximum {max_length}"
             )
 
@@ -1789,12 +1825,12 @@ async def iterate_rpc_inference(
         logger.info(
             f"[STEP_TIMING_BREAKDOWN] step_id={step_id_for_log} mode={execution_mode} "
             f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
-            f"deserialize={deserialize_time:.2f}ms compute={compute_time:.2f}ms "
-            f"serialize={serialize_time:.2f}ms residual={step_residual_ms:.2f}ms "
-            f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
-            f"cross_gpu_window={cross_gpu_receive_time:.2f}ms "
-            f"batch={batch_size} seq_inc={length_increment} is_spec_dec={int(bool(is_spec_dec))}"
-        )
+                f"deserialize={deserialize_time:.2f}ms compute={compute_time:.2f}ms "
+                f"serialize={serialize_time:.2f}ms residual={step_residual_ms:.2f}ms "
+                f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
+                f"cross_gpu_window={cross_gpu_receive_time:.2f}ms "
+                f"batch={batch_size} seq_inc={token_increment} raw_seq={length_increment} is_spec_dec={int(bool(is_spec_dec))}"
+            )
         
         # [MBPIPE] Record stage timing for cross-stage overlap decisions
         try:
@@ -1819,7 +1855,7 @@ async def iterate_rpc_inference(
         yield output_tensors, can_push, step_metadata
         # print('output_tensors ',output_tensors)
         # prepare for next step
-        prefix_length += length_increment
+        prefix_length += token_increment
 
     end_iterate_rpc_infer_time = perf_counter()#######
     # print('iterate (all steps) rpc infer time cost (sec): ', end_iterate_rpc_infer_time - start_iterate_rpc_infer_time)########

@@ -1134,7 +1134,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         expected_num_mb = metadata.get("total_micro_batches")
         if expected_num_mb is None:
             micro_batch_size_config = get_micro_batch_size()
-            expected_num_mb = (full_batch_size + micro_batch_size_config - 1) // micro_batch_size_config
+            if micro_batch_size_config > 0:
+                expected_num_mb = (full_batch_size + micro_batch_size_config - 1) // micro_batch_size_config
+            else:
+                # Safety fallback: if micro-batching is disabled/misconfigured, treat as a single chunk.
+                expected_num_mb = 1
         
         mb_key = (session_id, step_id)
         

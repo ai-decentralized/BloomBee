@@ -1,13 +1,12 @@
 """
-Micro-batch Pipeline Configuration Module
+Micro-batch Pipeline Configuration Module.
 
-This module provides configuration and utilities for the micro-batch pipeline feature.
 The feature is controlled via environment variables:
+- BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: "1" to enable (default), "0" to disable
+- BLOOMBEE_MICRO_BATCH_SIZE: positive integer micro-batch size
 
-- BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: Set to "1" to enable (default), "0" to disable
-- BLOOMBEE_MICRO_BATCH_SIZE: Set the micro-batch size, default is 4
-
-All logs from this feature use the prefix [MBPIPE] for easy filtering.
+Non-positive micro-batch sizes are treated as disabled to make local toggling safe.
+All logs from this feature use the prefix [MBPIPE].
 """
 
 import os
@@ -25,13 +24,13 @@ ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
-DEFAULT_MICRO_BATCH_SIZE = 8  # Default micro-batch size for pipeline overlap
+DEFAULT_MICRO_BATCH_SIZE = 0  # Default micro-batch size for pipeline overlap
 
 
-def is_microbatch_enabled() -> bool:
+def _is_microbatch_flag_enabled() -> bool:
     """
     Check if micro-batch pipeline is enabled via environment variable.
-    
+
     Returns:
         True by default, or if BLOOMBEE_ENABLE_MICROBATCH_PIPELINE is set to "1".
         False only if explicitly set to "0".
@@ -47,20 +46,29 @@ def get_micro_batch_size() -> int:
     Returns:
         The micro-batch size. If not set or invalid, returns DEFAULT_MICRO_BATCH_SIZE.
     """
-    if not is_microbatch_enabled():
-        return DEFAULT_MICRO_BATCH_SIZE
-    
+    if not _is_microbatch_flag_enabled():
+        return 0
+
     env_value = os.environ.get(ENV_MICRO_BATCH_SIZE, "")
     if not env_value:
-        return DEFAULT_MICRO_BATCH_SIZE
-    
+        return DEFAULT_MICRO_BATCH_SIZE if DEFAULT_MICRO_BATCH_SIZE > 0 else 0
+
     try:
         size = int(env_value)
         if size < 1:
-            return DEFAULT_MICRO_BATCH_SIZE
+            return 0
         return size
     except ValueError:
-        return DEFAULT_MICRO_BATCH_SIZE
+        return DEFAULT_MICRO_BATCH_SIZE if DEFAULT_MICRO_BATCH_SIZE > 0 else 0
+
+
+def is_microbatch_enabled() -> bool:
+    """
+    Check if micro-batch pipeline is effectively enabled.
+
+    A non-positive micro-batch size is treated as disabled.
+    """
+    return _is_microbatch_flag_enabled() and get_micro_batch_size() > 0
 
 
 def get_micro_batch_config() -> dict:
@@ -143,7 +151,7 @@ def log_memory_savings_diagnosis(logger: logging.Logger, batch_size: int = 8) ->
     logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch enabled: {enabled}")
     logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch size: {micro_batch_size}")
     
-    if not enabled:
+    if not enabled or micro_batch_size <= 0:
         logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro-batching disabled)")
         return
     
@@ -211,7 +219,7 @@ def log_microbatch_runtime_info(
     logger.info(f"{MBPIPE_LOG_PREFIX} Global batch_size: {batch_size}")
     logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch size: {micro_batch_size}")
     
-    if enabled and micro_batch_size < batch_size:
+    if enabled and micro_batch_size > 0 and micro_batch_size < batch_size:
         num_microbatches = (batch_size + micro_batch_size - 1) // micro_batch_size
         logger.info(f"{MBPIPE_LOG_PREFIX} Number of micro-batches: {num_microbatches}")
         logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: MULTIPLEXING (cache sized for {micro_batch_size})")
@@ -273,6 +281,12 @@ def compute_micro_batch_ranges(batch_size: int) -> List[Tuple[int, int]]:
         A list of (start, end) tuples for each micro-batch.
     """
     micro_batch_size = get_micro_batch_size()
+
+    if batch_size <= 0:
+        return []
+    if micro_batch_size <= 0:
+        # Safety fallback: treat as no-split.
+        return [(0, batch_size)]
     
     ranges = []
     start = 0
