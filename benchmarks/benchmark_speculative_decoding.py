@@ -49,7 +49,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     ssm = AutoModelForCausalLM.from_pretrained("JackFram/llama-68m")
-    ssm = ssm.to(device).eval()
+    ssm = ssm.to(device)
     # warm up ssm to reduce inference later
     with torch.no_grad():
         dummy_input = torch.ones(1, 8, dtype=torch.long, device=device)
@@ -60,7 +60,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
-    batch_size = 4
+    batch_size = 8
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
     indices = random.sample(range(len(dataset)), batch_size)
     sampled = dataset.select(indices)
@@ -69,6 +69,10 @@ def benchmark_inference(process_idx, args, result_pipe):
         # test_prompts.append(item["instruction"])
         
     test_prompts.append("Hi,")
+    test_prompts.append("")
+    test_prompts.append("")
+    test_prompts.append("")
+    test_prompts.append("")
     test_prompts.append("")
     test_prompts.append("")
     test_prompts.append("")
@@ -97,6 +101,7 @@ def benchmark_inference(process_idx, args, result_pipe):
         result_length = result[i].ne(tokenizer.pad_token_id).sum().item()
         generated_tokens_num = result_length - prompt_length
         generated_tokens_nums.append(generated_tokens_num)
+        logger.info(f"result: {result[i]}")
     
     avg_generated_tokens = sum(generated_tokens_nums) / batch_size
     speed = avg_generated_tokens / time

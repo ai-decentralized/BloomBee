@@ -34,7 +34,7 @@ def print_time_now(s):
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
 # Note: NF4 refers to FlexGen's 4-bit group quantization, not bitsandbytes
-MAX_SHORT_INFERENCE_TOKENS = 128
+MAX_SHORT_INFERENCE_TOKENS = 1280
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
 logger = get_logger(__name__)
@@ -425,6 +425,8 @@ async def iterate_rpc_inference(
                 # print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
                 # offload_logger.info(" Using merged pool for inference")
                 
+                # t0 = perf_counter()
+                
                 inference_infos = tuple(
                     InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec)
                     for i, (uid, handles) in enumerate(zip(requested_uids, cache_handles))
@@ -432,6 +434,9 @@ async def iterate_rpc_inference(
                 (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
                     hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                 )
+                t1 = perf_counter()
+                # total_time = (t1 - t0) * 1000  # ms
+                # logger.info(f"[MERGED_POOL_INFERENCE] Total Time: {total_time:.4f}ms")
                 
             else:
                 pass

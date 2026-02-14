@@ -1,6 +1,7 @@
 from typing import Optional, Union, List, Tuple, Any
 
 import torch
+import time
 import numpy as np
 import contextlib
 from transformers.generation import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
@@ -37,7 +38,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 128,
         **model_kwargs,
     ) -> torch.LongTensor:
         
@@ -49,7 +50,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         generation_config.return_dict_in_generate = False
 
         # Calculate session max length - this is critical for distributed inference
-        session_max_length = 4096
+        session_max_length = 512
 
         # Use inference session for proper distributed caching
         with self.transformer.h.inference_session(max_length=session_max_length) as session:
@@ -121,13 +122,16 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         pad_token_id = generation_config.pad_token_id if generation_config.pad_token_id is not None else 0
         logger.info(f"init input_ids: {input_ids}, seq_lengths: {seq_lengths}")
         # 修改循环条件：基于最短序列的长度判断
+        t0 = time.perf_counter()
         initial_len = input_ids.shape[1]
         while not finished and (seq_lengths.min().item() - initial_len) < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
+            t1 = time.perf_counter()
             spec_trees = self._build_speculative_trees_batched(
                 current_input_ids, ssm, beam_width, max_tree_depth, seq_lengths
             )
-            
+            t2 = time.perf_counter()
+            logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
             # logger.info(f"spec_trees, {spec_trees}")
             
             # 2. Verify trees using distributed inference
@@ -142,6 +146,9 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 kv_cache_window=kv_cache_window,
                 seq_lengths=seq_lengths,
             )
+            
+            t3 = time.perf_counter()
+            logger.info(f"Step {step_idx}: Verified trees with distributed inference in {t3 - t2:.4f} seconds")
             
             # logger.info(f"verified_tokens_positions: {verified_tokens_positions}")
             
@@ -173,6 +180,9 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 seq_lengths=seq_lengths,
                 pad_token_id=pad_token_id,
             )
+            
+            t4 = time.perf_counter()
+            logger.info(f"Step {step_idx}: Updated input_ids with padding in {t4 - t3:.4f} seconds")
             
             # logger.info(f"current_input_ids: {current_input_ids}, seq_lengths: {seq_lengths}")
 
@@ -269,12 +279,15 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             llm_generated_tokens: [batch_size, 1]
             valid_lengths: [batch_size] 每个序列验证通过的 token 数
         """
-        
+        # logger.info(f"input_ids: {input_ids}")
+        # logger.info(f"seq_lengths: {seq_lengths}")
+        # logger.info(f"kv_cache_position_ids: {past_key_values.kv_cache_position_ids}")
         tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tree_batch(
-            trees, input_ids, input_ids.device, seq_lengths=seq_lengths
+            trees, input_ids, input_ids.device, seq_lengths=seq_lengths, is_prefill=is_first_iteration, kv_cache_position_ids=past_key_values.kv_cache_position_ids
         )
         
         # logger.info(f"tree_tokens: {tree_tokens}, attention_mask: {attention_mask.shape}")
+        # logger.info(f"attention_mask: {attention_mask}")
         
         batch_size = input_ids.shape[0]
         device = input_ids.device
@@ -285,8 +298,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             valid_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
             return None, torch.zeros(batch_size, 1, dtype=torch.long, device=device), past_key_values, fallback_token, valid_lengths
         
-        tree_mask_packed = self.pack_bool_mask_to_int64(attention_mask)
-        
+        # tree_mask_packed = self.pack_bool_mask_to_int64(attention_mask)
+        tree_mask_packed = attention_mask
         # logger.info(f"tree_mask_packed: {tree_mask_packed}")
         
         with torch.no_grad():

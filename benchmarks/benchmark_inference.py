@@ -82,6 +82,8 @@ def benchmark_inference(process_idx, args, result_pipe):
         prompts = ["Once upon a time", "In a galaxy far away"]
     elif batch_size == 3:
         prompts = ["Once upon a time", "In a galaxy far away", "The quick brown fox"]
+    elif batch_size == 4:
+        prompts = ["Hi", "", "", ""]
     else:
         base_prompt = (
             "Quantum mechanics explains the behavior of particles at very small scales. "
@@ -156,19 +158,21 @@ def benchmark_inference(process_idx, args, result_pipe):
     cross_gpu_latencies = []  # Track cross-GPU transfer latencies
     server_processing_latencies = []  # Track server processing latencies
     
+    start_time = perf_counter()
+    
     with model.transformer.h.inference_session(max_length=total_max_length) as sess:
-        logger.info(f"[DEBUG] {process_idx=} Created inference session with max_length={total_max_length}")
-        logger.info(f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | SeqLen={args.seq_len}")
+        # logger.info(f"[DEBUG] {process_idx=} Created inference session with max_length={total_max_length}")
+        # logger.info(f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | SeqLen={args.seq_len}")
         
         for step in range(args.seq_len):
             step_start_time = perf_counter()
             
             # For the first step, pass input_ids; for subsequent steps, generate() will use session state
             if step == 0:
-                logger.info(f"[DEBUG] {process_idx=} {step=} First step, passing input_ids.shape={input_ids.shape}")
+                # logger.info(f"[DEBUG] {process_idx=} {step=} First step, passing input_ids.shape={input_ids.shape}")
                 outputs = model.generate(input_ids, max_new_tokens=1, session=sess)
             else:
-                logger.info(f"[DEBUG] {process_idx=} {step=} Subsequent step, using session state")
+                # logger.info(f"[DEBUG] {process_idx=} {step=} Subsequent step, using session state")
                 outputs = model.generate(max_new_tokens=1, session=sess)
             
             step_end_time = perf_counter()
@@ -176,15 +180,15 @@ def benchmark_inference(process_idx, args, result_pipe):
             step_latencies.append(step_latency_ms)
             
             # Enhanced logging for cross-GPU analysis
-            logger.info(f"[STEP_LATENCY] Process={process_idx} | Step={step} | "
-                       f"Latency={step_latency_ms:.2f}ms | BatchSize={batch_size}")
-            logger.info(f"[DEBUG] {process_idx=} {step=} After generate, outputs.shape={outputs.shape}")
+            # logger.info(f"[STEP_LATENCY] Process={process_idx} | Step={step} | "
+                    #    f"Latency={step_latency_ms:.2f}ms | BatchSize={batch_size}")
+            # logger.info(f"[DEBUG] {process_idx=} {step=} After generate, outputs.shape={outputs.shape}")
             
             # Log generated tokens for all sequences in the batch
             for batch_idx in range(outputs.shape[0]):
                 new_token_id = outputs[batch_idx][-1].item()  
                 new_token_text = tokenizer.decode([new_token_id])
-                logger.info(f"[DEBUG] {process_idx=} {step=} batch[{batch_idx}] Generated token: '{new_token_text}' (id={new_token_id})")
+                # logger.info(f"[DEBUG] {process_idx=} {step=} batch[{batch_idx}] Generated token: '{new_token_text}' (id={new_token_id})")
             
             temp_result_tokens = torch.cat([temp_result_tokens, outputs[:, -1:]], dim=1)
 
@@ -193,7 +197,7 @@ def benchmark_inference(process_idx, args, result_pipe):
                 speed = 1 / np.mean(step_times)
                 # Report speed per sequence (total tokens / time) 
                 effective_speed = speed * batch_size
-                logger.info(f"{process_idx=} {step=} {speed=:.2f} tokens/sec/sequence, effective={effective_speed:.2f} tokens/sec")
+                # logger.info(f"{process_idx=} {step=} {speed=:.2f} tokens/sec/sequence, effective={effective_speed:.2f} tokens/sec")
                 
                 # Collect latencies for analysis
                 cross_gpu_latencies.append(step_latency_ms)
@@ -258,6 +262,8 @@ def benchmark_inference(process_idx, args, result_pipe):
             logger.info(f"{'='*80}\n")
     
     # Calculate final throughput and effective throughput
+    end_time = perf_counter()
+    logger.info(f"[BENCHMARK_END] Process={process_idx} | TotalTime={end_time - start_time:.4f} seconds")
     if step_times:
         speed = 1 / np.mean(step_times)
     else:
@@ -271,7 +277,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     logger.info(f"{'='*80}")
     for batch_idx in range(temp_result_tokens.shape[0]):
         full_text = tokenizer.decode(temp_result_tokens[batch_idx], skip_special_tokens=True)
-        logger.info(f"\nbatch[{batch_idx}] Full generated text:\n{full_text}\n")
+        logger.info(f"\nbatch[{batch_idx}] Full generated text:\n{full_text}\n, total tokens: {temp_result_tokens[batch_idx]}")
     logger.info(f"{'='*80}\n")
     
     result_pipe.send((speed, effective_speed))

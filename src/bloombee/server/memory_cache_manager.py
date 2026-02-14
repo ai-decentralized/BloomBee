@@ -4,6 +4,7 @@ import contextlib
 import asyncio
 import torch
 import os
+import threading
 from typing import Optional, Tuple, AsyncContextManager, Sequence
 
 from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata
@@ -254,7 +255,7 @@ class KVCacheManager:
         except Exception as e:
             logger.warning(f"OFFLOAD: delete_cache failed for handles={handles}: {e}")
     
-    def _write_kvs(self, kvs, start_position: int) -> None:
+    def _write_kvs(self, kvs, start_position: int, cache_tensors: Sequence[torch.Tensor] = None) -> None:
         """
         Write new_kvs to current active cache:
         - Target cache_tensors: k_cache, v_cache, both with shape (S_total, B*H, D)
@@ -263,8 +264,9 @@ class KVCacheManager:
             key:   (B*H, D, s_new)
             value: (B*H, s_new, D)
         """
-        assert self._active_cache_tensors_stack, "KV write called outside of use_cache context"
-        cache_tensors = self._active_cache_tensors_stack[-1]  # TorchTensor
+        if cache_tensors is None:
+            assert self._active_cache_tensors_stack, "write_pkv_cache called outside of use_cache context"
+            cache_tensors = self._active_cache_tensors_stack[-1]  # TorchTensor
         (k_cache, v_cache), = cache_tensors
         # logger.info(f"_active_cache_tensors_stack, k_cache: {k_cache}")
         S_total, BH_dst, D_dst = k_cache.shape
@@ -343,6 +345,23 @@ class KVCacheManager:
             start_position=start_position
         )
         
+    def async_write_pkv_cache(
+        self, 
+        k_pkv: torch.Tensor, 
+        v_pkv: torch.Tensor, 
+        start_position: int = 0, 
+        cache_tensors: Sequence[torch.Tensor] = None
+    ) -> None:
+        B, H, S, D = k_pkv.shape
+        BH = B * H
+        k_write = k_pkv.reshape(BH, S, D).permute(0, 2, 1)  # (B, H, S, D) -> (B*H, S, D) -> (B*H, D, S)
+        v_write = v_pkv.reshape(BH, S, D)                    # (B, H, S, D) -> (B*H, S, D)
+        self._write_kvs(
+            kvs=(k_write, v_write),
+            start_position=start_position,
+            cache_tensors=cache_tensors
+        )
+        
     def update_cache_batched(
         self,
         new_kvs: AdaptedKVCache,
@@ -417,68 +436,63 @@ class KVCacheManager:
         k_pkv: torch.Tensor,
         v_pkv: torch.Tensor,
         kv_cache_position_ids: torch.Tensor,
+        cache_tensors: Sequence[torch.Tensor],
     ) -> Tuple[int, torch.Tensor]:
-        """
-        将分散的 positions 重排到连续位置 [0, N)
-        
-        Args:
-            k_pkv, v_pkv: [B, H, S_old, D] 原始取出的 cache
-            kv_cache_position_ids: [B, pos_len] 每个 batch 需要保留的 positions（-1 为无效）
-        
-        Returns:
-            max_new_length: 重排后的最大有效长度（用于 select_cache）
-            valid_lengths: [B] 每个 batch 的实际有效长度（用于 attention mask）
-        """
-        assert self._active_cache_tensors_stack, "write called outside of use_cache"
-    
         B, H, S_old, D = k_pkv.shape
         device = k_pkv.device
         
         if kv_cache_position_ids.dim() == 1:
             kv_cache_position_ids = kv_cache_position_ids.unsqueeze(0)
         
-        # 计算每个 batch 的完整索引（prefix + valid tree positions）
-        batch_all_positions = []
-        valid_lengths_list = []
+        kv_cache_position_ids = kv_cache_position_ids.to(device)
         
-        for i in range(B):
-            positions = kv_cache_position_ids[i]
-            valid_mask = positions >= 0
-            valid_positions = positions[valid_mask].tolist()
-            
-            if len(valid_positions) > 0:
-                # root_position 是第一个有效位置
-                root_position = valid_positions[0]
-                # prefix: [0, 1, ..., root_position - 1]
-                prefix_positions = list(range(root_position))
-                # 完整序列: prefix + valid tree positions
-                all_positions = prefix_positions + valid_positions
-            else:
-                # 没有有效的 tree positions，保持原样
-                all_positions = list(range(S_old))
-            
-            batch_all_positions.append(all_positions)
-            valid_lengths_list.append(len(all_positions))
+        valid_mask = kv_cache_position_ids >= 0
+        has_valid = valid_mask.any(dim=1)
+        first_valid_idx = valid_mask.int().argmax(dim=1)
         
-        valid_lengths = torch.tensor(valid_lengths_list, dtype=torch.long, device=device)
+        batch_indices = torch.arange(B, device=device)
+        root_positions = torch.where(
+            has_valid,
+            kv_cache_position_ids[batch_indices, first_valid_idx],
+            torch.tensor(S_old, device=device)
+        )
+        
+        tree_valid_counts = valid_mask.sum(dim=1)
+        valid_lengths = root_positions + tree_valid_counts
         max_new_length = valid_lengths.max().item()
         
-        # 创建新的 reordered cache
         k_new = torch.zeros(B, H, max_new_length, D, dtype=k_pkv.dtype, device=device)
         v_new = torch.zeros(B, H, max_new_length, D, dtype=v_pkv.dtype, device=device)
         
-        for i in range(B):
-            all_positions = batch_all_positions[i]
-            valid_len = len(all_positions)
-            
-            if valid_len > 0:
-                positions_tensor = torch.tensor(all_positions, dtype=torch.long, device=device)
-                # 从原 cache 的 all_positions 位置取出，写入新 cache 的 [0, valid_len)
-                k_new[i, :, :valid_len, :] = k_pkv[i, :, positions_tensor, :]
-                v_new[i, :, :valid_len, :] = v_pkv[i, :, positions_tensor, :]
+        max_root = root_positions.max().item()
+        pos_len = kv_cache_position_ids.shape[1]
         
-        # 写回 cache（从 position 0 开始）
-        self.write_pkv_cache(k_new, v_new, start_position=0)
+        # Prefix
+        if max_root > 0:
+            prefix_idx = torch.arange(max_root, device=device)
+            batch_idx_prefix = batch_indices.unsqueeze(1).expand(B, max_root)
+            prefix_idx_expanded = prefix_idx.unsqueeze(0).expand(B, max_root)
+            prefix_valid = prefix_idx_expanded < root_positions.unsqueeze(1)
+            
+            valid_batch_prefix = batch_idx_prefix[prefix_valid]
+            valid_pos_prefix = prefix_idx_expanded[prefix_valid]
+            
+            k_new[valid_batch_prefix, :, valid_pos_prefix, :] = k_pkv[valid_batch_prefix, :, valid_pos_prefix, :]
+            v_new[valid_batch_prefix, :, valid_pos_prefix, :] = v_pkv[valid_batch_prefix, :, valid_pos_prefix, :]
+        
+        # Tree
+        batch_idx_tree = batch_indices.unsqueeze(1).expand(B, pos_len)
+        cumsum_valid = valid_mask.int().cumsum(dim=1) - 1
+        dst_positions = root_positions.unsqueeze(1) + cumsum_valid
+        
+        valid_batch_tree = batch_idx_tree[valid_mask]
+        valid_src_tree = kv_cache_position_ids[valid_mask]
+        valid_dst_tree = dst_positions[valid_mask]
+        
+        k_new[valid_batch_tree, :, valid_dst_tree, :] = k_pkv[valid_batch_tree, :, valid_src_tree, :]
+        v_new[valid_batch_tree, :, valid_dst_tree, :] = v_pkv[valid_batch_tree, :, valid_src_tree, :]
+        
+        self.async_write_pkv_cache(k_new, v_new, start_position=0, cache_tensors=cache_tensors)
         
         return max_new_length, valid_lengths
     
@@ -532,3 +546,123 @@ class KVCacheManager:
         need_reorder = True  # 只要有 kv_cache_position_ids 就需要
         
         return k_pkv, v_pkv, need_reorder
+    
+    
+    def select_cache_without_reorder(
+        self,
+        kv_cache_position_ids: torch.Tensor,  # (B, max_pos_len), -1 是 padding
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        """
+        不重排，直接取 cache
+        
+        Returns:
+            k_pkv: (B, H, cache_len, D)
+            v_pkv: (B, H, cache_len, D)
+            cache_len: 取出的 cache 长度
+        """
+        assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
+        
+        cache_tensors = self._active_cache_tensors_stack[-1]
+        (k_cache, v_cache), = cache_tensors
+        S_full, BH, D = k_cache.shape
+        
+        H = getattr(self.block_config, "num_attention_heads", None)
+        B = BH // H
+        
+        # 1. 找到需要取的 cache 范围
+        valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
+        if not valid_mask.any():
+            return None, None, 0
+        
+        max_position = kv_cache_position_ids[valid_mask].max().item()
+        cache_len = int(max_position) + 1
+        
+        # 2. 取出 [0, cache_len) 的 cache
+        compute_dst = self.attention_compute
+        idx_all = (slice(0, cache_len), slice(0, BH))
+        
+        def _as_torch(x):
+            return x.data if hasattr(x, "data") else x
+        
+        k_sel, _ = k_cache.smart_copy(compute_dst, idx_all)
+        v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
+        k_sbh = _as_torch(k_sel)  # (cache_len, BH, D)
+        v_sbh = _as_torch(v_sel)
+        
+        def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:
+            return x_sbh.view(cache_len, B, H, D).permute(1, 2, 0, 3)
+        
+        k_pkv = _to_pkv(k_sbh)  # (B, H, cache_len, D)
+        v_pkv = _to_pkv(v_sbh)
+        
+        return k_pkv, v_pkv, cache_len
+
+    def update_cache_and_async_reorder(
+        self,
+        new_kvs: AdaptedKVCache,
+        kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len), -1 是 padding，可能为 None
+        cache_tensors: Sequence[torch.Tensor],
+    ) -> None:
+        """
+        1. 将新 KV 写入到 max_position + 1 位置（同步）
+        2. 启动异步线程重排整个 cache
+        """
+        # ============ Prefill 阶段：直接写入，不需要重排 ============
+        if kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0:
+            # Prefill 阶段，cache 从位置 0 开始写入
+            self._write_kvs(new_kvs, start_position=0)
+            return
+        
+        # ============ Generation 阶段 ============
+        valid_mask = kv_cache_position_ids >= 0
+        
+        # 再次检查是否有有效位置
+        if not valid_mask.any():
+            self._write_kvs(new_kvs, start_position=0)
+            return
+        
+        max_position = kv_cache_position_ids[valid_mask].max().item()
+        write_position = int(max_position) + 1
+        
+        # 1. 同步写入新 KV
+        self._write_kvs(new_kvs, write_position)
+        
+        # 2. 准备异步重排
+        # 从 new_kvs 中获取 tree_len
+        new_kvs_data = new_kvs.kvs if hasattr(new_kvs, "kvs") else new_kvs
+        key, value = new_kvs_data
+        key_data = key.data if hasattr(key, 'data') else key
+        tree_len = key_data.shape[-1]
+        
+        device = kv_cache_position_ids.device
+        B = kv_cache_position_ids.shape[0]
+        
+        new_positions = torch.arange(write_position, write_position + tree_len, device=device)
+        new_positions = new_positions.unsqueeze(0).expand(B, tree_len)
+        extended_position_ids = torch.cat([kv_cache_position_ids, new_positions], dim=1)
+        
+        k_pkv, v_pkv, _ = self.select_cache_without_reorder(extended_position_ids)
+        
+        if k_pkv is None:
+            return
+        
+        k_pkv_copy = k_pkv.clone()
+        v_pkv_copy = v_pkv.clone()
+        extended_position_ids_copy = extended_position_ids.clone()
+        
+        # 3. 启动异步重排线程
+        def reorder_task():
+            try:
+                with torch.inference_mode():
+                    self.reorder_and_write_cache(
+                        k_pkv=k_pkv_copy,
+                        v_pkv=v_pkv_copy,
+                        kv_cache_position_ids=extended_position_ids_copy,
+                        cache_tensors=cache_tensors
+                    )
+            except Exception as e:
+                import logging
+                logging.error(f"Async cache reorder failed: {e}")
+        
+        reorder_thread = threading.Thread(target=reorder_task, daemon=False)
+        reorder_thread.start()

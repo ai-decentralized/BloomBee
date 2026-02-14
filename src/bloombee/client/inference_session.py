@@ -117,7 +117,7 @@ class _ServerInferenceSession:
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
         if is_spec_dec:
-            n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids.numel()
+            n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
         else:
             n_input_tokens = inputs.shape[1]
         # print('client step() n_input_tokens', n_input_tokens)
@@ -363,7 +363,7 @@ class InferenceSession:
         step_id = str(uuid.uuid4())  # Generate a unique step ID.
         batch_size = inputs.shape[0]
 
-        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids.numel()
+        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
         if self._position + n_input_tokens > self._max_length:
             raise ValueError(
                 f"Maximum length exceeded: prefix {self._position} + current {n_input_tokens} exceeds pre-allocated maximum {self._max_length}"
@@ -372,7 +372,7 @@ class InferenceSession:
         server_idx = 0
         block_idx = 0
         inference_step_start = time.perf_counter()
-        if tree_attention_mask is not None:
+        if prefill_length is not None:
             self.prefill_length = prefill_length.to(inputs.device)
         else:
             self.prefill_length = torch.zeros(batch_size)
@@ -446,8 +446,11 @@ class InferenceSession:
         self._position += n_input_tokens
         # logger.info(f"keep_indices: {keep_indices}")
         # logger.info(f"before _recover_hidden_states: {inputs}")
+        t0 = time.perf_counter()
         if draft_tokens is not None and is_spec_dec:
             inputs = self._restore_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
+        t1 = time.perf_counter()
+        logger.info(f"_restore_hidden_states took {(t1 - t0) * 1000:.2f} ms")
         # logger.info(f"after _recover_hidden_states: {inputs}")
         outputs = inputs 
         

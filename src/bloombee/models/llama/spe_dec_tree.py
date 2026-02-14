@@ -3,6 +3,10 @@ import math
 from typing import List, Optional, Dict, Tuple, Any
 import torch
 
+from hivemind.utils.logging import get_logger
+
+logger = get_logger()
+
 
 class TreeNode:
     def __init__(self, token_id: int, probability: float = 1.0, depth: int = 0):
@@ -180,28 +184,17 @@ def build_incremental_tree_attention_mask(
 
     return tree_mask.unsqueeze(0)
 
-
 def prepare_incremental_tree_batch(
     trees: List[SpeculativeTree], 
     input_ids: torch.LongTensor,
     device: torch.device,
     pad_token_id: int = 0,
     seq_lengths: Optional[torch.LongTensor] = None,
+    is_prefill: bool = False,
+    kv_cache_position_ids: Optional[torch.Tensor] = None,  # (B, max_pos_len), -1 是 padding
 ) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
     """
     准备增量 tree batch，支持不同序列长度
-    
-    Args:
-        trees: speculative trees 列表
-        input_ids: [batch_size, max_seq_len] 输入 token ids（可能包含 padding）
-        device: 设备
-        pad_token_id: padding token id
-        seq_lengths: [batch_size] 每个序列的真实长度，如果为 None 则假设所有序列长度相同
-    
-    Returns:
-        tree_tokens: [batch_size, max_tree_size]
-        attention_mask: [batch_size, max_tree_size, past_len + max_tree_size]
-        batch_node_paths: 每个 batch 的节点路径列表
     """
     batch_size = len(trees)
 
@@ -209,33 +202,106 @@ def prepare_incremental_tree_batch(
         return torch.empty(batch_size, 0, dtype=torch.long, device=device), None, [[] for _ in trees]
 
     max_tree_size = max(tree.total_nodes - 1 for tree in trees if tree.total_nodes > 1)
-    past_len = input_ids.shape[1]
+    
+    # Generation 阶段：计算统一的 cache_len（所有 batch 中最大的有效位置 + 1）
+    cache_len = 0
+    if not is_prefill and kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
+        valid_mask = kv_cache_position_ids >= 0
+        if valid_mask.any():
+            max_position = kv_cache_position_ids[valid_mask].max().item()
+            cache_len = int(max_position) + 1
 
     batch_tree_tokens = []
     batch_attention_masks = []
     batch_node_paths = []
 
-    for tree in trees:
+    for i, tree in enumerate(trees):
+        if seq_lengths is not None:
+            curr_seq_len = seq_lengths[i].item()
+        else:
+            curr_seq_len = input_ids.shape[1]
+        
         linearized_nodes, parent_indices = linearize_tree_with_positions(tree)
 
         tree_token_ids = [node.token_id for node in linearized_nodes]
         padded_tokens = tree_token_ids + [pad_token_id] * (max_tree_size - len(tree_token_ids))
         batch_tree_tokens.append(padded_tokens)
 
-        tree_len = len(tree_token_ids)
-        if tree_len > 0:
-            mask = build_incremental_tree_attention_mask(
-                past_len, tree_len, parent_indices, device
-            )
+        tree_len = len(tree_token_ids)  # 不包含 root
+        inputs_len = tree_len + 1  # root + tree tokens
+        
+        if is_prefill:
+            # ============ Prefill 阶段（不变） ============
+            past_len = input_ids.shape[1]
+            total_len = past_len + tree_len
+            mask = torch.zeros(1, total_len, total_len, dtype=torch.bool, device=device)
+            
+            prompt_len = curr_seq_len - 1 if curr_seq_len > 0 else 0
+            root_pos = prompt_len
+            
+            if prompt_len > 0:
+                row_idx = torch.arange(prompt_len, device=device).view(-1, 1)
+                col_idx = torch.arange(prompt_len, device=device).view(1, -1)
+                causal_mask = row_idx >= col_idx
+                mask[0, :prompt_len, :prompt_len] = causal_mask
+            
+            if prompt_len > 0:
+                mask[0, root_pos, :prompt_len] = True
+            mask[0, root_pos, root_pos] = True
+            
+            if tree_len > 0:
+                if prompt_len > 0:
+                    mask[0, past_len:past_len + tree_len, :prompt_len] = True
+                mask[0, past_len:past_len + tree_len, root_pos] = True
+            
+            if tree_len > 0:
+                tree_mask = build_tree_attention_mask_with_root(tree_len, parent_indices, device)
+                mask[0, past_len:past_len + tree_len, past_len:past_len + tree_len] = tree_mask
+            
             if tree_len < max_tree_size:
-                pad_len = max_tree_size - tree_len
-                pad_mask = torch.cat([
-                    torch.ones(pad_len, past_len, dtype=torch.bool, device=device),
-                    torch.zeros(pad_len, max_tree_size, dtype=torch.bool, device=device)
-                ], dim=1).unsqueeze(0).expand(1, pad_len, past_len + max_tree_size)
-                mask = torch.cat([mask, pad_mask], dim=1)
+                total_padded_len = past_len + max_tree_size
+                padded_mask = torch.zeros(1, total_padded_len, total_padded_len, dtype=torch.bool, device=device)
+                padded_mask[0, :total_len, :total_len] = mask[0]
+                if curr_seq_len > 0:
+                    padded_mask[0, total_len:, :curr_seq_len] = True
+                mask = padded_mask
+        
         else:
-            mask = torch.ones(1, max_tree_size, past_len + max_tree_size, dtype=torch.bool, device=device)
+            # ============ Generation 阶段 ============
+            # 总长度 = cache + 本轮输入
+            total_len = cache_len + inputs_len
+            
+            mask = torch.zeros(1, inputs_len, total_len, dtype=torch.bool, device=device)
+            
+            # 计算 cache 中的有效位置
+            cache_valid_mask = _compute_single_cache_valid_mask(
+                kv_cache_position_ids[i], cache_len, device
+            )
+            
+            # 1. Root attend to cache + 自己
+            mask[0, 0, :cache_len] = cache_valid_mask
+            mask[0, 0, cache_len] = True  # root attend 自己
+            
+            # 2. Tree tokens attend to cache + root
+            if tree_len > 0:
+                mask[0, 1:inputs_len, :cache_len] = cache_valid_mask.unsqueeze(0).expand(tree_len, cache_len)
+                mask[0, 1:inputs_len, cache_len] = True  # tree tokens attend to root
+            
+            # 3. Tree tokens 之间
+            if tree_len > 0:
+                tree_mask = build_tree_attention_mask_with_root(tree_len, parent_indices, device)
+                mask[0, 1:inputs_len, cache_len + 1:total_len] = tree_mask
+            
+            # Padding
+            max_inputs_len = max_tree_size + 1
+            if inputs_len < max_inputs_len:
+                pad_len = max_inputs_len - inputs_len
+                total_padded_len = cache_len + max_inputs_len
+                padded_mask = torch.zeros(1, max_inputs_len, total_padded_len, dtype=torch.bool, device=device)
+                padded_mask[0, :inputs_len, :total_len] = mask[0]
+                # Padding 行 attend to cache（避免 NaN）
+                padded_mask[0, inputs_len:, :cache_len] = cache_valid_mask.unsqueeze(0).expand(pad_len, cache_len)
+                mask = padded_mask
 
         batch_attention_masks.append(mask)
         batch_node_paths.append(tree.root.get_all_leaf_node_paths())
@@ -249,19 +315,61 @@ def prepare_incremental_tree_batch(
 
     return tree_tokens, attention_mask, batch_node_paths
 
-def prepare_tree_attention_batch(
-    trees: List[SpeculativeTree], 
-    prefix_tokens: torch.Tensor,
-    device: torch.device,
-    pad_token_id: int = 0,
-    seq_lengths: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
-    tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tree_batch(
-        trees, prefix_tokens, device, pad_token_id, seq_lengths
-    )
-    if tree_tokens.shape[1] > 0:
-        full_sequence = torch.cat([prefix_tokens, tree_tokens], dim=-1)
-    else:
-        full_sequence = prefix_tokens
 
-    return full_sequence, attention_mask, batch_node_paths
+def _compute_single_cache_valid_mask(
+    kv_cache_position_ids_single: torch.Tensor,  # (max_pos_len,) 单个 batch
+    cache_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    计算单个 batch 的 cache 有效位置 mask
+    
+    Cache 布局：
+    [已整理好的 cache: 0 到 root_pos-1] [上一轮的 tree (含空洞): root_pos 到 cache_len-1]
+    
+    Returns:
+        cache_valid_mask: (cache_len,) - True 表示有效位置
+    """
+    kv_cache_position_ids_single = kv_cache_position_ids_single.to(device)
+    
+    valid_mask = kv_cache_position_ids_single >= 0
+    
+    cache_valid_mask = torch.zeros(cache_len, dtype=torch.bool, device=device)
+    
+    # 1. 找到 root_position（第一个有效值）
+    first_valid_idx = valid_mask.int().argmax().item()
+    root_position = kv_cache_position_ids_single[first_valid_idx].item()
+    
+    # [0, root_position) 一定有效（已整理好的部分）
+    cache_valid_mask[:root_position] = True
+    
+    # 2. kv_cache_position_ids 中的有效位置（上一轮被接收的 token）
+    valid_positions = kv_cache_position_ids_single[valid_mask]
+    valid_positions = valid_positions.clamp(0, cache_len - 1)
+    cache_valid_mask[valid_positions] = True
+    
+    return cache_valid_mask
+
+
+def build_tree_attention_mask_with_root(
+    tree_len: int,
+    parent_indices: List[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    构建 tree tokens 之间的 attention mask（不包含 root）
+    """
+    mask = torch.zeros(tree_len, tree_len, dtype=torch.bool, device=device)
+    
+    for i in range(tree_len):
+        mask[i, i] = True
+        current = i
+        while current >= 0:
+            parent = parent_indices[current]
+            if parent >= 0:
+                mask[i, parent] = True
+                current = parent
+            else:
+                break
+    
+    return mask
