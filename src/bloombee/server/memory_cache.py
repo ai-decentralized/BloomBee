@@ -51,6 +51,11 @@ offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
 
 
+def _is_verbose_kv_alloc_logs() -> bool:
+    """Enable detailed KV allocation logs with BLOOMBEE_VERBOSE_KV_LOGS=1."""
+    return os.environ.get("BLOOMBEE_VERBOSE_KV_LOGS", "0") == "1"
+
+
 class MemoryCache:
     """A shared cache for storing tensors that persist across calls. Main use case: storing past attention KVs"""
 
@@ -198,6 +203,9 @@ class MemoryCache:
         assert os.getpid() == self.runtime_pid
         # note: this specific function is not concurrent, so you can safely allocate/offload/defragment data here
 
+        verbose_kv_alloc_logs = _is_verbose_kv_alloc_logs()
+        kv_alloc_log = logger.info if verbose_kv_alloc_logs else logger.debug
+
         # read creation/deletion requests from connection handlers
         def _process_message(recv_handles, recv_data):
             if recv_data is not None:  # create new tensors
@@ -209,10 +217,10 @@ class MemoryCache:
                     descr_batch_size = descr.shape[0] if descr.shape else 1
                     
                     # [MBPIPE_DEBUG] Log descriptor shape and batch_size BEFORE allocation
-                    logger.info(f"[MBPIPE_KV_DEBUG] === KV CACHE TENSOR ALLOCATION ===")
-                    logger.info(f"[MBPIPE_KV_DEBUG] Descriptor shape: {descr.shape}")
-                    logger.info(f"[MBPIPE_KV_DEBUG] Extracted batch_size from descriptor: {descr_batch_size}")
-                    logger.info(f"[MBPIPE_KV_DEBUG] Sequence length (max_length): {seq_len}")
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] === KV CACHE TENSOR ALLOCATION ===")
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] Descriptor shape: {descr.shape}")
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] Extracted batch_size from descriptor: {descr_batch_size}")
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] Sequence length (max_length): {seq_len}")
                     
                     self.mocked_task = Task(
                         inputs=None,
@@ -230,15 +238,18 @@ class MemoryCache:
                     override_policy = dataclass_replace(self.allocation_policy, gpu_batch_size=descr_batch_size)
                     
                     # [MBPIPE_DEBUG] Log the override policy
-                    logger.info(f"[MBPIPE_KV_DEBUG] Policy gpu_batch_size override: "
-                               f"original={self.allocation_policy.gpu_batch_size} -> override={descr_batch_size}")
+                    kv_alloc_log(
+                        f"[MBPIPE_KV_DEBUG] Policy gpu_batch_size override: "
+                        f"original={self.allocation_policy.gpu_batch_size} -> override={descr_batch_size}"
+                    )
                     
                     # [MBPIPE_DEBUG] Log GPU memory BEFORE allocation
-                    try:
-                        from bloombee.utils.memory_usage import log_mbpipe_memory
-                        log_mbpipe_memory("BEFORE_KV_ALLOC", f"handle={handle}, batch_size={descr_batch_size}")
-                    except Exception as e:
-                        logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
+                    if verbose_kv_alloc_logs:
+                        try:
+                            from bloombee.utils.memory_usage import log_mbpipe_memory
+                            log_mbpipe_memory("BEFORE_KV_ALLOC", f"handle={handle}, batch_size={descr_batch_size}")
+                        except Exception as e:
+                            logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
                     
                     allocated_cache = self.device.init_cache_one_gpu_batch(
                         self.block_config, self.mocked_task, override_policy
@@ -249,40 +260,41 @@ class MemoryCache:
                         if allocated_cache is not None:
                             # Try to determine the structure of allocated_cache
                             cache_type = type(allocated_cache).__name__
-                            logger.info(f"[MBPIPE_KV_DEBUG] allocated_cache type: {cache_type}")
+                            kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache type: {cache_type}")
                             
                             if hasattr(allocated_cache, 'shape'):
                                 # Single tensor
-                                logger.info(f"[MBPIPE_KV_DEBUG] allocated_cache.shape: {allocated_cache.shape}")
+                                kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache.shape: {allocated_cache.shape}")
                             elif hasattr(allocated_cache, 'data'):
                                 # TorchTensor wrapper
                                 data = allocated_cache.data
                                 if hasattr(data, 'shape'):
-                                    logger.info(f"[MBPIPE_KV_DEBUG] allocated_cache.data.shape: {data.shape}")
+                                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache.data.shape: {data.shape}")
                                 elif isinstance(data, tuple):
-                                    logger.info(f"[MBPIPE_KV_DEBUG] allocated_cache.data is tuple, len={len(data)}")
+                                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache.data is tuple, len={len(data)}")
                             elif isinstance(allocated_cache, (list, tuple)):
-                                logger.info(f"[MBPIPE_KV_DEBUG] allocated_cache is sequence, len={len(allocated_cache)}")
+                                kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache is sequence, len={len(allocated_cache)}")
                                 # Try to inspect first element
                                 if len(allocated_cache) > 0:
                                     first = allocated_cache[0]
                                     first_type = type(first).__name__
-                                    logger.info(f"[MBPIPE_KV_DEBUG] First element type: {first_type}")
+                                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] First element type: {first_type}")
                                     if hasattr(first, 'shape'):
-                                        logger.info(f"[MBPIPE_KV_DEBUG] First element shape: {first.shape}")
+                                        kv_alloc_log(f"[MBPIPE_KV_DEBUG] First element shape: {first.shape}")
                                     elif hasattr(first, 'data') and hasattr(first.data, 'shape'):
-                                        logger.info(f"[MBPIPE_KV_DEBUG] First element.data.shape: {first.data.shape}")
+                                        kv_alloc_log(f"[MBPIPE_KV_DEBUG] First element.data.shape: {first.data.shape}")
                     except Exception as debug_e:
                         logger.debug(f"[MBPIPE_KV_DEBUG] Failed to log cache structure: {debug_e}")
                     
                     # [MBPIPE_DEBUG] Log GPU memory AFTER allocation
-                    try:
-                        from bloombee.utils.memory_usage import log_mbpipe_memory
-                        log_mbpipe_memory("AFTER_KV_ALLOC", f"handle={handle}, batch_size={descr_batch_size}")
-                    except Exception as e:
-                        logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
+                    if verbose_kv_alloc_logs:
+                        try:
+                            from bloombee.utils.memory_usage import log_mbpipe_memory
+                            log_mbpipe_memory("AFTER_KV_ALLOC", f"handle={handle}, batch_size={descr_batch_size}")
+                        except Exception as e:
+                            logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
                     
-                    logger.info(f"[MBPIPE_KV_DEBUG] === KV CACHE ALLOCATION COMPLETE ===")
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] === KV CACHE ALLOCATION COMPLETE ===")
                     
                     self._allocated_tensors[handle] = allocated_cache
                     

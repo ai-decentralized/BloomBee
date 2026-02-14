@@ -120,13 +120,36 @@ class KVCacheManager:
             return None
         return slot_id, mb_index
 
-    def _compute_microbatch_index(self, batch_offset: int, micro_batch_size: Optional[int] = None) -> int:
-        """Compute stable micro-batch index from logical offset."""
-        if micro_batch_size is not None and int(micro_batch_size) > 0:
-            configured_mb = int(micro_batch_size)
-        else:
-            configured_mb = max(1, int(getattr(self.offloading_policy, "gpu_batch_size", 1)))
-        return max(0, batch_offset // configured_mb)
+    def _compute_microbatch_index(
+        self,
+        batch_offset: int,
+        micro_batch_size: Optional[int] = None,
+        full_batch_size: Optional[int] = None,
+    ) -> int:
+        """
+        Compute a stable micro-batch index from logical offset.
+
+        Default mapping uses policy.gpu_batch_size (configured micro-batch size).
+        If runtime size mismatches policy, we only keep policy-based mapping for
+        expected tail micro-batches; otherwise we fall back to runtime mapping.
+        """
+        policy_mb = max(1, int(getattr(self.offloading_policy, "gpu_batch_size", 1)))
+        runtime_mb = int(micro_batch_size) if micro_batch_size is not None and int(micro_batch_size) > 0 else policy_mb
+        total_b = int(full_batch_size) if full_batch_size is not None else 0
+
+        use_policy_mapping = True
+        if runtime_mb != policy_mb:
+            is_expected_tail_mb = (
+                total_b > 0
+                and runtime_mb < policy_mb
+                and batch_offset >= 0
+                and (batch_offset + runtime_mb == total_b)
+            )
+            if not is_expected_tail_mb:
+                use_policy_mapping = False
+
+        configured_mb = policy_mb if use_policy_mapping else runtime_mb
+        return max(0, batch_offset // max(1, configured_mb))
 
     def _log_kv_detail(self, message: str, *args):
         """High-frequency KV diagnostics: INFO only when verbose flag is enabled."""
@@ -315,7 +338,7 @@ class KVCacheManager:
         gpu_multiplexing = full_batch_size > 0 and full_batch_in_cache < full_batch_size
         if full_batch_size > 0 and micro_batch_size > 0:
             if gpu_multiplexing:
-                mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size)
+                mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size, full_batch_size)
                 slot_id = self._get_active_cache_slot_id()
                 current_mb = self._current_gpu_mb.get(slot_id) if slot_id is not None else None
                 pending_mb = self._pending_gpu_mb.get(slot_id) if slot_id is not None else None
@@ -932,12 +955,32 @@ class KVCacheManager:
         gpu_multiplexing = (full_batch_size > 0 and cache_batch_size < full_batch_size)
         if micro_batch_size > 0:
             policy_mb = max(1, int(getattr(self.offloading_policy, "gpu_batch_size", 1)))
-            if policy_mb != int(micro_batch_size):
-                logger.warning(
-                    "[MBPIPE_KV_VERIFY] micro_batch_size mismatch: "
-                    f"policy.gpu_batch_size={policy_mb}, runtime_micro_batch_size={micro_batch_size}. "
-                    "Using runtime value for mb_index mapping."
-                )
+            runtime_mb = int(micro_batch_size)
+            # Common/expected case: the last micro-batch can be smaller than policy size
+            # (e.g., batch=84, policy_mb=50 -> [50, 34]). Do not warn for tail remainder.
+            is_expected_tail_mb = (
+                full_batch_size > 0
+                and runtime_mb < policy_mb
+                and batch_offset >= 0
+                and (batch_offset + runtime_mb == full_batch_size)
+            )
+            # Also expected: a whole request that is smaller than policy_mb.
+            is_expected_small_single_mb = (
+                full_batch_size > 0
+                and batch_offset == 0
+                and runtime_mb == full_batch_size
+                and runtime_mb <= policy_mb
+            )
+            if policy_mb != runtime_mb and not (is_expected_tail_mb or is_expected_small_single_mb):
+                mismatch_key = ("kv_mb_size_mismatch", policy_mb, runtime_mb, int(full_batch_size))
+                if mismatch_key not in self._kv_log_once_keys:
+                    self._kv_log_once_keys.add(mismatch_key)
+                    logger.warning(
+                        "[MBPIPE_KV_VERIFY] micro_batch_size mismatch: "
+                        f"policy.gpu_batch_size={policy_mb}, runtime_micro_batch_size={runtime_mb}, "
+                        f"batch_offset={batch_offset}, full_batch_size={full_batch_size}. "
+                        "Using runtime value for mb_index mapping."
+                    )
         
         # [MBPIPE_KV_VERIFY] High-frequency per-layer write diagnostics
         self._log_kv_detail("[MBPIPE_KV_VERIFY] === KV CACHE WRITE ===")
@@ -1139,7 +1182,7 @@ class KVCacheManager:
         # In GPU multiplexing mode, immediately offload this micro-batch cache snapshot
         # while still inside use_cache context, so the next micro-batch can reuse GPU slots.
         if gpu_multiplexing:
-            mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size)
+            mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size, full_batch_size)
             self.offload_microbatch_kv(mb_index, prefix_length=end_position)
     
     def write_pkv_cache(self, k_pkv: torch.Tensor, v_pkv: torch.Tensor, start_position: int = 0) -> None:

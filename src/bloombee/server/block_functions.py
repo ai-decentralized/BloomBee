@@ -915,6 +915,45 @@ async def iterate_rpc_inference(
                 
                 # Sort by mb_idx and merge
                 sorted_indices = sorted(accum['results'].keys())
+                expected_indices = list(range(int(accum.get('expected', len(sorted_indices)))))
+                if sorted_indices != expected_indices:
+                    logger.warning(
+                        f"{MBPIPE_LOG_PREFIX} Non-contiguous micro-batch indices for step_id={step_id}: "
+                        f"got={sorted_indices}, expected={expected_indices}"
+                    )
+
+                # Validate merged layout coverage (offset continuity + full-batch size coverage)
+                layout_issues = []
+                expected_next_offset = 0
+                observed_total = 0
+                for idx in sorted_indices:
+                    h, _, offset = accum['results'][idx]
+                    mb_rows = int(h.shape[0]) if torch.is_tensor(h) and h.ndim >= 1 else 0
+                    offset_i = int(offset)
+                    if offset_i != expected_next_offset:
+                        layout_issues.append(
+                            f"mb_idx={idx}: offset={offset_i}, expected_offset={expected_next_offset}, rows={mb_rows}"
+                        )
+                    expected_next_offset = offset_i + mb_rows
+                    observed_total += mb_rows
+                full_batch_expected = int(accum.get('full_batch_size') or 0)
+                if full_batch_expected > 0 and observed_total != full_batch_expected:
+                    layout_issues.append(
+                        f"observed_total={observed_total}, full_batch_expected={full_batch_expected}"
+                    )
+                if layout_issues:
+                    preview = "; ".join(layout_issues[:3])
+                    suffix = " ..." if len(layout_issues) > 3 else ""
+                    logger.warning(
+                        f"{MBPIPE_LOG_PREFIX} Micro-batch merge layout check failed for step_id={step_id}: "
+                        f"{preview}{suffix}"
+                    )
+                elif log_mb_detail:
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} Merge layout validated for step_id={step_id}: "
+                        f"merged_batch={observed_total}, expected={full_batch_expected or observed_total}"
+                    )
+
                 merged_hidden_list = []
                 for idx in sorted_indices:
                     h, k, offset = accum['results'][idx]
