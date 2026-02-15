@@ -434,7 +434,7 @@ async def iterate_rpc_inference(
                 (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
                     hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                 )
-                t1 = perf_counter()
+                # t1 = perf_counter()
                 # total_time = (t1 - t0) * 1000  # ms
                 # logger.info(f"[MERGED_POOL_INFERENCE] Total Time: {total_time:.4f}ms")
                 

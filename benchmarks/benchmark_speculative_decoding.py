@@ -10,6 +10,7 @@ from transformers import AutoTokenizer
 
 from bloombee import AutoDistributedSpeculativeModel
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
+from bloombee.models.llama.spec_decoding_drafter import MultiSSMDrafter
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -48,12 +49,15 @@ def main():
 def benchmark_inference(process_idx, args, result_pipe):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    ssm = AutoModelForCausalLM.from_pretrained("JackFram/llama-68m")
-    ssm = ssm.to(device)
+    drafter = MultiSSMDrafter(
+        ssm_model_name="JackFram/llama-68m",
+        num_workers=2,
+        device="cuda"
+    )
     # warm up ssm to reduce inference later
-    with torch.no_grad():
-        dummy_input = torch.ones(1, 8, dtype=torch.long, device=device)
-        ssm(dummy_input, attention_mask=torch.ones_like(dummy_input))
+    # with torch.no_grad():
+    #     dummy_input = torch.ones(1, 8, dtype=torch.long, device=device)
+    #     ssm(dummy_input, attention_mask=torch.ones_like(dummy_input))
 
     model = AutoDistributedSpeculativeModel.from_pretrained(
         args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype]
@@ -93,7 +97,7 @@ def benchmark_inference(process_idx, args, result_pipe):
 
     result = ""
     start_time = perf_counter()
-    result = model.generate(input_ids=input_ids, ssm=ssm)
+    result = model.generate(input_ids=input_ids, drafter=drafter)
     time = perf_counter() - start_time
     generated_tokens_nums = []
     for i in range(batch_size):

@@ -446,11 +446,11 @@ class InferenceSession:
         self._position += n_input_tokens
         # logger.info(f"keep_indices: {keep_indices}")
         # logger.info(f"before _recover_hidden_states: {inputs}")
-        t0 = time.perf_counter()
+        # t0 = time.perf_counter()
         if draft_tokens is not None and is_spec_dec:
             inputs = self._restore_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
-        t1 = time.perf_counter()
-        logger.info(f"_restore_hidden_states took {(t1 - t0) * 1000:.2f} ms")
+        # t1 = time.perf_counter()
+        # logger.info(f"_restore_hidden_states took {(t1 - t0) * 1000:.2f} ms")
         # logger.info(f"after _recover_hidden_states: {inputs}")
         outputs = inputs 
         

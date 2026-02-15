@@ -262,7 +262,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             
             self._ensure_model_on_device()
             
-            t0 = time.perf_counter()
+            # t0 = time.perf_counter()
             with self.cache_manager.use_cache(
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
@@ -287,8 +287,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # if self._is_spec_decoding and not self._need_pruning:
                 #     kv_cache_position_ids = self._update_kv_cache_position_ids(kv_cache_position_ids, self._last_keep_indices)
                 # logger.info(f"after format kv_cache_position_ids: {kv_cache_position_ids}")
-                t1 = time.perf_counter()
-                logger.info(f"inference_step: cache selection and preparation took {t1 - t0:.4f} seconds")
+                # t1 = time.perf_counter()
+                # logger.info(f"inference_step: cache selection and preparation took {t1 - t0:.4f} seconds")
                 if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
                     # 1. 取出需要 reorder 的 cache
                     # k_pkv_old, v_pkv_old, need_reorder = self.cache_manager.select_cache_for_reorder(
@@ -321,8 +321,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     )
                     cache_len = k_pkv.shape[2] if k_pkv is not None else 0
                     
-                t2 = time.perf_counter()
-                logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
+                # t2 = time.perf_counter()
+                # logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
 
                 layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
                 # if k_pkv is not None:
@@ -351,8 +351,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     full_mask = self._create_causal_attention_mask(batch_size, (seq_len + cache_len), cache_len, hidden_states.device)
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
                     
-                t3 = time.perf_counter()
-                logger.info(f"inference_step: attention mask creation took {t3 - t2:.4f} seconds")
+                # t3 = time.perf_counter()
+                # logger.info(f"inference_step: attention mask creation took {t3 - t2:.4f} seconds")
                 # logger.info(f"full_mask, shape: {full_mask.shape},  {full_mask[1]}")
                 # logger.info(f"hidden states in backend before compute: {hidden_states}")
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
@@ -381,8 +381,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     else:
                         rotary_position_ids = None
                     
-                    t4 = time.perf_counter()
-                    logger.info(f"inference_step: position_ids generation took {t4 - t3:.4f} seconds")
+                    # t4 = time.perf_counter()
+                    # logger.info(f"inference_step: position_ids generation took {t4 - t3:.4f} seconds")
                         
                     # logger.info(f"before gather rotary_position_ids: {rotary_position_ids}")
                     # logger.info(f"keep_indices: {inference_info.keep_indices}")
@@ -402,8 +402,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         )
                         # print(f' module.forward returned: {type(forward_result)}, length: {len(forward_result) if forward_result else "None"}')
                         
-                        t5 = time.perf_counter()
-                        logger.info(f"inference_step: module.forward call took {t5 - t4:.4f} seconds")
+                        # t5 = time.perf_counter()
+                        # logger.info(f"inference_step: module.forward call took {t5 - t4:.4f} seconds")
                         
                         if forward_result is None:
                             logger.info(f" ERROR: module.forward returned None!")
@@ -442,12 +442,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     
                 keep_indices = inference_info.keep_indices
                 
-                t6 = time.perf_counter()
-                logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
+                # t6 = time.perf_counter()
+                # logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
                 
                 if self._is_spec_decoding and self._need_pruning and self._is_last_block:
-                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    # norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    # keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    keep_indices = keep_indices
                     
                 if self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states
@@ -458,8 +459,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     valid_hidden_states = original_hidden_states[batch_idx[valid_mask], keep_indices[valid_mask], :]
                     output_hidden_states = valid_hidden_states.unsqueeze(0)
                     
-                t7 = time.perf_counter()
-                logger.info(f"inference_step: pruning and gathering took {t7 - t6:.4f} seconds")
+                # t7 = time.perf_counter()
+                # logger.info(f"inference_step: pruning and gathering took {t7 - t6:.4f} seconds")
                     
                 # logger.info(f"inference_step completed for block {self.name} in {time.perf_counter() - t0:.4f} seconds")
 
@@ -477,6 +478,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     final_logits = self.module.lm_head_forward(norm_hidden_states)
                     self.pruner_manager.train_model(final_logits, full_mask, inference_info.draft_tokens)
                 
+                # t8 = time.perf_counter()
+                # logger.info(f"inference_step: took {t8 - t0:.4f} seconds")
                 return (output_hidden_states, keep_indices) # Return output hidden states
                 
         except Exception as e:

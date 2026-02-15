@@ -12,6 +12,7 @@ from transformers.generation.streamers import BaseStreamer
 
 from bloombee.models.llama.config import DistributedLlamaConfig
 from bloombee.models.llama.model import DistributedLlamaForCausalLM
+from bloombee.models.llama.spec_decoding_drafter import MultiSSMDrafter
 
 
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree, TreeNode, prepare_incremental_tree_batch
@@ -29,7 +30,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
     def generate(
         self,
         input_ids: torch.LongTensor,
-        ssm: LlamaForCausalLM,
+        drafter: MultiSSMDrafter,
         generation_config: Optional[GenerationConfig] = None,
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
@@ -56,7 +57,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         with self.transformer.h.inference_session(max_length=session_max_length) as session:
             return self._sample_with_session(
                 input_ids=input_ids,
-                ssm=ssm,
+                drafter=drafter,
                 logits_processor=logits_processor,
                 stopping_criteria=stopping_criteria,
                 generation_config=generation_config,
@@ -73,7 +74,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
     def _sample_with_session(
         self,
         input_ids: torch.LongTensor,
-        ssm: LlamaForCausalLM,
+        drafter: MultiSSMDrafter,
         logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
@@ -124,11 +125,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # 修改循环条件：基于最短序列的长度判断
         t0 = time.perf_counter()
         initial_len = input_ids.shape[1]
+        total_time = 0.0
         while not finished and (seq_lengths.min().item() - initial_len) < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
-            spec_trees = self._build_speculative_trees_batched(
-                current_input_ids, ssm, beam_width, max_tree_depth, seq_lengths
+            spec_trees = drafter.build_trees_parallel(
+                current_input_ids, seq_lengths, beam_width, max_tree_depth, 
             )
             t2 = time.perf_counter()
             logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
@@ -198,6 +200,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(current_input_ids, None)
             finished = unfinished_sequences.max() == 0
             step_idx += 1
+            total_time = time.perf_counter() - t0
+            logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
 
         if streamer is not None:
             streamer.end()
@@ -431,95 +435,120 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         max_depth: int,
         seq_lengths: torch.LongTensor,
     ) -> List[SpeculativeTree]:
-        """Build speculative trees using the small model (SSM)"""
-        batch_size = input_ids.shape[0]
-        trees = []
+        """Build speculative trees - 所有样本按 depth 批量处理"""
         
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
         pad_token_id = getattr(ssm.config, 'pad_token_id', 0)
-
+        
+        # 初始化所有 trees
+        trees = []
+        valid_inputs = []  # 每个样本的有效 input_ids
+        
         for batch_idx in range(batch_size):
-            # 获取该序列的真实长度
             actual_len = seq_lengths[batch_idx].item()
-            
-            # 只取有效部分的 input_ids
             valid_input_ids = input_ids[batch_idx, :actual_len]
+            valid_inputs.append(valid_input_ids)
             
             root_token = valid_input_ids[-1].item()
             tree = SpeculativeTree(root_token, f"req_{batch_idx}")
+            trees.append(tree)
+        
+        # 按 depth 循环，每层一次 SSM 调用
+        for depth in range(max_depth):
             
-            for depth in range(max_depth):
+            # 收集所有样本在当前 depth 的 nodes 和 contexts
+            all_contexts = []
+            node_mapping = []  # (batch_idx, node) 用于结果拆分
+            
+            for batch_idx in range(batch_size):
+                tree = trees[batch_idx]
+                valid_input_ids = valid_inputs[batch_idx]
+                root_token = valid_input_ids[-1].item()
+                
                 current_nodes = tree.get_nodes_at_depth(depth)
-                if not current_nodes:
-                    break
-
-                # Build contexts
-                contexts = []
+                
                 for node in current_nodes:
                     path_to_node = node.get_path_from_root()
                     context = torch.cat([
-                        valid_input_ids[:-1],  # 使用有效的 input_ids
-                        torch.tensor([root_token] + path_to_node, device=input_ids.device)
+                        valid_input_ids[:-1],
+                        torch.tensor([root_token] + path_to_node, device=device)
                     ])
-                    contexts.append(context)
-
-                if not contexts:
-                    break
-
-                max_len = max(len(ctx) for ctx in contexts)
-                padded_contexts = []
-                attention_masks = []
-
-                for ctx in contexts:
-                    pad_len = max_len - len(ctx)
-
-                    # 左侧 padding
-                    padded = torch.cat([
-                        torch.full((pad_len,), pad_token_id, dtype=torch.long, device=input_ids.device),
-                        ctx
-                    ])
-
-                    mask = torch.cat([
-                        torch.zeros(pad_len, dtype=torch.long, device=input_ids.device),
-                        torch.ones(len(ctx), dtype=torch.long, device=input_ids.device)
-                    ])
-
-                    padded_contexts.append(padded)
-                    attention_masks.append(mask)
-
-                batch_contexts = torch.stack(padded_contexts)
-                batch_masks = torch.stack(attention_masks)
-
-                # SSM forward
-                with torch.no_grad():
-                    # logger.info(f"batch_contexts: {batch_contexts}")
-                    # logger.info(f"batch_masks: {batch_masks}")
-                    outputs = ssm(batch_contexts, attention_mask=batch_masks, use_cache=False)
-                    batch_logits = outputs.logits[:, -1, :]  # 左侧 padding 所以 -1 是正确的
-
-                # Generate candidates
-                candidates_per_node = []
-                for i in range(len(current_nodes)):
-                    logits = batch_logits[i]
-                    top_k_values, top_k_indices = torch.topk(logits, k=beam_width)
-                    probs = torch.softmax(logits, dim=-1)
-
-                    candidates = []
-                    for j in range(beam_width):
-                        token_id = top_k_indices[j].item()
-                        prob = probs[token_id].item()
-                        candidates.append((token_id, prob))
-
-                    candidates_per_node.append(candidates)
-
-                try:
-                    new_nodes = tree.add_layer(current_nodes, candidates_per_node)
-                    if not new_nodes:
-                        break
-                except ValueError as e:
-                    logger.warning(f"Failed to add tree layer: {e}")
-                    break
+                    all_contexts.append(context)
+                    node_mapping.append((batch_idx, node))
+            
+            # 如果没有 context，结束
+            if not all_contexts:
+                break
+            
+            # Padding 成统一长度
+            max_len = max(len(ctx) for ctx in all_contexts)
+            padded_contexts = []
+            attention_masks = []
+            
+            for ctx in all_contexts:
+                pad_len = max_len - len(ctx)
+                padded = torch.cat([
+                    torch.full((pad_len,), pad_token_id, dtype=torch.long, device=device),
+                    ctx
+                ])
+                mask = torch.cat([
+                    torch.zeros(pad_len, dtype=torch.long, device=device),
+                    torch.ones(len(ctx), dtype=torch.long, device=device)
+                ])
+                padded_contexts.append(padded)
+                attention_masks.append(mask)
+            
+            batch_contexts = torch.stack(padded_contexts)
+            batch_masks = torch.stack(attention_masks)
+            
+            # 一次 SSM forward 处理所有
+            with torch.no_grad():
+                outputs = ssm(batch_contexts, attention_mask=batch_masks, use_cache=False)
+                all_logits = outputs.logits[:, -1, :]  # (total_nodes, vocab_size)
+            
+            # 按样本分组处理结果
+            # 先按 batch_idx 分组
+            batch_node_results = {}  # batch_idx -> [(node, candidates), ...]
+            
+            for i, (batch_idx, node) in enumerate(node_mapping):
+                logits = all_logits[i]
+                _, top_k_indices = torch.topk(logits, k=beam_width)
+                probs = torch.softmax(logits, dim=-1)
                 
-            trees.append(tree)
+                candidates = []
+                for j in range(beam_width):
+                    token_id = top_k_indices[j].item()
+                    prob = probs[token_id].item()
+                    candidates.append((token_id, prob))
+                
+                if batch_idx not in batch_node_results:
+                    batch_node_results[batch_idx] = []
+                batch_node_results[batch_idx].append((node, candidates))
+            
+            # 更新每个 tree
+            any_new_nodes = False
+            for batch_idx in range(batch_size):
+                if batch_idx not in batch_node_results:
+                    continue
+                
+                tree = trees[batch_idx]
+                node_candidates = batch_node_results[batch_idx]
+                
+                # 保持顺序：nodes 和 candidates_per_node 要对应
+                nodes = [nc[0] for nc in node_candidates]
+                candidates_per_node = [nc[1] for nc in node_candidates]
+                
+                try:
+                    new_nodes = tree.add_layer(nodes, candidates_per_node)
+                    if new_nodes:
+                        any_new_nodes = True
+                except ValueError as e:
+                    logger.warning(f"Failed to add tree layer for batch {batch_idx}: {e}")
+            
+            if not any_new_nodes:
+                break
+        
         return trees
     
     def _extract_best_verified_paths_fixed(
