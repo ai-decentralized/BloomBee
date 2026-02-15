@@ -3,7 +3,11 @@ from bloombee.models.llama.spe_dec_tree import SpeculativeTree
 from typing import List
 import threading
 from transformers.cache_utils import DynamicCache
+import time
 
+from hivemind.utils.logging import get_logger
+
+logger = get_logger()
 
 class MultiSSMDrafter:
     
@@ -16,7 +20,9 @@ class MultiSSMDrafter:
         self.ssms = []
         self.streams = []
         for _ in range(num_workers):
-            ssm = AutoModelForCausalLM.from_pretrained(ssm_model_name)
+            ssm = AutoModelForCausalLM.from_pretrained(
+                ssm_model_name,
+                torch_dtype=torch.float16)
             ssm = ssm.to(self.device)
             ssm.eval()
             self.ssms.append(ssm)
@@ -86,6 +92,7 @@ class MultiSSMDrafter:
         trees = {}
         valid_inputs = {}
         prefix_lengths = {}
+        t0 = time.perf_counter()
         
         for batch_idx in batch_indices:
             actual_len = seq_lengths[batch_idx].item()
@@ -135,13 +142,20 @@ class MultiSSMDrafter:
             
             with torch.no_grad():
                 prefix_outputs = ssm(batch_prefixes, attention_mask=batch_prefix_masks, use_cache=True)
-                prefix_cache = prefix_outputs.past_key_values  # 这是 DynamicCache 对象
+                prefix_cache = prefix_outputs.past_key_values
         
         idx_map = {batch_idx: i for i, batch_idx in enumerate(batch_indices)}
         
         # ========== 按 depth 扩展 ==========
+        t1 = time.perf_counter()
+        logger.info(f"Prefix processing time: {t1 - t0:.4f}s")
+        
+        t_forward = 0
+        t_postprocess = 0
+        t_prepare = 0
         for depth in range(max_depth):
             
+            t0 = time.perf_counter()
             all_paths = []
             node_mapping = []
             cache_indices = []
@@ -160,64 +174,57 @@ class MultiSSMDrafter:
             if not all_paths:
                 break
             
+            num_nodes = len(all_paths)
             max_path_len = max(len(p) for p in all_paths)
             max_pf_len = max(prefix_lengths[nm[0]] for nm in node_mapping)
+            total_mask_len = max_pf_len + max_path_len
             
-            padded_paths = []
-            path_masks = []
+            # 预分配
+            batch_paths = torch.full((num_nodes, max_path_len), pad_token_id, dtype=torch.long, device=self.device)
+            batch_path_masks = torch.zeros((num_nodes, total_mask_len), dtype=torch.long, device=self.device)
             
+            # 填充
             for i, path in enumerate(all_paths):
+                path_len = len(path)
+                batch_paths[i, -path_len:] = path
+                
                 batch_idx = node_mapping[i][0]
                 pf_len = prefix_lengths[batch_idx]
-                path_len = len(path)
-                pad_len = max_path_len - path_len
                 prefix_pad_len = max_pf_len - pf_len
                 
-                padded_paths.append(torch.cat([
-                    torch.full((pad_len,), pad_token_id, dtype=torch.long, device=self.device),
-                    path
-                ]))
-                path_masks.append(torch.cat([
-                    torch.zeros(prefix_pad_len, dtype=torch.long, device=self.device),
-                    torch.ones(pf_len, dtype=torch.long, device=self.device),
-                    torch.zeros(pad_len, dtype=torch.long, device=self.device),
-                    torch.ones(path_len, dtype=torch.long, device=self.device)
-                ]))
+                batch_path_masks[i, prefix_pad_len:prefix_pad_len + pf_len] = 1
+                batch_path_masks[i, -path_len:] = 1
             
-            batch_paths = torch.stack(padded_paths)
-            batch_path_masks = torch.stack(path_masks)
-            
-            # 构建新的 DynamicCache，按 cache_indices 选取
+            # cache
             if prefix_cache is not None:
                 node_cache = DynamicCache()
                 for layer_idx in range(len(prefix_cache)):
                     key, value = prefix_cache[layer_idx]
-                    node_cache.update(
-                        key[cache_indices],
-                        value[cache_indices],
-                        layer_idx
-                    )
+                    node_cache.update(key[cache_indices], value[cache_indices], layer_idx)
             else:
                 node_cache = None
             
+            t_prepare += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            # forward
             with torch.no_grad():
-                outputs = ssm(
-                    batch_paths,
-                    attention_mask=batch_path_masks,
-                    past_key_values=node_cache,
-                    use_cache=False
-                )
+                outputs = ssm(batch_paths, attention_mask=batch_path_masks, past_key_values=node_cache, use_cache=False)
                 all_logits = outputs.logits[:, -1, :]
+            
+            t_forward += time.perf_counter() - t0
+            t0 =    time.perf_counter()
+            # 批量 topk
+            _, all_top_k_indices = torch.topk(all_logits, k=beam_width, dim=-1)
+            all_probs = torch.softmax(all_logits, dim=-1)
+            all_top_k_probs = torch.gather(all_probs, 1, all_top_k_indices)
+            
+            all_top_k_indices_np = all_top_k_indices.cpu().numpy()
+            all_top_k_probs_np = all_top_k_probs.cpu().numpy()
             
             batch_node_results = {}
             for i, (batch_idx, node) in enumerate(node_mapping):
-                logits = all_logits[i]
-                _, top_k_indices = torch.topk(logits, k=beam_width)
-                probs = torch.softmax(logits, dim=-1)
-                
-                candidates = [(top_k_indices[j].item(), probs[top_k_indices[j]].item()) 
+                candidates = [(int(all_top_k_indices_np[i, j]), float(all_top_k_probs_np[i, j])) 
                             for j in range(beam_width)]
-                
                 if batch_idx not in batch_node_results:
                     batch_node_results[batch_idx] = []
                 batch_node_results[batch_idx].append((node, candidates))
@@ -226,18 +233,18 @@ class MultiSSMDrafter:
             for batch_idx in batch_indices:
                 if batch_idx not in batch_node_results:
                     continue
-                
                 tree = trees[batch_idx]
                 nodes = [nc[0] for nc in batch_node_results[batch_idx]]
                 candidates = [nc[1] for nc in batch_node_results[batch_idx]]
-                
                 try:
                     if tree.add_layer(nodes, candidates):
                         any_new = True
                 except ValueError:
                     pass
+            t_postprocess += time.perf_counter() - t0
             
             if not any_new:
                 break
         
+        logger.info(f"forward: {t_forward:.4f}s, postprocess: {t_postprocess:.4f}s, total prepare: {t_prepare:.4f}s")
         return [(idx, trees[idx]) for idx in batch_indices]
