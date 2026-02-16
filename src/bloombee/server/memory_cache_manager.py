@@ -5,7 +5,9 @@ import asyncio
 import torch
 import os
 import threading
+import time
 from typing import Optional, Tuple, AsyncContextManager, Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -39,6 +41,7 @@ class KVCacheManager:
         self.block_config = block_config
         self.max_alloc_timeout = max_alloc_timeout
         self._active_cache_tensors_stack = []
+        self._reorder_executor = ThreadPoolExecutor(max_workers=1)
         
         
     def get_cache_device(self, policy):
@@ -133,6 +136,7 @@ class KVCacheManager:
         prefix_length: int,
         hypo_ids: Optional[torch.Tensor] = None,
         kv_cache_position_ids: Optional[torch.Tensor] = None,
+        cache_tensors: Sequence[torch.Tensor] = None,
     ):
         """
         Return standard KV for computation
@@ -141,11 +145,12 @@ class KVCacheManager:
         - Internal cache is stored along dimension (S, B*H, D)
         - If mixed device (MIXED), segments will be merged on compute_dst and returned
         """
-        assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
+        if cache_tensors is None:
+            assert self._active_cache_tensors_stack, "write_pkv_cache called outside of use_cache context"
+            cache_tensors = self._active_cache_tensors_stack[-1]  # TorchTensor
         if prefix_length <= 0:
             return None, None, False
-
-        cache_tensors = self._active_cache_tensors_stack[-1]
+        
         (k_cache, v_cache), = cache_tensors
         S_full, BH, D = k_cache.shape
         assert prefix_length <= S_full, f"prefix_length={prefix_length} > seq_len={S_full}"
@@ -608,61 +613,87 @@ class KVCacheManager:
         2. 启动异步线程重排整个 cache
         """
         # ============ Prefill 阶段：直接写入，不需要重排 ============
-        if kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0:
-            # Prefill 阶段，cache 从位置 0 开始写入
-            self._write_kvs(new_kvs, start_position=0)
-            return
         
-        # ============ Generation 阶段 ============
-        valid_mask = kv_cache_position_ids >= 0
-        
-        # 再次检查是否有有效位置
-        if not valid_mask.any():
-            self._write_kvs(new_kvs, start_position=0)
-            return
-        
-        max_position = kv_cache_position_ids[valid_mask].max().item()
-        write_position = int(max_position) + 1
-        
-        # 1. 同步写入新 KV
-        self._write_kvs(new_kvs, write_position)
-        
-        # 2. 准备异步重排
-        # 从 new_kvs 中获取 tree_len
-        new_kvs_data = new_kvs.kvs if hasattr(new_kvs, "kvs") else new_kvs
-        key, value = new_kvs_data
-        key_data = key.data if hasattr(key, 'data') else key
-        tree_len = key_data.shape[-1]
-        
-        device = kv_cache_position_ids.device
-        B = kv_cache_position_ids.shape[0]
-        
-        new_positions = torch.arange(write_position, write_position + tree_len, device=device)
-        new_positions = new_positions.unsqueeze(0).expand(B, tree_len)
-        extended_position_ids = torch.cat([kv_cache_position_ids, new_positions], dim=1)
-        
-        k_pkv, v_pkv, _ = self.select_cache_without_reorder(extended_position_ids)
-        
-        if k_pkv is None:
-            return
-        
-        k_pkv_copy = k_pkv.clone()
-        v_pkv_copy = v_pkv.clone()
-        extended_position_ids_copy = extended_position_ids.clone()
-        
+        # 保存 self 引用
+        cache_manager = self
         # 3. 启动异步重排线程
-        def reorder_task():
-            try:
-                with torch.inference_mode():
-                    self.reorder_and_write_cache(
-                        k_pkv=k_pkv_copy,
-                        v_pkv=v_pkv_copy,
-                        kv_cache_position_ids=extended_position_ids_copy,
-                        cache_tensors=cache_tensors
-                    )
-            except Exception as e:
-                import logging
-                logging.error(f"Async cache reorder failed: {e}")
+        self._reorder_executor.submit(
+            self._do_reorder_task,
+            new_kvs,
+            kv_cache_position_ids,  # (B, max_pos_len), -1 是 padding，可能为 None
+            cache_tensors,
+            cache_manager=cache_manager,
+        )
         
-        reorder_thread = threading.Thread(target=reorder_task, daemon=False)
-        reorder_thread.start()
+    def _do_reorder_task(
+        self,
+        new_kvs: AdaptedKVCache,
+        kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len), -1 是 padding，可能为 None
+        cache_tensors: Sequence[torch.Tensor],
+        cache_manager: "KVCacheManager",
+    ):
+        try:
+            with torch.inference_mode():
+                if kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0:
+                    self._write_kvs(new_kvs, start_position=0, cache_tensors=cache_tensors)
+                    return
+                
+                # ============ Generation 阶段 ============
+                valid_mask = kv_cache_position_ids >= 0
+                
+                if not valid_mask.any():
+                    self._write_kvs(new_kvs, start_position=0, cache_tensors=cache_tensors)
+                    return
+                
+                max_position = kv_cache_position_ids[valid_mask].max().item()
+                write_position = int(max_position) + 1
+                
+                # 1. 同步写入新 KV
+                self._write_kvs(new_kvs, write_position, cache_tensors=cache_tensors)
+                
+                # 2. 准备异步重排所需的参数
+                new_kvs_data = new_kvs.kvs if hasattr(new_kvs, "kvs") else new_kvs
+                key, _ = new_kvs_data
+                key_data = key.data if hasattr(key, 'data') else key
+                tree_len = key_data.shape[-1]
+                
+                device = kv_cache_position_ids.device
+                B = kv_cache_position_ids.shape[0]
+                
+                # 复制 position_ids（轻量操作）
+                kv_cache_position_ids_copy = kv_cache_position_ids.clone()
+                
+                
+                # 构建 extended_position_ids
+                new_positions = torch.arange(write_position, write_position + tree_len, device=device)
+                new_positions = new_positions.unsqueeze(0).expand(B, tree_len)
+                extended_position_ids = torch.cat([kv_cache_position_ids_copy, new_positions], dim=1)
+                
+                # 计算 cache 长度
+                ext_valid_mask = extended_position_ids >= 0
+                max_ext_position = extended_position_ids[ext_valid_mask].max().item()
+                cache_len = int(max_ext_position) + 1
+                
+                # 直接调用现有的 select_cache
+                k_pkv, v_pkv, _ = cache_manager.select_cache(
+                    prefix_length=cache_len,
+                    hypo_ids=None,
+                    kv_cache_position_ids=None,
+                    cache_tensors=cache_tensors,
+                )
+                
+                if k_pkv is None:
+                    return
+                
+                # 重排并写回
+                cache_manager.reorder_and_write_cache(
+                    k_pkv=k_pkv,
+                    v_pkv=v_pkv,
+                    kv_cache_position_ids=extended_position_ids,
+                    cache_tensors=cache_tensors,
+                )
+                    
+        except Exception as e:
+            import logging
+            logging.error(f"Async cache reorder failed: {e}")
+        
