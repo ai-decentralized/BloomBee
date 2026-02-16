@@ -82,8 +82,6 @@ def benchmark_inference(process_idx, args, result_pipe):
         prompts = ["Once upon a time", "In a galaxy far away"]
     elif batch_size == 3:
         prompts = ["Once upon a time", "In a galaxy far away", "The quick brown fox"]
-    elif batch_size == 4:
-        prompts = ["Hi", "", "", ""]
     else:
         base_prompt = (
             "Quantum mechanics explains the behavior of particles at very small scales. "

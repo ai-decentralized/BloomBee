@@ -64,7 +64,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
-    batch_size = 8
+    batch_size = 4
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
     indices = random.sample(range(len(dataset)), batch_size)
     sampled = dataset.select(indices)
@@ -72,14 +72,22 @@ def benchmark_inference(process_idx, args, result_pipe):
     # for item in sampled:
         # test_prompts.append(item["instruction"])
         
-    test_prompts.append("Hi,")
-    test_prompts.append("")
-    test_prompts.append("")
-    test_prompts.append("")
-    test_prompts.append("")
-    test_prompts.append("")
-    test_prompts.append("")
-    test_prompts.append("")
+    base_prompt = (
+        "Quantum mechanics explains the behavior of particles at very small scales. "
+        "Neural networks learn patterns by adjusting weights through backpropagation. "
+        "Distributed systems require robust consensus mechanisms to maintain state. "
+        "Optimization algorithms like gradient descent are fundamental to machine learning. "
+        "Transformer architectures rely on attention mechanisms to capture dependencies. "
+        "Reinforcement learning optimizes actions by maximizing cumulative rewards. "
+        "Bayesian inference updates beliefs based on observed evidence and prior knowledge. "
+        "Convex optimization problems guarantee global minima under certain conditions. "
+        "Signal processing extracts meaningful information from noisy measurements. "
+    )
+    prompts = [
+        f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
+        for i in range(batch_size)
+    ]
+    test_prompts = prompts
 
     tokenizer.pad_token = tokenizer.eos_token
     # tokenizer.padding_side = "left"
@@ -101,10 +109,21 @@ def benchmark_inference(process_idx, args, result_pipe):
     time = perf_counter() - start_time
     generated_tokens_nums = []
     for i in range(batch_size):
-        prompt_length = input_ids[i].ne(tokenizer.pad_token_id).sum().item()
-        result_length = result[i].ne(tokenizer.pad_token_id).sum().item()
+        # 1. 计算 Prompt 长度（排除 pad）
+        prompt_mask = input_ids[i].ne(tokenizer.pad_token_id)
+        prompt_length = prompt_mask.sum().item()
+        
+        # 2. 计算 Result 长度（排除 pad 且 排除 ID 为 0 的 token）
+        # 使用 & 符号连接两个条件
+        result_mask = result[i].ne(tokenizer.pad_token_id) & result[i].ne(0)
+        result_length = result_mask.sum().item()
+        
+        # 3. 计算真正生成的 token 数
+        # 注意：如果 prompt 里本身就包含 0，逻辑可能需要微调。
+        # 这里假设 0 只出现在生成的后缀部分
         generated_tokens_num = result_length - prompt_length
         generated_tokens_nums.append(generated_tokens_num)
+        
         logger.info(f"result: {result[i]}")
     
     avg_generated_tokens = sum(generated_tokens_nums) / batch_size

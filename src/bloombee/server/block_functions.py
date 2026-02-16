@@ -34,7 +34,7 @@ def print_time_now(s):
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
 # Note: NF4 refers to FlexGen's 4-bit group quantization, not bitsandbytes
-MAX_SHORT_INFERENCE_TOKENS = 1280
+MAX_SHORT_INFERENCE_TOKENS = 8192
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
 logger = get_logger(__name__)

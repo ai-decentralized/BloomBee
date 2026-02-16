@@ -148,7 +148,7 @@ class MultiSSMDrafter:
         
         # ========== 按 depth 扩展 ==========
         t1 = time.perf_counter()
-        logger.info(f"Prefix processing time: {t1 - t0:.4f}s")
+        # logger.info(f"Prefix processing time: {t1 - t0:.4f}s")
         
         t_forward = 0
         t_postprocess = 0
@@ -246,5 +246,5 @@ class MultiSSMDrafter:
             if not any_new:
                 break
         
-        logger.info(f"forward: {t_forward:.4f}s, postprocess: {t_postprocess:.4f}s, total prepare: {t_prepare:.4f}s")
+        # logger.info(f"forward: {t_forward:.4f}s, postprocess: {t_postprocess:.4f}s, total prepare: {t_prepare:.4f}s")
         return [(idx, trees[idx]) for idx in batch_indices]

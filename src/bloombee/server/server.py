@@ -235,7 +235,7 @@ class Server:
 
         is_multiquery_attn = self.block_config.num_key_value_groups > 1
         if max_batch_size is None:
-            max_batch_size = 8192 if is_multiquery_attn else 2048
+            max_batch_size = 8192 if is_multiquery_attn else 8192
         if inference_max_length is None:
             inference_max_length = 8192 if is_multiquery_attn else 4096
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size

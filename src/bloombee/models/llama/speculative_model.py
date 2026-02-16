@@ -51,7 +51,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         generation_config.return_dict_in_generate = False
 
         # Calculate session max length - this is critical for distributed inference
-        session_max_length = 512
+        session_max_length = 624
 
         # Use inference session for proper distributed caching
         with self.transformer.h.inference_session(max_length=session_max_length) as session:
@@ -123,17 +123,18 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         pad_token_id = generation_config.pad_token_id if generation_config.pad_token_id is not None else 0
         logger.info(f"init input_ids: {input_ids}, seq_lengths: {seq_lengths}")
         # 修改循环条件：基于最短序列的长度判断
-        t0 = time.perf_counter()
+        # t0 = time.perf_counter()
         initial_len = input_ids.shape[1]
-        total_time = 0.0
+        t0 = time.perf_counter()  # 用于记录第一个达标的时间
+        has_printed_first_reach = False # 确保只打印一次
         while not finished and (seq_lengths.min().item() - initial_len) < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
-            t1 = time.perf_counter()
+            # t1 = time.perf_counter()
             spec_trees = drafter.build_trees_parallel(
                 current_input_ids, seq_lengths, beam_width, max_tree_depth, 
             )
-            t2 = time.perf_counter()
-            logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
+            # t2 = time.perf_counter()
+            # logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
             # logger.info(f"spec_trees, {spec_trees}")
             
             # 2. Verify trees using distributed inference
@@ -149,8 +150,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 seq_lengths=seq_lengths,
             )
             
-            t3 = time.perf_counter()
-            logger.info(f"Step {step_idx}: Verified trees with distributed inference in {t3 - t2:.4f} seconds")
+            # t3 = time.perf_counter()
+            # logger.info(f"Step {step_idx}: Verified trees with distributed inference in {t3 - t2:.4f} seconds")
             
             # logger.info(f"verified_tokens_positions: {verified_tokens_positions}")
             
@@ -183,8 +184,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 pad_token_id=pad_token_id,
             )
             
-            t4 = time.perf_counter()
-            logger.info(f"Step {step_idx}: Updated input_ids with padding in {t4 - t3:.4f} seconds")
+            # t4 = time.perf_counter()
+            # logger.info(f"Step {step_idx}: Updated input_ids with padding in {t4 - t3:.4f} seconds")
             
             # logger.info(f"current_input_ids: {current_input_ids}, seq_lengths: {seq_lengths}")
 
@@ -199,9 +200,14 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             # 5. Check if finished
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(current_input_ids, None)
             finished = unfinished_sequences.max() == 0
+            # logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
             step_idx += 1
-            total_time = time.perf_counter() - t0
-            logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
+            current_generations = seq_lengths - initial_len
+            if not has_printed_first_reach and current_generations.max().item() >= max_new_tokens:
+                first_reach_time = time.perf_counter() - t0
+                logger.info(f"🚀 [First Reach] 第一个样本达到 max_new_tokens，耗时: {first_reach_time:.4f}s")
+                has_printed_first_reach = True
+            
 
         if streamer is not None:
             streamer.end()
