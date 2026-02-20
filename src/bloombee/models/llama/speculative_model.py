@@ -38,6 +38,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
         max_new_tokens: int = 64,
+        session_max_length: Optional[int] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
         
@@ -48,8 +49,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         generation_config.do_sample = False
         generation_config.return_dict_in_generate = False
 
-        # Calculate session max length - this is critical for distributed inference
-        session_max_length = 4096
+        # Roll back to fixed session max length mode.
+        # Keep the argument for API compatibility, but ignore runtime overrides.
+        if "session_max_length" in model_kwargs:
+            model_kwargs.pop("session_max_length", None)
+        session_max_length = 512
+        logger.info("Speculative session_max_length=%s (hardcoded)", session_max_length)
 
         # Use inference session for proper distributed caching
         with self.transformer.h.inference_session(max_length=session_max_length) as session:

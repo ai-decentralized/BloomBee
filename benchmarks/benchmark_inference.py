@@ -33,6 +33,29 @@ def main():
     parser.add_argument("--prompt_len", type=int, default=None, help="Desired prompt/prefill length in tokens (optional)")
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
     parser.add_argument("--batch_size", type=int, default=1, help="Client batch size (number of sequences to generate in parallel)")
+    parser.add_argument(
+        "--prompt_start_index",
+        type=int,
+        default=1,
+        help="Starting index for prompt generation; default=1 avoids the degenerate 'Number 0' case",
+    )
+    parser.add_argument(
+        "--prompt_template",
+        type=str,
+        default="Number {i}: ",
+        help="Prompt template. Must contain '{i}', e.g. 'Number {i}: ' or 'Topic {i}: '",
+    )
+    parser.add_argument(
+        "--token_log_every",
+        type=int,
+        default=8,
+        help="Log generated tokens every N decode steps (<=0 logs only first/last step)",
+    )
+    parser.add_argument(
+        "--log_all_tokens",
+        action="store_true",
+        help="Log generated tokens for every decode step (high-volume logs)",
+    )
     args = parser.parse_args()
 
     if args.n_processes == "n_gpus":
@@ -64,7 +87,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     # Set pad_token for LLaMA tokenizer (required for batch padding)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        logger.info(f"[DEBUG] Set pad_token to eos_token: {tokenizer.pad_token}")
+        logger.info(f"Set pad_token to eos_token: {tokenizer.pad_token}")
 
     model = AutoDistributedModelForCausalLM.from_pretrained(
         args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype],
@@ -75,29 +98,12 @@ def benchmark_inference(process_idx, args, result_pipe):
     # Prepare batch of prompts for benchmarking
     batch_size = getattr(args, 'batch_size', 1)
     
-    # Create different prompts for each batch to verify independent generation
-    if batch_size == 1:
-        prompts = [""]
-    elif batch_size == 2:
-        prompts = ["Once upon a time", "In a galaxy far away"]
-    elif batch_size == 3:
-        prompts = ["Once upon a time", "In a galaxy far away", "The quick brown fox"]
-    else:
-        base_prompt = (
-            "Quantum mechanics explains the behavior of particles at very small scales. "
-            "Neural networks learn patterns by adjusting weights through backpropagation. "
-            "Distributed systems require robust consensus mechanisms to maintain state. "
-            "Optimization algorithms like gradient descent are fundamental to machine learning. "
-            "Transformer architectures rely on attention mechanisms to capture dependencies. "
-            "Reinforcement learning optimizes actions by maximizing cumulative rewards. "
-            "Bayesian inference updates beliefs based on observed evidence and prior knowledge. "
-            "Convex optimization problems guarantee global minima under certain conditions. "
-            "Signal processing extracts meaningful information from noisy measurements. "
-        )
-        prompts = [
-            f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
-            for i in range(batch_size)
-        ]
+    # Use different prompts for each batch item to verify micro-batch correctness.
+    # NOTE: Starting from 0 may trigger degenerate greedy output ("0000...") for some models.
+    prompt_indices = [args.prompt_start_index + i for i in range(batch_size)]
+    if "{i}" not in args.prompt_template:
+        raise ValueError("--prompt_template must include '{i}' placeholder")
+    prompts = [args.prompt_template.format(i=i) for i in prompt_indices]
     
     if args.prompt_len is None:
         encodings = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=True)
@@ -128,9 +134,12 @@ def benchmark_inference(process_idx, args, result_pipe):
             processed.append(full_tokens)
         input_ids = torch.tensor(processed, dtype=torch.long)
     
-    logger.info(f"[DEBUG] {process_idx=} Client batch_size={batch_size}, input_ids.shape={input_ids.shape}")
+    logger.info(f"{process_idx=} Client batch_size={batch_size}, input_ids.shape={input_ids.shape}")
     for i, prompt in enumerate(prompts):
-        logger.info(f"[DEBUG] {process_idx=} batch[{i}] prompt: '{prompt}' (token_ids: {input_ids[i].tolist()})")
+        logger.info(
+            f"{process_idx=} batch[{i}] prompt: '{prompt}' "
+            f"(prompt_index={prompt_indices[i]}, token_ids={input_ids[i].tolist()})"
+        )
     temp_result_tokens = input_ids
     
     # Calculate max_length: prompt_length + number of tokens to generate
@@ -146,10 +155,10 @@ def benchmark_inference(process_idx, args, result_pipe):
             input_ids = torch.cat([input_ids, pad_block], dim=1)
         prompt_length = target_prompt_length
         temp_result_tokens = input_ids
-        logger.info(f"[DEBUG] {process_idx=} adjusted prompt_length to {prompt_length} tokens")
+        logger.info(f"{process_idx=} adjusted prompt_length to {prompt_length} tokens")
 
     total_max_length = prompt_length + args.seq_len
-    logger.info(f"[DEBUG] {process_idx=} prompt_length={prompt_length}, generating {args.seq_len} tokens, total_max_length={total_max_length}")
+    logger.info(f"{process_idx=} prompt_length={prompt_length}, generating {args.seq_len} tokens, total_max_length={total_max_length}")
     
     step_times = []
     step_latencies = []  # Track individual step latencies for cross-GPU analysis
@@ -157,7 +166,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     server_processing_latencies = []  # Track server processing latencies
     
     with model.transformer.h.inference_session(max_length=total_max_length) as sess:
-        logger.info(f"[DEBUG] {process_idx=} Created inference session with max_length={total_max_length}")
+        logger.info(f"{process_idx=} Created inference session with max_length={total_max_length}")
         logger.info(f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | SeqLen={args.seq_len}")
         
         for step in range(args.seq_len):
@@ -165,10 +174,10 @@ def benchmark_inference(process_idx, args, result_pipe):
             
             # For the first step, pass input_ids; for subsequent steps, generate() will use session state
             if step == 0:
-                logger.info(f"[DEBUG] {process_idx=} {step=} First step, passing input_ids.shape={input_ids.shape}")
+                logger.info(f"{process_idx=} {step=} First step, passing input_ids.shape={input_ids.shape}")
                 outputs = model.generate(input_ids, max_new_tokens=1, session=sess)
             else:
-                logger.info(f"[DEBUG] {process_idx=} {step=} Subsequent step, using session state")
+                logger.debug(f"{process_idx=} {step=} Subsequent step, using session state")
                 outputs = model.generate(max_new_tokens=1, session=sess)
             
             step_end_time = perf_counter()
@@ -178,13 +187,23 @@ def benchmark_inference(process_idx, args, result_pipe):
             # Enhanced logging for cross-GPU analysis
             logger.info(f"[STEP_LATENCY] Process={process_idx} | Step={step} | "
                        f"Latency={step_latency_ms:.2f}ms | BatchSize={batch_size}")
-            logger.info(f"[DEBUG] {process_idx=} {step=} After generate, outputs.shape={outputs.shape}")
+            logger.debug(f"{process_idx=} {step=} After generate, outputs.shape={outputs.shape}")
             
             # Log generated tokens for all sequences in the batch
-            for batch_idx in range(outputs.shape[0]):
-                new_token_id = outputs[batch_idx][-1].item()  
-                new_token_text = tokenizer.decode([new_token_id])
-                logger.info(f"[DEBUG] {process_idx=} {step=} batch[{batch_idx}] Generated token: '{new_token_text}' (id={new_token_id})")
+            log_step_tokens = (
+                args.log_all_tokens
+                or step < 2
+                or step == args.seq_len - 1
+                or (args.token_log_every > 0 and step % args.token_log_every == 0)
+            )
+            if log_step_tokens:
+                for batch_idx in range(outputs.shape[0]):
+                    new_token_id = outputs[batch_idx][-1].item()
+                    new_token_text = tokenizer.decode([new_token_id])
+                    logger.info(
+                        f"[TOKEN] process={process_idx} step={step} batch[{batch_idx}] "
+                        f"token='{new_token_text}' id={new_token_id}"
+                    )
             
             temp_result_tokens = torch.cat([temp_result_tokens, outputs[:, -1:]], dim=1)
 

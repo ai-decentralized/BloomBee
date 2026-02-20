@@ -50,6 +50,7 @@ from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
 from bloombee.utils.misc import get_size_in_bytes
 from bloombee.utils.ping import PingAggregator
 from bloombee.utils.random import sample_up_to
+from bloombee.utils.microbatch_config import get_micro_batch_size
 from bloombee.utils.version import get_compatible_model_repo
 from bloombee.utils.memory_usage import see_memory_usage
 
@@ -58,6 +59,13 @@ from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
+from bloombee.utils.microbatch_config import (
+    is_microbatch_enabled,
+    get_micro_batch_size,
+    get_current_path,
+    log_config as mbpipe_log_config,
+    MBPIPE_LOG_PREFIX,
+)
 from pynvml import *
 
 # Create dedicated offloading debug logger
@@ -275,11 +283,26 @@ class Server:
         self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
         # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU
-        # Default to GPU-only, no offloading, no compression
+        # [TRUE MICRO-BATCH MULTIPLEXING] When micro-batching is enabled:
+        # - gpu_batch_size = micro_batch_size (GPU only holds ONE micro-batch)
+        # - Other micro-batches stay 100% on CPU, swapped via offload/prefetch
+        # When disabled: use full batch_size for backwards compatibility
+        from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
+        mb_config = get_micro_batch_config()
+        micro_batch_size = get_micro_batch_size()
+        
+        if mb_config['enabled']:
+            gpu_batch_size = micro_batch_size  # GPU only allocates for ONE micro-batch
+            logger.info(f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
+                        f"client can request up to batch_size={batch_size} (handled via offload/prefetch)")
+        else:
+            gpu_batch_size = batch_size  # Full batch for backwards compatibility
+            logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
+        
         self.policy = Policy(
-            batch_size, 1,            # gpu_batch_size, num_gpu_batches
+            gpu_batch_size, 1,        # gpu_batch_size controls GPU cache allocation
             100, 0,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent, cache_cpu_percent (KV on GPU)
+            100, 0,                   # cache_gpu_percent=100% (GPU cache only holds micro_batch_size slots)
             100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
@@ -369,6 +392,9 @@ class Server:
             'batch_sizes': [],
             'throughput_history': []
         }
+        
+        # [MBPIPE] Log micro-batch pipeline configuration at server startup
+        mbpipe_log_config(logger, context="Server.__init__")
 
     def _choose_num_blocks(self) -> int:
         assert self.device.type in ("cuda", "mps"), (
