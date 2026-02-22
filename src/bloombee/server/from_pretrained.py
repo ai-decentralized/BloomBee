@@ -39,6 +39,8 @@ import numpy as np
 # import pdb
 
 from bloombee.models.llama.flex_llama import load_weights_from_pytorch_model
+from bloombee.utils.memory_usage import log_mem
+import os
 
 
 
@@ -72,26 +74,14 @@ def load_pretrained_block(
     torch_dtype = resolve_block_dtype(config, torch_dtype)
     
     with init_empty_weights():
-        print('load_pretrained_block : init_empty_weights() ') 
+        logger.debug('load_pretrained_block: init_empty_weights()')
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
     
-    block_prefix = f"{config.block_prefix}.{block_index}."
-    state_dict = _load_state_dict_from_repo(
-        model_name,
-        block_prefix,
-        revision=revision,
-        token=token,
-        cache_dir=cache_dir,
-        max_disk_space=max_disk_space,
-    )
+    # Skip HuggingFace weight loading - use FlexGen weight management only
+    # This prevents duplicate weight allocation (HF + FlexGen)
+    # log_mem(f"[FlexGen] skipping HF weight loading for block={block_index} - using FlexGen weights only")
     
-    # 将权重加载到模型中
-    for param_name, param in state_dict.items():
-        if not str(param.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
-            param = param.to(torch_dtype)
-        set_module_tensor_to_device(block, param_name, "cpu", value=param, dtype=param.dtype)
-    
-    # # 使用 FlexGen 的权重加载方式
+    # # Use FlexGen weight loading方式
     # try:
     #     load_weights_from_pytorch_model(block, policy, env, weight_home, block_index)
     #     logger.info(f"Loaded {model_name} block {block_index} with FlexGen weight management")
@@ -398,9 +388,8 @@ def set_module_tensor_to_device(
     param = module._parameters[tensor_name] if tensor_name in module._parameters else None
     param_cls = type(param) # param_cls is <class 'torch.nn.parameter.Parameter'>
     if value is not None:
-        # We can expect mismatches when using bnb 4bit since Params4bit will reshape and pack the weights.
-        # In other cases, we want to make sure we're not loading checkpoints that do not match the config.
-        if old_value.shape != value.shape and param_cls.__name__ != "Params4bit":
+        # Check shape mismatch (bitsandbytes quantization is not used, so no special handling needed)
+        if old_value.shape != value.shape:
             raise ValueError(
                 f'Trying to set a tensor of shape {value.shape} in "{tensor_name}" (which has shape {old_value.shape}), this looks incorrect.'
             )
@@ -411,19 +400,9 @@ def set_module_tensor_to_device(
         elif not str(value.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
             value = value.to(dtype) #------------
 
-    device_quantization = None #------------
-    
     with torch.no_grad(): #------------
         # leave it on cpu first before moving them to cuda
-        # # fix the case where the device is meta, we don't want to put it on cpu because there is no data =0
-        if (
-            param is not None
-            and param.device.type != "cuda"
-            and torch.device(device).type == "cuda"
-            and param_cls.__name__ in ["Int8Params", "FP4Params", "Params4bit"]
-        ):
-            device_quantization = device
-            device = "cpu"
+        # Note: bitsandbytes quantization is not used, so no special device handling needed
         # # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16)).
         if isinstance(device, int):
             if is_npu_available():
@@ -448,25 +427,13 @@ def set_module_tensor_to_device(
             new_value = value.to(device) #------------
         else:
             new_value = torch.tensor(value, device=device)
-        if device_quantization is not None:
-            device = device_quantization
         if is_buffer:
             module._buffers[tensor_name] = new_value
         elif value is not None or not check_device_same(torch.device(device), module._parameters[tensor_name].device):
             param_cls = type(module._parameters[tensor_name]) #------------
-            kwargs = module._parameters[tensor_name].__dict__
-            if param_cls.__name__ in ["Int8Params", "FP4Params", "Params4bit"]:
-                if param_cls.__name__ == "Int8Params" and new_value.dtype == torch.float32:
-                    # downcast to fp16 if any - needed for 8bit serialization
-                    new_value = new_value.to(torch.float16)
-                # quantize module that are going to stay on the cpu so that we offload quantized weights
-                if device == "cpu" and param_cls.__name__ == "Int8Params":
-                    new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(0).to("cpu")
-                    new_value.CB = new_value.CB.to("cpu")
-                    new_value.SCB = new_value.SCB.to("cpu")
-                else:
-                    new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(device)
-            elif param_cls.__name__ in ["QTensor", "QBitsTensor"]:
+            # Note: bitsandbytes quantization is not used, so no special handling for Int8Params, Params4bit, etc.
+            # Standard parameter handling only
+            if param_cls.__name__ in ["QTensor", "QBitsTensor"]:
                 new_value = torch.nn.Parameter(new_value, requires_grad=old_value.requires_grad).to(device)
             elif param_cls.__name__ in ["AffineQuantizedTensor"]:
                 new_value = torch.nn.Parameter(
@@ -490,46 +457,22 @@ def set_module_tensor_to_device(
             if fp16_statistics is not None:
                 module._parameters[tensor_name].SCB = fp16_statistics.to(device)
                 del fp16_statistics
-            # as we put the weight to meta, it doesn't have SCB attr anymore. make sure that it is not a meta weight
-            if (
-                module.__class__.__name__ == "Linear8bitLt"
-                and getattr(module.weight, "SCB", None) is None
-                and str(module.weight.device) != "meta"
-            ):
-                # quantize only if necessary
-                device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
-                if not getattr(module.weight, "SCB", None) and device_index is not None:
-                    if module.bias is not None and module.bias.device.type != "meta":
-                        # if a bias exists, we need to wait until the bias is set on the correct device
-                        module = module.cuda(device_index)
-                    elif module.bias is None:
-                        # if no bias exists, we can quantize right away
-                        module = module.cuda(device_index)
-            elif (
-                module.__class__.__name__ == "Linear4bit"
-                and getattr(module.weight, "quant_state", None) is None
-                and str(module.weight.device) != "meta"
-            ):
-                # quantize only if necessary
-                device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
-                if not getattr(module.weight, "quant_state", None) and device_index is not None:
-                    module.weight = module.weight.cuda(device_index)
+            # Note: bitsandbytes Linear8bitLt and Linear4bit handling removed (not used)
     if device != "cpu": #---------
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
-
-def compare_tensors(new_value, weight_data):  
-    print('new_value ', new_value.device)
-    print('weight_data ', weight_data.device)
-    print()
-    # Compare data types  
-    if new_value.dtype != weight_data.dtype:  
-        return f"Data types are different: {new_value.dtype} vs {weight_data.dtype}"  
+# def compare_tensors(new_value, weight_data):  
+#     print('new_value ', new_value.device)
+#     print('weight_data ', weight_data.device)
+#     print()
+#     # Compare data types  
+#     if new_value.dtype != weight_data.dtype:  
+#         return f"Data types are different: {new_value.dtype} vs {weight_data.dtype}"  
     
-    # Compare values  
-    if torch.equal(new_value.to('cpu'), weight_data.to('cpu')):  
-        return "The tensors are equal in value."  
-    else:  
-        return "The tensors are not equal in value."  
+#     # Compare values  
+#     if torch.equal(new_value.to('cpu'), weight_data.to('cpu')):  
+#         return "The tensors are equal in value."  
+#     else:  
+#         return "The tensors are not equal in value."  
     

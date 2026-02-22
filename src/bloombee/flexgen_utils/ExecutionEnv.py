@@ -1,7 +1,6 @@
 import argparse
 import dataclasses
-from attr import define, field
-from attr.setters import frozen
+
 import functools
 import gc
 import math
@@ -21,8 +20,12 @@ class ExecutionEnv:
     mixed: Any = None
 
     @classmethod
-    def create(cls, offload_dir):
-        gpu = TorchDevice("cuda:0")
+    def create(cls, offload_dir, device_type="cuda"):
+        # For CPU-only mode, use CPU for all devices including 'gpu' slot
+        if device_type == "cpu":
+            gpu = TorchDevice("cpu")  # Use CPU for the 'gpu' slot
+        else:
+            gpu = TorchDevice("cuda:0")
         print('ExecutionEnv: gpu ', gpu)
         cpu = TorchDevice("cpu")
         disk = TorchDisk(offload_dir)

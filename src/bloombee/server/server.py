@@ -6,9 +6,18 @@ import multiprocessing as mp
 import os
 import random
 import sys
+import tempfile
 import threading
 import time
 from typing import Dict, List, Optional, Sequence, Union
+
+# Optimize shared memory usage for systems with limited /dev/shm
+# Set environment variables before importing PyTorch to limit shared memory allocation
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    # Limit CUDA memory allocator's shared memory usage
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+if "TORCH_SHOW_CPP_STACKTRACES" not in os.environ:
+    os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "0"
 
 import hivemind
 import psutil
@@ -29,15 +38,19 @@ from bloombee.server.backend import TransformerBackend, merge_inference_pools_in
 from bloombee.server.block_utils import get_block_size, resolve_block_dtype
 from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.server.handler import TransformerConnectionHandler
-from bloombee.server.memory_cache import MemoryCache
+from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+from bloombee.server.speculative_pruner.utils import PruningMethod
+from bloombee.server.speculative_pruner.utils import PruningConfig
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
 from bloombee.utils.misc import get_size_in_bytes
 from bloombee.utils.ping import PingAggregator
 from bloombee.utils.random import sample_up_to
+from bloombee.utils.microbatch_config import get_micro_batch_size
 from bloombee.utils.version import get_compatible_model_repo
 from bloombee.utils.memory_usage import see_memory_usage
 
@@ -46,22 +59,34 @@ from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
+from bloombee.utils.microbatch_config import (
+    is_microbatch_enabled,
+    get_micro_batch_size,
+    get_current_path,
+    log_config as mbpipe_log_config,
+    MBPIPE_LOG_PREFIX,
+)
 from pynvml import *
 
-def see_memory_usage(message, force=True):
-	logger = ''
-	logger += message
-	nvmlInit()
- 
-	# nvidia_smi.nvmlInit()
-	handle = nvmlDeviceGetHandleByIndex(0)
-	info = nvmlDeviceGetMemoryInfo(handle)
-	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-	
-	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-	logger +=   'Max Memory Allocated: ' + str(
-		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-	print(logger)
+# Create dedicated offloading debug logger
+import logging
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
+
+# def see_memory_usage(message, force=True):
+# 	logger = ''
+# 	logger += message
+# 	nvmlInit()
+#  
+# 	# nvidia_smi.nvmlInit()
+# 	handle = nvmlDeviceGetHandleByIndex(0)
+# 	info = nvmlDeviceGetMemoryInfo(handle)
+# 	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
+# 	
+# 	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
+# 	logger +=   'Max Memory Allocated: ' + str(
+# 		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
+# 	print(logger)
 
 logger = get_logger(__name__)
 
@@ -115,6 +140,7 @@ class Server:
         use_relay: bool = True,
         use_auto_relay: bool = True,
         adapters: Sequence[str] = (),
+        batch_size: int = 1,
         **kwargs,
     ):
         """Create a server with one or more bloom blocks. See run_server.py for documentation."""
@@ -209,9 +235,9 @@ class Server:
             logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
             check_device_balance(self.tensor_parallel_devices)
 
+        # Quantization is disabled by default. Use FlexGen compression internally if needed.
         if quant_type is None:
-            quant_type = QuantType.NF4 if device.type == "cuda" else QuantType.NONE
-        quant_type = QuantType.NONE ########## manually change the QuantType
+            quant_type = QuantType.NONE
         self.quant_type = quant_type
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
 
@@ -219,15 +245,17 @@ class Server:
         if max_batch_size is None:
             max_batch_size = 8192 if is_multiquery_attn else 2048
         if inference_max_length is None:
-            inference_max_length = 8192 if is_multiquery_attn else 2048
+            inference_max_length = 8192 if is_multiquery_attn else 4096
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
         self.inference_max_length = inference_max_length
         self.max_chunk_size_bytes = max_chunk_size_bytes
         self.max_alloc_timeout = max_alloc_timeout
 
         # For attention cache in GPU or RAM
+        # Align cache token budget with inference_max_length by default to fit requested allocations
         if attn_cache_tokens is None:
-            attn_cache_tokens = 16384 if is_multiquery_attn else 4096
+            attn_cache_tokens = self.inference_max_length
+        # Per-token KV values per block (K and V), accounting for multi-query heads
         cache_values_per_block = 2 * self.block_config.hidden_size * attn_cache_tokens
         cache_values_per_block //= self.block_config.num_key_value_groups
         self._cache_bytes_per_block = cache_values_per_block * get_size_in_bytes(self.torch_dtype)
@@ -251,31 +279,64 @@ class Server:
             num_blocks = len(block_indices)
         self.strict_block_indices, self.num_blocks = block_indices, num_blocks
 
-        gib = 1024**3
-        self.attn_cache_bytes = self._cache_bytes_per_block * num_blocks
-        logger.info(f"Attention cache for all blocks will consume up to {self.attn_cache_bytes / gib:.2f} GiB")
-
         ##############################################################
-        self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
-        self.policy = Policy(1, 1,       #  gpu_batch_size: int, num_gpu_batches: int
-                    100, 0,              # w_gpu_percent: float, w_cpu_percent: float
-                    0, 100,             # cache_gpu_percent: float, cache_cpu_percent: float
-                    0, 100,             # act_gpu_percent: float, act_cpu_percent: float
-                    overlap=False, sep_layer=True, pin_weight=True,
-                    cpu_cache_compute=False, attn_sparsity=1.0,
-                    compress_weight=False,  # 暂时禁用权重压缩，避免 compressed_device 问题
-                    comp_weight_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=0, symmetric=False),
-                    compress_cache=False,  # 暂时禁用缓存压缩
-                    comp_cache_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=2, symmetric=False))
+        self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
+
+        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU
+        # [TRUE MICRO-BATCH MULTIPLEXING] When micro-batching is enabled:
+        # - gpu_batch_size = micro_batch_size (GPU only holds ONE micro-batch)
+        # - Other micro-batches stay 100% on CPU, swapped via offload/prefetch
+        # When disabled: use full batch_size for backwards compatibility
+        from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
+        mb_config = get_micro_batch_config()
+        micro_batch_size = get_micro_batch_size()
+        
+        if mb_config['enabled']:
+            gpu_batch_size = micro_batch_size  # GPU only allocates for ONE micro-batch
+            logger.info(f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
+                        f"client can request up to batch_size={batch_size} (handled via offload/prefetch)")
+        else:
+            gpu_batch_size = batch_size  # Full batch for backwards compatibility
+            logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
+        
+        self.policy = Policy(
+            gpu_batch_size, 1,        # gpu_batch_size controls GPU cache allocation
+            100, 0,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # cache_gpu_percent=100% (GPU cache only holds micro_batch_size slots)
+            100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
+            overlap=False, sep_layer=True, pin_weight=True,
+            cpu_cache_compute=False, attn_sparsity=1.0,
+            compress_weight=False,
+            comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
+            compress_cache=False,
+            comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
+        )
+        
+        # Log compression configuration
+        self.policy.log_batch_size_strategy()
+
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
-        self.path = '/tmp/data/llama_weights'
+        self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
+        
+        hidden_size = 4096
+        vocab_size = 32000
+        
+        # Create configuration
+        config = PruningConfig(
+            method=PruningMethod.SIMPLE_PROBABILITY,
+            neural_threshold=0.5,
+            simple_threshold=0.1
+        )
+        
+        self.pruner_manager = SpeculativePrunerManager(
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            config=config
+        )
+        
         ##############################################################
         
-        see_memory_usage("-----------------------------------------in server: after policy  ")
+        # see_memory_usage("-----------------------------------------in server: after policy  ")
         
         assert isinstance(throughput, float) or throughput in ["auto", "eval", "dry_run"]
         if throughput in ["auto", "eval", "dry_run"]:
@@ -301,7 +362,7 @@ class Server:
                 sys.exit(0)
         else:
             throughput_info = {"throughput": throughput}
-        see_memory_usage("-----------------------------------------in server: after throughput calculation  ")
+        # see_memory_usage("-----------------------------------------in server: after throughput calculation  ")
         self.server_info = ServerInfo(
             state=ServerState.JOINING,
             public_name=public_name,
@@ -322,6 +383,18 @@ class Server:
 
         self.module_container = None
         self.stop = threading.Event()
+        
+        # 🔍 Batch Size Performance Tracking
+        self.batch_size_stats = {
+            'total_requests': 0,
+            'total_tokens': 0,
+            'total_time': 0.0,
+            'batch_sizes': [],
+            'throughput_history': []
+        }
+        
+        # [MBPIPE] Log micro-batch pipeline configuration at server startup
+        mbpipe_log_config(logger, context="Server.__init__")
 
     def _choose_num_blocks(self) -> int:
         assert self.device.type in ("cuda", "mps"), (
@@ -354,8 +427,7 @@ class Server:
         block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
         total_memory_per_block = block_size + self._cache_bytes_per_block
         if self.adapters:
-            # Delay import of petals.utils.peft to avoid unnecessary import of bitsandbytes
-            from bloombee.utils.peft import estimate_adapter_memory_per_block
+
 
             total_memory_per_block += estimate_adapter_memory_per_block(
                 self.block_config,
@@ -388,9 +460,9 @@ class Server:
                 policy=self.policy, #####
                 weight_home= self.weight_home, #####
                 path=self.path, ######
-                attn_cache_bytes=self.attn_cache_bytes,
                 server_info=self.server_info,
                 model_info=self.model_info,
+                pruner_manager = self.pruner_manager,
                 block_indices=block_indices,
                 num_handlers=self.num_handlers,
                 min_batch_size=self.min_batch_size,
@@ -433,6 +505,9 @@ class Server:
                     if self._should_choose_other_blocks():
                         logger.info("Swarm is imbalanced, server will load other blocks")
                         break  # Stop serving this set of modules
+                    
+                    # 🔍 Batch Size Debug: Log performance statistics periodically
+                    self.log_batch_size_performance()
             finally:
                 self.module_container.shutdown()
 
@@ -459,9 +534,13 @@ class Server:
         if self.strict_block_indices is not None:
             return self.strict_block_indices
 
-        # If multiple servers (e.g., launched on the same machine by a script) get to this line at the same time,
-        # this delay decreases the probability of a race condition while choosing the best blocks to serve.
-        time.sleep(random.random() * 2 * self.mean_block_selection_delay)
+        # Optimization: reduce unnecessary random delay to speed up startup
+        # Original delay: time.sleep(random.random() * 2 * self.mean_block_selection_delay)
+        # Use a smaller delay or remove it entirely in single-machine deployment
+        if hasattr(self, '_single_machine_mode') and self._single_machine_mode:
+            pass  # No delay needed in single-machine mode
+        else:
+            time.sleep(min(0.1, random.random() * self.mean_block_selection_delay))  # Maximum 100ms delay
         module_infos = get_remote_module_infos(self.dht, self.module_uids, latest=True)
         return block_selection.choose_best_blocks(self.num_blocks, module_infos)
 
@@ -471,6 +550,28 @@ class Server:
 
         module_infos = get_remote_module_infos(self.dht, self.module_uids, latest=True)
         return block_selection.should_choose_other_blocks(self.dht.peer_id, module_infos, self.balance_quality)
+    
+    def log_batch_size_performance(self):
+        """Log batch size performance statistics for debugging"""
+        if self.batch_size_stats['total_requests'] > 0:
+            avg_batch_size = sum(self.batch_size_stats['batch_sizes']) / len(self.batch_size_stats['batch_sizes'])
+            avg_throughput = self.batch_size_stats['total_tokens'] / self.batch_size_stats['total_time'] if self.batch_size_stats['total_time'] > 0 else 0
+            
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Requests: {self.batch_size_stats['total_requests']}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Average Batch Size: {avg_batch_size:.2f}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Average Throughput: {avg_throughput:.1f} tokens/sec")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Tokens: {self.batch_size_stats['total_tokens']}")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Total Time: {self.batch_size_stats['total_time']:.2f}s")
+            logger.info(f"[BATCH_SIZE_PERFORMANCE] Batch Size Range: {min(self.batch_size_stats['batch_sizes'])}-{max(self.batch_size_stats['batch_sizes'])}")
+            
+            # Analyze batch size efficiency
+            if len(self.batch_size_stats['throughput_history']) > 1:
+                throughput_trend = self.batch_size_stats['throughput_history'][-1] - self.batch_size_stats['throughput_history'][0]
+                logger.info(f"[BATCH_SIZE_TREND] Throughput Trend: {throughput_trend:.1f} tokens/sec change")
+                if throughput_trend < 0:
+                    logger.warning(f"[BATCH_SIZE_WARNING] Throughput is decreasing! Consider adjusting batch size.")
+                else:
+                    logger.info(f"[BATCH_SIZE_SUCCESS] Throughput is improving with current batch size.")
 
     def shutdown(self, timeout: Optional[float] = 5):
         self.stop.set()
@@ -499,14 +600,15 @@ class ModuleContainer(threading.Thread):
         policy: Policy,    ####
         weight_home: array_1d, ####
         path: str,
-        attn_cache_bytes: int,
         server_info: ServerInfo,
         model_info: ModelInfo,
+        pruner_manager: BloombeePrunerManager,
         block_indices: List[int],
         min_batch_size: int,
         max_batch_size: int,
         max_chunk_size_bytes: int,
         max_alloc_timeout: float,
+        inference_max_length: int,
         torch_dtype: torch.dtype,
         cache_dir: str,
         max_disk_space: int,
@@ -522,8 +624,8 @@ class ModuleContainer(threading.Thread):
         **kwargs,
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
-        print('module_uids ', module_uids)
-        memory_cache = MemoryCache(attn_cache_bytes, max_alloc_timeout)
+
+        cache_manager = KVCacheManager(inference_max_length, max_alloc_timeout, policy, env, block_config)
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(
@@ -532,7 +634,7 @@ class ModuleContainer(threading.Thread):
             server_info,
             model_info,
             block_config=block_config,
-            memory_cache=memory_cache,
+            cache_manager=cache_manager,
             update_period=update_period,
             expiration=expiration,
             daemon=True,
@@ -545,8 +647,7 @@ class ModuleContainer(threading.Thread):
         blocks = {}
         try:
             for module_uid, block_index in zip(module_uids, block_indices):
-                print('blocks uid before load_pretrained_block() ', module_uid )
-                see_memory_usage("-----------------------------------------before petals load pretrained block ")
+                # see_memory_usage("-----------------------------------------before petals load pretrained block ")
                 block = load_pretrained_block(
                     converted_model_name_or_path,
                     block_index,
@@ -561,7 +662,7 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                see_memory_usage("-----------------------------------------after petals load pretrained block ")
+                # see_memory_usage("-----------------------------------------after petals load pretrained block ")
                 # print('block nn.module() before convert_block() ', block )
                 # print('block_config' , block_config)
                 block = convert_block(
@@ -577,12 +678,15 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                see_memory_usage("-----------------------------------------sever: after convert_block  ")
+                # see_memory_usage("-----------------------------------------sever: after convert_block  ")
+                is_last_block = block_index == block_indices[-1]
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
                     block,  ###### block instance
                     config=block_config,
-                    memory_cache=memory_cache,
+                    cache_manager=cache_manager,
+                    pruner_manager=pruner_manager,
+                    is_last_block=is_last_block,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
                     args_schema=(
@@ -594,6 +698,16 @@ class ModuleContainer(threading.Thread):
                     outputs_schema=(
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression
+                        ),
+                        BatchTensorDescriptor(
+                            1, 64,                             # keep_indices_padded: [B, 64]
+                            dtype=torch.int64,
+                            compression=compression
+                        ),
+                        BatchTensorDescriptor(
+                            1,                             # if need pruning next
+                            dtype=torch.int64,
+                            compression=compression
                         ),
                     ),
                     min_batch_size=min_batch_size,
@@ -617,6 +731,8 @@ class ModuleContainer(threading.Thread):
             dht,
             dht_prefix,
             blocks,
+            inference_max_length=inference_max_length,
+            pruner_manager = pruner_manager,
             dht_announcer=dht_announcer,
             server_info=server_info,
             update_period=update_period,
@@ -631,6 +747,7 @@ class ModuleContainer(threading.Thread):
         module_backends: Dict[str, TransformerBackend],
         *,
         inference_max_length: int,
+        pruner_manager: BloombeePrunerManager,
         num_handlers: int,
         dht_announcer: ModuleAnnouncerThread,
         server_info: ServerInfo,
@@ -647,7 +764,12 @@ class ModuleContainer(threading.Thread):
         self.dht, self.module_backends = dht, module_backends
         self.server_info, self.update_period, self.expiration = server_info, update_period, expiration
 
-        handler_event_queues = [mp.Queue() for _ in range(num_handlers)]
+        # Optimize shared memory usage: limit Queue maxsize to reduce /dev/shm peak usage
+        # Default Queue maxsize is unlimited, which can cause high /dev/shm usage during warmup
+        # For systems with limited /dev/shm (e.g., 64MB), use smaller queue size
+        # Queue size scales with batch_size, so we use a conservative limit
+        max_queue_size = 500  # Reduced from 1000 to further limit shared memory usage
+        handler_event_queues = [mp.Queue(maxsize=max_queue_size) for _ in range(num_handlers)]
         self.conn_handlers = [
             TransformerConnectionHandler(
                 dht,
@@ -661,12 +783,12 @@ class ModuleContainer(threading.Thread):
                 session_timeout=session_timeout,
                 step_timeout=step_timeout,
                 quant_type=QuantType[server_info.quant_type.upper()],
+                pruner_manager = pruner_manager,
             )
             for i in range(num_handlers)
         ]
 
         self.runtime = RuntimeWithDeduplicatedPools(self.module_backends, device=None, **kwargs)
-        # note: We set device=None in runtime to avoid moving all modules to device 0 in runtime.run(). tensor_parallel has already moved it as needed.
 
         dht_announcer.announce(ServerState.ONLINE)
         self.dht_announcer = dht_announcer
@@ -752,7 +874,7 @@ class ModuleAnnouncerThread(threading.Thread):
         model_info: ModelInfo,
         *,
         block_config: PretrainedConfig,
-        memory_cache: MemoryCache,
+        cache_manager: KVCacheManager,
         update_period: float,
         expiration: float,
         max_pinged: int = 5,
@@ -763,7 +885,7 @@ class ModuleAnnouncerThread(threading.Thread):
         self.dht = dht
         self.server_info = server_info
         self.model_info = model_info
-        self.memory_cache = memory_cache
+        self.cache_manager = cache_manager
 
         self.bytes_per_token = block_config.hidden_size * get_size_in_bytes(DTYPE_MAP[server_info.torch_dtype])
         self.bytes_per_token //= block_config.num_key_value_groups
@@ -788,7 +910,7 @@ class ModuleAnnouncerThread(threading.Thread):
         while True:
             start_time = time.perf_counter()
 
-            self.server_info.cache_tokens_left = self.memory_cache.bytes_left // self.bytes_per_token
+            self.server_info.cache_tokens_left = self.cache_manager.tokens_left()
             if self.server_info.state != ServerState.OFFLINE:
                 self._ping_next_servers()
                 self.server_info.next_pings = {

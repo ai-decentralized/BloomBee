@@ -173,3 +173,7 @@ cython_debug/
 
 # Petals
 *.ida
+
+
+bloombee-env/*
+bootstrap*

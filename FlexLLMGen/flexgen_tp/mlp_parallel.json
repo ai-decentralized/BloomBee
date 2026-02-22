@@ -1,8 +1,0 @@
-{
-"fc1.weight":"col",
-"fc1.bias":"col",
-"fc2.weight":"row",
-"fc2.bias":"divide",
-"final_layer_norm.weight":"none",
-"final_layer_norm.bias":"none"
-}

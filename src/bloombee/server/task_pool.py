@@ -94,24 +94,25 @@ class PrioritizedTaskPool(threading.Thread):
 
     def submit_task(self, *args: Any, priority: float = 0.0) -> MPFuture:
         """ Add task to this pool's queue, return Future for its output.
-            主要用于管理任务的提交，确保任务在处理前符合大小限制，并维护任务的优先级。
-            通过 MPFuture 对象，调用者可以在任务完成时获取结果或处理异常。
+            Mainly used for managing task submission, ensuring tasks meet size constraints before processing,
+            and maintaining task priority. Through MPFuture objects, callers can get results or handle exceptions
+            when tasks complete.
         """
         future = MPFuture()
         # Remove shared memory from MPFuture. This disables the .cancel() feature but
         # saves the server from "could not unlink the shared memory file" crashes during rebalancing
         future._shared_state_code = torch.tensor([ALL_STATES.index(PENDING)], dtype=torch.uint8)
 
-        task = Task(priority, time.monotonic(), future, args)# 创建一个任务对象，包含优先级、提交时间、未来对象和任务参数 
-        if self.get_task_size(task) > self.max_batch_size: # 检查任务的大小是否超过最大批处理大小  
-            exc = ValueError(f"Task size greater than max_batch_size ({self.max_batch_size}), it can't be processed")# 如果超过，抛出异常
-            task.future.set_exception(exc) # 将异常设置到未来对象中  
+        task = Task(priority, time.monotonic(), future, args)  # Create a task object containing priority, submission time, future object and task arguments 
+        if self.get_task_size(task) > self.max_batch_size:  # Check if task size exceeds max batch size  
+            exc = ValueError(f"Task size greater than max_batch_size ({self.max_batch_size}), it can't be processed")  # If exceeded, raise exception
+            task.future.set_exception(exc)  # Set exception to future object  
         else:
-            self.submitted_tasks.put(task) # 将任务添加到提交的任务队列中, submitted_tasks is a SimpleQueue
-            self.batch_sender.send(None)  # use this pipe to count the number of unfinished batches # 使用此管道来计算未完成批次的数量  
-            if (task.priority, task.time_submitted) < self.priority: # 检查新任务的优先级和提交时间
-                self.priority = (task.priority, task.time_submitted) # 更新当前优先级
-        return task.future # 返回任务的未来对象
+            self.submitted_tasks.put(task)  # Add task to submitted task queue, submitted_tasks is a SimpleQueue
+            self.batch_sender.send(None)  # use this pipe to count the number of unfinished batches  
+            if (task.priority, task.time_submitted) < self.priority:  # Check new task priority and submission time
+                self.priority = (task.priority, task.time_submitted)  # Update current priority
+        return task.future  # Return task future object
 
     def get_task_size(self, task: Task) -> int:
         """compute task processing complexity; defaults to the total number of tokens"""
@@ -123,16 +124,16 @@ class PrioritizedTaskPool(threading.Thread):
         self, timeout: Optional[float] = None, device: Optional[torch.device] = None
     ) -> Tuple[Any, List[torch.Tensor]]:
         """receive next batch of arrays"""
-        device = device if device is not None else self.device # 如果未指定设备，则使用默认设备 
-        print('-=-==-=-=-=-=- task pool: load_batch_to_runtime(): device ', device)
-        task = self._ordered_tasks.get(block=True, timeout=timeout) # 从有序任务队列中获取下一个任务，可能会阻塞直到超时 
-        batch_inputs = [_move_to_device_if_tensor(arg, device, share_memory=False) for arg in task.args] # 将任务参数移动到指定设备 
-        self._dispatched_tasks[task.uid] = task # 将任务标记为已分派 
+        device = device if device is not None else self.device  # If device not specified, use default device 
+        # print('-=-==-=-=-=-=- task pool: load_batch_to_runtime(): device ', device)
+        task = self._ordered_tasks.get(block=True, timeout=timeout)  # Get next task from ordered task queue, may block until timeout 
+        batch_inputs = [_move_to_device_if_tensor(arg, device, share_memory=False) for arg in task.args]  # Move task arguments to specified device 
+        self._dispatched_tasks[task.uid] = task  # Mark task as dispatched 
         self.batch_receiver.recv()  # reduce the number of active batches
-        if not self._ordered_tasks.empty(): # 如果还有剩余任务  
-            first_remaining_task: Task = self._ordered_tasks.queue[0] # 获取队列中的第一个剩余任务
-            self.priority = (first_remaining_task.priority, first_remaining_task.time_submitted) # 更新当前优先级
-        return task.uid, batch_inputs # 返回任务的唯一标识符和批次输入  
+        if not self._ordered_tasks.empty():  # If there are remaining tasks  
+            first_remaining_task: Task = self._ordered_tasks.queue[0]  # Get first remaining task in queue
+            self.priority = (first_remaining_task.priority, first_remaining_task.time_submitted)  # Update current priority
+        return task.uid, batch_inputs  # Return task unique identifier and batch inputs  
 
     def send_outputs_from_runtime(self, uid: int, batch_outputs: List[torch.Tensor]):
         """send results for a processed batch, previously loaded through load_batch_to_runtime"""

@@ -4,7 +4,7 @@ import torch
 import numpy as np
 
 from bloombee.flexgen_utils.pytorch_backend import (TorchTensor, TorchDevice,
-    TorchDisk, TorchMixedDevice)
+    TorchDisk, TorchMixedDevice, general_copy)
 from bloombee.flexgen_utils.utils import np_dtype_to_torch_dtype
 from bloombee.flexgen_utils.DeviceType import DeviceType
 

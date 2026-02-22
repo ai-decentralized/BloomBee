@@ -10,55 +10,102 @@ import ctypes
 import multiprocessing as mp
 import os
 import time
-from typing import AsyncContextManager, Dict, Optional, Sequence
+
+import logging
+from typing import AsyncContextManager, Dict, Optional, Sequence, Tuple, Union, Any, List
 
 import async_timeout
 import torch
+import dataclasses
 from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
 
+# Optimize shared memory usage: configure multiprocessing to use smaller buffers
+# This helps reduce /dev/shm peak usage during warmup/prefill phase
+if hasattr(mp, 'set_sharing_strategy'):
+    # Use 'file_system' instead of 'file_descriptor' to reduce shared memory usage
+    # Note: This may have slight performance impact but significantly reduces /dev/shm usage
+    try:
+        mp.set_sharing_strategy('file_system')
+    except RuntimeError:
+        # Already set, ignore
+        pass
+
+
 from bloombee.data_structures import Handle
+from transformers import PretrainedConfig
+
 from bloombee.utils.asyncio import shield_and_wait
 from bloombee.utils.misc import get_size_in_bytes
+from bloombee.flexgen_utils.policy import Policy
+from bloombee.flexgen_utils.task import Task
+
+from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice, DeviceType, general_copy
+from bloombee.flexgen_utils.compression import TorchCompressedDevice, general_copy_compressed
+from bloombee.flexgen_utils.utils import torch_dtype_to_np_dtype
+import numpy as np
 
 logger = get_logger(__name__)
+
+# Create dedicated offloading debug logger
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
+
+
+def _is_verbose_kv_alloc_logs() -> bool:
+    """Enable detailed KV allocation logs with BLOOMBEE_VERBOSE_KV_LOGS=1."""
+    return os.environ.get("BLOOMBEE_VERBOSE_KV_LOGS", "0") == "1"
 
 
 class MemoryCache:
     """A shared cache for storing tensors that persist across calls. Main use case: storing past attention KVs"""
 
-    def __init__(self, max_size_bytes: Optional[int], max_alloc_timeout: Optional[float] = None):
-        self.max_size_bytes = max_size_bytes if max_size_bytes is not None else (2**64 - 1)
+    def __init__(self, 
+                 max_size_tokens: Optional[int], 
+                 max_alloc_timeout: Optional[float] = None, 
+                 policy: Optional[Policy] = None, 
+                 block_config: Optional[PretrainedConfig] = None,
+                 device: Any = None):
+        logger.info(f"max_size_tokens: {max_size_tokens}")
+        self.max_size_tokens = max_size_tokens if max_size_tokens is not None else (2048)
         self.max_alloc_timeout = max_alloc_timeout
         self._lock_metadata = mp.Lock()
-        self._current_size = mp.Value(ctypes.c_int64, 0, lock=False)
-        self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
+        self._current_tokens = mp.Value(ctypes.c_int64, 0, lock=False)
+        self._enqueued_tokens = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
-        self._allocated_tensors: Dict[Handle, torch.Tensor] = {}
+        self._allocated_tensors: Dict[Handle, Any] = {}
+        self._handle_size_bytes: Dict[Handle, int] = {}
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
         self._lock_acquire_memory = mp.Lock()
         self._memory_freed_event = mp.Event()
+        
+
+        # flexgen' offloading depends on the task parameter, we need to mock a temp task variable for memory allocation without changing the data structure of flexgen.
+        self.allocation_policy = policy
+        self.block_config = block_config
+        self.device = device
+        
 
     @property
-    def current_size_bytes(self) -> int:
-        return self._current_size.value
+    def current_size_tokens(self) -> int:
+        return self._current_tokens.value
 
-    @current_size_bytes.setter
-    def current_size_bytes(self, value: int):
-        self._current_size.value = value
-
-    @property
-    def enqueued_size_bytes(self) -> int:
-        return self._enqueued_size.value
-
-    @enqueued_size_bytes.setter
-    def enqueued_size_bytes(self, value: int):
-        self._enqueued_size.value = value
+    @current_size_tokens.setter
+    def current_size_tokens(self, value: int):
+        self._current_tokens.value = value
 
     @property
-    def bytes_left(self) -> int:
-        return self.max_size_bytes - self.current_size_bytes
+    def enqueued_size_tokens(self) -> int:
+        return self._enqueued_tokens.value
+
+    @enqueued_size_tokens.setter
+    def enqueued_size_tokens(self, value: int):
+        self._enqueued_tokens.value = value
+
+    @property
+    def tokens_left(self) -> int:
+        return self.max_size_tokens - self.current_size_tokens
 
     @property
     def handle_counter(self) -> int:
@@ -68,127 +115,80 @@ class MemoryCache:
     def handle_counter(self, value: int):
         self._handle_counter.value = value
 
-    @contextlib.asynccontextmanager
-    async def allocate_cache(
-        self, *descriptors: TensorDescriptor, timeout: float
-    ) -> AsyncContextManager[Sequence[Handle]]:
-        """
-        Create a handle that is associated with buffers on unique device. If cache full, raises AllocationFailed.
-
-        :param descriptors: one or more tensors tensor of this size, dtype, etc
-        :param timeout: optional maximum time to wait for cache allocation; None (default) means no time limit
-
-        :note: if descriptors reside on different devices, it is expected that they are approximately balanced across devices;
-          if not, it will count maximum tensor allocation across devices for the purposes of size limit
-
-        :note: This function should be called by connection handlers, it can be called concurrently from multiple processes.
-        Furthermore, it can be called concurrently with at most one use_cache call in runtime.
-        """
-        assert os.getpid() != self.runtime_pid, "must be called by a ConnectionHandler, not runtime"
-        assert all(descr.device is not None for descr in descriptors), "please specify allocated devices"
-        if self.max_alloc_timeout is not None:
-            timeout = min(timeout, self.max_alloc_timeout)
-        max_alloc_size = self.get_allocation_size(*descriptors)
-
-        gib = 1024**3
-        cur_size, max_size = self.current_size_bytes, self.max_size_bytes
-        friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
-        logger.info(
-            f"rpc_inference.wait_for_alloc(size={max_alloc_size / gib:.2f} GiB), "
-            f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({cur_size / max_size * 100:.1f}%)"
-        )
-
-        alloc_task = asyncio.create_task(self._schedule_alloc(max_alloc_size, *descriptors, timeout=timeout))
-        try:
-            handles = await shield_and_wait(alloc_task)
-            logger.info(f"rpc_inference.alloc_done(size={max_alloc_size / gib:.2f} GiB)")
-            yield handles
-        finally:
-            self._free(max_alloc_size, alloc_task)
-
-    @staticmethod
-    def get_allocation_size(*descriptors: TensorDescriptor) -> int:
-        """Return the memory size (bytes) to be allocated on a device. If there are many devices, return maximum"""
-        alloc_size_by_device = {}
-        for descr in descriptors:
-            tensor_size = descr.numel() * get_size_in_bytes(descr.dtype)
-            alloc_size_by_device[descr.device] = alloc_size_by_device.get(descr.device, 0) + tensor_size
-        return max(alloc_size_by_device.values())
-
     async def _schedule_alloc(
-        self, alloc_size: int, *descriptors: TensorDescriptor, timeout: Optional[float]
+        self, alloc_tokens_num: int, *descriptors: TensorDescriptor, timeout: Optional[float]
     ) -> Sequence[Handle]:
         """
         This method should be called inside asyncio.shield() because:
             - hivemind.utils.enter_asynchronously() does not always release the lock on cancellation
         """
         try:
-            async with self._wait_for_free_memory(alloc_size, timeout):
+            async with self._wait_for_free_memory(alloc_tokens_num, timeout):
                 with self._lock_metadata:
                     handles = tuple(int(self.handle_counter) + i for i in range(len(descriptors)))
-                    self.current_size_bytes += alloc_size
+                    self.current_size_tokens += alloc_tokens_num
                     self.handle_counter += len(handles)  # note: this will eventually overflow and it is okay
                     self._pipe_send.send((handles, descriptors))
                     return handles
         except TimeoutError:
-            raise AllocationFailed(f"Could not allocate {alloc_size} (timeout={timeout})")
+            raise AllocationFailed(f"Could not allocate {alloc_tokens_num} (timeout={timeout})")
 
     @contextlib.asynccontextmanager
-    async def _wait_for_free_memory(self, alloc_size: int, timeout: Optional[float]):
+    async def _wait_for_free_memory(self, alloc_tokens_num: int, timeout: Optional[float]):
         start_time = time.perf_counter()
         loop = asyncio.get_event_loop()
 
-        with self._enqueued_size.get_lock():
-            self._enqueued_size.value += alloc_size
+        with self._enqueued_tokens.get_lock():
+            self._enqueued_tokens.value += alloc_tokens_num
         allocated = False
         try:
             context_manager = async_timeout.timeout(timeout) if timeout != 0 else contextlib.AsyncExitStack()
             # contextlib.AsyncExitStack() is used as a null context here
             async with context_manager:
-                if timeout == 0 and self.current_size_bytes + self.enqueued_size_bytes > self.max_size_bytes:
-                    raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
+                if timeout == 0 and self.current_size_tokens + self.enqueued_size_tokens > self.max_size_tokens:
+                    raise AllocationFailed(f"Could not allocate {alloc_tokens_num} tokens cache immediately: out of memory")
                 async with enter_asynchronously(self._lock_acquire_memory):
-                    if self.current_size_bytes + alloc_size > self.max_size_bytes:
+                    if self.current_size_tokens + alloc_tokens_num > self.max_size_tokens:
                         if timeout == 0:
-                            raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
+                            raise AllocationFailed(f"Could not allocate {alloc_tokens_num} tokens cache immediately: out of memory")
                         elapsed_time = time.perf_counter() - start_time
                         remaining_timeout = max(0.0, timeout - elapsed_time) if timeout is not None else None
-                        await loop.run_in_executor(None, self._wait_until_available, alloc_size, remaining_timeout)
+                        await loop.run_in_executor(None, self._wait_until_available, alloc_tokens_num, remaining_timeout)
 
                 allocated = True
-                with self._enqueued_size.get_lock():
-                    self._enqueued_size.value -= alloc_size
+                with self._enqueued_tokens.get_lock():
+                    self._enqueued_tokens.value -= alloc_tokens_num
                 yield
         except asyncio.TimeoutError:
-            raise AllocationFailed(f"Could not allocate {alloc_size} within {timeout} seconds")
+            raise AllocationFailed(f"Could not allocate {alloc_tokens_num} within {timeout} seconds")
         finally:
             if not allocated:
-                with self._enqueued_size.get_lock():
-                    self._enqueued_size.value -= alloc_size
+                with self._enqueued_tokens.get_lock():
+                    self._enqueued_tokens.value -= alloc_tokens_num
 
-    def _free(self, alloc_size: int, alloc_task: asyncio.Task):
+    def _free(self, alloc_tokens_num: int, alloc_task: asyncio.Task):
         if alloc_task.exception() is not None:
             return
         handles = alloc_task.result()
 
         with self._lock_metadata:
             self._pipe_send.send((handles, None))  # signal runtime to free these handles
-            self.current_size_bytes -= alloc_size
+            self.current_size_tokens -= alloc_tokens_num
         self._memory_freed_event.set()
 
-    def _wait_until_available(self, allocated_size: int, timeout: Optional[float] = None):
+    def _wait_until_available(self, alloc_tokens_num: int, timeout: Optional[float] = None):
         # note: this function should only be called inside _lock_acquire_memory!
-        if allocated_size > self.max_size_bytes:
+        if alloc_tokens_num > self.max_size_tokens:
             raise AllocationFailed(
-                f"Could not allocate {allocated_size} bytes, max cache size = {self.max_size_bytes} bytes"
+                f"Could not allocate {alloc_tokens_num} tokens cache, max cache size = {self.max_size_tokens} tokens"
             )
         timeout = timeout if timeout != float("inf") else None
         deadline = None if timeout is None else time.perf_counter() + timeout
-        while self.current_size_bytes + allocated_size > self.max_size_bytes:
+        while self.current_size_tokens + alloc_tokens_num > self.max_size_tokens:
             remaining_time = None if timeout is None else deadline - time.perf_counter()
             if not self._memory_freed_event.wait(remaining_time):
                 raise AllocationFailed(
-                    f"Server's attention cache is full, failed to allocate {allocated_size} bytes in {timeout} seconds"
+                    f"Server's attention cache is full, failed to allocate {alloc_tokens_num} tokens cache in {timeout} seconds"
                 )
             self._memory_freed_event.clear()
 
@@ -203,14 +203,101 @@ class MemoryCache:
         assert os.getpid() == self.runtime_pid
         # note: this specific function is not concurrent, so you can safely allocate/offload/defragment data here
 
+        verbose_kv_alloc_logs = _is_verbose_kv_alloc_logs()
+        kv_alloc_log = logger.info if verbose_kv_alloc_logs else logger.debug
+
         # read creation/deletion requests from connection handlers
-        while self._pipe_recv.poll():
-            recv_handles, recv_data = self._pipe_recv.recv()
+        def _process_message(recv_handles, recv_data):
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
-                    self._allocated_tensors[handle] = descr.make_zeros()
-                    assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
+                    seq_len = descr.shape[-1] if descr.shape else 0
+                    # [MBPIPE] Extract batch_size from descriptor (first dim)
+                    # descriptor shape: (batch_size, num_heads, head_dim, max_length)
+                    descr_batch_size = descr.shape[0] if descr.shape else 1
+                    
+                    # [MBPIPE_DEBUG] Log descriptor shape and batch_size BEFORE allocation
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] === KV CACHE TENSOR ALLOCATION ===")
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] Descriptor shape: {descr.shape}")
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] Extracted batch_size from descriptor: {descr_batch_size}")
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] Sequence length (max_length): {seq_len}")
+                    
+                    self.mocked_task = Task(
+                        inputs=None,
+                        prompt_len=1,
+                        gen_len=max(1, seq_len),
+                        cut_gen_len=None,
+                        do_sample=False,
+                        temperature=0,
+                        stop=None,
+                        top_p=None,
+                    )
+                    # [MBPIPE] Override policy.gpu_batch_size with descriptor's batch_size
+                    # so actual allocation strictly follows descriptor shape (full or micro).
+                    from dataclasses import replace as dataclass_replace
+                    override_policy = dataclass_replace(self.allocation_policy, gpu_batch_size=descr_batch_size)
+                    
+                    # [MBPIPE_DEBUG] Log the override policy
+                    kv_alloc_log(
+                        f"[MBPIPE_KV_DEBUG] Policy gpu_batch_size override: "
+                        f"original={self.allocation_policy.gpu_batch_size} -> override={descr_batch_size}"
+                    )
+                    
+                    # [MBPIPE_DEBUG] Log GPU memory BEFORE allocation
+                    if verbose_kv_alloc_logs:
+                        try:
+                            from bloombee.utils.memory_usage import log_mbpipe_memory
+                            log_mbpipe_memory("BEFORE_KV_ALLOC", f"handle={handle}, batch_size={descr_batch_size}")
+                        except Exception as e:
+                            logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
+                    
+                    allocated_cache = self.device.init_cache_one_gpu_batch(
+                        self.block_config, self.mocked_task, override_policy
+                    )
+                    
+                    # [MBPIPE_DEBUG] Log the allocated cache shape (handle different structures)
+                    try:
+                        if allocated_cache is not None:
+                            # Try to determine the structure of allocated_cache
+                            cache_type = type(allocated_cache).__name__
+                            kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache type: {cache_type}")
+                            
+                            if hasattr(allocated_cache, 'shape'):
+                                # Single tensor
+                                kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache.shape: {allocated_cache.shape}")
+                            elif hasattr(allocated_cache, 'data'):
+                                # TorchTensor wrapper
+                                data = allocated_cache.data
+                                if hasattr(data, 'shape'):
+                                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache.data.shape: {data.shape}")
+                                elif isinstance(data, tuple):
+                                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache.data is tuple, len={len(data)}")
+                            elif isinstance(allocated_cache, (list, tuple)):
+                                kv_alloc_log(f"[MBPIPE_KV_DEBUG] allocated_cache is sequence, len={len(allocated_cache)}")
+                                # Try to inspect first element
+                                if len(allocated_cache) > 0:
+                                    first = allocated_cache[0]
+                                    first_type = type(first).__name__
+                                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] First element type: {first_type}")
+                                    if hasattr(first, 'shape'):
+                                        kv_alloc_log(f"[MBPIPE_KV_DEBUG] First element shape: {first.shape}")
+                                    elif hasattr(first, 'data') and hasattr(first.data, 'shape'):
+                                        kv_alloc_log(f"[MBPIPE_KV_DEBUG] First element.data.shape: {first.data.shape}")
+                    except Exception as debug_e:
+                        logger.debug(f"[MBPIPE_KV_DEBUG] Failed to log cache structure: {debug_e}")
+                    
+                    # [MBPIPE_DEBUG] Log GPU memory AFTER allocation
+                    if verbose_kv_alloc_logs:
+                        try:
+                            from bloombee.utils.memory_usage import log_mbpipe_memory
+                            log_mbpipe_memory("AFTER_KV_ALLOC", f"handle={handle}, batch_size={descr_batch_size}")
+                        except Exception as e:
+                            logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
+                    
+                    kv_alloc_log(f"[MBPIPE_KV_DEBUG] === KV CACHE ALLOCATION COMPLETE ===")
+                    
+                    self._allocated_tensors[handle] = allocated_cache
+                    
             else:  # delete tensors by handle
                 for handle in recv_handles:
                     if handle not in self._allocated_tensors:
@@ -218,8 +305,29 @@ class MemoryCache:
                             f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
                         )
                     self._allocated_tensors.pop(handle, None)
-        yield tuple(self._allocated_tensors[handle] for handle in handles)
 
+        while self._pipe_recv.poll():
+            _process_message(*self._pipe_recv.recv())
+
+        # Ensure all requested handles are materialized; wait synchronously if needed
+        missing_handles = [handle for handle in handles if handle not in self._allocated_tensors]
+        while missing_handles:
+            _process_message(*self._pipe_recv.recv())
+            missing_handles = [handle for handle in handles if handle not in self._allocated_tensors]
+
+        yield tuple(self._allocated_tensors[handle] for handle in handles)
+        
 
 class AllocationFailed(Exception):
     pass
+
+class KVCacheMetadata:
+    device: Any               # On which device
+    offloaded: bool = False             # Whether offloaded to CPU
+    # TODO: add more device info
+
+
+@dataclasses.dataclass(frozen=True)
+class AdaptedKVCache:
+    kvs: Sequence[torch.Tensor]
+    device: KVCacheMetadata

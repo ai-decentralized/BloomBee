@@ -228,6 +228,14 @@ def measure_compute_rps(
     device = torch.device(device)
     if not tensor_parallel_devices:
         tensor_parallel_devices = (device,)
+    
+    # 🔍 Batch Size Debug: Log throughput measurement parameters
+    logger.info(f"[THROUGHPUT_DEBUG] Measuring {'inference' if inference else 'forward'} RPS")
+    logger.info(f"[THROUGHPUT_DEBUG] Policy GPU Batch Size: {policy.gpu_batch_size}")
+    logger.info(f"[THROUGHPUT_DEBUG] Policy Num GPU Batches: {policy.num_gpu_batches}")
+    logger.info(f"[THROUGHPUT_DEBUG] N Tokens: {n_tokens}, N Steps: {n_steps}")
+    logger.info(f"[THROUGHPUT_DEBUG] Device: {device}, Dtype: {dtype}")
+    
     with torch.inference_mode():
         block = get_model_block(config, env, policy, weight_home, path) #####
 
@@ -264,10 +272,16 @@ def measure_compute_rps(
         device_names = tuple(map(get_device_name, map(torch.device, tensor_parallel_devices)))
         devices_repr = ", ".join(f"{count}x {name}" for name, count in Counter(device_names).most_common())
 
+    # 🔍 Batch Size Debug: Log throughput results with batch size context
     logger.info(
         f"{'Inference' if inference else 'Forward pass'} throughput: {device_rps:.1f} tokens/sec per block "
         f"({n_tokens} tokens/batch, {devices_repr}, {get_dtype_name(dtype, quant_type)})"
     )
+    logger.info(f"[THROUGHPUT_RESULT] Policy GPU Batch Size: {policy.gpu_batch_size} | "
+                f"Effective RPS: {device_rps:.1f} | "
+                f"Elapsed Time: {elapsed:.3f}s | "
+                f"Steps: {n_steps} | "
+                f"Tokens per Step: {n_tokens}")
     return device_rps
 
 
@@ -283,7 +297,11 @@ def get_device_name(device: torch.device) -> str:
 
 
 def get_dtype_name(dtype: torch.dtype, quant_type: QuantType) -> str:
+    """
+    Get a human-readable dtype name, including FlexGen compression info if applicable.
+    Note: quant_type refers to FlexGen's group-wise quantization, not bitsandbytes.
+    """
     name = str(dtype).replace("torch.", "")
     if quant_type != QuantType.NONE:
-        name += f", quantized to {quant_type.name.lower()}"
+        name += f", compressed with FlexGen {quant_type.name.lower()} group quantization"
     return name

@@ -12,22 +12,22 @@ from hivemind.utils.logging import get_logger, use_hivemind_log_handler
 from tensor_parallel.slicing_configs import get_bloom_config
 from transformers import PretrainedConfig
 from pynvml import *
-from bloombee.utils.memory_usage import see_memory_usage
+from bloombee.utils.memory_usage import see_memory_usage, log_mem
 
-def see_memory_usage(message, force=True):
-	logger = ''
-	logger += message
-	nvmlInit()
- 
-	# nvidia_smi.nvmlInit()
-	handle = nvmlDeviceGetHandleByIndex(0)
-	info = nvmlDeviceGetMemoryInfo(handle)
-	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-	
-	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-	logger +=   'Max Memory Allocated: ' + str(
-		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-	print(logger)
+# def see_memory_usage(message, force=True):
+# 	logger = ''
+# 	logger += message
+# 	nvmlInit()
+#  
+# 	# nvidia_smi.nvmlInit()
+# 	handle = nvmlDeviceGetHandleByIndex(0)
+# 	info = nvmlDeviceGetMemoryInfo(handle)
+# 	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
+# 	
+# 	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
+# 	logger +=   'Max Memory Allocated: ' + str(
+# 		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
+# 	print(logger)
 
 logger = get_logger(__name__)
 use_hivemind_log_handler("in_root_logger")
@@ -35,9 +35,13 @@ logger = get_logger(__name__)
 
 
 class QuantType(Enum):
+    """
+    Quantization type enum for FlexGen compression.
+    Note: bitsandbytes quantization is not used. This enum only controls FlexGen's group-wise quantization.
+    """
     NONE = 0
-    INT8 = 1  # 8-bit as in the LLM.int8() paper
-    NF4 = 2  # 4-bit as in the QLoRA paper
+    INT8 = 1  # 8-bit group-wise quantization for FlexGen
+    NF4 = 2  # 4-bit group-wise quantization for FlexGen
 
 
 def convert_block(
@@ -52,7 +56,10 @@ def convert_block(
     **kwargs,
 ) -> tp.TensorParallel:
     """
-    Optimize a transformer block for use in a Petals server, apply tensor parallelism and/or LLM.8bit quantization
+    Optimize a transformer block for use in a Petals server with FlexGen.
+    
+    Note: Quantization is handled by FlexGen's weight loading system, not here.
+    The quant_type parameter is passed through but not used in this function.
 
     :note: some optimizations will modify the input block in-place!
     :param block: a single transformer block, either pre-trained or newly initialized
@@ -60,85 +67,80 @@ def convert_block(
     :param tensor_parallel_devices: if specified, use tensor parallelism to split the model between these devices
     :note: if there is only a single device, model wil still be wrapped with TensorParallel (for uniformity)
     :param output_device: if tensor_parallel_devices is True, output
-    :param quant_type: quantization type
+    :param quant_type: quantization type (used by FlexGen compression, not applied here)
     :param freeze: if True (default), make all module parameters non-trainable
     :return: a module that acts like the original block, but runs with all specified optimizations
 
     """
     if freeze:
         block.requires_grad_(False)
-    # print()
-    # import pdb; pdb.set_trace()
-    # print()
-    see_memory_usage("-----------------------------------------convert_block before make_tensor_parallel ")
-    block = make_tensor_parallel(block, config, tensor_parallel_devices, output_device=output_device)
-    see_memory_usage("-----------------------------------------convert_block after make_tensor_parallel ")
-    if quant_type != QuantType.NONE:
-        block = quantize_module(block, quant_type=quant_type)
-
-    # for shard, device in zip(block.module_shards, block.devices):
-    #     shard.to(device)
-    # for shard, device in zip(block.modules, block.devices):
-    #     shard.to(device)
+    # Skip tensor parallelism for FlexGen blocks - they manage their own weights and devices
+    log_prefix = f"[convert_block:{block_index}]"
+    # log_mem(f"{log_prefix} skipping tensor parallelism - FlexGen manages weights directly")
+    
+    # Quantization is handled by FlexGen's compression system during weight loading
+    # No bitsandbytes quantization is applied here
+    # log_mem(f"{log_prefix} quantization handled by FlexGen compression system")
+    
+    # Create a simple wrapper that provides TensorParallel interface for pipeline parallelism
+    # but uses FlexGen's forward method directly
+    class PipelineParallelWrapper:
+        def __init__(self, module, devices, output_device):
+            self._module = module
+            self.devices = devices
+            self.output_device_index = 0  # Single device in pipeline parallelism
+            self.module_shards = [module]  # Single shard per pipeline stage
+            
+        def forward(self, *args, **kwargs):
+            # Use FlexGen's forward method directly
+            return self._module.forward(*args, **kwargs)
+            
+        def named_parameters(self, *args, **kwargs):
+            return self._module.named_parameters(*args, **kwargs)
+            
+        def named_buffers(self, *args, **kwargs):
+            return self._module.named_buffers(*args, **kwargs)
+        
+        def rms_norm(self, *args, **kwargs):
+            return self._module.rms_norm(*args, **kwargs)
+        
+        def load_lm_head(self, *args, **kwargs):
+            return self._module.load_lm_head(*args, **kwargs)
+        
+        def lm_head_forward(self, *args, **kwargs):
+            return self._module.lm_head_forward(*args, **kwargs)
+    
+    tp_block = PipelineParallelWrapper(block, tensor_parallel_devices, output_device)
+    # log_mem(f"{log_prefix} created PipelineParallel wrapper")
+    
     print('quant_type ', quant_type)
     print('adapters ', adapters )
     if adapters:
         
         from bloombee.utils.peft import add_adapter_to_block, create_lora_adapter, load_peft
 
-        create_lora_adapter(block)
+        create_lora_adapter(tp_block)
         for adapter_name in adapters:
             adapter_config, adapter_state_dict = load_peft(
                 adapter_name,
                 block_idx=block_index,
                 **kwargs,
             )
-            add_adapter_to_block(block, block_index, adapter_name, adapter_config, adapter_state_dict)
+            add_adapter_to_block(tp_block, block_index, adapter_name, adapter_config, adapter_state_dict)
 
-    return block
+    return tp_block
 
 
+# NOTE: bitsandbytes quantization has been removed.
+# Quantization is now handled entirely by FlexGen's compression system during weight loading.
+# This function is kept for backward compatibility but does nothing.
 def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
-    # Import bitsandbytes only when necessary, so Petals runs on platforms not supported by bitsandbytes
-    import bitsandbytes as bnb
-
-    for n, module in model.named_children():
-        if len(list(module.children())) > 0:
-            # import pdb; pdb.set_trace() 
-            quantize_module(module, quant_type=quant_type)
-
-        if isinstance(module, torch.nn.Linear) and n not in ["lm_head", "score"]:
-            # import pdb; pdb.set_trace() 
-            assert module.weight.device.type == "cpu", f"expected linear layers on CPU, got {module.weight.device}"
-            if quant_type == QuantType.INT8:
-                model._modules[n] = bnb.nn.Linear8bitLt(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    has_fp16_weights=False,
-                    threshold=6.0,  # Default from the LLM.int8() paper
-                )
-                model._modules[n].weight = bnb.nn.Int8Params(
-                    module.weight.data, requires_grad=False, has_fp16_weights=False
-                ).to(module.weight.dtype)
-            elif quant_type == QuantType.NF4: #------
-                compress_statistics = True
-                model._modules[n] = bnb.nn.LinearNF4(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    compress_statistics=compress_statistics,
-                )
-                model._modules[n].weight = bnb.nn.Params4bit(
-                    module.weight.data,
-                    requires_grad=False,
-                    quant_type="nf4",
-                    blocksize=64,
-                    compress_statistics=compress_statistics,
-                ).to(module.weight.dtype)
-            else:
-                raise ValueError(f"Unsupported quant_type='{quant_type}'")
-            model._modules[n].bias = module.bias
+    """
+    Deprecated: Quantization is now handled by FlexGen's compression system.
+    This function is a no-op and kept for backward compatibility.
+    """
+    if quant_type != QuantType.NONE:
+        logger.debug(f"Quantization type {quant_type} specified, but quantization is handled by FlexGen compression system")
     return model
 
 

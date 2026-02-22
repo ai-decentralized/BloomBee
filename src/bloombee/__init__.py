@@ -1,8 +1,6 @@
 import os
 import platform
 
-os.environ.setdefault("BITSANDBYTES_NOWELCOME", "1")
-
 if platform.system() == "Darwin":
     # Necessary for forks to work properly on macOS, see https://github.com/kevlened/pytest-parallel/issues/93
     os.environ.setdefault("no_proxy", "*")

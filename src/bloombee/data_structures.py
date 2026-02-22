@@ -1,10 +1,17 @@
 import dataclasses
+import time
 from enum import Enum
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
+import torch
 import pydantic
+import torch
 from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
+
+# 避免循环导入，使用TYPE_CHECKING
+if TYPE_CHECKING:
+    from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
 
 ModuleUID = str
 UID_DELIMITER = "."  # delimits parts of one module uid, e.g. "bloom.transformer.h.4.self_attention"
@@ -106,6 +113,7 @@ class RemoteSpanInfo:
 
 RPCInfo = Dict[str, Any]
 
+# 定义Handle类型
 Handle = int
 
 
@@ -113,5 +121,16 @@ Handle = int
 class InferenceMetadata:
     uid: ExpertUID
     prefix_length: int
-    cache_handles: Tuple[Handle, ...]
+    cache_handles: Tuple["Handle", ...]  # 使用字符串类型注解避免循环导入
     active_adapter: Optional[str]
+    tree_attention_mask: Optional[torch.Tensor] = None
+    kv_cache_position_ids: Optional[torch.Tensor] = None
+    draft_tokens: Optional[torch.Tensor] = None
+    prefill_length: Optional[torch.Tensor] = None
+    keep_indices: Optional[torch.Tensor] = None
+    need_pruning: Optional[torch.Tensor] = None
+    is_spec_dec: Optional[torch.Tensor] = None
+    # Micro-batch support: batch slicing for KV cache
+    batch_offset: int = 0  # Start index in the full batch for this micro-batch
+    full_batch_size: int = 0  # Total batch size (0 means no micro-batch, use entire cache)
+    micro_batch_size: int = 0  # Actual size of this micro-batch (0 means use full_batch_size - batch_offset)

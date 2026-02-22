@@ -5,8 +5,7 @@ import asyncio
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
-from hivemind import nested_compare, nested_flatten, nested_pack, serialize_torch_tensor
-from hivemind.compression.serialization import deserialize_tensor_stream, deserialize_torch_tensor
+from hivemind import nested_compare, nested_flatten, nested_pack
 from hivemind.p2p import StubBase
 from hivemind.p2p.p2p_daemon_bindings.control import DEFAULT_MAX_MSG_SIZE, MAX_UNARY_PAYLOAD_SIZE
 from hivemind.proto import runtime_pb2
@@ -16,6 +15,7 @@ from hivemind.utils.tensor_descr import BatchTensorDescriptor
 
 from bloombee.client.config import ClientConfig
 from bloombee.data_structures import ModuleUID, RPCInfo
+from bloombee.utils.lossless_transport import deserialize_tensor_stream, deserialize_torch_tensor, serialize_torch_tensor
 
 
 async def _forward_unary(
@@ -94,10 +94,16 @@ async def run_remote_forward(
     assert len(inputs) >= len(args_schema) + 1, "Inputs and prompt tensors are necessary for a forward step"
 
     # Asynchronous serialization
+    # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
     loop = asyncio.get_running_loop()
     serialized_tensors = await asyncio.gather(
         *(
-            loop.run_in_executor(None, serialize_torch_tensor, tensor.to(proto.dtype), proto.compression)
+            loop.run_in_executor(
+                None,
+                serialize_torch_tensor,
+                tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
+                proto.compression
+            )
             for tensor, proto in zip(inputs, forward_schema)
         )
     )
@@ -134,10 +140,16 @@ async def run_remote_backward(
     ), "Inputs, grad_outputs and prompt tensors are necessary for a backward step"
 
     # Asynchronous serialization
+    # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
     loop = asyncio.get_running_loop()
     serialized_tensors = await asyncio.gather(
         *(
-            loop.run_in_executor(None, serialize_torch_tensor, tensor.to(proto.dtype), proto.compression)
+            loop.run_in_executor(
+                None,
+                serialize_torch_tensor,
+                tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
+                proto.compression
+            )
             for tensor, proto in zip(inputs_and_grad_outputs, backward_schema)
         )
     )

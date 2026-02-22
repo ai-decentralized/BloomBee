@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 def validate_version() -> None:
     logger.info(f"Running {TextStyle.BOLD}bloombee {bloombee.__version__}{TextStyle.RESET}")
     try:
-        r = requests.get("https://pypi.python.org/pypi/bloombee/json")
+        r = requests.get("https://pypi.python.org/pypi/bloombee/json", timeout=10)
         r.raise_for_status()
         response = r.json()
 
