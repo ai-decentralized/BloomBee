@@ -1,0 +1,36 @@
+[MAIN]
+# Use multiple processes to speed up pylint
+jobs=0
+
+[FORMAT]
+# Match black and isort line length
+max-line-length=120
+
+[MESSAGES CONTROL]
+disable=
+    # Import errors are expected in CI where heavy deps (torch, hivemind) aren't installed
+    E0401,
+    # Docstrings are not enforced project-wide
+    C0114,
+    C0115,
+    C0116,
+    # Allow TODO comments
+    W0511,
+    # Too-few-public-methods is noisy for config/data classes
+    R0903,
+    # Allow broad exception catching common in server/network code
+    W0703
+
+[DESIGN]
+max-args=10
+max-attributes=12
+max-bool-expr=5
+max-branches=15
+max-locals=20
+max-returns=8
+max-statements=60
+
+[SIMILARITIES]
+# Ignore imports when checking for duplicate code
+ignore-imports=yes
+min-similarity-lines=10
