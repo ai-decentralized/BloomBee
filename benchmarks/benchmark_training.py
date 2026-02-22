@@ -8,8 +8,8 @@ import numpy as np
 import torch
 from hivemind.utils.logging import get_logger
 
-from bloombee_bak import AutoDistributedModelForCausalLM, AutoDistributedModelForSequenceClassification
-from bloombee_bak.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
+from bloombee import AutoDistributedModelForCausalLM, AutoDistributedModelForSequenceClassification
+from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 
 logger = get_logger()
 
