@@ -42,6 +42,8 @@ from bloombee.utils.lossless_transport import (
     deserialize_torch_tensor,
     serialize_torch_tensor,
     log_comp_ratio_event,
+    log_transport_profile_event,
+    transport_profile_scope,
     tensor_nnz_ratio,
     tensor_raw_nbytes,
 )
@@ -1657,14 +1659,26 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_peer_id = PeerID.from_base58(next_peer_id)
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
             
-            # Serialize the micro-batch hidden states
+            # Serialize the micro-batch tensors
             outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
-            
-            serialized_hidden = serialize_torch_tensor(
-                mb_hidden.to(outputs_schema[0].dtype),
-                outputs_schema[0].compression,
-                allow_inplace=True
-            )
+            with transport_profile_scope() as push_transport_profile:
+                serialized_hidden = serialize_torch_tensor(
+                    mb_hidden.to(outputs_schema[0].dtype),
+                    outputs_schema[0].compression,
+                    allow_inplace=True
+                )
+                if mb_keep_indices is not None:
+                    serialized_keep = serialize_torch_tensor(
+                        mb_keep_indices.to(torch.int64),
+                        outputs_schema[1].compression if len(outputs_schema) > 1 else runtime_pb2.CompressionType.NONE,
+                        allow_inplace=True
+                    )
+                else:
+                    serialized_keep = serialize_torch_tensor(
+                        torch.arange(mb_hidden.shape[1], dtype=torch.int64),
+                        runtime_pb2.CompressionType.NONE,
+                        allow_inplace=True
+                    )
             sender_blocks = str(metadata.get("sender_blocks", "unknown"))
             log_comp_ratio_event(
                 logger,
@@ -1679,20 +1693,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                 nnz_ratio=tensor_nnz_ratio(mb_hidden),
                 extra={"mb_idx": int(mb_idx)},
             )
-            
-            # Serialize keep_indices if present
-            if mb_keep_indices is not None:
-                serialized_keep = serialize_torch_tensor(
-                    mb_keep_indices.to(torch.int64),
-                    outputs_schema[1].compression if len(outputs_schema) > 1 else runtime_pb2.CompressionType.NONE,
-                    allow_inplace=True
-                )
-            else:
-                serialized_keep = serialize_torch_tensor(
-                    torch.arange(mb_hidden.shape[1], dtype=torch.int64),
-                    runtime_pb2.CompressionType.NONE,
-                    allow_inplace=True
-                )
+            log_transport_profile_event(
+                logger,
+                source="server",
+                channel="rpc_push_microbatch",
+                blocks=f"{sender_blocks}->{next_start}:{next_end}",
+                step_id=str(metadata.get("step_id", "unknown")),
+                batch_size=int(mb_size),
+                stats=push_transport_profile,
+                extra={"mb_idx": int(mb_idx)},
+            )
             
             # Build metadata for micro-batch push
             push_metadata = {

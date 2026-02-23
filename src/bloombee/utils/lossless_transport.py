@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextvars
 import os
 import struct
+import time
 import zlib
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import AsyncIterator, Dict, Iterable, List, Optional
 
@@ -37,6 +40,10 @@ _HEADER_SIZE = _HEADER_STRUCT.size
 
 _MISSING_ZSTD_WARNING_EMITTED = False
 _COMP_PROFILE_ENV = "BLOOMBEE_COMP_RATIO_PROFILE"
+_COMP_TIMING_PROFILE_ENV = "BLOOMBEE_COMP_TIMING_PROFILE"
+_TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
+    "bloombee_transport_profile", default=None
+)
 
 
 def _get_env_bool(name: str, default: str = "0") -> bool:
@@ -131,6 +138,125 @@ def comp_ratio_profile_enabled() -> bool:
     return _get_env_bool(_COMP_PROFILE_ENV, "1")
 
 
+def comp_timing_profile_enabled() -> bool:
+    """
+    Enable detailed compression/decompression timing profiling.
+    """
+    return _get_env_bool(_COMP_TIMING_PROFILE_ENV, "1")
+
+
+def _new_transport_profile() -> Dict[str, float]:
+    return {
+        "serialize_calls": 0.0,
+        "deserialize_calls": 0.0,
+        "serialize_core_ms": 0.0,
+        "deserialize_core_ms": 0.0,
+        "serialize_wrapper_ms": 0.0,
+        "deserialize_unwrap_ms": 0.0,
+        "compress_ms": 0.0,
+        "decompress_ms": 0.0,
+        "compress_calls": 0.0,
+        "decompress_calls": 0.0,
+        "serialize_wrapper_applied_calls": 0.0,
+        "deserialize_wrapper_applied_calls": 0.0,
+        "serialize_raw_bytes": 0.0,
+        "serialize_wire_bytes": 0.0,
+        "deserialize_wire_bytes": 0.0,
+        "deserialize_raw_bytes": 0.0,
+        "compress_input_bytes": 0.0,
+        "compress_output_bytes": 0.0,
+        "decompress_input_bytes": 0.0,
+        "decompress_output_bytes": 0.0,
+    }
+
+
+def _record_transport_profile(key: str, value: float) -> None:
+    stats = _TRANSPORT_PROFILE_CTX.get()
+    if stats is None:
+        return
+    stats[key] = float(stats.get(key, 0.0) + value)
+
+
+@contextmanager
+def transport_profile_scope():
+    """
+    Capture lossless transport timing and volume counters for a logical step.
+    """
+    if not comp_timing_profile_enabled():
+        yield None
+        return
+
+    profile = _new_transport_profile()
+    token = _TRANSPORT_PROFILE_CTX.set(profile)
+    try:
+        yield profile
+    finally:
+        _TRANSPORT_PROFILE_CTX.reset(token)
+
+
+def summarize_transport_profile(stats: Optional[Dict[str, float]]) -> Dict[str, float]:
+    summary = _new_transport_profile()
+    if stats:
+        for k, v in stats.items():
+            if k in summary:
+                summary[k] = float(v)
+
+    raw = max(float(summary["serialize_raw_bytes"]), 1.0)
+    wire = float(summary["serialize_wire_bytes"])
+    summary["serialize_ratio"] = wire / raw
+    summary["serialize_savings"] = 1.0 - summary["serialize_ratio"]
+
+    draw = max(float(summary["deserialize_wire_bytes"]), 1.0)
+    draw_out = float(summary["deserialize_raw_bytes"])
+    summary["deserialize_ratio"] = draw_out / draw
+    return summary
+
+
+def log_transport_profile_event(
+    log,
+    *,
+    source: str,
+    channel: str,
+    blocks: str,
+    step_id: str,
+    batch_size: int,
+    stats: Optional[Dict[str, float]],
+    extra: Optional[Dict[str, object]] = None,
+) -> None:
+    """
+    Emit a stable single-line timing/volume record for compression profiling.
+    """
+    if not comp_timing_profile_enabled():
+        return
+    summary = summarize_transport_profile(stats)
+    msg = (
+        "[COMP_TIMING] "
+        f"source={source} "
+        f"channel={channel} "
+        f"blocks={blocks} "
+        f"step_id={step_id} "
+        f"batch={int(batch_size)} "
+        f"serialize_core_ms={summary['serialize_core_ms']:.3f} "
+        f"serialize_wrap_ms={summary['serialize_wrapper_ms']:.3f} "
+        f"compress_ms={summary['compress_ms']:.3f} "
+        f"deserialize_unwrap_ms={summary['deserialize_unwrap_ms']:.3f} "
+        f"decompress_ms={summary['decompress_ms']:.3f} "
+        f"deserialize_core_ms={summary['deserialize_core_ms']:.3f} "
+        f"serialize_raw_bytes={int(summary['serialize_raw_bytes'])} "
+        f"serialize_wire_bytes={int(summary['serialize_wire_bytes'])} "
+        f"deserialize_wire_bytes={int(summary['deserialize_wire_bytes'])} "
+        f"deserialize_raw_bytes={int(summary['deserialize_raw_bytes'])} "
+        f"serialize_ratio={summary['serialize_ratio']:.6f} "
+        f"serialize_savings={summary['serialize_savings']:.6f} "
+        f"compress_calls={int(summary['compress_calls'])} "
+        f"decompress_calls={int(summary['decompress_calls'])}"
+    )
+    if extra:
+        for k, v in extra.items():
+            msg += f" {k}={v}"
+    log.info(msg)
+
+
 def tensor_raw_nbytes(tensor: Optional[torch.Tensor]) -> int:
     if tensor is None or not torch.is_tensor(tensor):
         return 0
@@ -193,7 +319,9 @@ def log_comp_ratio_event(
             f"wire_bytes={wire_i} "
             f"ratio={ratio:.6f} "
             f"savings={savings:.6f} "
-            f"nnz={nnz:.6f}"
+            f"nnz={nnz:.6f} "
+            f"lossless={int(_lossless_send_enabled())} "
+            f"algo={_lossless_algo()}"
         )
         if extra:
             for k, v in extra.items():
@@ -230,17 +358,32 @@ def _compress_buffer(raw: bytes) -> tuple[int, bytes]:
         if compressor is None:
             _warn_missing_zstd_once()
             return 0, raw
-        return _ALGO_ZSTD, compressor.compress(raw)
+        t0 = time.perf_counter()
+        compressed = compressor.compress(raw)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        _record_transport_profile("compress_calls", 1.0)
+        _record_transport_profile("compress_ms", dt_ms)
+        _record_transport_profile("compress_input_bytes", float(len(raw)))
+        _record_transport_profile("compress_output_bytes", float(len(compressed)))
+        return _ALGO_ZSTD, compressed
 
     if algo == "zlib":
         zlib_level = max(-1, min(level, 9))
-        return _ALGO_ZLIB, zlib.compress(raw, level=zlib_level)
+        t0 = time.perf_counter()
+        compressed = zlib.compress(raw, level=zlib_level)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        _record_transport_profile("compress_calls", 1.0)
+        _record_transport_profile("compress_ms", dt_ms)
+        _record_transport_profile("compress_input_bytes", float(len(raw)))
+        _record_transport_profile("compress_output_bytes", float(len(compressed)))
+        return _ALGO_ZLIB, compressed
 
     logger.warning(f"Unknown BLOOMBEE_LOSSLESS_ALGO={algo!r}, disabling wrapper compression")
     return 0, raw
 
 
 def _decompress_buffer(algo_id: int, payload: bytes, original_size: int) -> bytes:
+    t0 = time.perf_counter()
     if algo_id == _ALGO_ZSTD:
         decompressor = _get_zstd_decompressor()
         if decompressor is None:
@@ -253,6 +396,11 @@ def _decompress_buffer(algo_id: int, payload: bytes, original_size: int) -> byte
 
     if len(raw) != original_size:
         raise ValueError(f"Lossless wrapper size mismatch: expected {original_size}, got {len(raw)}")
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _record_transport_profile("decompress_calls", 1.0)
+    _record_transport_profile("decompress_ms", dt_ms)
+    _record_transport_profile("decompress_input_bytes", float(len(payload)))
+    _record_transport_profile("decompress_output_bytes", float(len(raw)))
     return raw
 
 
@@ -279,31 +427,36 @@ def wrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_pb2
     Optionally wrap runtime_pb2.Tensor.buffer with a lossless compression header.
     This only affects transport bytes; tensor protobuf fields (dtype/shape/compression) stay intact.
     """
-    if not _lossless_send_enabled():
-        return serialized_tensor
+    wrap_t0 = time.perf_counter()
+    try:
+        if not _lossless_send_enabled():
+            return serialized_tensor
 
-    raw = serialized_tensor.buffer
-    if not raw:
-        return serialized_tensor
-    if len(raw) < _lossless_min_bytes():
-        return serialized_tensor
-    if _parse_wrapper(raw, strict=False) is not None:
-        return serialized_tensor
+        raw = serialized_tensor.buffer
+        if not raw:
+            return serialized_tensor
+        if len(raw) < _lossless_min_bytes():
+            return serialized_tensor
+        if _parse_wrapper(raw, strict=False) is not None:
+            return serialized_tensor
 
-    algo_id, compressed = _compress_buffer(raw)
-    if algo_id == 0:
-        return serialized_tensor
+        algo_id, compressed = _compress_buffer(raw)
+        if algo_id == 0:
+            return serialized_tensor
 
-    wrapped_buffer = _HEADER_STRUCT.pack(_MAGIC, _VERSION, algo_id, len(raw)) + compressed
+        wrapped_buffer = _HEADER_STRUCT.pack(_MAGIC, _VERSION, algo_id, len(raw)) + compressed
 
-    # Skip compression if it does not reduce payload enough to amortize header/CPU overhead.
-    if len(wrapped_buffer) + _lossless_min_gain_bytes() >= len(raw):
-        return serialized_tensor
+        # Skip compression if it does not reduce payload enough to amortize header/CPU overhead.
+        if len(wrapped_buffer) + _lossless_min_gain_bytes() >= len(raw):
+            return serialized_tensor
 
-    wrapped = runtime_pb2.Tensor()
-    wrapped.CopyFrom(serialized_tensor)
-    wrapped.buffer = wrapped_buffer
-    return wrapped
+        wrapped = runtime_pb2.Tensor()
+        wrapped.CopyFrom(serialized_tensor)
+        wrapped.buffer = wrapped_buffer
+        _record_transport_profile("serialize_wrapper_applied_calls", 1.0)
+        return wrapped
+    finally:
+        _record_transport_profile("serialize_wrapper_ms", (time.perf_counter() - wrap_t0) * 1000.0)
 
 
 def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_pb2.Tensor:
@@ -312,18 +465,27 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
     - Wrapped tensor: decode and restore original buffer.
     - Legacy/raw tensor: returned unchanged.
     """
-    wrapped_buffer = serialized_tensor.buffer
-    parsed = _parse_wrapper(wrapped_buffer, strict=True)
-    if parsed is None:
-        return serialized_tensor
+    unwrap_t0 = time.perf_counter()
+    try:
+        wrapped_buffer = serialized_tensor.buffer
+        _record_transport_profile("deserialize_wire_bytes", float(len(wrapped_buffer)))
 
-    algo_id, original_size, payload = parsed
-    raw_buffer = _decompress_buffer(algo_id, payload, original_size)
+        parsed = _parse_wrapper(wrapped_buffer, strict=True)
+        if parsed is None:
+            _record_transport_profile("deserialize_raw_bytes", float(len(wrapped_buffer)))
+            return serialized_tensor
 
-    unwrapped = runtime_pb2.Tensor()
-    unwrapped.CopyFrom(serialized_tensor)
-    unwrapped.buffer = raw_buffer
-    return unwrapped
+        algo_id, original_size, payload = parsed
+        raw_buffer = _decompress_buffer(algo_id, payload, original_size)
+
+        unwrapped = runtime_pb2.Tensor()
+        unwrapped.CopyFrom(serialized_tensor)
+        unwrapped.buffer = raw_buffer
+        _record_transport_profile("deserialize_wrapper_applied_calls", 1.0)
+        _record_transport_profile("deserialize_raw_bytes", float(len(raw_buffer)))
+        return unwrapped
+    finally:
+        _record_transport_profile("deserialize_unwrap_ms", (time.perf_counter() - unwrap_t0) * 1000.0)
 
 
 def serialize_torch_tensor(
@@ -333,6 +495,7 @@ def serialize_torch_tensor(
     allow_inplace: bool = False,
     **kwargs,
 ) -> runtime_pb2.Tensor:
+    t0 = time.perf_counter()
     serialized = _serialize_torch_tensor(
         tensor,
         compression_type=compression_type,
@@ -340,12 +503,21 @@ def serialize_torch_tensor(
         allow_inplace=allow_inplace,
         **kwargs,
     )
-    return wrap_serialized_tensor(serialized)
+    _record_transport_profile("serialize_calls", 1.0)
+    _record_transport_profile("serialize_core_ms", (time.perf_counter() - t0) * 1000.0)
+    _record_transport_profile("serialize_raw_bytes", float(len(serialized.buffer)))
+    wrapped = wrap_serialized_tensor(serialized)
+    _record_transport_profile("serialize_wire_bytes", float(len(wrapped.buffer)))
+    return wrapped
 
 
 def deserialize_torch_tensor(serialized_tensor: runtime_pb2.Tensor) -> torch.Tensor:
+    _record_transport_profile("deserialize_calls", 1.0)
     unwrapped = unwrap_serialized_tensor(serialized_tensor)
-    return _deserialize_torch_tensor(unwrapped)
+    t0 = time.perf_counter()
+    tensor = _deserialize_torch_tensor(unwrapped)
+    _record_transport_profile("deserialize_core_ms", (time.perf_counter() - t0) * 1000.0)
+    return tensor
 
 
 async def deserialize_tensor_stream(

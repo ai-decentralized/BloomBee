@@ -34,6 +34,12 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
     parser.add_argument("--batch_size", type=int, default=1, help="Client batch size (number of sequences to generate in parallel)")
     parser.add_argument(
+        "--early_terminate_steps",
+        type=int,
+        default=256,
+        help="Early terminate after this many generated tokens; set <=0 to disable",
+    )
+    parser.add_argument(
         "--prompt_start_index",
         type=int,
         default=1,
@@ -157,8 +163,20 @@ def benchmark_inference(process_idx, args, result_pipe):
         temp_result_tokens = input_ids
         logger.info(f"{process_idx=} adjusted prompt_length to {prompt_length} tokens")
 
-    total_max_length = prompt_length + args.seq_len
-    logger.info(f"{process_idx=} prompt_length={prompt_length}, generating {args.seq_len} tokens, total_max_length={total_max_length}")
+    requested_seq_len = int(args.seq_len)
+    early_terminate_steps = int(getattr(args, "early_terminate_steps", 0))
+    if early_terminate_steps > 0:
+        decode_target_steps = min(requested_seq_len, early_terminate_steps)
+    else:
+        decode_target_steps = requested_seq_len
+    if decode_target_steps <= 0:
+        raise ValueError("decode_target_steps must be > 0")
+
+    total_max_length = prompt_length + decode_target_steps
+    logger.info(
+        f"{process_idx=} prompt_length={prompt_length}, requested_seq_len={requested_seq_len}, "
+        f"decode_target_steps={decode_target_steps}, total_max_length={total_max_length}"
+    )
     
     step_times = []
     step_latencies = []  # Track individual step latencies for cross-GPU analysis
@@ -167,9 +185,12 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     with model.transformer.h.inference_session(max_length=total_max_length) as sess:
         logger.info(f"{process_idx=} Created inference session with max_length={total_max_length}")
-        logger.info(f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | SeqLen={args.seq_len}")
+        logger.info(
+            f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | "
+            f"RequestedSeqLen={requested_seq_len} | DecodeTargetSteps={decode_target_steps}"
+        )
         
-        for step in range(args.seq_len):
+        for step in range(requested_seq_len):
             step_start_time = perf_counter()
             
             # For the first step, pass input_ids; for subsequent steps, generate() will use session state
@@ -193,7 +214,7 @@ def benchmark_inference(process_idx, args, result_pipe):
             log_step_tokens = (
                 args.log_all_tokens
                 or step < 2
-                or step == args.seq_len - 1
+                or step == decode_target_steps - 1
                 or (args.token_log_every > 0 and step % args.token_log_every == 0)
             )
             if log_step_tokens:
@@ -217,11 +238,23 @@ def benchmark_inference(process_idx, args, result_pipe):
                 # Collect latencies for analysis
                 cross_gpu_latencies.append(step_latency_ms)
                 server_processing_latencies.append(step_latency_ms)
+
+            if (step + 1) >= decode_target_steps:
+                speed_now = (1 / np.mean(step_times)) if step_times else 0.0
+                effective_speed_now = speed_now * batch_size
+                if decode_target_steps < requested_seq_len:
+                    logger.info(
+                        f"[EARLY_TERMINATE] Process={process_idx} | ReachedSteps={step + 1} | "
+                        f"TargetSteps={decode_target_steps} | RequestedSeqLen={requested_seq_len} | "
+                        f"throughput={speed_now:.2f} tokens/sec/sequence | "
+                        f"effective_throughput={effective_speed_now:.2f} tokens/sec"
+                    )
+                break
         
         # Calculate and log statistics
         warmup_latencies = step_latencies[args.warmup_steps:]
-        warmup_cross_gpu_latencies = cross_gpu_latencies[args.warmup_steps:]
-        warmup_server_processing_latencies = server_processing_latencies[args.warmup_steps:]
+        warmup_cross_gpu_latencies = cross_gpu_latencies
+        warmup_server_processing_latencies = server_processing_latencies
         
         if warmup_latencies:
             mean_latency = np.mean(warmup_latencies)

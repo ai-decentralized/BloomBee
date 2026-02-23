@@ -17,7 +17,12 @@ from bloombee.client.config import ClientConfig
 from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo, RPCInfo
 from bloombee.server.handler import TransformerConnectionHandler
-from bloombee.utils.lossless_transport import deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.lossless_transport import (
+    deserialize_torch_tensor,
+    serialize_torch_tensor,
+    transport_profile_scope,
+    log_transport_profile_event,
+)
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import pack_args_kwargs, normalize_arg
 from bloombee.utils.microbatch_config import (
@@ -218,55 +223,56 @@ class _ServerInferenceSession:
         #     server_side_inference_schema
         # ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
-        # [NETWORK_TIMING] Measure serialization time
-        serialize_start = time.perf_counter()
-        
-        # Serialize and send data (debug output removed for performance)
-        # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
-        serialized_tensors = [
-            serialize_torch_tensor(
-                tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
-                proto.compression
-            )
-            for tensor, proto in zip(input_tensors, inference_schema)
-        ]
-        serialized_metadata = MSGPackSerializer.dumps(request_metadata)
-        
-        serialize_end = time.perf_counter()
-        serialize_time_ms = (serialize_end - serialize_start) * 1000
-        
-        # [NETWORK_TIMING] Measure serialized data size
-        total_tensor_bytes = sum(len(t.buffer) for t in serialized_tensors)
-        metadata_bytes = len(serialized_metadata)
-        total_send_bytes = total_tensor_bytes + metadata_bytes
-        
-        logger.info(f"[NETWORK_TX] SEND_START | step_id={step_id} | "
-                   f"tensor_size={total_tensor_bytes/1024:.2f}KB | "
-                   f"metadata_size={metadata_bytes}B | "
-                   f"total={total_send_bytes/1024:.2f}KB | "
-                   f"serialize_time={serialize_time_ms:.2f}ms")
-        
-        # [NETWORK_TIMING] Measure network round-trip time
-        network_start = time.perf_counter()
-        
-        outputs_serialized = RemoteExpertWorker.run_coroutine(
-            self._step(
-                runtime_pb2.ExpertRequest(
-                    uid=self.uid,
-                    tensors=serialized_tensors,
-                    metadata=serialized_metadata,
+        with transport_profile_scope() as transport_profile:
+            # [NETWORK_TIMING] Measure serialization time
+            serialize_start = time.perf_counter()
+
+            # Serialize and send data (debug output removed for performance)
+            # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
+            serialized_tensors = [
+                serialize_torch_tensor(
+                    tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
+                    proto.compression
+                )
+                for tensor, proto in zip(input_tensors, inference_schema)
+            ]
+            serialized_metadata = MSGPackSerializer.dumps(request_metadata)
+
+            serialize_end = time.perf_counter()
+            serialize_time_ms = (serialize_end - serialize_start) * 1000
+
+            # [NETWORK_TIMING] Measure serialized data size
+            total_tensor_bytes = sum(len(t.buffer) for t in serialized_tensors)
+            metadata_bytes = len(serialized_metadata)
+            total_send_bytes = total_tensor_bytes + metadata_bytes
+
+            logger.info(f"[NETWORK_TX] SEND_START | step_id={step_id} | "
+                       f"tensor_size={total_tensor_bytes/1024:.2f}KB | "
+                       f"metadata_size={metadata_bytes}B | "
+                       f"total={total_send_bytes/1024:.2f}KB | "
+                       f"serialize_time={serialize_time_ms:.2f}ms")
+
+            # [NETWORK_TIMING] Measure network round-trip time
+            network_start = time.perf_counter()
+
+            outputs_serialized = RemoteExpertWorker.run_coroutine(
+                self._step(
+                    runtime_pb2.ExpertRequest(
+                        uid=self.uid,
+                        tensors=serialized_tensors,
+                        metadata=serialized_metadata,
+                    )
                 )
             )
-        )
-        
-        network_end = time.perf_counter()
-        network_rtt_ms = (network_end - network_start) * 1000
-        
-        # [NETWORK_TIMING] Measure deserialization time
-        deserialize_start = time.perf_counter()
-        outputs = list(map(deserialize_torch_tensor, outputs_serialized.tensors))
-        deserialize_end = time.perf_counter()
-        deserialize_time_ms = (deserialize_end - deserialize_start) * 1000
+
+            network_end = time.perf_counter()
+            network_rtt_ms = (network_end - network_start) * 1000
+
+            # [NETWORK_TIMING] Measure deserialization time
+            deserialize_start = time.perf_counter()
+            outputs = list(map(deserialize_torch_tensor, outputs_serialized.tensors))
+            deserialize_end = time.perf_counter()
+            deserialize_time_ms = (deserialize_end - deserialize_start) * 1000
         
         # [NETWORK_TIMING] Measure received data size
         total_recv_bytes = sum(len(t.buffer) for t in outputs_serialized.tensors)
@@ -282,6 +288,16 @@ class _ServerInferenceSession:
                    f"send={total_send_bytes/1024:.2f}KB | recv={total_recv_bytes/1024:.2f}KB | "
                    f"serialize={serialize_time_ms:.2f}ms | network={network_rtt_ms:.2f}ms | "
                    f"deserialize={deserialize_time_ms:.2f}ms | total={total_time_ms:.2f}ms")
+        log_transport_profile_event(
+            logger,
+            source="client",
+            channel="rpc_inference",
+            blocks=f"{self.span.start}:{self.span.end}",
+            step_id=step_id,
+            batch_size=int(logical_full_batch_size),
+            stats=transport_profile,
+            extra={"peer": str(self.span.peer_id)},
+        )
         # assert (
         #     outputs[0].shape == inputs.shape
         # ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"

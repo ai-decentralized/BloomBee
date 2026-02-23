@@ -71,9 +71,12 @@ def parse_comp_rows(logs):
                 m = COMP_RATIO_RE.search(line)
                 if not m:
                     continue
+                source_role = source_name.split(".")[-1]
                 rows.append(
                     {
-                        "source": source_name,
+                        "source": source_role,
+                        "source_tag": source_name,
+                        "record_source": m.group("source"),
                         "channel": m.group("channel"),
                         "blocks": m.group("blocks"),
                         "step_id": m.group("step_id"),
@@ -94,6 +97,9 @@ def summarize_rows(rows):
         "overall_weighted_ratio": _weighted_ratio(rows),
         "overall_mean_ratio": _safe_mean([r["ratio"] for r in rows]) if rows else 0.0,
         "overall_mean_nnz": _safe_mean([r["nnz"] for r in rows]) if rows else 0.0,
+        "by_source": {},
+        "by_channel": {},
+        "by_source_channel": {},
         "by_blocks": {},
         "by_batch": {},
         "pearson_ratio_vs_nnz": 0.0,
@@ -104,11 +110,38 @@ def summarize_rows(rows):
     if not rows:
         return out
 
+    by_source = defaultdict(list)
+    by_channel = defaultdict(list)
+    by_source_channel = defaultdict(list)
     by_blocks = defaultdict(list)
     by_batch = defaultdict(list)
     for r in rows:
+        by_source[r["source"]].append(r)
+        by_channel[r["channel"]].append(r)
+        by_source_channel[(r["source"], r["channel"])].append(r)
         by_blocks[r["blocks"]].append(r)
         by_batch[r["batch"]].append(r)
+    for k, group in by_source.items():
+        out["by_source"][k] = {
+            "count": len(group),
+            "weighted_ratio": _weighted_ratio(group),
+            "mean_ratio": _safe_mean([x["ratio"] for x in group]),
+            "mean_nnz": _safe_mean([x["nnz"] for x in group]),
+        }
+    for k, group in by_channel.items():
+        out["by_channel"][k] = {
+            "count": len(group),
+            "weighted_ratio": _weighted_ratio(group),
+            "mean_ratio": _safe_mean([x["ratio"] for x in group]),
+            "mean_nnz": _safe_mean([x["nnz"] for x in group]),
+        }
+    for k, group in by_source_channel.items():
+        out["by_source_channel"][k] = {
+            "count": len(group),
+            "weighted_ratio": _weighted_ratio(group),
+            "mean_ratio": _safe_mean([x["ratio"] for x in group]),
+            "mean_nnz": _safe_mean([x["nnz"] for x in group]),
+        }
     for k, group in by_blocks.items():
         out["by_blocks"][k] = {
             "count": len(group),
@@ -157,6 +190,41 @@ def print_summary(title: str, summary):
         f"mean_ratio={_fmt(summary['overall_mean_ratio'])}, "
         f"mean_nnz={_fmt(summary['overall_mean_nnz'])}"
     )
+    print()
+    print("By source file:")
+    print(f"{'source':26} {'w_ratio':>10} {'mean_ratio':>12} {'mean_nnz':>10} {'count':>8}")
+    for source in sorted(summary["by_source"]):
+        item = summary["by_source"][source]
+        print(
+            f"{source:26} "
+            f"{_fmt(item['weighted_ratio']):>10} "
+            f"{_fmt(item['mean_ratio']):>12} "
+            f"{_fmt(item['mean_nnz']):>10} "
+            f"{item['count']:>8}"
+        )
+    print()
+    print("By channel:")
+    print(f"{'channel':26} {'w_ratio':>10} {'mean_ratio':>12} {'mean_nnz':>10} {'count':>8}")
+    for channel in sorted(summary["by_channel"]):
+        item = summary["by_channel"][channel]
+        print(
+            f"{channel:26} "
+            f"{_fmt(item['weighted_ratio']):>10} "
+            f"{_fmt(item['mean_ratio']):>12} "
+            f"{_fmt(item['mean_nnz']):>10} "
+            f"{item['count']:>8}"
+        )
+    print()
+    print("By source+channel:")
+    print(f"{'source':14} {'channel':20} {'w_ratio':>10} {'mean_ratio':>12} {'count':>8}")
+    for source, channel in sorted(summary["by_source_channel"]):
+        item = summary["by_source_channel"][(source, channel)]
+        print(
+            f"{source:14} {channel:20} "
+            f"{_fmt(item['weighted_ratio']):>10} "
+            f"{_fmt(item['mean_ratio']):>12} "
+            f"{item['count']:>8}"
+        )
     print()
     print("By layer/span:")
     print(f"{'blocks':26} {'w_ratio':>10} {'mean_ratio':>12} {'mean_nnz':>10} {'count':>8}")
@@ -207,6 +275,18 @@ def print_delta(before, after):
         f"pearson(ratio,nnz)    : {before['pearson_ratio_vs_nnz']:.4f} -> {after['pearson_ratio_vs_nnz']:.4f} "
         f"(delta={after['pearson_ratio_vs_nnz']-before['pearson_ratio_vs_nnz']:+.4f})"
     )
+    print("-" * 96)
+    print("By source+channel (intersection):")
+    skeys = sorted(set(before["by_source_channel"]).intersection(set(after["by_source_channel"])))
+    if not skeys:
+        print("No shared source+channel keys.")
+    else:
+        print(f"{'source':14} {'channel':20} {'before_w':>10} {'after_w':>10} {'delta':>10}")
+        for key in skeys:
+            source, channel = key
+            b = before["by_source_channel"][key]["weighted_ratio"]
+            a = after["by_source_channel"][key]["weighted_ratio"]
+            print(f"{source:14} {channel:20} {b:>10.4f} {a:>10.4f} {a-b:>10.4f}")
     print("-" * 96)
     print("By layer/span (intersection):")
     keys = sorted(set(before["by_blocks"]).intersection(set(after["by_blocks"])), key=_parse_block_key)

@@ -21,8 +21,11 @@ from bloombee.utils.lossless_transport import (
     deserialize_torch_tensor,
     serialize_torch_tensor,
     log_comp_ratio_event,
+    log_transport_profile_event,
+    summarize_transport_profile,
     tensor_nnz_ratio,
     tensor_raw_nbytes,
+    transport_profile_scope,
 )
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
@@ -562,8 +565,10 @@ async def iterate_rpc_inference(
             
             # Deserialize only the 2 tensors from micro-batch push
             mb_deserialize_start = perf_counter()
-            flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+            with transport_profile_scope() as mb_transport_profile:
+                flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
             mb_deserialize_ms = (perf_counter() - mb_deserialize_start) * 1000.0
+            mb_transport_summary = summarize_transport_profile(mb_transport_profile)
             
             # [MB_DEBUG] Log deserialized tensors
             logger.debug(f"[MB_DEBUG] Deserialized {len(flat_tensors)} tensors from request")
@@ -899,6 +904,9 @@ async def iterate_rpc_inference(
                     'queue_wait_inter_ms': 0.0,
                     'deserialize_ms_sum': 0.0,
                     'compute_ms_sum': 0.0,
+                    'decompress_ms_sum': 0.0,
+                    'deserialize_unwrap_ms_sum': 0.0,
+                    'deserialize_core_ms_sum': 0.0,
                     'queue_source_counts': {},
                     'token_increment': int(token_increment),
                 }
@@ -918,12 +926,18 @@ async def iterate_rpc_inference(
                 accum['queue_wait_inter_ms'] += queue_wait_ms
             accum['deserialize_ms_sum'] += mb_deserialize_ms
             accum['compute_ms_sum'] += process_time_ms
+            accum['decompress_ms_sum'] += float(mb_transport_summary.get('decompress_ms', 0.0))
+            accum['deserialize_unwrap_ms_sum'] += float(mb_transport_summary.get('deserialize_unwrap_ms', 0.0))
+            accum['deserialize_core_ms_sum'] += float(mb_transport_summary.get('deserialize_core_ms', 0.0))
             accum['queue_source_counts'][queue_source] = accum['queue_source_counts'].get(queue_source, 0) + 1
             if log_mb_detail:
                 logger.info(
                     f"[STEP_TIMING_MB] step_id={step_id} mb_idx={mb_idx} "
                     f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
-                    f"deserialize={mb_deserialize_ms:.2f}ms compute={process_time_ms:.2f}ms"
+                    f"deserialize={mb_deserialize_ms:.2f}ms compute={process_time_ms:.2f}ms "
+                    f"decompress={mb_transport_summary.get('decompress_ms', 0.0):.2f}ms "
+                    f"unwrap={mb_transport_summary.get('deserialize_unwrap_ms', 0.0):.2f}ms "
+                    f"deserialize_core={mb_transport_summary.get('deserialize_core_ms', 0.0):.2f}ms"
                 )
             
             if log_mb_detail:
@@ -1151,13 +1165,15 @@ async def iterate_rpc_inference(
                 
                 need_pruning_next = torch.tensor(0)
                 merge_serialize_start = perf_counter()
-                output_tensors = [
-                    serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-                    for result, proto in zip(
-                        (merged_hidden_states, merged_keep_indices, need_pruning_next), 
-                        nested_flatten(requested_backends[-1].outputs_schema)
-                    )
-                ]
+                with transport_profile_scope() as merge_transport_profile:
+                    output_tensors = [
+                        serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
+                        for result, proto in zip(
+                            (merged_hidden_states, merged_keep_indices, need_pruning_next), 
+                            nested_flatten(requested_backends[-1].outputs_schema)
+                        )
+                    ]
+                merge_transport_summary = summarize_transport_profile(merge_transport_profile)
                 log_comp_ratio_event(
                     logger,
                     source="server",
@@ -1177,6 +1193,9 @@ async def iterate_rpc_inference(
                 queue_wait_inter_ms = float(accum.get('queue_wait_inter_ms', 0.0))
                 deserialize_sum_ms = float(accum.get('deserialize_ms_sum', 0.0))
                 compute_sum_ms = float(accum.get('compute_ms_sum', 0.0))
+                decompress_sum_ms = float(accum.get('decompress_ms_sum', 0.0))
+                deserialize_unwrap_sum_ms = float(accum.get('deserialize_unwrap_ms_sum', 0.0))
+                deserialize_core_sum_ms = float(accum.get('deserialize_core_ms_sum', 0.0))
                 merge_residual_ms = merge_total_ms - (
                     deserialize_sum_ms + compute_sum_ms + merge_serialize_ms
                 )
@@ -1192,12 +1211,34 @@ async def iterate_rpc_inference(
                     f"deserialize_sum={deserialize_sum_ms:.2f}ms "
                     f"compute_sum={compute_sum_ms:.2f}ms "
                     f"serialize={merge_serialize_ms:.2f}ms "
+                    f"decompress_sum={decompress_sum_ms:.2f}ms "
+                    f"deserialize_unwrap_sum={deserialize_unwrap_sum_ms:.2f}ms "
+                    f"deserialize_core_sum={deserialize_core_sum_ms:.2f}ms "
+                    f"compress={merge_transport_summary.get('compress_ms', 0.0):.2f}ms "
+                    f"serialize_wrap={merge_transport_summary.get('serialize_wrapper_ms', 0.0):.2f}ms "
+                    f"serialize_core={merge_transport_summary.get('serialize_core_ms', 0.0):.2f}ms "
                     f"residual={merge_residual_ms:.2f}ms "
                     f"total={merge_total_ms:.2f}ms "
                     f"queue_sources={queue_source_stats} "
                     f"queue_wait_pre={queue_wait_pre_ms:.2f}ms "
                     f"queue_wait_inter={queue_wait_inter_ms:.2f}ms "
                     f"total_with_pre_wait={total_with_pre_wait_ms:.2f}ms"
+                )
+                log_transport_profile_event(
+                    logger,
+                    source="server",
+                    channel="rpc_inference_mb_merge",
+                    blocks=_block_span_from_uids(requested_uids),
+                    step_id=str(step_id),
+                    batch_size=int(merged_hidden_states.shape[0]) if merged_hidden_states.ndim >= 1 else 1,
+                    stats=merge_transport_profile,
+                    extra={
+                        "expected_mb": int(accum.get('expected', 0)),
+                        "recv_mb": int(len(accum.get('results', {}))),
+                        "decompress_sum_ms": f"{decompress_sum_ms:.3f}",
+                        "deserialize_unwrap_sum_ms": f"{deserialize_unwrap_sum_ms:.3f}",
+                        "deserialize_core_sum_ms": f"{deserialize_core_sum_ms:.3f}",
+                    },
                 )
                 # Cleanup accumulator
                 del iterate_rpc_inference._mb_accumulators[mb_accum_key]
@@ -1211,8 +1252,10 @@ async def iterate_rpc_inference(
 
         # [MERGED] Use upstream's standard tensor unpacking for full-batch path
         deserialize_start = perf_counter()
-        flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+        with transport_profile_scope() as full_deserialize_profile:
+            flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
         deserialize_time = (perf_counter() - deserialize_start) * 1000.0
+        full_deserialize_summary = summarize_transport_profile(full_deserialize_profile)
         if args_structure is not None:
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
@@ -1874,10 +1917,12 @@ async def iterate_rpc_inference(
         
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)
-        output_tensors = [
-            serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-            for result, proto in zip((hidden_states, keep_indices, need_pruning_next), nested_flatten(requested_backends[-1].outputs_schema))
-        ]
+        with transport_profile_scope() as full_serialize_profile:
+            output_tensors = [
+                serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
+                for result, proto in zip((hidden_states, keep_indices, need_pruning_next), nested_flatten(requested_backends[-1].outputs_schema))
+            ]
+        full_serialize_summary = summarize_transport_profile(full_serialize_profile)
         log_comp_ratio_event(
             logger,
             source="server",
@@ -1919,8 +1964,45 @@ async def iterate_rpc_inference(
                 f"serialize={serialize_time:.2f}ms residual={step_residual_ms:.2f}ms "
                 f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
                 f"cross_gpu_window={cross_gpu_receive_time:.2f}ms "
-                f"batch={batch_size} seq_inc={token_increment} raw_seq={length_increment} is_spec_dec={int(bool(is_spec_dec))}"
+                f"batch={batch_size} seq_inc={token_increment} raw_seq={length_increment} is_spec_dec={int(bool(is_spec_dec))} "
+                f"decompress={full_deserialize_summary.get('decompress_ms', 0.0):.2f}ms "
+                f"deserialize_unwrap={full_deserialize_summary.get('deserialize_unwrap_ms', 0.0):.2f}ms "
+                f"deserialize_core={full_deserialize_summary.get('deserialize_core_ms', 0.0):.2f}ms "
+                f"compress={full_serialize_summary.get('compress_ms', 0.0):.2f}ms "
+                f"serialize_wrap={full_serialize_summary.get('serialize_wrapper_ms', 0.0):.2f}ms "
+                f"serialize_core={full_serialize_summary.get('serialize_core_ms', 0.0):.2f}ms"
             )
+        log_transport_profile_event(
+            logger,
+            source="server",
+            channel="rpc_inference_final",
+            blocks=_block_span_from_uids(requested_uids),
+            step_id=str(step_id_for_log),
+            batch_size=int(batch_size),
+            stats={
+                "serialize_calls": full_serialize_summary.get("serialize_calls", 0.0),
+                "deserialize_calls": full_deserialize_summary.get("deserialize_calls", 0.0),
+                "serialize_core_ms": full_serialize_summary.get("serialize_core_ms", 0.0),
+                "deserialize_core_ms": full_deserialize_summary.get("deserialize_core_ms", 0.0),
+                "serialize_wrapper_ms": full_serialize_summary.get("serialize_wrapper_ms", 0.0),
+                "deserialize_unwrap_ms": full_deserialize_summary.get("deserialize_unwrap_ms", 0.0),
+                "compress_ms": full_serialize_summary.get("compress_ms", 0.0),
+                "decompress_ms": full_deserialize_summary.get("decompress_ms", 0.0),
+                "compress_calls": full_serialize_summary.get("compress_calls", 0.0),
+                "decompress_calls": full_deserialize_summary.get("decompress_calls", 0.0),
+                "serialize_wrapper_applied_calls": full_serialize_summary.get("serialize_wrapper_applied_calls", 0.0),
+                "deserialize_wrapper_applied_calls": full_deserialize_summary.get("deserialize_wrapper_applied_calls", 0.0),
+                "serialize_raw_bytes": full_serialize_summary.get("serialize_raw_bytes", 0.0),
+                "serialize_wire_bytes": full_serialize_summary.get("serialize_wire_bytes", 0.0),
+                "deserialize_wire_bytes": full_deserialize_summary.get("deserialize_wire_bytes", 0.0),
+                "deserialize_raw_bytes": full_deserialize_summary.get("deserialize_raw_bytes", 0.0),
+                "compress_input_bytes": full_serialize_summary.get("compress_input_bytes", 0.0),
+                "compress_output_bytes": full_serialize_summary.get("compress_output_bytes", 0.0),
+                "decompress_input_bytes": full_deserialize_summary.get("decompress_input_bytes", 0.0),
+                "decompress_output_bytes": full_deserialize_summary.get("decompress_output_bytes", 0.0),
+            },
+            extra={"mode": execution_mode},
+        )
         
         # [MBPIPE] Record stage timing for cross-stage overlap decisions
         try:

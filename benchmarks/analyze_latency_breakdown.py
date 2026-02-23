@@ -41,6 +41,14 @@ STEP_TIMING_BREAKDOWN_RE = re.compile(
     r"cross_gpu_window=(?P<cross_gpu_window_ms>-?[0-9.]+)ms "
     r"batch=(?P<batch>\d+) seq_inc=(?P<seq_inc>-?\d+)"
     r"(?: raw_seq=(?P<raw_seq>-?\d+))? is_spec_dec=(?P<is_spec_dec>\d+)"
+    r"(?: "
+    r"decompress=(?P<decompress_ms>-?[0-9.]+)ms "
+    r"deserialize_unwrap=(?P<deserialize_unwrap_ms>-?[0-9.]+)ms "
+    r"deserialize_core=(?P<deserialize_core_ms>-?[0-9.]+)ms "
+    r"compress=(?P<compress_ms>-?[0-9.]+)ms "
+    r"serialize_wrap=(?P<serialize_wrap_ms>-?[0-9.]+)ms "
+    r"serialize_core=(?P<serialize_core_ms>-?[0-9.]+)ms"
+    r")?"
 )
 STEP_TIMING_BREAKDOWN_MB_RE = re.compile(
     r"\[STEP_TIMING_BREAKDOWN_MB\] step_id=(?P<step_id>\S+) mode=micro_batch "
@@ -49,6 +57,12 @@ STEP_TIMING_BREAKDOWN_MB_RE = re.compile(
     r"deserialize_sum=(?P<deserialize_sum_ms>-?[0-9.]+)ms "
     r"compute_sum=(?P<compute_sum_ms>-?[0-9.]+)ms "
     r"serialize=(?P<serialize_ms>-?[0-9.]+)ms "
+    r"(?:decompress_sum=(?P<decompress_sum_ms>-?[0-9.]+)ms "
+    r"deserialize_unwrap_sum=(?P<deserialize_unwrap_sum_ms>-?[0-9.]+)ms "
+    r"deserialize_core_sum=(?P<deserialize_core_sum_ms>-?[0-9.]+)ms "
+    r"compress=(?P<compress_ms>-?[0-9.]+)ms "
+    r"serialize_wrap=(?P<serialize_wrap_ms>-?[0-9.]+)ms "
+    r"serialize_core=(?P<serialize_core_ms>-?[0-9.]+)ms )?"
     r"residual=(?P<residual_ms>-?[0-9.]+)ms "
     r"total=(?P<total_ms>-?[0-9.]+)ms "
     r"queue_sources=(?P<queue_sources>\S+)"
@@ -77,6 +91,28 @@ COMP_RATIO_RE = re.compile(
     r"ratio=(?P<ratio>-?[0-9.]+)\s+"
     r"savings=(?P<savings>-?[0-9.]+)\s+"
     r"nnz=(?P<nnz>-?[0-9.]+)"
+)
+COMP_TIMING_RE = re.compile(
+    r"\[COMP_TIMING\]\s+"
+    r"source=(?P<source>\S+)\s+"
+    r"channel=(?P<channel>\S+)\s+"
+    r"blocks=(?P<blocks>\S+)\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"serialize_core_ms=(?P<serialize_core_ms>-?[0-9.]+)\s+"
+    r"serialize_wrap_ms=(?P<serialize_wrap_ms>-?[0-9.]+)\s+"
+    r"compress_ms=(?P<compress_ms>-?[0-9.]+)\s+"
+    r"deserialize_unwrap_ms=(?P<deserialize_unwrap_ms>-?[0-9.]+)\s+"
+    r"decompress_ms=(?P<decompress_ms>-?[0-9.]+)\s+"
+    r"deserialize_core_ms=(?P<deserialize_core_ms>-?[0-9.]+)\s+"
+    r"serialize_raw_bytes=(?P<serialize_raw_bytes>\d+)\s+"
+    r"serialize_wire_bytes=(?P<serialize_wire_bytes>\d+)\s+"
+    r"deserialize_wire_bytes=(?P<deserialize_wire_bytes>\d+)\s+"
+    r"deserialize_raw_bytes=(?P<deserialize_raw_bytes>\d+)\s+"
+    r"serialize_ratio=(?P<serialize_ratio>-?[0-9.]+)\s+"
+    r"serialize_savings=(?P<serialize_savings>-?[0-9.]+)\s+"
+    r"compress_calls=(?P<compress_calls>\d+)\s+"
+    r"decompress_calls=(?P<decompress_calls>\d+)"
 )
 
 
@@ -206,6 +242,7 @@ def parse_detailed_server_logs(logs):
     step_rows = []
     mb_rows = []
     handler_rows = []
+    comp_timing_rows = []
 
     for source_name, path in logs:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
@@ -222,6 +259,20 @@ def parse_detailed_server_logs(logs):
                             "deserialize_ms": float(m.group("deserialize_ms")),
                             "compute_ms": float(m.group("compute_ms")),
                             "serialize_ms": float(m.group("serialize_ms")),
+                            "decompress_ms": float(m.group("decompress_ms")) if m.group("decompress_ms") is not None else 0.0,
+                            "deserialize_unwrap_ms": float(m.group("deserialize_unwrap_ms"))
+                            if m.group("deserialize_unwrap_ms") is not None
+                            else 0.0,
+                            "deserialize_core_ms": float(m.group("deserialize_core_ms"))
+                            if m.group("deserialize_core_ms") is not None
+                            else 0.0,
+                            "compress_ms": float(m.group("compress_ms")) if m.group("compress_ms") is not None else 0.0,
+                            "serialize_wrap_ms": float(m.group("serialize_wrap_ms"))
+                            if m.group("serialize_wrap_ms") is not None
+                            else 0.0,
+                            "serialize_core_ms": float(m.group("serialize_core_ms"))
+                            if m.group("serialize_core_ms") is not None
+                            else 0.0,
                             "residual_ms": float(m.group("residual_ms")),
                             "step_total_ms": float(m.group("step_total_ms")),
                             "total_with_queue_ms": float(m.group("total_with_queue_ms")),
@@ -245,6 +296,22 @@ def parse_detailed_server_logs(logs):
                             "deserialize_sum_ms": float(m.group("deserialize_sum_ms")),
                             "compute_sum_ms": float(m.group("compute_sum_ms")),
                             "serialize_ms": float(m.group("serialize_ms")),
+                            "decompress_sum_ms": float(m.group("decompress_sum_ms"))
+                            if m.group("decompress_sum_ms") is not None
+                            else 0.0,
+                            "deserialize_unwrap_sum_ms": float(m.group("deserialize_unwrap_sum_ms"))
+                            if m.group("deserialize_unwrap_sum_ms") is not None
+                            else 0.0,
+                            "deserialize_core_sum_ms": float(m.group("deserialize_core_sum_ms"))
+                            if m.group("deserialize_core_sum_ms") is not None
+                            else 0.0,
+                            "compress_ms": float(m.group("compress_ms")) if m.group("compress_ms") is not None else 0.0,
+                            "serialize_wrap_ms": float(m.group("serialize_wrap_ms"))
+                            if m.group("serialize_wrap_ms") is not None
+                            else 0.0,
+                            "serialize_core_ms": float(m.group("serialize_core_ms"))
+                            if m.group("serialize_core_ms") is not None
+                            else 0.0,
                             "residual_ms": float(m.group("residual_ms")),
                             "total_ms": float(m.group("total_ms")),
                             "queue_sources": m.group("queue_sources"),
@@ -273,7 +340,35 @@ def parse_detailed_server_logs(logs):
                     )
                     continue
 
-    return step_rows, mb_rows, handler_rows
+                m = COMP_TIMING_RE.search(line)
+                if m:
+                    comp_timing_rows.append(
+                        {
+                            "source": source_name,
+                            "record_source": m.group("source"),
+                            "channel": m.group("channel"),
+                            "blocks": m.group("blocks"),
+                            "step_id": m.group("step_id"),
+                            "batch": int(m.group("batch")),
+                            "serialize_core_ms": float(m.group("serialize_core_ms")),
+                            "serialize_wrap_ms": float(m.group("serialize_wrap_ms")),
+                            "compress_ms": float(m.group("compress_ms")),
+                            "deserialize_unwrap_ms": float(m.group("deserialize_unwrap_ms")),
+                            "decompress_ms": float(m.group("decompress_ms")),
+                            "deserialize_core_ms": float(m.group("deserialize_core_ms")),
+                            "serialize_raw_bytes": int(m.group("serialize_raw_bytes")),
+                            "serialize_wire_bytes": int(m.group("serialize_wire_bytes")),
+                            "deserialize_wire_bytes": int(m.group("deserialize_wire_bytes")),
+                            "deserialize_raw_bytes": int(m.group("deserialize_raw_bytes")),
+                            "serialize_ratio": float(m.group("serialize_ratio")),
+                            "serialize_savings": float(m.group("serialize_savings")),
+                            "compress_calls": int(m.group("compress_calls")),
+                            "decompress_calls": int(m.group("decompress_calls")),
+                        }
+                    )
+                    continue
+
+    return step_rows, mb_rows, handler_rows, comp_timing_rows
 
 
 def parse_comp_ratio_logs(logs):
@@ -306,8 +401,8 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
     step_network, server_duration, step_latency = parse_client_log(client_log)
     s1_vals = parse_server1_log(server1_log)
     s2_vals = parse_server2_log(server2_log)
-    step_breakdown_rows, mb_breakdown_rows, handler_step_rows = parse_detailed_server_logs(
-        [("server1", server1_log), ("server2", server2_log)]
+    step_breakdown_rows, mb_breakdown_rows, handler_step_rows, comp_timing_rows = parse_detailed_server_logs(
+        [("client", client_log), ("server1", server1_log), ("server2", server2_log)]
     )
     comp_rows = parse_comp_ratio_logs(
         [("client", client_log), ("server1", server1_log), ("server2", server2_log)]
@@ -437,6 +532,12 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             ("deserialize_ms", "deserialize_ms"),
             ("compute_ms", "compute_ms"),
             ("serialize_ms", "serialize_ms"),
+            ("decompress_ms", "decompress_ms"),
+            ("deserialize_unwrap_ms", "deserialize_unwrap_ms"),
+            ("deserialize_core_ms", "deserialize_core_ms"),
+            ("compress_ms", "compress_ms"),
+            ("serialize_wrap_ms", "serialize_wrap_ms"),
+            ("serialize_core_ms", "serialize_core_ms"),
             ("residual_ms", "residual_ms"),
             ("step_total_ms", "step_total_ms"),
             ("total_with_queue_ms", "total_with_queue_ms"),
@@ -462,6 +563,12 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             ("deserialize_sum_ms", "deserialize_sum_ms"),
             ("compute_sum_ms", "compute_sum_ms"),
             ("serialize_ms", "serialize_ms"),
+            ("decompress_sum_ms", "decompress_sum_ms"),
+            ("deserialize_unwrap_sum_ms", "deserialize_unwrap_sum_ms"),
+            ("deserialize_core_sum_ms", "deserialize_core_sum_ms"),
+            ("compress_ms", "compress_ms"),
+            ("serialize_wrap_ms", "serialize_wrap_ms"),
+            ("serialize_core_ms", "serialize_core_ms"),
             ("residual_ms", "residual_ms"),
             ("total_ms", "total_ms"),
         ]:
@@ -509,6 +616,53 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
     print("-" * 92)
 
     print()
+    print("Transport compression/decompression timing (from [COMP_TIMING]):")
+    print("-" * 92)
+    if comp_timing_rows:
+        source_counts = Counter(x["source"] for x in comp_timing_rows)
+        channel_counts = Counter(x["channel"] for x in comp_timing_rows)
+        print(
+            "sources="
+            + ",".join(f"{k}:{v}" for k, v in sorted(source_counts.items()))
+            + " | channels="
+            + ",".join(f"{k}:{v}" for k, v in sorted(channel_counts.items()))
+        )
+        print(f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}")
+        for key, label in [
+            ("serialize_core_ms", "serialize_core_ms"),
+            ("serialize_wrap_ms", "serialize_wrap_ms"),
+            ("compress_ms", "compress_ms"),
+            ("deserialize_unwrap_ms", "deserialize_unwrap_ms"),
+            ("decompress_ms", "decompress_ms"),
+            ("deserialize_core_ms", "deserialize_core_ms"),
+            ("serialize_ratio", "serialize_ratio"),
+            ("serialize_savings", "serialize_savings"),
+        ]:
+            vals = [r[key] for r in comp_timing_rows]
+            print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
+
+        print()
+        print(
+            f"{'source':10} {'channel':22} {'w_ratio':>10} {'mean_savings':>14} {'count':>8} "
+            f"{'raw_kb':>10} {'wire_kb':>10}"
+        )
+        by_src_channel = defaultdict(list)
+        for r in comp_timing_rows:
+            by_src_channel[(r["source"], r["channel"])].append(r)
+        for (src, channel), rows in sorted(by_src_channel.items()):
+            raw_total = sum(x["serialize_raw_bytes"] for x in rows)
+            wire_total = sum(x["serialize_wire_bytes"] for x in rows)
+            ratio = (wire_total / raw_total) if raw_total > 0 else 1.0
+            print(
+                f"{src:10} {channel:22} {ratio:>10.4f} {_safe_mean([x['serialize_savings'] for x in rows]):>14.4f} "
+                f"{len(rows):>8} {raw_total / 1024.0:>10.1f} {wire_total / 1024.0:>10.1f}"
+            )
+    else:
+        print("No [COMP_TIMING] entries found.")
+        print("Hint: ensure BLOOMBEE_COMP_TIMING_PROFILE=1 and rerun inference.")
+    print("-" * 92)
+
+    print()
     print("Compression ratio factor analysis (from [COMP_RATIO]):")
     print("-" * 92)
     print("Method / formulas:")
@@ -525,6 +679,20 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             f"mean_ratio={_fmt(_safe_mean([r['ratio'] for r in comp_rows]))}, "
             f"mean_nnz={_fmt(_safe_mean([r['nnz'] for r in comp_rows]))}"
         )
+
+        print()
+        print("By source/channel:")
+        print(f"{'source':12} {'channel':20} {'w_ratio':>10} {'mean_ratio':>12} {'count':>8}")
+        by_src_channel = defaultdict(list)
+        for r in comp_rows:
+            by_src_channel[(r["source"], r["channel"])].append(r)
+        for (src, channel), rows in sorted(by_src_channel.items()):
+            print(
+                f"{src:12} {channel:20} "
+                f"{_fmt(_weighted_ratio(rows)):>10} "
+                f"{_fmt(_safe_mean([x['ratio'] for x in rows])):>12} "
+                f"{len(rows):>8}"
+            )
 
         print()
         print("By layer/span (blocks):")
