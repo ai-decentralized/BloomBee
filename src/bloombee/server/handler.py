@@ -1317,6 +1317,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         mb_size = metadata.get("micro_batch_size", 1)
         full_batch_size = metadata.get("full_batch_size", mb_size)
         start_from_position = metadata.get("start_from_position", None)
+        receive_us = self._now_us()
         
         # Use total_micro_batches from metadata if available, otherwise calculate
         expected_num_mb = metadata.get("total_micro_batches")
@@ -1341,6 +1342,72 @@ class TransformerConnectionHandler(ConnectionHandler):
             return runtime_pb2.ExpertResponse()
         
         self._mb_processed[mb_key].add(mb_idx)
+
+        # [S2S_WIRE] Sender->receiver micro-batch transport timing breakdown.
+        # Uses sender->receiver clock offset when available to isolate pure wire time.
+        sender_blocks = str(metadata.get("sender_blocks", "unknown"))
+        receiver_blocks = str(metadata.get("receiver_blocks", "unknown"))
+        sender_send_us = self._to_int(metadata.get("clock_sync_sender_send_us"), 0)
+        sender_ser_start_us = self._to_int(metadata.get("s2s_sender_serialize_start_us"), 0)
+        sender_ser_end_us = self._to_int(metadata.get("s2s_sender_serialize_end_us"), 0)
+        sender_enqueue_us = self._to_int(metadata.get("s2s_sender_enqueue_us"), 0)
+        push_timestamp_us = self._to_int(metadata.get("stage_push_timestamp_us"), 0)
+        sender_sem_wait_ms = 0.0
+        try:
+            sender_sem_wait_ms = float(metadata.get("s2s_sender_sem_wait_ms", 0.0))
+        except Exception:
+            sender_sem_wait_ms = 0.0
+
+        sender_to_receiver_clock_offset_us = self._to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
+        sender_to_receiver_clock_rtt_us = max(0, self._to_int(metadata.get("sender_to_receiver_clock_rtt_us"), 0))
+        sender_to_receiver_clock_samples = self._to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
+        clock_sync_ok = sender_to_receiver_clock_samples > 0
+
+        sender_serialize_ms = (
+            max(0.0, (sender_ser_end_us - sender_ser_start_us) / 1000.0)
+            if sender_ser_start_us > 0 and sender_ser_end_us >= sender_ser_start_us
+            else -1.0
+        )
+        sender_queue_ms = (
+            max(0.0, (sender_send_us - sender_enqueue_us) / 1000.0)
+            if sender_enqueue_us > 0 and sender_send_us >= sender_enqueue_us
+            else -1.0
+        )
+        sender_prep_ms = (
+            max(0.0, (sender_send_us - sender_ser_end_us) / 1000.0)
+            if sender_ser_end_us > 0 and sender_send_us >= sender_ser_end_us
+            else -1.0
+        )
+        raw_transfer_ms = (
+            max(0.0, (receive_us - push_timestamp_us) / 1000.0)
+            if push_timestamp_us > 0 and receive_us >= push_timestamp_us
+            else -1.0
+        )
+
+        wire_ms = -1.0
+        e2e_from_serialize_end_ms = -1.0
+        if clock_sync_ok and sender_send_us > 0:
+            sender_send_local_us = sender_send_us + sender_to_receiver_clock_offset_us
+            wire_ms = max(0.0, (receive_us - sender_send_local_us) / 1000.0)
+            if sender_ser_end_us > 0:
+                sender_ser_end_local_us = sender_ser_end_us + sender_to_receiver_clock_offset_us
+                e2e_from_serialize_end_ms = max(0.0, (receive_us - sender_ser_end_local_us) / 1000.0)
+
+        payload_bytes = sum(len(t.buffer) for t in request.tensors)
+        metadata_bytes = len(request.metadata) if request.metadata else 0
+        logger.info(
+            f"[S2S_WIRE] step_id={step_id} mb_idx={int(mb_idx)} "
+            f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
+            f"batch={int(mb_size)} payload_kb={payload_bytes/1024.0:.2f} metadata_b={metadata_bytes} "
+            f"raw_transfer_ms={raw_transfer_ms:.3f} "
+            f"sender_serialize_ms={sender_serialize_ms:.3f} "
+            f"sender_sem_wait_ms={sender_sem_wait_ms:.3f} "
+            f"sender_queue_ms={sender_queue_ms:.3f} sender_prep_ms={sender_prep_ms:.3f} "
+            f"wire_ms={wire_ms:.3f} e2e_from_serialize_end_ms={e2e_from_serialize_end_ms:.3f} "
+            f"clock_sync={int(clock_sync_ok)} "
+            f"clock_offset_ms={sender_to_receiver_clock_offset_us/1000.0:.3f} "
+            f"clock_rtt_ms={sender_to_receiver_clock_rtt_us/1000.0:.3f}"
+        )
         
         # Initialize tracking for this (session, step) if not exists
         if mb_key not in self._mb_queues:
@@ -1661,6 +1728,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # Serialize the micro-batch tensors
             outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
+            serialize_start_us = self._now_us()
             with transport_profile_scope() as push_transport_profile:
                 serialized_hidden = serialize_torch_tensor(
                     mb_hidden.to(outputs_schema[0].dtype),
@@ -1679,6 +1747,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         runtime_pb2.CompressionType.NONE,
                         allow_inplace=True
                     )
+            serialize_end_us = self._now_us()
             sender_blocks = str(metadata.get("sender_blocks", "unknown"))
             log_comp_ratio_event(
                 logger,
@@ -1715,6 +1784,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "micro_batch_offset": mb_offset,
                 "micro_batch_size": mb_size,
                 "full_batch_size": full_batch_size,
+                # Stable S1->S2 transport timing markers (sender clock domain)
+                "sender_blocks": sender_blocks,
+                "receiver_blocks": f"{next_start}:{next_end}",
+                "s2s_sender_serialize_start_us": int(serialize_start_us),
+                "s2s_sender_serialize_end_us": int(serialize_end_us),
             }
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
@@ -1747,19 +1821,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             stub = self.get_stub(self._p2p, next_peer_id)
             
-            # [ASYNC_PUSH] Fire-and-forget: don't await RPC response
-            # This allows Stage 1 compute to continue immediately while data is sent in background
-            push_metadata["clock_sync_sender_send_us"] = self._now_us()
-            rpc_request = runtime_pb2.ExpertRequest(
-                uid=next_uid,
-                tensors=[serialized_hidden, serialized_keep],
-                metadata=MSGPackSerializer.dumps(push_metadata),
-            )
-            
             # Prioritize MB0 delivery to reduce per-step startup bubble on downstream stage.
             mb0_bypass_enabled = os.environ.get("BLOOMBEE_MB0_SEMAPHORE_BYPASS", "1") == "1"
             bypass_limiter = mb0_bypass_enabled and int(mb_idx) == 0
             acquired_slot = False
+            sem_wait_time = 0.0
             if not bypass_limiter:
                 sem_wait_time = await self._push_limiter.acquire()
                 acquired_slot = True
@@ -1773,6 +1839,18 @@ class TransformerConnectionHandler(ConnectionHandler):
                     f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB0 bypassed limiter "
                     f"(set BLOOMBEE_MB0_SEMAPHORE_BYPASS=0 to disable)"
                 )
+
+            # [ASYNC_PUSH] Fire-and-forget: don't await RPC response
+            # This allows Stage 1 compute to continue immediately while data is sent in background.
+            # These timestamps are used on the receiver to isolate pure wire latency.
+            push_metadata["s2s_sender_sem_wait_ms"] = float(sem_wait_time)
+            push_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
+            push_metadata["clock_sync_sender_send_us"] = int(push_metadata["s2s_sender_enqueue_us"])
+            rpc_request = runtime_pb2.ExpertRequest(
+                uid=next_uid,
+                tensors=[serialized_hidden, serialized_keep],
+                metadata=MSGPackSerializer.dumps(push_metadata),
+            )
             
             # Create task for background sending - don't await
             send_task = asyncio.create_task(

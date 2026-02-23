@@ -114,6 +114,26 @@ COMP_TIMING_RE = re.compile(
     r"compress_calls=(?P<compress_calls>\d+)\s+"
     r"decompress_calls=(?P<decompress_calls>\d+)"
 )
+S2S_WIRE_RE = re.compile(
+    r"\[S2S_WIRE\]\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"mb_idx=(?P<mb_idx>-?\d+)\s+"
+    r"sender_blocks=(?P<sender_blocks>\S+)\s+"
+    r"receiver_blocks=(?P<receiver_blocks>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"payload_kb=(?P<payload_kb>-?[0-9.]+)\s+"
+    r"metadata_b=(?P<metadata_b>\d+)\s+"
+    r"raw_transfer_ms=(?P<raw_transfer_ms>-?[0-9.]+)\s+"
+    r"sender_serialize_ms=(?P<sender_serialize_ms>-?[0-9.]+)\s+"
+    r"sender_sem_wait_ms=(?P<sender_sem_wait_ms>-?[0-9.]+)\s+"
+    r"sender_queue_ms=(?P<sender_queue_ms>-?[0-9.]+)\s+"
+    r"sender_prep_ms=(?P<sender_prep_ms>-?[0-9.]+)\s+"
+    r"wire_ms=(?P<wire_ms>-?[0-9.]+)\s+"
+    r"e2e_from_serialize_end_ms=(?P<e2e_from_serialize_end_ms>-?[0-9.]+)\s+"
+    r"clock_sync=(?P<clock_sync>[01])\s+"
+    r"clock_offset_ms=(?P<clock_offset_ms>-?[0-9.]+)\s+"
+    r"clock_rtt_ms=(?P<clock_rtt_ms>-?[0-9.]+)"
+)
 
 
 def _safe_mean(xs):
@@ -243,6 +263,7 @@ def parse_detailed_server_logs(logs):
     mb_rows = []
     handler_rows = []
     comp_timing_rows = []
+    s2s_wire_rows = []
 
     for source_name, path in logs:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
@@ -368,7 +389,33 @@ def parse_detailed_server_logs(logs):
                     )
                     continue
 
-    return step_rows, mb_rows, handler_rows, comp_timing_rows
+                m = S2S_WIRE_RE.search(line)
+                if m:
+                    s2s_wire_rows.append(
+                        {
+                            "source": source_name,
+                            "step_id": m.group("step_id"),
+                            "mb_idx": int(m.group("mb_idx")),
+                            "sender_blocks": m.group("sender_blocks"),
+                            "receiver_blocks": m.group("receiver_blocks"),
+                            "batch": int(m.group("batch")),
+                            "payload_kb": float(m.group("payload_kb")),
+                            "metadata_b": int(m.group("metadata_b")),
+                            "raw_transfer_ms": float(m.group("raw_transfer_ms")),
+                            "sender_serialize_ms": float(m.group("sender_serialize_ms")),
+                            "sender_sem_wait_ms": float(m.group("sender_sem_wait_ms")),
+                            "sender_queue_ms": float(m.group("sender_queue_ms")),
+                            "sender_prep_ms": float(m.group("sender_prep_ms")),
+                            "wire_ms": float(m.group("wire_ms")),
+                            "e2e_from_serialize_end_ms": float(m.group("e2e_from_serialize_end_ms")),
+                            "clock_sync": int(m.group("clock_sync")),
+                            "clock_offset_ms": float(m.group("clock_offset_ms")),
+                            "clock_rtt_ms": float(m.group("clock_rtt_ms")),
+                        }
+                    )
+                    continue
+
+    return step_rows, mb_rows, handler_rows, comp_timing_rows, s2s_wire_rows
 
 
 def parse_comp_ratio_logs(logs):
@@ -401,7 +448,7 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
     step_network, server_duration, step_latency = parse_client_log(client_log)
     s1_vals = parse_server1_log(server1_log)
     s2_vals = parse_server2_log(server2_log)
-    step_breakdown_rows, mb_breakdown_rows, handler_step_rows, comp_timing_rows = parse_detailed_server_logs(
+    step_breakdown_rows, mb_breakdown_rows, handler_step_rows, comp_timing_rows, s2s_wire_rows = parse_detailed_server_logs(
         [("client", client_log), ("server1", server1_log), ("server2", server2_log)]
     )
     comp_rows = parse_comp_ratio_logs(
@@ -507,6 +554,57 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
         )
     else:
         print("No [CROSS_STAGE_OVERLAP_SUMMARY] entries found in server2 log.")
+    print("-" * 92)
+
+    print()
+    print("Server1->Server2 transport timing (from [S2S_WIRE]):")
+    print("-" * 92)
+    if s2s_wire_rows:
+        source_counts = Counter(x["source"] for x in s2s_wire_rows)
+        pair_counts = Counter((x["sender_blocks"], x["receiver_blocks"]) for x in s2s_wire_rows)
+        valid_wire = [x for x in s2s_wire_rows if x["clock_sync"] == 1 and x["wire_ms"] >= 0.0]
+        valid_e2e = [x for x in s2s_wire_rows if x["clock_sync"] == 1 and x["e2e_from_serialize_end_ms"] >= 0.0]
+        print(
+            "sources="
+            + ",".join(f"{k}:{v}" for k, v in sorted(source_counts.items()))
+            + f" | samples={len(s2s_wire_rows)} | wire_valid={len(valid_wire)}"
+        )
+        print(
+            f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}"
+        )
+        # raw_transfer_ms is same-clock uncorrected; use it as a fallback indicator only.
+        for key, label, rows in [
+            ("raw_transfer_ms", "raw_transfer_ms(uncorrected)", [x for x in s2s_wire_rows if x["raw_transfer_ms"] >= 0.0]),
+            ("wire_ms", "wire_ms(clock_corrected)", valid_wire),
+            ("e2e_from_serialize_end_ms", "e2e_from_serialize_end_ms", valid_e2e),
+            ("sender_serialize_ms", "sender_serialize_ms", [x for x in s2s_wire_rows if x["sender_serialize_ms"] >= 0.0]),
+            ("sender_sem_wait_ms", "sender_sem_wait_ms", [x for x in s2s_wire_rows if x["sender_sem_wait_ms"] >= 0.0]),
+            ("sender_queue_ms", "sender_queue_ms", [x for x in s2s_wire_rows if x["sender_queue_ms"] >= 0.0]),
+            ("sender_prep_ms", "sender_prep_ms", [x for x in s2s_wire_rows if x["sender_prep_ms"] >= 0.0]),
+            ("payload_kb", "payload_kb", s2s_wire_rows),
+        ]:
+            vals = [r[key] for r in rows]
+            print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
+
+        print()
+        print(
+            f"{'sender->receiver':28} {'wire_ms':>12} {'e2e_ser_end_ms':>14} {'count':>8}"
+        )
+        for pair, count in sorted(pair_counts.items()):
+            pair_rows = [x for x in s2s_wire_rows if (x["sender_blocks"], x["receiver_blocks"]) == pair]
+            pair_wire = [x["wire_ms"] for x in pair_rows if x["clock_sync"] == 1 and x["wire_ms"] >= 0.0]
+            pair_e2e = [
+                x["e2e_from_serialize_end_ms"]
+                for x in pair_rows
+                if x["clock_sync"] == 1 and x["e2e_from_serialize_end_ms"] >= 0.0
+            ]
+            pair_name = f"{pair[0]}->{pair[1]}"
+            print(
+                f"{pair_name:28} {_fmt(_safe_mean(pair_wire)):>12} {_fmt(_safe_mean(pair_e2e)):>14} {count:>8}"
+            )
+    else:
+        print("No [S2S_WIRE] entries found.")
+        print("Hint: rerun with updated server code on both stages.")
     print("-" * 92)
 
     print()
