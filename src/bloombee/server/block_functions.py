@@ -310,7 +310,6 @@ async def iterate_rpc_inference(
 
         hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
         draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
-        batch_size, length_increment, _ = hidden_states.shape
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
         # Deserialized tensors from network buffers may not be properly aligned,
@@ -339,6 +338,8 @@ async def iterate_rpc_inference(
         
         if is_spec_dec and draft_tokens.shape[0] != hidden_states.shape[0]:
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
+            
+        batch_size, length_increment, _ = hidden_states.shape
         
         # if is_spec_dec and not need_pruning:
             
@@ -425,7 +426,7 @@ async def iterate_rpc_inference(
                 # print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
                 # offload_logger.info(" Using merged pool for inference")
                 
-                # t0 = perf_counter()
+                t0 = perf_counter()
                 
                 inference_infos = tuple(
                     InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec)
@@ -434,9 +435,9 @@ async def iterate_rpc_inference(
                 (hidden_states, keep_indices) = await requested_backends[0].inference_pool.submit_task(
                     hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                 )
-                # t1 = perf_counter()
-                # total_time = (t1 - t0) * 1000  # ms
-                # logger.info(f"[MERGED_POOL_INFERENCE] Total Time: {total_time:.4f}ms")
+                t1 = perf_counter()
+                total_time = (t1 - t0) * 1000  # ms
+                logger.info(f"[MERGED_POOL_INFERENCE] Total Time: {total_time:.4f}ms")
                 
             else:
                 pass

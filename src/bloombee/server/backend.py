@@ -460,9 +460,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
                 
                 if self._is_spec_decoding and self._need_pruning and self._is_last_block:
-                    # norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    # keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
+                    logger.info(f"keep_indices: {keep_indices}")
                     
                 if self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states

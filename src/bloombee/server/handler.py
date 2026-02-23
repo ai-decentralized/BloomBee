@@ -450,12 +450,30 @@ class TransformerConnectionHandler(ConnectionHandler):
             logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
             # Sending hidden states serialized with output_schema to avoid double serialization
-            next_tensors = [serialized_outputs] + request.tensors[2:]
+            next_tensors = [serialized_outputs] + request.tensors[3:]
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
 
             stub = self.get_stub(self._p2p, next_peer_id)
             transfer_start = perf_counter()
+            
+            payload_size_bytes = sum(len(t.buffer) for t in next_tensors if hasattr(t, 'buffer'))
+            payload_size_mb = payload_size_bytes / (1024 * 1024)
+
+            # 2. 或者：计算整个 Request 序列化后的精确大小 (更接近网络实际流量)
+            full_request = runtime_pb2.ExpertRequest(
+                uid=next_uid,
+                tensors=next_tensors,
+                metadata=MSGPackSerializer.dumps(next_metadata),
+            )
+            total_wire_size_mb = full_request.ByteSize() / (1024 * 1024)
+
+            logger.info(
+                f"[CROSS_GPU_TRANSFER_DATA] Size: {payload_size_mb:.2f} MB "
+                f"(Total Wire: {total_wire_size_mb:.2f} MB) "
+                f"ToPeer: {next_peer_id}"
+            )
+            
             await stub.rpc_push(
                 runtime_pb2.ExpertRequest(
                     uid=next_uid,

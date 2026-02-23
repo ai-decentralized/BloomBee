@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--n_processes", type=str, default=1, help="Number of concurrent processes")
     parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length")
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
+    parser.add_argument("--batch_size", type=int, default=1, help="Client batch size (number of sequences to generate in parallel)")
     args = parser.parse_args()
 
     if args.n_processes == "n_gpus":
@@ -64,7 +65,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
-    batch_size = 4
+    batch_size = getattr(args, 'batch_size', 8)
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
     indices = random.sample(range(len(dataset)), batch_size)
     sampled = dataset.select(indices)

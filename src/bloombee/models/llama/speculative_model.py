@@ -129,7 +129,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         has_printed_first_reach = False # 确保只打印一次
         while not finished and (seq_lengths.min().item() - initial_len) < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
-            # t1 = time.perf_counter()
+            t1 = time.perf_counter()
             spec_trees = drafter.build_trees_parallel(
                 current_input_ids, seq_lengths, beam_width, max_tree_depth, 
             )
@@ -200,7 +200,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             # 5. Check if finished
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(current_input_ids, None)
             finished = unfinished_sequences.max() == 0
-            # logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
+            total_time = time.perf_counter() - t1
+            logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
             step_idx += 1
             current_generations = seq_lengths - initial_len
             if not has_printed_first_reach and current_generations.max().item() >= max_new_tokens:

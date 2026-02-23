@@ -118,7 +118,7 @@ class Server:
         expiration: Optional[float] = None,
         request_timeout: float = 3 * 60,
         session_timeout: float = 30 * 60,
-        step_timeout: float = 5 * 60,
+        step_timeout: float = 10 * 60,
         prefetch_batches: int = 1,
         sender_threads: int = 1,
         balance_quality: float = 0.75,
@@ -300,7 +300,7 @@ class Server:
         
         # Create configuration
         config = PruningConfig(
-            method=PruningMethod.SIMPLE_PROBABILITY,
+            method=PruningMethod.ADAPTIVE_NEURAL,
             neural_threshold=0.5,
             simple_threshold=0.1
         )
