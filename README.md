@@ -22,7 +22,7 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 ## NEWS
 
 - `2026/02/23` : Improve documentation, CI, and developer tooling (PR [#41](../../pull/41) by @dadaism).
-- `2026/02/19` : Support Micro Batching and Lossless Compression (PR [#39](../../pull/39) by @JiuChen0).
+- `2026/02/19` : Support micro batching and lossless compression (PR [#39](../../pull/39) by @JiuChen0).
 - `2026/02/05` : Add batch support for speculative decoding and its pruning (PR [#38](../../pull/38) by @xiongxu1998).
 - `2026/01/13` : Spec dec (PR [#37](../../pull/37) by @xiongxu1998).
 
@@ -334,12 +334,12 @@ Jupyter notebook examples are in the `examples/` directory:
 
 ---
 ## Contributing
-Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://github.com/yottalabsai). We also thank Jie Ren@Willam&Mary for her significant contributions. We welcome and appreciate any contribution to this open-source project.
+Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/). We also thank Jie Ren@Willam&Mary for her significant contributions. We welcome and appreciate any contribution to this open-source project.
  
 
 ## Acknowledgements
 
-BloomBee is built upon the following open-source project:
+BloomBee is built upon the following open-source projects:
 
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.
   - [FlexLLMGen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.
