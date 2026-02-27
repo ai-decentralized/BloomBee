@@ -22,13 +22,13 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 ## NEWS
 
 - `2026/02/23` : Improve documentation, CI, and developer tooling (PR [#41](../../pull/41) by @dadaism).
-- `2026/02/19` : Support Micro Batching and Lossess Compression (PR [#39](../../pull/39) by @JiuChen0).
-- `2026/02/05` : Add batch support for speculative decoding and it's pruning (PR [#38](../../pull/38) by @xiongxu1998).
+- `2026/02/19` : Support Micro Batching and Lossless Compression (PR [#39](../../pull/39) by @JiuChen0).
+- `2026/02/05` : Add batch support for speculative decoding and its pruning (PR [#38](../../pull/38) by @xiongxu1998).
 - `2026/01/13` : Spec dec (PR [#37](../../pull/37) by @xiongxu1998).
 
 ### More News
 
-- `2025/11/29` : Update new template to support weight cache and batch (PR [#36](../../pull/36) by @TomekWei).
+- `2025/11/29` : Update a new template to support weight cache and batch (PR [#36](../../pull/36) by @TomekWei).
 - `2025/11/21` : Remove O(prompt_len) prompt copies (PR [#35](../../pull/35) by @JiuChen0).
 - `2025/11/12` : Optimize shared memory usage, clean up legacy quantization, and remove unused modules (PR [#34](../../pull/34) by @JiuChen0).
 - `2025/11/01` : Add multi-batch inference support, fix hivemind dependency, and improve installation process (PR [#27](../../pull/27) by @JiuChen0).
@@ -334,11 +334,12 @@ Jupyter notebook examples are in the `examples/` directory:
 
 ---
 ## Contributing
-We welcome all contributions, including from [Yotta Labs](https://github.com/yottalabsai), [UC Merced PASA Lab](https://www.pasalabs.org/), [William & Mary](https://www.wm.edu/), [Washington University in Saint Louis](https://washu.edu/) and [UW–Madison](https://www.wisc.edu/).  
+Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://github.com/yottalabsai). We also thank Jie Ren@Willam&Mary for her significant contributions. We welcome and appreciate any contribution to this open-source project.
+ 
 
 ## Acknowledgements
 
-BloomBee is built upon a few popular libraries:
+BloomBee is built upon the following open-source project:
 
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.
   - [FlexLLMGen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.
