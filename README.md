@@ -334,7 +334,7 @@ Jupyter notebook examples are in the `examples/` directory:
 
 ---
 ## Contribution
-Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/) and College of Willam&Mary. We welcome and appreciate any contribution to this open-source project.
+Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/) and College of William&Mary. We welcome and appreciate any contribution to this open-source project.
  
 
 ## Acknowledgements
