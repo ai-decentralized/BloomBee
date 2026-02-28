@@ -26,7 +26,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip
+          pip install "setuptools==65.5.0" wheel
           pip install --no-build-isolation -e ".[dev]"
 
       - name: Run cache tests
