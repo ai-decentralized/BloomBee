@@ -19,6 +19,25 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
     🚀 &nbsp;<b><a href="https://colab.research.google.com/drive/1BZn0KrEGaNA2dlzmCTtTIjJKx3bNzOMs#scrollTo=1Qhi4I2PSGgg">Try now in Colab</a></b>
 </p>
 
+## NEWS
+
+- `2026/02/23` : Improve documentation, CI, and developer tooling (PR [#41](../../pull/41) by @dadaism).
+- `2026/02/19` : Support micro batching and lossless compression (PR [#39](../../pull/39) by @JiuChen0).
+- `2026/02/05` : Add batch support for speculative decoding and its pruning (PR [#38](../../pull/38) by @xiongxu1998).
+- `2026/01/13` : Spec dec (PR [#37](../../pull/37) by @xiongxu1998).
+
+### More News
+
+- `2025/11/29` : Update a new template to support weight cache and batch (PR [#36](../../pull/36) by @TomekWei).
+- `2025/11/21` : Remove O(prompt_len) prompt copies (PR [#35](../../pull/35) by @JiuChen0).
+- `2025/11/12` : Optimize shared memory usage, clean up legacy quantization, and remove unused modules (PR [#34](../../pull/34) by @JiuChen0).
+- `2025/11/01` : Add multi-batch inference support, fix hivemind dependency, and improve installation process (PR [#27](../../pull/27) by @JiuChen0).
+ 
+
+
+
+
+
 ## Table of Contents
 
 - [How It Works](#how-it-works)
@@ -314,10 +333,13 @@ Jupyter notebook examples are in the `examples/` directory:
 - Ensure workers report accurate throughput: use `--throughput eval` on the first run.
 
 ---
+## Contributing
+Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/). We also thank Jie Ren@Willam&Mary for her significant contributions. We welcome and appreciate any contribution to this open-source project.
+ 
 
 ## Acknowledgements
 
-BloomBee is built upon a few popular libraries:
+BloomBee is built upon the following open-source projects:
 
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.
   - [FlexLLMGen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.
