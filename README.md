@@ -19,7 +19,7 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
     🚀 &nbsp;<b><a href="https://colab.research.google.com/drive/1BZn0KrEGaNA2dlzmCTtTIjJKx3bNzOMs#scrollTo=1Qhi4I2PSGgg">Try now in Colab</a></b>
 </p>
 
-## NEWS
+## News
 
 - `2026/02/23` : Improve documentation, CI, and developer tooling (PR [#41](../../pull/41) by @dadaism).
 - `2026/02/19` : Support micro batching and lossless compression (PR [#39](../../pull/39) by @JiuChen0).
@@ -333,8 +333,8 @@ Jupyter notebook examples are in the `examples/` directory:
 - Ensure workers report accurate throughput: use `--throughput eval` on the first run.
 
 ---
-## Contributing
-Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/). We also thank Jie Ren@Willam&Mary for her significant contributions. We welcome and appreciate any contribution to this open-source project.
+## Contribution
+Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/) and College of Willam&Mary. We welcome and appreciate any contribution to this open-source project.
  
 
 ## Acknowledgements
