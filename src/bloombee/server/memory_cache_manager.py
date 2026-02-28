@@ -101,6 +101,16 @@ class KVCacheManager:
             "prefetch_launch_calls": 0,
             "offload_launch_calls": 0,
         }
+        # Request-level offload accounting. This gives a compact signal of whether
+        # micro-batch KV offload/prefetch actually happened and how much data moved.
+        self._offload_summary = {
+            "offload_calls": 0,
+            "prefetch_calls": 0,
+            "offload_bytes": 0,
+            "prefetch_bytes": 0,
+            "staging_peak_bytes": 0,
+        }
+        self._staging_bytes = {}  # {(slot_id, mb_index): bytes}
         
     def _get_active_cache_slot_id(self) -> Optional[int]:
         """Return a stable identifier for currently active cache tensors."""
@@ -172,6 +182,85 @@ class KVCacheManager:
         if call_key is not None:
             self._kv_timing[call_key] = self._kv_timing.get(call_key, 0) + 1
 
+    @staticmethod
+    def _bytes_to_mb(num_bytes: float) -> float:
+        return float(num_bytes) / (1024.0 * 1024.0)
+
+    def _update_staging_peak_bytes(self):
+        current_staged = sum(self._staging_bytes.values()) if self._staging_bytes else 0
+        if current_staged > self._offload_summary["staging_peak_bytes"]:
+            self._offload_summary["staging_peak_bytes"] = current_staged
+
+    def _get_gpu_memory_snapshot(self) -> dict:
+        snapshot = {
+            "gpu_alloc_mb": 0.0,
+            "gpu_reserved_mb": 0.0,
+            "gpu_max_alloc_mb": 0.0,
+        }
+        if not torch.cuda.is_available():
+            return snapshot
+        try:
+            device_idx = self._streams_device
+            if device_idx is None:
+                device_idx = torch.cuda.current_device()
+            snapshot["gpu_alloc_mb"] = self._bytes_to_mb(torch.cuda.memory_allocated(device_idx))
+            snapshot["gpu_reserved_mb"] = self._bytes_to_mb(torch.cuda.memory_reserved(device_idx))
+            snapshot["gpu_max_alloc_mb"] = self._bytes_to_mb(torch.cuda.max_memory_allocated(device_idx))
+        except Exception:
+            pass
+        return snapshot
+
+    def _log_offload_summary(self, staged_entries: int):
+        if not any(
+            (
+                self._offload_summary["offload_calls"],
+                self._offload_summary["prefetch_calls"],
+                staged_entries,
+            )
+        ):
+            return
+
+        gpu_alloc_mb = gpu_reserved_mb = gpu_max_alloc_mb = None
+        if torch.cuda.is_available():
+            try:
+                device_idx = self._streams_device
+                if device_idx is None:
+                    device_idx = torch.cuda.current_device()
+                gpu_alloc_mb = self._bytes_to_mb(torch.cuda.memory_allocated(device_idx))
+                gpu_reserved_mb = self._bytes_to_mb(torch.cuda.memory_reserved(device_idx))
+                gpu_max_alloc_mb = self._bytes_to_mb(torch.cuda.max_memory_allocated(device_idx))
+            except Exception:
+                pass
+
+        msg = (
+            "[KVCACHE_OFFLOAD_SUMMARY] staged_entries=%d, peak_staged=%.2fMB, "
+            "offload_calls=%d, offload_total=%.2fMB, prefetch_calls=%d, prefetch_total=%.2fMB"
+            % (
+                staged_entries,
+                self._bytes_to_mb(self._offload_summary["staging_peak_bytes"]),
+                int(self._offload_summary["offload_calls"]),
+                self._bytes_to_mb(self._offload_summary["offload_bytes"]),
+                int(self._offload_summary["prefetch_calls"]),
+                self._bytes_to_mb(self._offload_summary["prefetch_bytes"]),
+            )
+        )
+        if gpu_alloc_mb is not None:
+            msg += (
+                ", torch_cuda_alloc=%.2fMB, torch_cuda_reserved=%.2fMB, torch_cuda_max_alloc=%.2fMB"
+                % (gpu_alloc_mb, gpu_reserved_mb, gpu_max_alloc_mb)
+            )
+        logger.info(msg)
+
+    def _reset_offload_summary(self):
+        self._offload_summary = {
+            "offload_calls": 0,
+            "prefetch_calls": 0,
+            "offload_bytes": 0,
+            "prefetch_bytes": 0,
+            "staging_peak_bytes": 0,
+        }
+        self._staging_bytes.clear()
+
     def get_kv_timing_snapshot(self, reset: bool = False) -> dict:
         """
         Return cumulative KV timing counters used to quantify overlap effectiveness.
@@ -180,6 +269,15 @@ class KVCacheManager:
             reset: If True, clear counters after snapshot.
         """
         snapshot = dict(self._kv_timing)
+        snapshot["offload_calls"] = float(self._offload_summary.get("offload_calls", 0))
+        snapshot["prefetch_calls"] = float(self._offload_summary.get("prefetch_calls", 0))
+        snapshot["offload_bytes"] = float(self._offload_summary.get("offload_bytes", 0))
+        snapshot["prefetch_bytes"] = float(self._offload_summary.get("prefetch_bytes", 0))
+        snapshot["staging_peak_bytes"] = float(self._offload_summary.get("staging_peak_bytes", 0))
+        snapshot["staging_live_bytes"] = float(sum(self._staging_bytes.values()) if self._staging_bytes else 0)
+        snapshot["active_staged_entries"] = float(len(self._mb_cpu_staging))
+        snapshot["async_kv_transfer"] = 1.0 if self._async_kv_transfer else 0.0
+        snapshot.update(self._get_gpu_memory_snapshot())
         if reset:
             for k in list(self._kv_timing.keys()):
                 self._kv_timing[k] = 0 if k.endswith("_calls") else 0.0
@@ -338,6 +436,13 @@ class KVCacheManager:
         gpu_multiplexing = full_batch_size > 0 and full_batch_in_cache < full_batch_size
         if full_batch_size > 0 and micro_batch_size > 0:
             if gpu_multiplexing:
+                if hasattr(k_cache, "device") and getattr(getattr(k_cache, "device", None), "device_type", None) == DeviceType.MIXED:
+                    self._log_kv_once(
+                        ("kv_mixed_multiplex_unsupported", int(full_batch_size), int(micro_batch_size)),
+                        "[KVCACHE_OFFLOAD_UNSUPPORTED] MixedDevice cache + GPU multiplexing is not equivalent to per-microbatch KV staging. "
+                        "cache_gpu/cache_cpu splits one micro-batch across devices, but does not preserve separate KV snapshots for other micro-batches. "
+                        "This can change activation values and make wire-byte compression ratios look artificially better.",
+                    )
                 mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size, full_batch_size)
                 slot_id = self._get_active_cache_slot_id()
                 current_mb = self._current_gpu_mb.get(slot_id) if slot_id is not None else None
@@ -712,6 +817,10 @@ class KVCacheManager:
             # Calculate memory
             bytes_offloaded = k_data[:prefix_length].numel() * k_data.element_size() * 2
             mb_offloaded = bytes_offloaded / (1024 * 1024)
+            self._offload_summary["offload_calls"] += 1
+            self._offload_summary["offload_bytes"] += int(bytes_offloaded)
+            self._staging_bytes[staging_key] = int(bytes_offloaded)
+            self._update_staging_peak_bytes()
             
             slot_mbs = sorted(mb for (slot, mb) in self._mb_cpu_staging.keys() if slot == slot_id)
             self._log_kv_detail(
@@ -809,6 +918,8 @@ class KVCacheManager:
             
             bytes_prefetched = k_cpu[:prefix_length].numel() * k_cpu.element_size() * 2
             mb_prefetched = bytes_prefetched / (1024 * 1024)
+            self._offload_summary["prefetch_calls"] += 1
+            self._offload_summary["prefetch_bytes"] += int(bytes_prefetched)
             
             self._log_kv_once(
                 ("prefetch_path", "active"),
@@ -921,11 +1032,13 @@ class KVCacheManager:
         if self._async_kv_transfer and self._offload_stream is not None and self._mb_cpu_staging:
             self.sync_offload()
         num_cleared = len(self._mb_cpu_staging)
+        self._log_offload_summary(num_cleared)
         self._mb_cpu_staging.clear()
         self._current_gpu_mb.clear()
         self._pending_gpu_mb.clear()
         self._mb_offload_events.clear()
         self._mb_prefetch_events.clear()
+        self._reset_offload_summary()
         if num_cleared > 0:
             logger.info(f"[KVCACHE_OFFLOAD] Cleared offload state: {num_cleared} staged micro-batches")
     

@@ -970,7 +970,7 @@ class _MergedInferenceStep:
         self._offloaded_slices: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         # Get cache_manager from first backend for offloading operations
         self._cache_manager = next(iter(backends.values())).cache_manager if backends else None
-        self._kv_timing_keys = (
+        self._kv_counter_keys = (
             "prefetch_wait_ms",
             "offload_wait_ms",
             "prefetch_wait_calls",
@@ -979,6 +979,19 @@ class _MergedInferenceStep:
             "offload_launch_ms",
             "prefetch_launch_calls",
             "offload_launch_calls",
+            "offload_calls",
+            "prefetch_calls",
+            "offload_bytes",
+            "prefetch_bytes",
+        )
+        self._kv_gauge_keys = (
+            "staging_peak_bytes",
+            "staging_live_bytes",
+            "active_staged_entries",
+            "async_kv_transfer",
+            "gpu_alloc_mb",
+            "gpu_reserved_mb",
+            "gpu_max_alloc_mb",
         )
 
     def _offload_completed_microbatch(self, k_cache: torch.Tensor, v_cache: torch.Tensor, 
@@ -1061,7 +1074,7 @@ class _MergedInferenceStep:
             return None
 
         normalized: Dict[str, float] = {}
-        for key in self._kv_timing_keys:
+        for key in self._kv_counter_keys + self._kv_gauge_keys:
             try:
                 normalized[key] = float(snapshot.get(key, 0.0))
             except Exception:
@@ -1072,7 +1085,7 @@ class _MergedInferenceStep:
         self, before: Optional[Dict[str, float]], after: Optional[Dict[str, float]]
     ) -> Dict[str, float]:
         delta: Dict[str, float] = {}
-        for key in self._kv_timing_keys:
+        for key in self._kv_counter_keys:
             b = 0.0 if before is None else float(before.get(key, 0.0))
             a = 0.0 if after is None else float(after.get(key, 0.0))
             v = max(0.0, a - b)
@@ -1080,6 +1093,8 @@ class _MergedInferenceStep:
                 delta[key] = int(v)
             else:
                 delta[key] = v
+        for key in self._kv_gauge_keys:
+            delta[key] = 0.0 if after is None else float(after.get(key, 0.0))
         delta["_source"] = "runtime_kv_timing"
         delta["_valid"] = 1 if (before is not None and after is not None) else 0
         return delta

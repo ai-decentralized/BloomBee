@@ -4,9 +4,10 @@ import asyncio
 import contextlib
 import multiprocessing as mp
 import sys
+from collections import deque
 from enum import Enum
 from itertools import chain
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from time import perf_counter
 import time
@@ -124,6 +125,58 @@ class StreamingDecodeState:
     cache_handles: Optional[List] = None    # KV cache handles
     first_mb_metadata: Optional[Dict] = None  # Metadata from first MB for context
     start_time: float = 0.0                 # Start time for timing
+
+
+@dataclass
+class S2SLinkTelemetry:
+    """
+    Rolling transport telemetry for one server-to-server link.
+
+    This is used to distinguish real throughput changes from network variance:
+    we log latency, bandwidth and jitter over a sliding window so experiments
+    can show whether the network stayed stable while throughput changed.
+    """
+
+    label: str
+    window_size: int
+    samples: int = 0
+    total_bytes: int = 0
+    clock_sync_samples: int = 0
+    last_latency_ms: Optional[float] = None
+    latency_ms_window: Deque[float] = field(init=False)
+    bandwidth_mbps_window: Deque[float] = field(init=False)
+    jitter_ms_window: Deque[float] = field(init=False)
+    raw_latency_ms_window: Deque[float] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.latency_ms_window = deque(maxlen=self.window_size)
+        self.bandwidth_mbps_window = deque(maxlen=self.window_size)
+        self.jitter_ms_window = deque(maxlen=self.window_size)
+        self.raw_latency_ms_window = deque(maxlen=self.window_size)
+
+    def record(
+        self,
+        *,
+        latency_ms: float,
+        raw_latency_ms: float,
+        bandwidth_mbps: float,
+        total_bytes: int,
+        clock_sync_ok: bool,
+    ) -> float:
+        jitter_ms = 0.0
+        if self.last_latency_ms is not None:
+            jitter_ms = abs(float(latency_ms) - float(self.last_latency_ms))
+        self.last_latency_ms = float(latency_ms)
+
+        self.samples += 1
+        self.total_bytes += max(0, int(total_bytes))
+        if clock_sync_ok:
+            self.clock_sync_samples += 1
+        self.latency_ms_window.append(float(latency_ms))
+        self.bandwidth_mbps_window.append(float(bandwidth_mbps))
+        self.jitter_ms_window.append(float(jitter_ms))
+        self.raw_latency_ms_window.append(float(raw_latency_ms))
+        return jitter_ms
 
 # Directory for storing micro-batch accumulator data
 _MB_ACCUMULATOR_DIR = os.path.join(tempfile.gettempdir(), "bloombee_mb_accumulator")
@@ -408,6 +461,17 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"max_rtt={self._clock_sync_max_rtt_us/1000:.1f}ms, log_every={self._clock_sync_log_every}"
         )
 
+        # [S2S_TELEMETRY] Rolling link telemetry for server-to-server transport.
+        # This makes it easier to verify that throughput changes are not caused by
+        # transient network jitter or bandwidth fluctuations.
+        self._s2s_stats_window = max(4, int(os.environ.get("BLOOMBEE_S2S_STATS_WINDOW", "32")))
+        self._s2s_stats_log_every = max(1, int(os.environ.get("BLOOMBEE_S2S_STATS_LOG_EVERY", "8")))
+        self._s2s_link_stats: Dict[str, S2SLinkTelemetry] = {}
+        logger.info(
+            f"{MBPIPE_LOG_PREFIX} S2S telemetry enabled: "
+            f"window={self._s2s_stats_window}, log_every={self._s2s_stats_log_every}"
+        )
+
         # [FLOW_CONTROL] Internal adaptive limiter for cross-stage async pushes.
         # Keeps pipeline stable while seeking higher throughput from runtime feedback.
         self._push_limiter = AdaptivePushConcurrency(
@@ -532,6 +596,121 @@ class TransformerConnectionHandler(ConnectionHandler):
             "clock_sync_receiver_ack_us": int(self._now_us()),
         }
         return runtime_pb2.ExpertResponse(metadata=MSGPackSerializer.dumps(ack_metadata))
+
+    @staticmethod
+    def _calc_mbps(total_bytes: int, latency_ms: float) -> float:
+        if total_bytes <= 0 or latency_ms <= 0:
+            return 0.0
+        return (float(total_bytes) * 8.0) / (float(latency_ms) * 1000.0)
+
+    @staticmethod
+    def _window_stats(values: Sequence[float]) -> Tuple[float, float, float, float]:
+        if not values:
+            return 0.0, 0.0, 0.0, 0.0
+        arr = np.asarray(values, dtype=np.float64)
+        mean = float(np.mean(arr))
+        std = float(np.std(arr))
+        p50 = float(np.percentile(arr, 50))
+        p95 = float(np.percentile(arr, 95))
+        return mean, std, p50, p95
+
+    @staticmethod
+    def _classify_link_stability(latency_mean_ms: float, latency_std_ms: float, jitter_p95_ms: float) -> str:
+        if latency_mean_ms <= 0:
+            return "unknown"
+        cv = latency_std_ms / latency_mean_ms
+        if cv <= 0.05 and jitter_p95_ms <= max(2.0, latency_mean_ms * 0.10):
+            return "stable"
+        if cv <= 0.15 and jitter_p95_ms <= max(5.0, latency_mean_ms * 0.25):
+            return "moderate"
+        return "volatile"
+
+    @staticmethod
+    def _uids_to_block_span_label(uids: Union[str, Sequence[str]]) -> str:
+        if isinstance(uids, str):
+            uid_items = [item for item in uids.split(CHAIN_DELIMITER) if item]
+        else:
+            uid_items = [str(item) for item in uids if item]
+        indices: List[int] = []
+        for uid in uid_items:
+            try:
+                indices.append(int(uid.split(UID_DELIMITER)[-1]))
+            except Exception:
+                continue
+        if not indices:
+            return "unknown"
+        return f"{min(indices)}:{max(indices) + 1}"
+
+    def _record_s2s_network_sample(
+        self,
+        *,
+        channel: str,
+        sender_blocks: str,
+        receiver_blocks: str,
+        payload_bytes: int,
+        metadata_bytes: int,
+        raw_transfer_ms: float,
+        wire_ms: float,
+        clock_sync_ok: bool,
+    ) -> None:
+        effective_latency_ms = wire_ms if wire_ms > 0 else raw_transfer_ms
+        if effective_latency_ms <= 0:
+            return
+
+        total_bytes = max(0, int(payload_bytes)) + max(0, int(metadata_bytes))
+        bandwidth_mbps = self._calc_mbps(total_bytes, effective_latency_ms)
+        link_key = f"{channel}:{sender_blocks}->{receiver_blocks}"
+        telemetry = self._s2s_link_stats.get(link_key)
+        if telemetry is None:
+            telemetry = S2SLinkTelemetry(label=link_key, window_size=self._s2s_stats_window)
+            self._s2s_link_stats[link_key] = telemetry
+
+        jitter_ms = telemetry.record(
+            latency_ms=effective_latency_ms,
+            raw_latency_ms=raw_transfer_ms if raw_transfer_ms > 0 else effective_latency_ms,
+            bandwidth_mbps=bandwidth_mbps,
+            total_bytes=total_bytes,
+            clock_sync_ok=clock_sync_ok,
+        )
+
+        logger.info(
+            f"[S2S_NET] link={link_key} samples={telemetry.samples} "
+            f"latency_ms={effective_latency_ms:.3f} "
+            f"bandwidth_mbps={bandwidth_mbps:.3f} "
+            f"jitter_ms={jitter_ms:.3f} "
+            f"payload_kb={payload_bytes / 1024.0:.2f} "
+            f"metadata_b={metadata_bytes} "
+            f"clock_sync={int(clock_sync_ok)}"
+        )
+
+        if telemetry.samples <= 3 or telemetry.samples % self._s2s_stats_log_every == 0:
+            latency_mean_ms, latency_std_ms, latency_p50_ms, latency_p95_ms = self._window_stats(
+                list(telemetry.latency_ms_window)
+            )
+            bw_mean_mbps, bw_std_mbps, bw_p50_mbps, bw_p95_mbps = self._window_stats(
+                list(telemetry.bandwidth_mbps_window)
+            )
+            jitter_mean_ms, jitter_std_ms, jitter_p50_ms, jitter_p95_ms = self._window_stats(
+                list(telemetry.jitter_ms_window)
+            )
+            stability = self._classify_link_stability(latency_mean_ms, latency_std_ms, jitter_p95_ms)
+            clock_sync_coverage = (
+                100.0 * float(telemetry.clock_sync_samples) / float(telemetry.samples)
+                if telemetry.samples > 0
+                else 0.0
+            )
+            logger.info(
+                f"[S2S_NET_SUMMARY] link={link_key} window={len(telemetry.latency_ms_window)} "
+                f"samples={telemetry.samples} stability={stability} "
+                f"lat_mean={latency_mean_ms:.3f}ms lat_std={latency_std_ms:.3f}ms "
+                f"lat_p50={latency_p50_ms:.3f}ms lat_p95={latency_p95_ms:.3f}ms "
+                f"jit_mean={jitter_mean_ms:.3f}ms jit_std={jitter_std_ms:.3f}ms "
+                f"jit_p50={jitter_p50_ms:.3f}ms jit_p95={jitter_p95_ms:.3f}ms "
+                f"bw_mean={bw_mean_mbps:.3f}Mbps bw_std={bw_std_mbps:.3f}Mbps "
+                f"bw_p50={bw_p50_mbps:.3f}Mbps bw_p95={bw_p95_mbps:.3f}Mbps "
+                f"bytes_total_mb={telemetry.total_bytes / (1024.0 * 1024.0):.3f} "
+                f"clock_sync_coverage={clock_sync_coverage:.1f}%"
+            )
 
 
     async def add_p2p_handlers(self, *args, **kwargs) -> None:
@@ -1289,6 +1468,41 @@ class TransformerConnectionHandler(ConnectionHandler):
             return self._build_rpc_push_ack_response(receive_us)
         
         # Original flow: put into session queue for normal processing
+        if metadata.get("pushed"):
+            sender_blocks = str(metadata.get("sender_blocks", "unknown"))
+            receiver_blocks = str(metadata.get("receiver_blocks", "unknown"))
+            sender_send_us = self._to_int(metadata.get("clock_sync_sender_send_us"), 0)
+            sender_to_receiver_clock_offset_us = self._to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
+            sender_to_receiver_clock_samples = self._to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
+            clock_sync_ok = sender_to_receiver_clock_samples > 0
+            raw_transfer_ms = (
+                max(0.0, (receive_us - sender_send_us) / 1000.0)
+                if sender_send_us > 0 and receive_us >= sender_send_us
+                else -1.0
+            )
+            wire_ms = -1.0
+            if clock_sync_ok and sender_send_us > 0:
+                sender_send_local_us = sender_send_us + sender_to_receiver_clock_offset_us
+                wire_ms = max(0.0, (receive_us - sender_send_local_us) / 1000.0)
+            payload_bytes = sum(len(t.buffer) for t in request.tensors)
+            metadata_bytes = len(request.metadata) if request.metadata else 0
+            logger.info(
+                f"[S2S_WIRE] step_id={metadata.get('step_id')} channel=full_batch "
+                f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
+                f"payload_kb={payload_bytes / 1024.0:.2f} metadata_b={metadata_bytes} "
+                f"raw_transfer_ms={raw_transfer_ms:.3f} wire_ms={wire_ms:.3f} "
+                f"clock_sync={int(clock_sync_ok)}"
+            )
+            self._record_s2s_network_sample(
+                channel="full_batch",
+                sender_blocks=sender_blocks,
+                receiver_blocks=receiver_blocks,
+                payload_bytes=payload_bytes,
+                metadata_bytes=metadata_bytes,
+                raw_transfer_ms=raw_transfer_ms,
+                wire_ms=wire_ms,
+                clock_sync_ok=clock_sync_ok,
+            )
         self._log_request("rpc_push", requested_uids, context, debug=f"session_id={session_id}")
         self._put_into_session_queue(session_id, request)
         return self._build_rpc_push_ack_response(receive_us)
@@ -1407,6 +1621,16 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"clock_sync={int(clock_sync_ok)} "
             f"clock_offset_ms={sender_to_receiver_clock_offset_us/1000.0:.3f} "
             f"clock_rtt_ms={sender_to_receiver_clock_rtt_us/1000.0:.3f}"
+        )
+        self._record_s2s_network_sample(
+            channel="micro_batch",
+            sender_blocks=sender_blocks,
+            receiver_blocks=receiver_blocks,
+            payload_bytes=payload_bytes,
+            metadata_bytes=metadata_bytes,
+            raw_transfer_ms=raw_transfer_ms,
+            wire_ms=wire_ms,
+            clock_sync_ok=clock_sync_ok,
         )
         
         # Initialize tracking for this (session, step) if not exists
@@ -1610,14 +1834,24 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_peer_id_str = str(next_peer_id)
             next_peer_id = PeerID.from_base58(next_peer_id)
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
+            sender_blocks = self._uids_to_block_span_label(request.uid)
 
             # Log cross-GPU transfer start
-            logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
+            logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
             # Sending hidden states serialized with output_schema to avoid double serialization
             next_tensors = [serialized_outputs] + request.tensors[2:]
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
+            next_metadata["sender_blocks"] = sender_blocks
+            next_metadata["receiver_blocks"] = f"{next_start}:{next_end}"
+            next_metadata["s2s_channel"] = "full_batch"
+            next_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
+            clock_sync_estimate = self._get_clock_sync_estimate(next_peer_id_str)
+            if clock_sync_estimate is not None:
+                next_metadata["sender_to_receiver_clock_offset_us"] = clock_sync_estimate["offset_us"]
+                next_metadata["sender_to_receiver_clock_rtt_us"] = clock_sync_estimate["rtt_us"]
+                next_metadata["sender_to_receiver_clock_samples"] = clock_sync_estimate["samples"]
             sender_send_us = self._now_us()
             next_metadata["clock_sync_sender_send_us"] = sender_send_us
 
@@ -1646,13 +1880,15 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             transfer_end = perf_counter()
             transfer_time_ms = (transfer_end - transfer_start) * 1000
+            transfer_bw_mbps = self._calc_mbps(push_tensor_bytes + push_metadata_bytes, transfer_time_ms)
             
             # [NETWORK_TIMING] Log server-to-server transfer
             logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "
-                       f"from_blocks={self.dht_prefix} | to_blocks={next_start}:{next_end} | "
+                       f"from_blocks={sender_blocks} | to_blocks={next_start}:{next_end} | "
                        f"tensor_size={push_tensor_bytes/1024:.2f}KB | "
                        f"metadata_size={push_metadata_bytes}B | "
-                       f"transfer_time={transfer_time_ms:.2f}ms")
+                       f"transfer_time={transfer_time_ms:.2f}ms | "
+                       f"approx_bw={transfer_bw_mbps:.2f}Mbps")
             
         except Exception:
             logger.warning(
@@ -1772,6 +2008,31 @@ class TransformerConnectionHandler(ConnectionHandler):
                 stats=push_transport_profile,
                 extra={"mb_idx": int(mb_idx)},
             )
+            activation_raw_bytes = int(metadata.get("activation_raw_bytes", tensor_raw_nbytes(mb_hidden)))
+            activation_wire_bytes = len(serialized_hidden.buffer)
+            activation_ratio = (
+                (activation_wire_bytes / activation_raw_bytes) if activation_raw_bytes > 0 else 1.0
+            )
+            kv_offload_bytes = int(metadata.get("kv_offload_bytes", 0))
+            kv_prefetch_bytes = int(metadata.get("kv_prefetch_bytes", 0))
+            kv_pcie_bytes = int(metadata.get("kv_pcie_bytes", 0))
+            kv_to_activation_ratio = (
+                (kv_pcie_bytes / activation_wire_bytes) if activation_wire_bytes > 0 else 0.0
+            )
+            logger.info(
+                f"[ACTIVATION_XFER_CHECK] step_id={metadata.get('step_id', 'unknown')} "
+                f"mb_idx={int(mb_idx)} blocks={sender_blocks}->{next_start}:{next_end} "
+                f"batch={int(mb_size)} activation_raw_bytes={activation_raw_bytes} "
+                f"activation_wire_bytes={activation_wire_bytes} activation_ratio={activation_ratio:.6f} "
+                f"kv_offload_bytes={kv_offload_bytes} kv_prefetch_bytes={kv_prefetch_bytes} "
+                f"kv_pcie_bytes={kv_pcie_bytes} kv_submit_ms={float(metadata.get('kv_pcie_submit_ms', 0.0)):.3f} "
+                f"kv_block_ms={float(metadata.get('kv_pcie_block_ms', 0.0)):.3f} "
+                f"kv_pcie_bw_mbps={float(metadata.get('kv_pcie_bw_mbps', 0.0)):.3f} "
+                f"kv_gpu_alloc_mb={float(metadata.get('kv_gpu_alloc_mb', 0.0)):.3f} "
+                f"kv_staging_peak_mb={float(metadata.get('kv_staging_peak_mb', 0.0)):.3f} "
+                f"kv_to_activation_ratio={kv_to_activation_ratio:.6f} "
+                f"invariant=1"
+            )
             
             # Build metadata for micro-batch push
             push_metadata = {
@@ -1784,6 +2045,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "micro_batch_offset": mb_offset,
                 "micro_batch_size": mb_size,
                 "full_batch_size": full_batch_size,
+                "s2s_channel": "micro_batch",
                 # Stable S1->S2 transport timing markers (sender clock domain)
                 "sender_blocks": sender_blocks,
                 "receiver_blocks": f"{next_start}:{next_end}",
@@ -1899,6 +2161,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         send_time = 0.0
         success = False
         try:
+            payload_bytes = sum(len(t.buffer) for t in request.tensors)
+            metadata_bytes = len(request.metadata) if request.metadata else 0
             sender_send_us = self._now_us()
             if request.metadata:
                 try:
@@ -1919,9 +2183,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
             total_time = (perf_counter() - queue_start_time) * 1000
             send_time = (perf_counter() - send_start) * 1000
+            approx_bw_mbps = self._calc_mbps(payload_bytes + metadata_bytes, send_time)
             logger.debug(
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} sent: "
-                f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms"
+                f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms, "
+                f"payload_kb={payload_bytes / 1024.0:.2f}, approx_bw={approx_bw_mbps:.2f}Mbps"
             )
             success = True
         except Exception as e:

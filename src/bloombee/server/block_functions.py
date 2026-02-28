@@ -117,6 +117,18 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _bytes_to_mb(value: Any) -> float:
+    return _to_float(value) / (1024.0 * 1024.0)
+
+
+def _estimate_bandwidth_mbps(total_bytes: Any, elapsed_ms: Any) -> float:
+    bytes_f = max(0.0, _to_float(total_bytes))
+    ms_f = max(0.0, _to_float(elapsed_ms))
+    if bytes_f <= 0.0 or ms_f <= 0.0:
+        return 0.0
+    return (bytes_f * 8.0) / (ms_f / 1000.0) / 1_000_000.0
+
+
 def _as_python_bool(value: Any) -> bool:
     """Safely normalize scalar/tensor flags to a Python bool."""
     if value is None:
@@ -1517,6 +1529,17 @@ async def iterate_rpc_inference(
                         offload_wait_calls = int(kv_timing.get("offload_wait_calls", 0))
                         prefetch_launch_calls = int(kv_timing.get("prefetch_launch_calls", 0))
                         offload_launch_calls = int(kv_timing.get("offload_launch_calls", 0))
+                        offload_bytes = float(kv_timing.get("offload_bytes", 0.0))
+                        prefetch_bytes = float(kv_timing.get("prefetch_bytes", 0.0))
+                        offload_calls = int(kv_timing.get("offload_calls", 0))
+                        prefetch_calls = int(kv_timing.get("prefetch_calls", 0))
+                        staging_live_bytes = float(kv_timing.get("staging_live_bytes", 0.0))
+                        staging_peak_bytes = float(kv_timing.get("staging_peak_bytes", 0.0))
+                        active_staged_entries = int(kv_timing.get("active_staged_entries", 0))
+                        gpu_alloc_mb = float(kv_timing.get("gpu_alloc_mb", 0.0))
+                        gpu_reserved_mb = float(kv_timing.get("gpu_reserved_mb", 0.0))
+                        gpu_max_alloc_mb = float(kv_timing.get("gpu_max_alloc_mb", 0.0))
+                        async_kv_transfer = int(kv_timing.get("async_kv_transfer", 0))
                         
                         # [MBPIPE_MEM_DEBUG] End-of-micro-batch memory summary in verbose mode only.
                         if verbose_mb:
@@ -1534,6 +1557,19 @@ async def iterate_rpc_inference(
                         total_mb_time_ms = (mb_end_time - mb_start_time) * 1000
                         transfer_wait_time_ms = prefetch_wait_time_ms + offload_wait_time_ms
                         transfer_launch_time_ms = prefetch_launch_time_ms + offload_launch_time_ms
+                        pcie_total_bytes = offload_bytes + prefetch_bytes
+                        pcie_observed_ms = transfer_launch_time_ms + transfer_wait_time_ms
+                        pcie_bandwidth_mbps = _estimate_bandwidth_mbps(pcie_total_bytes, pcie_observed_ms)
+                        activation_raw_bytes = tensor_raw_nbytes(mb_out_hidden)
+                        activation_to_kv_ratio = (
+                            (activation_raw_bytes / pcie_total_bytes) if pcie_total_bytes > 0 else 0.0
+                        )
+                        pcie_hidden_tail_ms = max(0.0, compute_time_ms - transfer_wait_time_ms)
+                        pcie_overlap_cover_pct = (
+                            min(100.0, (pcie_hidden_tail_ms / compute_time_ms) * 100.0)
+                            if compute_time_ms > 0
+                            else 0.0
+                        )
                         if log_mb_detail:
                             logger.info(
                                 f"[KVCACHE_TIMING] MB{mb_idx}: compute={compute_time_ms:.2f}ms, "
@@ -1544,6 +1580,26 @@ async def iterate_rpc_inference(
                                 f"wait_total={transfer_wait_time_ms:.2f}ms, launch_total={transfer_launch_time_ms:.2f}ms, "
                                 f"total={total_mb_time_ms:.2f}ms"
                             )
+                        logger.info(
+                            f"[KVCACHE_IO] step_id={step_metadata.get('step_id', 'unknown') if isinstance(step_metadata, dict) else 'unknown'} "
+                            f"mb_idx={mb_idx} blocks={_block_span_from_uids(requested_uids)} "
+                            f"batch={mb_size} compute_ms={compute_time_ms:.2f} "
+                            f"pcie_submit_ms={transfer_launch_time_ms:.2f} "
+                            f"pcie_block_ms={transfer_wait_time_ms:.2f} "
+                            f"pcie_total_obs_ms={pcie_observed_ms:.2f} "
+                            f"offload_calls={offload_calls} prefetch_calls={prefetch_calls} "
+                            f"offload_bytes={int(offload_bytes)} prefetch_bytes={int(prefetch_bytes)} "
+                            f"pcie_bytes={int(pcie_total_bytes)} pcie_bw_mbps={pcie_bandwidth_mbps:.2f} "
+                            f"activation_raw_bytes={int(activation_raw_bytes)} "
+                            f"activation_to_kv_ratio={activation_to_kv_ratio:.4f} "
+                            f"overlap_headroom_ms={pcie_hidden_tail_ms:.2f} "
+                            f"overlap_cover_pct={pcie_overlap_cover_pct:.2f} "
+                            f"gpu_alloc_mb={gpu_alloc_mb:.2f} gpu_reserved_mb={gpu_reserved_mb:.2f} "
+                            f"gpu_max_alloc_mb={gpu_max_alloc_mb:.2f} "
+                            f"staging_live_mb={_bytes_to_mb(staging_live_bytes):.2f} "
+                            f"staging_peak_mb={_bytes_to_mb(staging_peak_bytes):.2f} "
+                            f"staged_entries={active_staged_entries} async={async_kv_transfer}"
+                        )
                         
                         # Store timing in list for later analysis
                         kv_timing_stats.append({
@@ -1556,6 +1612,20 @@ async def iterate_rpc_inference(
                             'offload_launch_ms': offload_launch_time_ms,
                             'prefetch_launch_calls': prefetch_launch_calls,
                             'offload_launch_calls': offload_launch_calls,
+                            'offload_calls': offload_calls,
+                            'prefetch_calls': prefetch_calls,
+                            'offload_bytes': offload_bytes,
+                            'prefetch_bytes': prefetch_bytes,
+                            'pcie_total_bytes': pcie_total_bytes,
+                            'pcie_observed_ms': pcie_observed_ms,
+                            'pcie_bandwidth_mbps': pcie_bandwidth_mbps,
+                            'activation_raw_bytes': activation_raw_bytes,
+                            'gpu_alloc_mb': gpu_alloc_mb,
+                            'gpu_reserved_mb': gpu_reserved_mb,
+                            'gpu_max_alloc_mb': gpu_max_alloc_mb,
+                            'staging_live_mb': _bytes_to_mb(staging_live_bytes),
+                            'staging_peak_mb': _bytes_to_mb(staging_peak_bytes),
+                            'active_staged_entries': active_staged_entries,
                             # Backward-compat aliases for existing diagnostics logic.
                             'prefetch_sync_ms': prefetch_wait_time_ms,
                             'offload_ms': offload_launch_time_ms,
@@ -1579,6 +1649,20 @@ async def iterate_rpc_inference(
                             push_metadata["stage_push_timestamp_us"] = push_timestamp_us  # For overlap analysis
                             push_metadata["stage_compute_start_timestamp_us"] = compute_start_timestamp_us  # When this MB started computing
                             push_metadata["stage_compute_end_timestamp_us"] = compute_end_timestamp_us
+                            push_metadata["kv_offload_bytes"] = int(offload_bytes)
+                            push_metadata["kv_prefetch_bytes"] = int(prefetch_bytes)
+                            push_metadata["kv_pcie_bytes"] = int(pcie_total_bytes)
+                            push_metadata["kv_pcie_submit_ms"] = round(transfer_launch_time_ms, 3)
+                            push_metadata["kv_pcie_block_ms"] = round(transfer_wait_time_ms, 3)
+                            push_metadata["kv_pcie_total_obs_ms"] = round(pcie_observed_ms, 3)
+                            push_metadata["kv_pcie_bw_mbps"] = round(pcie_bandwidth_mbps, 3)
+                            push_metadata["kv_gpu_alloc_mb"] = round(gpu_alloc_mb, 3)
+                            push_metadata["kv_gpu_reserved_mb"] = round(gpu_reserved_mb, 3)
+                            push_metadata["kv_gpu_max_alloc_mb"] = round(gpu_max_alloc_mb, 3)
+                            push_metadata["kv_staging_live_mb"] = round(_bytes_to_mb(staging_live_bytes), 3)
+                            push_metadata["kv_staging_peak_mb"] = round(_bytes_to_mb(staging_peak_bytes), 3)
+                            push_metadata["kv_staged_entries"] = int(active_staged_entries)
+                            push_metadata["activation_raw_bytes"] = int(activation_raw_bytes)
 
                             # [MBPIPE_FIX] Clone tensors before async push to avoid buffer reuse races.
                             push_hidden = mb_out_hidden.detach().clone()
