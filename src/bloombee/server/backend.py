@@ -459,13 +459,30 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # t6 = time.perf_counter()
                 # logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
                 
-                if self._is_spec_decoding and self._need_pruning and self._is_last_block:
+                # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
+                training_mode = False
+                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.15':
+                    self.pruner_manager.middle_states = output_hidden_states
+                
+                training_model_mode = False
+                if training_mode and training_model_mode and self._is_spec_decoding and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
-                    keep_indices = keep_indices
-                    logger.info(f"keep_indices: {keep_indices}")
+                    final_logits = self.module.lm_head_forward(norm_hidden_states)
+                    middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
+                    self.pruner_manager.train_model(middle_norm_hidden_states, final_logits, full_mask, inference_info.draft_tokens)
                     
-                if self._is_spec_decoding and self._is_last_block:
+                training_lm_head_mode = True
+                if training_mode and training_lm_head_mode and self._is_spec_decoding and self._is_last_block:
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
+                    self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
+                
+                if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block:
+                    # norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    # keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    keep_indices = keep_indices
+                    
+                if  not training_mode and self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states
                     batch_size, seq_len, hidden_size = original_hidden_states.shape
                     device = original_hidden_states.device
@@ -482,16 +499,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 self._last_keep_indices = keep_indices + cache_len
                 # logger.info(f"update _last_keep_indices: {self._last_keep_indices}")
                 
-                # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
-                training_mode = False
-                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.15':
-                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    self.pruner_manager.middle_states = norm_hidden_states
                 
-                if training_mode and self._is_spec_decoding and self._is_last_block:
-                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    final_logits = self.module.lm_head_forward(norm_hidden_states)
-                    self.pruner_manager.train_model(final_logits, full_mask, inference_info.draft_tokens)
                 
                 # t8 = time.perf_counter()
                 # logger.info(f"inference_step: took {t8 - t0:.4f} seconds")

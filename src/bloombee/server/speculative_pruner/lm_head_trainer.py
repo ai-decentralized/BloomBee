@@ -34,6 +34,7 @@ class LM_head_trainer:
             self.lm_head.parameters(), 
             lr=1e-4
         )
+        self.ite = 0
         
     def train_step(
         self,
