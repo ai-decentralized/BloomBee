@@ -1193,7 +1193,7 @@ class KVCacheManager:
         # [MBPIPE_MULTIPLEX] Detect GPU multiplexing mode by actual cache capacity.
         # Multiplexing is active when allocated cache capacity is smaller than logical full batch.
         gpu_multiplexing = (full_batch_size > 0 and cache_batch_size < full_batch_size)
-        if micro_batch_size > 0:
+        if micro_batch_size > 0 and gpu_multiplexing:
             policy_mb = max(1, int(getattr(self.offloading_policy, "gpu_batch_size", 1)))
             runtime_mb = int(micro_batch_size)
             # Common/expected case: the last micro-batch can be smaller than policy size

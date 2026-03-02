@@ -283,14 +283,11 @@ class Server:
         self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
         # Policy:
-        # - microbatch mode: weights/activations on GPU, active KV working slots on GPU,
-        #   inactive micro-batch snapshots staged outside GPU
-        # - legacy mode: preserve the previous FlexGen-style cache split policy
-        # [TRUE MICRO-BATCH MULTIPLEXING] When micro-batching is enabled:
-        # - gpu_batch_size = micro_batch_size (one working slot holds one micro-batch)
-        # - num_gpu_batches = working_slots (GPU can keep a small bounded set of hot slots)
-        # - Other micro-batches stay outside GPU, swapped via offload/prefetch
-        # When disabled: use full batch_size for backwards compatibility
+        # - overlap-only micro-batch mode (default): preserve FlexGen cache offload
+        #   and split requests only at the RPC scheduler level
+        # - true GPU multiplexing (opt-in): shrink active GPU KV capacity to a
+        #   bounded set of working slots and rely on per-micro-batch snapshots
+        # - legacy mode: no micro-batch splitting
         from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
         mb_config = get_micro_batch_config()
         micro_batch_size = get_micro_batch_size()
@@ -298,21 +295,34 @@ class Server:
             working_slots = max(1, int(os.environ.get("BLOOMBEE_MICRO_WORKING_SLOTS", "2")))
         except Exception:
             working_slots = 2
-        
-        if mb_config['enabled']:
+
+        cache_gpu_percent = 50
+        cache_cpu_percent = 50
+
+        if mb_config['enabled'] and mb_config.get('gpu_multiplexing', False):
             gpu_batch_size = micro_batch_size  # One working slot holds one micro-batch.
             num_gpu_batches = working_slots
-            cache_gpu_percent, cache_cpu_percent = 100, 0
+            cache_gpu_percent = 100
+            cache_cpu_percent = 0
             total_working_capacity = gpu_batch_size * num_gpu_batches
             logger.info(
                 f"[POLICY_MB_MULTIPLEX] GPU working_slots={num_gpu_batches}, "
                 f"slot_batch_size={gpu_batch_size}, total_working_capacity={total_working_capacity}; "
                 f"client can request up to batch_size={batch_size} (overflow handled via per-microbatch snapshots)"
             )
+        elif mb_config['enabled']:
+            gpu_batch_size = batch_size
+            num_gpu_batches = 1
+            logger.info(
+                f"[POLICY_MB_OVERLAP_ONLY] micro_batch_size={micro_batch_size}, "
+                f"policy_batch={gpu_batch_size}, cache_gpu_percent={cache_gpu_percent}, "
+                f"cache_cpu_percent={cache_cpu_percent}; "
+                f"micro-batching is used for overlap only, FlexGen cache offload remains enabled. "
+                f"Set BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING=1 to opt into bounded GPU working-slot reuse."
+            )
         else:
             gpu_batch_size = batch_size  # Full batch for backwards compatibility
             num_gpu_batches = 1
-            cache_gpu_percent, cache_cpu_percent = 50, 50
             logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
         
         self.policy = Policy(
