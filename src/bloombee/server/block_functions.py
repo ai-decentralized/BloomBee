@@ -6,7 +6,8 @@ from __future__ import annotations
 from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
 
 import torch
-from hivemind.compression.serialization import deserialize_torch_tensor, serialize_torch_tensor
+# from hivemind.compression.serialization import deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.lossless_transport import deserialize_tensor_stream, deserialize_torch_tensor, serialize_torch_tensor
 from hivemind.moe.expert_uid import ExpertUID
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
