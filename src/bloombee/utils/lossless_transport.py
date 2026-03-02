@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import math
 import os
 import struct
 import time
@@ -41,6 +42,7 @@ _HEADER_SIZE = _HEADER_STRUCT.size
 _MISSING_ZSTD_WARNING_EMITTED = False
 _COMP_PROFILE_ENV = "BLOOMBEE_COMP_RATIO_PROFILE"
 _COMP_TIMING_PROFILE_ENV = "BLOOMBEE_COMP_TIMING_PROFILE"
+_COMP_DETAIL_PROFILE_ENV = "BLOOMBEE_COMP_DETAIL_PROFILE"
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
 )
@@ -143,6 +145,14 @@ def comp_timing_profile_enabled() -> bool:
     Enable detailed compression/decompression timing profiling.
     """
     return _get_env_bool(_COMP_TIMING_PROFILE_ENV, "1")
+
+
+def comp_detail_profile_enabled() -> bool:
+    """
+    Enable heavyweight per-tensor compression diagnostics.
+    Default is off because this can generate a lot of logs and a small amount of CPU overhead.
+    """
+    return _get_env_bool(_COMP_DETAIL_PROFILE_ENV, "0")
 
 
 def _new_transport_profile() -> Dict[str, float]:
@@ -248,6 +258,12 @@ def log_transport_profile_event(
         f"deserialize_raw_bytes={int(summary['deserialize_raw_bytes'])} "
         f"serialize_ratio={summary['serialize_ratio']:.6f} "
         f"serialize_savings={summary['serialize_savings']:.6f} "
+        f"compress_input_bytes={int(summary['compress_input_bytes'])} "
+        f"compress_output_bytes={int(summary['compress_output_bytes'])} "
+        f"decompress_input_bytes={int(summary['decompress_input_bytes'])} "
+        f"decompress_output_bytes={int(summary['decompress_output_bytes'])} "
+        f"serialize_wrapper_applied={int(summary['serialize_wrapper_applied_calls'])} "
+        f"deserialize_wrapper_applied={int(summary['deserialize_wrapper_applied_calls'])} "
         f"compress_calls={int(summary['compress_calls'])} "
         f"decompress_calls={int(summary['decompress_calls'])}"
     )
@@ -329,6 +345,164 @@ def log_comp_ratio_event(
         log.info(msg)
     except Exception:
         # Profiling logs must never break inference.
+        return
+
+
+def _compression_type_name(compression_type: runtime_pb2.CompressionType) -> str:
+    try:
+        return runtime_pb2.CompressionType.Name(int(compression_type))
+    except Exception:
+        return str(int(compression_type)) if compression_type is not None else "unknown"
+
+
+def _sample_tensor_value_profile(tensor: Optional[torch.Tensor], max_values: int = 4096) -> Dict[str, float]:
+    profile = {
+        "tensor_zero_ratio": 0.0,
+        "tensor_pos_ratio": 0.0,
+        "tensor_sample_unique_ratio": 0.0,
+        "tensor_sample_mean": 0.0,
+        "tensor_sample_std": 0.0,
+        "tensor_sample_abs_mean": 0.0,
+        "tensor_sample_size": 0.0,
+    }
+    if tensor is None or not torch.is_tensor(tensor):
+        return profile
+    try:
+        flat = tensor.detach().reshape(-1)
+        if flat.numel() <= 0:
+            return profile
+        sample = flat[: min(int(flat.numel()), int(max_values))]
+        if sample.device.type != "cpu":
+            sample = sample.to("cpu")
+        sample = sample.to(torch.float32)
+        sample_n = int(sample.numel())
+        if sample_n <= 0:
+            return profile
+        zero_ratio = float((sample == 0).sum().item()) / float(sample_n)
+        pos_ratio = float((sample > 0).sum().item()) / float(sample_n)
+        if sample_n <= 512:
+            unique_ratio = float(torch.unique(sample).numel()) / float(sample_n)
+        else:
+            rounded = torch.round(sample * 1000.0) / 1000.0
+            unique_ratio = float(torch.unique(rounded).numel()) / float(sample_n)
+        profile.update(
+            {
+                "tensor_zero_ratio": zero_ratio,
+                "tensor_pos_ratio": pos_ratio,
+                "tensor_sample_unique_ratio": unique_ratio,
+                "tensor_sample_mean": float(sample.mean().item()),
+                "tensor_sample_std": float(sample.std(unbiased=False).item()),
+                "tensor_sample_abs_mean": float(sample.abs().mean().item()),
+                "tensor_sample_size": float(sample_n),
+            }
+        )
+    except Exception:
+        return profile
+    return profile
+
+
+def _sample_buffer_profile(buffer: bytes, max_bytes: int = 4096) -> Dict[str, float]:
+    profile = {
+        "byte_sample_size": 0.0,
+        "byte_zero_ratio": 0.0,
+        "byte_unique_count": 0.0,
+        "byte_unique_ratio": 0.0,
+        "byte_top1_ratio": 0.0,
+        "byte_adj_repeat_ratio": 0.0,
+        "byte_entropy_bits": 0.0,
+    }
+    if not buffer:
+        return profile
+    sample = memoryview(buffer)[: min(len(buffer), int(max_bytes))]
+    n = int(len(sample))
+    if n <= 0:
+        return profile
+    counts = [0] * 256
+    prev = None
+    adj_repeats = 0
+    for b in sample:
+        val = int(b)
+        counts[val] += 1
+        if prev is not None and prev == val:
+            adj_repeats += 1
+        prev = val
+    unique_count = sum(1 for c in counts if c > 0)
+    top1 = max(counts)
+    entropy = 0.0
+    for c in counts:
+        if c <= 0:
+            continue
+        p = float(c) / float(n)
+        entropy -= p * math.log2(p)
+    profile.update(
+        {
+            "byte_sample_size": float(n),
+            "byte_zero_ratio": float(counts[0]) / float(n),
+            "byte_unique_count": float(unique_count),
+            "byte_unique_ratio": float(unique_count) / float(n),
+            "byte_top1_ratio": float(top1) / float(n),
+            "byte_adj_repeat_ratio": float(adj_repeats) / float(max(1, n - 1)),
+            "byte_entropy_bits": entropy,
+        }
+    )
+    return profile
+
+
+def _log_comp_detail_event(
+    *,
+    tensor: Optional[torch.Tensor],
+    compression_type: runtime_pb2.CompressionType,
+    raw_buffer: bytes,
+    wire_buffer: bytes,
+    wrap_info: Dict[str, object],
+) -> None:
+    if not comp_detail_profile_enabled():
+        return
+    try:
+        raw_len = int(len(raw_buffer))
+        wire_len = int(len(wire_buffer))
+        ratio = (float(wire_len) / float(raw_len)) if raw_len > 0 else 1.0
+        savings = 1.0 - ratio
+        tensor_stats = _sample_tensor_value_profile(tensor)
+        byte_stats = _sample_buffer_profile(raw_buffer)
+        shape = tuple(int(dim) for dim in tensor.shape) if torch.is_tensor(tensor) else ()
+        dtype = str(tensor.dtype).replace("torch.", "") if torch.is_tensor(tensor) else "unknown"
+        msg = (
+            "[COMP_DETAIL] "
+            f"hivemind_comp={_compression_type_name(compression_type)} "
+            f"lossless_enabled={int(_lossless_send_enabled())} "
+            f"lossless_applied={int(wrap_info.get('applied', 0))} "
+            f"lossless_reason={wrap_info.get('reason', 'unknown')} "
+            f"lossless_algo={wrap_info.get('algo_name', _lossless_algo())} "
+            f"lossless_raw_bytes={raw_len} "
+            f"lossless_wire_bytes={wire_len} "
+            f"lossless_ratio={ratio:.6f} "
+            f"lossless_savings={savings:.6f} "
+            f"lossless_compressed_bytes={int(wrap_info.get('compressed_bytes', 0))} "
+            f"lossless_wrapped_bytes={int(wrap_info.get('wrapped_bytes', wire_len))} "
+            f"lossless_net_gain_bytes={int(wrap_info.get('net_gain_bytes', max(0, raw_len - wire_len)))} "
+            f"min_bytes={int(wrap_info.get('min_bytes', _lossless_min_bytes()))} "
+            f"min_gain_bytes={int(wrap_info.get('min_gain_bytes', _lossless_min_gain_bytes()))} "
+            f"dtype={dtype} "
+            f"shape={shape} "
+            f"numel={int(tensor.numel()) if torch.is_tensor(tensor) else 0} "
+            f"tensor_zero_ratio={tensor_stats['tensor_zero_ratio']:.6f} "
+            f"tensor_pos_ratio={tensor_stats['tensor_pos_ratio']:.6f} "
+            f"tensor_sample_unique_ratio={tensor_stats['tensor_sample_unique_ratio']:.6f} "
+            f"tensor_sample_mean={tensor_stats['tensor_sample_mean']:.6f} "
+            f"tensor_sample_std={tensor_stats['tensor_sample_std']:.6f} "
+            f"tensor_sample_abs_mean={tensor_stats['tensor_sample_abs_mean']:.6f} "
+            f"tensor_sample_size={int(tensor_stats['tensor_sample_size'])} "
+            f"byte_sample_size={int(byte_stats['byte_sample_size'])} "
+            f"byte_zero_ratio={byte_stats['byte_zero_ratio']:.6f} "
+            f"byte_unique_count={int(byte_stats['byte_unique_count'])} "
+            f"byte_unique_ratio={byte_stats['byte_unique_ratio']:.6f} "
+            f"byte_top1_ratio={byte_stats['byte_top1_ratio']:.6f} "
+            f"byte_adj_repeat_ratio={byte_stats['byte_adj_repeat_ratio']:.6f} "
+            f"byte_entropy_bits={byte_stats['byte_entropy_bits']:.6f}"
+        )
+        logger.info(msg)
+    except Exception:
         return
 
 
@@ -422,41 +596,69 @@ def _parse_wrapper(buffer: bytes, *, strict: bool = True):
     return algo_id, original_size, payload
 
 
+def _wrap_serialized_tensor_impl(
+    serialized_tensor: runtime_pb2.Tensor,
+) -> tuple[runtime_pb2.Tensor, Dict[str, object]]:
+    info: Dict[str, object] = {
+        "applied": 0,
+        "reason": "disabled",
+        "algo_name": _lossless_algo(),
+        "compressed_bytes": 0,
+        "wrapped_bytes": len(serialized_tensor.buffer) if serialized_tensor is not None else 0,
+        "net_gain_bytes": 0,
+        "min_bytes": _lossless_min_bytes(),
+        "min_gain_bytes": _lossless_min_gain_bytes(),
+    }
+    wrap_t0 = time.perf_counter()
+    try:
+        if not _lossless_send_enabled():
+            info["reason"] = "disabled"
+            return serialized_tensor, info
+
+        raw = serialized_tensor.buffer
+        if not raw:
+            info["reason"] = "empty"
+            return serialized_tensor, info
+        if len(raw) < _lossless_min_bytes():
+            info["reason"] = "below_min_bytes"
+            return serialized_tensor, info
+        if _parse_wrapper(raw, strict=False) is not None:
+            info["reason"] = "already_wrapped"
+            return serialized_tensor, info
+
+        algo_id, compressed = _compress_buffer(raw)
+        info["compressed_bytes"] = int(len(compressed))
+        if algo_id == 0:
+            info["reason"] = "compressor_not_applied"
+            return serialized_tensor, info
+
+        wrapped_buffer = _HEADER_STRUCT.pack(_MAGIC, _VERSION, algo_id, len(raw)) + compressed
+        info["wrapped_bytes"] = int(len(wrapped_buffer))
+        info["net_gain_bytes"] = int(max(0, len(raw) - len(wrapped_buffer)))
+
+        # Skip compression if it does not reduce payload enough to amortize header/CPU overhead.
+        if len(wrapped_buffer) + _lossless_min_gain_bytes() >= len(raw):
+            info["reason"] = "min_gain_not_met"
+            return serialized_tensor, info
+
+        wrapped = runtime_pb2.Tensor()
+        wrapped.CopyFrom(serialized_tensor)
+        wrapped.buffer = wrapped_buffer
+        info["applied"] = 1
+        info["reason"] = "applied"
+        _record_transport_profile("serialize_wrapper_applied_calls", 1.0)
+        return wrapped, info
+    finally:
+        _record_transport_profile("serialize_wrapper_ms", (time.perf_counter() - wrap_t0) * 1000.0)
+
+
 def wrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_pb2.Tensor:
     """
     Optionally wrap runtime_pb2.Tensor.buffer with a lossless compression header.
     This only affects transport bytes; tensor protobuf fields (dtype/shape/compression) stay intact.
     """
-    wrap_t0 = time.perf_counter()
-    try:
-        if not _lossless_send_enabled():
-            return serialized_tensor
-
-        raw = serialized_tensor.buffer
-        if not raw:
-            return serialized_tensor
-        if len(raw) < _lossless_min_bytes():
-            return serialized_tensor
-        if _parse_wrapper(raw, strict=False) is not None:
-            return serialized_tensor
-
-        algo_id, compressed = _compress_buffer(raw)
-        if algo_id == 0:
-            return serialized_tensor
-
-        wrapped_buffer = _HEADER_STRUCT.pack(_MAGIC, _VERSION, algo_id, len(raw)) + compressed
-
-        # Skip compression if it does not reduce payload enough to amortize header/CPU overhead.
-        if len(wrapped_buffer) + _lossless_min_gain_bytes() >= len(raw):
-            return serialized_tensor
-
-        wrapped = runtime_pb2.Tensor()
-        wrapped.CopyFrom(serialized_tensor)
-        wrapped.buffer = wrapped_buffer
-        _record_transport_profile("serialize_wrapper_applied_calls", 1.0)
-        return wrapped
-    finally:
-        _record_transport_profile("serialize_wrapper_ms", (time.perf_counter() - wrap_t0) * 1000.0)
+    wrapped, _ = _wrap_serialized_tensor_impl(serialized_tensor)
+    return wrapped
 
 
 def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_pb2.Tensor:
@@ -506,8 +708,15 @@ def serialize_torch_tensor(
     _record_transport_profile("serialize_calls", 1.0)
     _record_transport_profile("serialize_core_ms", (time.perf_counter() - t0) * 1000.0)
     _record_transport_profile("serialize_raw_bytes", float(len(serialized.buffer)))
-    wrapped = wrap_serialized_tensor(serialized)
+    wrapped, wrap_info = _wrap_serialized_tensor_impl(serialized)
     _record_transport_profile("serialize_wire_bytes", float(len(wrapped.buffer)))
+    _log_comp_detail_event(
+        tensor=tensor,
+        compression_type=compression_type,
+        raw_buffer=serialized.buffer,
+        wire_buffer=wrapped.buffer,
+        wrap_info=wrap_info,
+    )
     return wrapped
 
 

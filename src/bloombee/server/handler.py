@@ -1322,6 +1322,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         request = first_request
         anext_task = get_push_task = None
         queue_wait_ms = 0.0
+        queue_wait_start_us = 0
+        queue_wait_end_us = 0
         queue_source = "initial"
         try:
             start_iterate_inference_steps_time = perf_counter()
@@ -1381,6 +1383,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                             mb_metadata["pushed"] = True
                             mb_metadata["_queue_wait_ms"] = float(queue_wait_ms)
                             mb_metadata["_queue_source"] = queue_source
+                            mb_metadata["_queue_wait_start_us"] = int(queue_wait_start_us)
+                            mb_metadata["_queue_wait_end_us"] = int(queue_wait_end_us)
                             
                             logger.debug(
                                 f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
@@ -1424,6 +1428,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                         if (not skip_direct_request) and (step_id is None or step_id not in processed_step_ids):
                             metadata["_queue_wait_ms"] = float(queue_wait_ms)
                             metadata["_queue_source"] = queue_source
+                            metadata["_queue_wait_start_us"] = int(queue_wait_start_us)
+                            metadata["_queue_wait_end_us"] = int(queue_wait_end_us)
                             yield request, metadata
                             if step_id is not None:
                                 processed_step_ids.add(step_id)
@@ -1443,9 +1449,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                     
                     # Wait for next request, coming either from stream or push queue.
                     wait_start_time = perf_counter()
+                    queue_wait_start_us = self._now_us()
                     done, _ = await asyncio.wait(
                         [anext_task, get_push_task], timeout=self.step_timeout, return_when=asyncio.FIRST_COMPLETED
                     )
+                    queue_wait_end_us = self._now_us()
                     queue_wait_ms = (perf_counter() - wait_start_time) * 1000.0
                     
                     # Prefer push_queue when both are ready to keep micro-batch pipeline flowing.
@@ -1575,6 +1583,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             return runtime_pb2.ExpertResponse()
         
         self._mb_processed[mb_key].add(mb_idx)
+        metadata["s2s_receiver_receive_us"] = int(receive_us)
 
         # [S2S_WIRE] Sender->receiver micro-batch transport timing breakdown.
         # Uses sender->receiver clock offset when available to isolate pure wire time.
@@ -1585,6 +1594,13 @@ class TransformerConnectionHandler(ConnectionHandler):
         sender_ser_end_us = self._to_int(metadata.get("s2s_sender_serialize_end_us"), 0)
         sender_enqueue_us = self._to_int(metadata.get("s2s_sender_enqueue_us"), 0)
         push_timestamp_us = self._to_int(metadata.get("stage_push_timestamp_us"), 0)
+        sender_compute_to_serialize_start_ms = 0.0
+        try:
+            sender_compute_to_serialize_start_ms = float(
+                metadata.get("s2s_sender_compute_to_serialize_start_ms", 0.0)
+            )
+        except Exception:
+            sender_compute_to_serialize_start_ms = 0.0
         sender_sem_wait_ms = 0.0
         try:
             sender_sem_wait_ms = float(metadata.get("s2s_sender_sem_wait_ms", 0.0))
@@ -1611,6 +1627,13 @@ class TransformerConnectionHandler(ConnectionHandler):
             if sender_ser_end_us > 0 and sender_send_us >= sender_ser_end_us
             else -1.0
         )
+        sender_pre_send_wait_ms = sender_prep_ms
+        sender_pre_send_post_enqueue_ms = sender_queue_ms
+        sender_pre_send_misc_ms = (
+            max(0.0, sender_pre_send_wait_ms - sender_sem_wait_ms - max(0.0, sender_pre_send_post_enqueue_ms))
+            if sender_pre_send_wait_ms >= 0.0
+            else -1.0
+        )
         raw_transfer_ms = (
             max(0.0, (receive_us - push_timestamp_us) / 1000.0)
             if push_timestamp_us > 0 and receive_us >= push_timestamp_us
@@ -1633,9 +1656,13 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
             f"batch={int(mb_size)} payload_kb={payload_bytes/1024.0:.2f} metadata_b={metadata_bytes} "
             f"raw_transfer_ms={raw_transfer_ms:.3f} "
+            f"sender_compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
             f"sender_serialize_ms={sender_serialize_ms:.3f} "
             f"sender_sem_wait_ms={sender_sem_wait_ms:.3f} "
             f"sender_queue_ms={sender_queue_ms:.3f} sender_prep_ms={sender_prep_ms:.3f} "
+            f"sender_pre_send_wait_ms={sender_pre_send_wait_ms:.3f} "
+            f"sender_pre_send_post_enqueue_ms={sender_pre_send_post_enqueue_ms:.3f} "
+            f"sender_pre_send_misc_ms={sender_pre_send_misc_ms:.3f} "
             f"wire_ms={wire_ms:.3f} e2e_from_serialize_end_ms={e2e_from_serialize_end_ms:.3f} "
             f"clock_sync={int(clock_sync_ok)} "
             f"clock_offset_ms={sender_to_receiver_clock_offset_us/1000.0:.3f} "
@@ -1683,6 +1710,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         if self._enable_immediate_mb_queue:
             # ========== IMMEDIATE QUEUING PATH (Step A) ==========
             # Put each micro-batch directly into session queue as a queue item
+            metadata["s2s_receiver_queue_put_us"] = int(self._now_us())
             
             mb_queue_item = create_microbatch_queue_item(
                 request_id=session_id,
@@ -1983,6 +2011,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # Serialize the micro-batch tensors
             outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
+            sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
             serialize_start_us = self._now_us()
             with transport_profile_scope() as push_transport_profile:
                 serialized_hidden = serialize_torch_tensor(
@@ -2003,6 +2032,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                         allow_inplace=True
                     )
             serialize_end_us = self._now_us()
+            sender_serialize_ms = max(0.0, (serialize_end_us - serialize_start_us) / 1000.0)
+            sender_compute_to_serialize_start_ms = (
+                max(0.0, (serialize_start_us - sender_compute_end_us) / 1000.0)
+                if sender_compute_end_us > 0 and serialize_start_us >= sender_compute_end_us
+                else -1.0
+            )
             sender_blocks = str(metadata.get("sender_blocks", "unknown"))
             log_comp_ratio_event(
                 logger,
@@ -2070,6 +2105,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "receiver_blocks": f"{next_start}:{next_end}",
                 "s2s_sender_serialize_start_us": int(serialize_start_us),
                 "s2s_sender_serialize_end_us": int(serialize_end_us),
+                "s2s_sender_compute_to_serialize_start_ms": float(sender_compute_to_serialize_start_ms),
             }
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
@@ -2143,6 +2179,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                     next_peer_id_str,
                     release_slot=acquired_slot,
                 )
+            )
+            logger.info(
+                f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
+                f"mb_idx={int(mb_idx)} sender_blocks={sender_blocks} receiver_blocks={next_start}:{next_end} "
+                f"compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
+                f"serialize_ms={sender_serialize_ms:.3f} "
+                f"pre_send_wait_pending=1 "
+                f"sem_wait_ms={float(sender_sem_wait_ms):.3f}"
             )
             
             # Track task to prevent garbage collection

@@ -525,6 +525,13 @@ async def iterate_rpc_inference(
             sender_to_receiver_clock_samples = _to_int(
                 step_metadata.get("sender_to_receiver_clock_samples"), 0
             )
+            queue_wait_start_us = _to_int(step_metadata.get("_queue_wait_start_us"), 0)
+            queue_wait_end_us = _to_int(step_metadata.get("_queue_wait_end_us"), 0)
+            receiver_receive_us = _to_int(step_metadata.get("s2s_receiver_receive_us"), 0)
+            receiver_queue_put_us = _to_int(step_metadata.get("s2s_receiver_queue_put_us"), 0)
+            sender_send_us = _to_int(step_metadata.get("clock_sync_sender_send_us"), 0)
+            sender_serialize_start_us = _to_int(step_metadata.get("s2s_sender_serialize_start_us"), 0)
+            sender_serialize_end_us = _to_int(step_metadata.get("s2s_sender_serialize_end_us"), 0)
             transfer_latency_us = receive_timestamp_us - push_timestamp_us if push_timestamp_us > 0 else 0
             
             # [CROSS_STAGE] Pipeline overlap: If previous stage started MB1 compute before we receive MB0,
@@ -553,6 +560,14 @@ async def iterate_rpc_inference(
                 'prev_stage_clock_samples': sender_to_receiver_clock_samples,
                 'this_stage_receive_us': receive_timestamp_us,
                 'transfer_latency_us': transfer_latency_us,
+                'this_stage_queue_wait_ms': queue_wait_ms,
+                'this_stage_queue_wait_start_us': queue_wait_start_us,
+                'this_stage_queue_wait_end_us': queue_wait_end_us,
+                'receiver_receive_us': receiver_receive_us,
+                'receiver_queue_put_us': receiver_queue_put_us,
+                'sender_send_us': sender_send_us,
+                'sender_serialize_start_us': sender_serialize_start_us,
+                'sender_serialize_end_us': sender_serialize_end_us,
             }
             
             if compute_start_timestamp_us > 0:
@@ -1028,6 +1043,11 @@ async def iterate_rpc_inference(
                    overlap_tracking_key in iterate_rpc_inference._cross_stage_overlap_data:
                     
                     overlap_summary = iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]
+                    overlap_accum = (
+                        getattr(iterate_rpc_inference, '_mb_accumulators', {}).get(mb_accum_key, {})
+                        if hasattr(iterate_rpc_inference, '_mb_accumulators')
+                        else {}
+                    )
                     total_overlap_ms = 0.0
                     total_stage2_compute_ms = 0.0
                     total_comparable_stage2_compute_ms = 0.0
@@ -1128,6 +1148,208 @@ async def iterate_rpc_inference(
                     
                     # Calculate overlap efficiency
                     if total_stage2_compute_ms > 0:
+                        stage2_queue_wait_sum_ms = float(overlap_accum.get('queue_wait_ms_sum', 0.0))
+                        stage2_queue_wait_pre_ms = float(overlap_accum.get('queue_wait_pre_ms', 0.0))
+                        stage2_queue_wait_inter_ms = float(overlap_accum.get('queue_wait_inter_ms', 0.0))
+                        stage2_deserialize_sum_ms = float(overlap_accum.get('deserialize_ms_sum', 0.0))
+                        stage2_elapsed_to_summary_ms = (
+                            (perf_counter() - overlap_accum.get('step_start_time', step_receive_time)) * 1000.0
+                        )
+                        stage2_critical_path_ms = (
+                            stage2_queue_wait_sum_ms + stage2_deserialize_sum_ms + total_stage2_compute_ms
+                        )
+                        stage2_full_path_ms = stage2_elapsed_to_summary_ms + stage2_queue_wait_pre_ms
+                        stage2_residual_path_ms = stage2_full_path_ms - stage2_critical_path_ms
+                        stage2_queue_wait_pre_upstream_compute_ms = 0.0
+                        stage2_queue_wait_pre_transfer_receive_ms = 0.0
+                        stage2_queue_wait_pre_precompute_gap_ms = 0.0
+                        stage2_queue_wait_pre_sender_post_compute_ms = 0.0
+                        stage2_queue_wait_pre_sender_compute_to_serialize_ms = 0.0
+                        stage2_queue_wait_pre_sender_serialize_ms = 0.0
+                        stage2_queue_wait_pre_sender_pre_send_wait_ms = 0.0
+                        stage2_queue_wait_pre_wire_receive_ms = 0.0
+                        stage2_queue_wait_pre_receiver_dispatch_ms = 0.0
+                        stage2_queue_wait_pre_breakdown_ready = 0
+
+                        mb0_data = overlap_summary.get(0, {})
+                        mb0_wait_start_us = _to_int(mb0_data.get('this_stage_queue_wait_start_us'), 0)
+                        mb0_wait_end_us = _to_int(mb0_data.get('this_stage_queue_wait_end_us'), 0)
+                        mb0_prev_start_us = _to_int(mb0_data.get('prev_stage_compute_start_us'), 0)
+                        mb0_prev_end_us = _to_int(mb0_data.get('prev_stage_compute_end_us'), 0)
+                        mb0_clock_offset_us = _to_int(mb0_data.get('prev_stage_clock_offset_us'), 0)
+                        mb0_clock_samples = _to_int(mb0_data.get('prev_stage_clock_samples'), 0)
+                        mb0_sender_send_us = _to_int(mb0_data.get('sender_send_us'), 0)
+                        mb0_sender_ser_start_us = _to_int(mb0_data.get('sender_serialize_start_us'), 0)
+                        mb0_sender_ser_end_us = _to_int(mb0_data.get('sender_serialize_end_us'), 0)
+                        mb0_receiver_receive_us = _to_int(mb0_data.get('receiver_receive_us'), 0)
+                        mb0_receiver_queue_put_us = _to_int(mb0_data.get('receiver_queue_put_us'), 0)
+
+                        if (
+                            stage2_queue_wait_pre_ms > 0.0
+                            and mb0_wait_end_us <= 0
+                            and mb0_wait_start_us > 0
+                        ):
+                            mb0_wait_end_us = mb0_wait_start_us + int(round(stage2_queue_wait_pre_ms * 1000.0))
+                        if (
+                            stage2_queue_wait_pre_ms > 0.0
+                            and mb0_wait_start_us <= 0
+                            and mb0_wait_end_us > 0
+                        ):
+                            mb0_wait_start_us = mb0_wait_end_us - int(round(stage2_queue_wait_pre_ms * 1000.0))
+
+                        def _interval_overlap_ms(
+                            range_start_us: int,
+                            range_end_us: int,
+                            window_start_us: int,
+                            window_end_us: int,
+                        ) -> float:
+                            if (
+                                range_start_us <= 0
+                                or range_end_us <= range_start_us
+                                or window_start_us <= 0
+                                or window_end_us <= window_start_us
+                            ):
+                                return 0.0
+                            overlap_start_us = max(range_start_us, window_start_us)
+                            overlap_end_us = min(range_end_us, window_end_us)
+                            if overlap_end_us <= overlap_start_us:
+                                return 0.0
+                            return (overlap_end_us - overlap_start_us) / 1000.0
+
+                        if (
+                            mb0_wait_start_us > 0
+                            and mb0_wait_end_us > mb0_wait_start_us
+                            and mb0_prev_start_us > 0
+                            and mb0_prev_end_us >= mb0_prev_start_us
+                            and mb0_clock_samples > 0
+                        ):
+                            mb0_prev_start_local_us = mb0_prev_start_us + mb0_clock_offset_us
+                            mb0_prev_end_local_us = mb0_prev_end_us + mb0_clock_offset_us
+                            mb0_sender_ser_start_local_us = (
+                                mb0_sender_ser_start_us + mb0_clock_offset_us if mb0_sender_ser_start_us > 0 else 0
+                            )
+                            mb0_sender_ser_end_local_us = (
+                                mb0_sender_ser_end_us + mb0_clock_offset_us if mb0_sender_ser_end_us > 0 else 0
+                            )
+                            mb0_sender_send_local_us = (
+                                mb0_sender_send_us + mb0_clock_offset_us if mb0_sender_send_us > 0 else 0
+                            )
+
+                            stage2_queue_wait_pre_upstream_compute_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_prev_start_local_us,
+                                mb0_prev_end_local_us,
+                            )
+                            stage2_queue_wait_pre_sender_compute_to_serialize_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_prev_end_local_us,
+                                mb0_sender_ser_start_local_us,
+                            )
+                            stage2_queue_wait_pre_sender_serialize_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_sender_ser_start_local_us,
+                                mb0_sender_ser_end_local_us,
+                            )
+                            stage2_queue_wait_pre_sender_pre_send_wait_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_sender_ser_end_local_us,
+                                mb0_sender_send_local_us,
+                            )
+                            stage2_queue_wait_pre_sender_post_compute_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_prev_end_local_us,
+                                mb0_sender_send_local_us,
+                            )
+                            sender_post_compute_segment_sum_ms = (
+                                stage2_queue_wait_pre_sender_compute_to_serialize_ms
+                                + stage2_queue_wait_pre_sender_serialize_ms
+                                + stage2_queue_wait_pre_sender_pre_send_wait_ms
+                            )
+                            if sender_post_compute_segment_sum_ms > 0.0:
+                                stage2_queue_wait_pre_sender_post_compute_ms = sender_post_compute_segment_sum_ms
+                            stage2_queue_wait_pre_wire_receive_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_sender_send_local_us,
+                                mb0_receiver_receive_us,
+                            )
+                            stage2_queue_wait_pre_receiver_dispatch_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_receiver_receive_us,
+                                mb0_wait_end_us,
+                            )
+                            stage2_queue_wait_pre_transfer_receive_ms = (
+                                stage2_queue_wait_pre_sender_post_compute_ms
+                                + stage2_queue_wait_pre_wire_receive_ms
+                                + stage2_queue_wait_pre_receiver_dispatch_ms
+                            )
+                            accounted_pre_wait_ms = (
+                                stage2_queue_wait_pre_upstream_compute_ms
+                                + stage2_queue_wait_pre_transfer_receive_ms
+                            )
+                            stage2_queue_wait_pre_precompute_gap_ms = max(
+                                0.0, stage2_queue_wait_pre_ms - accounted_pre_wait_ms
+                            )
+                            stage2_queue_wait_pre_breakdown_ready = 1
+
+                            if (
+                                mb0_receiver_queue_put_us > 0
+                                and mb0_receiver_queue_put_us < mb0_receiver_receive_us
+                            ):
+                                mb0_receiver_queue_put_us = mb0_receiver_receive_us
+
+                            if (
+                                mb0_receiver_queue_put_us > 0
+                                and mb0_receiver_receive_us > 0
+                                and mb0_receiver_queue_put_us < mb0_wait_end_us
+                            ):
+                                receiver_handle_ms = _interval_overlap_ms(
+                                    mb0_wait_start_us,
+                                    mb0_wait_end_us,
+                                    mb0_receiver_receive_us,
+                                    mb0_receiver_queue_put_us,
+                                )
+                                receiver_ready_ms = _interval_overlap_ms(
+                                    mb0_wait_start_us,
+                                    mb0_wait_end_us,
+                                    mb0_receiver_queue_put_us,
+                                    mb0_wait_end_us,
+                                )
+                                stage2_queue_wait_pre_receiver_dispatch_ms = receiver_handle_ms + receiver_ready_ms
+                                stage2_queue_wait_pre_transfer_receive_ms = (
+                                    stage2_queue_wait_pre_sender_post_compute_ms
+                                    + stage2_queue_wait_pre_wire_receive_ms
+                                    + stage2_queue_wait_pre_receiver_dispatch_ms
+                                )
+                                accounted_pre_wait_ms = (
+                                    stage2_queue_wait_pre_upstream_compute_ms
+                                    + stage2_queue_wait_pre_transfer_receive_ms
+                                )
+                                stage2_queue_wait_pre_precompute_gap_ms = max(
+                                    0.0, stage2_queue_wait_pre_ms - accounted_pre_wait_ms
+                                )
+                        overlap_accum['queue_wait_pre_upstream_compute_ms'] = stage2_queue_wait_pre_upstream_compute_ms
+                        overlap_accum['queue_wait_pre_transfer_receive_ms'] = stage2_queue_wait_pre_transfer_receive_ms
+                        overlap_accum['queue_wait_pre_precompute_gap_ms'] = stage2_queue_wait_pre_precompute_gap_ms
+                        overlap_accum['queue_wait_pre_sender_post_compute_ms'] = stage2_queue_wait_pre_sender_post_compute_ms
+                        overlap_accum['queue_wait_pre_sender_compute_to_serialize_ms'] = (
+                            stage2_queue_wait_pre_sender_compute_to_serialize_ms
+                        )
+                        overlap_accum['queue_wait_pre_sender_serialize_ms'] = (
+                            stage2_queue_wait_pre_sender_serialize_ms
+                        )
+                        overlap_accum['queue_wait_pre_sender_pre_send_wait_ms'] = (
+                            stage2_queue_wait_pre_sender_pre_send_wait_ms
+                        )
+                        overlap_accum['queue_wait_pre_wire_receive_ms'] = stage2_queue_wait_pre_wire_receive_ms
+                        overlap_accum['queue_wait_pre_receiver_dispatch_ms'] = stage2_queue_wait_pre_receiver_dispatch_ms
+                        overlap_accum['queue_wait_pre_breakdown_ready'] = stage2_queue_wait_pre_breakdown_ready
                         overlap_efficiency = (total_overlap_ms / total_stage2_compute_ms) * 100
                         strict_efficiency = (
                             (total_overlap_ms / total_comparable_stage2_compute_ms) * 100
@@ -1148,6 +1370,23 @@ async def iterate_rpc_inference(
                         logger.info(
                             f"[CROSS_STAGE_OVERLAP_SUMMARY] step={overlap_tracking_key[1]} overlap={total_overlap_ms:.1f}ms, "
                             f"Stage2_compute={total_stage2_compute_ms:.1f}ms, "
+                            f"Stage2_queue_wait={stage2_queue_wait_sum_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre={stage2_queue_wait_pre_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_upstream_compute={stage2_queue_wait_pre_upstream_compute_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_transfer_receive={stage2_queue_wait_pre_transfer_receive_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_precompute_gap={stage2_queue_wait_pre_precompute_gap_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_sender_post_compute={stage2_queue_wait_pre_sender_post_compute_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_sender_compute_to_serialize={stage2_queue_wait_pre_sender_compute_to_serialize_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_sender_serialize={stage2_queue_wait_pre_sender_serialize_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_sender_pre_send_wait={stage2_queue_wait_pre_sender_pre_send_wait_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_wire_receive={stage2_queue_wait_pre_wire_receive_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_receiver_dispatch={stage2_queue_wait_pre_receiver_dispatch_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_breakdown_ready={stage2_queue_wait_pre_breakdown_ready}, "
+                            f"Stage2_queue_wait_inter={stage2_queue_wait_inter_ms:.1f}ms, "
+                            f"Stage2_deserialize={stage2_deserialize_sum_ms:.1f}ms, "
+                            f"Stage2_critical_path={stage2_critical_path_ms:.1f}ms, "
+                            f"Stage2_full_path={stage2_full_path_ms:.1f}ms, "
+                            f"Stage2_residual={stage2_residual_path_ms:.1f}ms, "
                             f"efficiency={overlap_efficiency:.1f}%, "
                             f"strict_efficiency={strict_efficiency:.1f}%, "
                             f"comparable_compute={total_comparable_stage2_compute_ms:.1f}ms, "
@@ -1208,10 +1447,29 @@ async def iterate_rpc_inference(
                 decompress_sum_ms = float(accum.get('decompress_ms_sum', 0.0))
                 deserialize_unwrap_sum_ms = float(accum.get('deserialize_unwrap_ms_sum', 0.0))
                 deserialize_core_sum_ms = float(accum.get('deserialize_core_ms_sum', 0.0))
+                queue_wait_pre_upstream_compute_ms = float(accum.get('queue_wait_pre_upstream_compute_ms', 0.0))
+                queue_wait_pre_transfer_receive_ms = float(accum.get('queue_wait_pre_transfer_receive_ms', 0.0))
+                queue_wait_pre_precompute_gap_ms = float(accum.get('queue_wait_pre_precompute_gap_ms', 0.0))
+                queue_wait_pre_sender_post_compute_ms = float(accum.get('queue_wait_pre_sender_post_compute_ms', 0.0))
+                queue_wait_pre_sender_compute_to_serialize_ms = float(
+                    accum.get('queue_wait_pre_sender_compute_to_serialize_ms', 0.0)
+                )
+                queue_wait_pre_sender_serialize_ms = float(
+                    accum.get('queue_wait_pre_sender_serialize_ms', 0.0)
+                )
+                queue_wait_pre_sender_pre_send_wait_ms = float(
+                    accum.get('queue_wait_pre_sender_pre_send_wait_ms', 0.0)
+                )
+                queue_wait_pre_wire_receive_ms = float(accum.get('queue_wait_pre_wire_receive_ms', 0.0))
+                queue_wait_pre_receiver_dispatch_ms = float(accum.get('queue_wait_pre_receiver_dispatch_ms', 0.0))
+                queue_wait_pre_breakdown_ready = int(accum.get('queue_wait_pre_breakdown_ready', 0) or 0)
                 merge_residual_ms = merge_total_ms - (
                     deserialize_sum_ms + compute_sum_ms + merge_serialize_ms
                 )
                 total_with_pre_wait_ms = merge_total_ms + queue_wait_pre_ms
+                critical_path_ms = queue_wait_sum_ms + deserialize_sum_ms + compute_sum_ms
+                full_path_ms = total_with_pre_wait_ms
+                residual_to_full_ms = full_path_ms - critical_path_ms
                 queue_source_counts = accum.get("queue_source_counts", {})
                 queue_source_stats = ",".join(
                     f"{k}:{v}" for k, v in sorted(queue_source_counts.items())
@@ -1230,10 +1488,23 @@ async def iterate_rpc_inference(
                     f"serialize_wrap={merge_transport_summary.get('serialize_wrapper_ms', 0.0):.2f}ms "
                     f"serialize_core={merge_transport_summary.get('serialize_core_ms', 0.0):.2f}ms "
                     f"residual={merge_residual_ms:.2f}ms "
+                    f"critical_path={critical_path_ms:.2f}ms "
                     f"total={merge_total_ms:.2f}ms "
                     f"queue_sources={queue_source_stats} "
                     f"queue_wait_pre={queue_wait_pre_ms:.2f}ms "
+                    f"queue_wait_pre_upstream_compute={queue_wait_pre_upstream_compute_ms:.2f}ms "
+                    f"queue_wait_pre_transfer_receive={queue_wait_pre_transfer_receive_ms:.2f}ms "
+                    f"queue_wait_pre_precompute_gap={queue_wait_pre_precompute_gap_ms:.2f}ms "
+                    f"queue_wait_pre_sender_post_compute={queue_wait_pre_sender_post_compute_ms:.2f}ms "
+                    f"queue_wait_pre_sender_compute_to_serialize={queue_wait_pre_sender_compute_to_serialize_ms:.2f}ms "
+                    f"queue_wait_pre_sender_serialize={queue_wait_pre_sender_serialize_ms:.2f}ms "
+                    f"queue_wait_pre_sender_pre_send_wait={queue_wait_pre_sender_pre_send_wait_ms:.2f}ms "
+                    f"queue_wait_pre_wire_receive={queue_wait_pre_wire_receive_ms:.2f}ms "
+                    f"queue_wait_pre_receiver_dispatch={queue_wait_pre_receiver_dispatch_ms:.2f}ms "
+                    f"queue_wait_pre_breakdown_ready={queue_wait_pre_breakdown_ready} "
                     f"queue_wait_inter={queue_wait_inter_ms:.2f}ms "
+                    f"full_path={full_path_ms:.2f}ms "
+                    f"residual_to_full={residual_to_full_ms:.2f}ms "
                     f"total_with_pre_wait={total_with_pre_wait_ms:.2f}ms"
                 )
                 log_transport_profile_event(

@@ -296,14 +296,9 @@ class Server:
         except Exception:
             working_slots = 2
 
-        cache_gpu_percent = 50
-        cache_cpu_percent = 50
-
         if mb_config['enabled'] and mb_config.get('gpu_multiplexing', False):
             gpu_batch_size = micro_batch_size  # One working slot holds one micro-batch.
             num_gpu_batches = working_slots
-            cache_gpu_percent = 100
-            cache_cpu_percent = 0
             total_working_capacity = gpu_batch_size * num_gpu_batches
             logger.info(
                 f"[POLICY_MB_MULTIPLEX] GPU working_slots={num_gpu_batches}, "
@@ -315,20 +310,20 @@ class Server:
             num_gpu_batches = 1
             logger.info(
                 f"[POLICY_MB_OVERLAP_ONLY] micro_batch_size={micro_batch_size}, "
-                f"policy_batch={gpu_batch_size}, cache_gpu_percent={cache_gpu_percent}, "
-                f"cache_cpu_percent={cache_cpu_percent}; "
+                f"policy_batch={gpu_batch_size}, cache_gpu_percent=50, "
+                f"cache_cpu_percent=50; "
                 f"micro-batching is used for overlap only, FlexGen cache offload remains enabled. "
-                f"Set BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING=1 to opt into bounded GPU working-slot reuse."
+                f"GPU multiplexing is temporarily force-disabled in code."
             )
         else:
             gpu_batch_size = batch_size  # Full batch for backwards compatibility
             num_gpu_batches = 1
             logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
-        
+
         self.policy = Policy(
             gpu_batch_size, num_gpu_batches,  # one working slot = one gpu_batch_size chunk
             100, 0,                   # w_gpu_percent, w_cpu_percent
-            cache_gpu_percent, cache_cpu_percent,
+            50, 50,                   # cache_gpu_percent, cache_cpu_percent
             100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
