@@ -482,7 +482,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
                     
-                if  not training_mode and self._is_spec_decoding and self._is_last_block:
+                if not training_mode and self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states
                     batch_size, seq_len, hidden_size = original_hidden_states.shape
                     device = original_hidden_states.device
