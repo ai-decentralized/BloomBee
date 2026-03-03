@@ -942,8 +942,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # Explicitly free the GPU memory. This is not necessary at the time this code is written,
         # but may help to avoid future issues when the module is not garbage-collected for some reasons
         dummy = torch.tensor([])
-        for p in self.module.parameters():
-            p.data = dummy
+        try:
+            params_iter = self.module.parameters() if hasattr(self.module, "parameters") else ()
+            for p in params_iter:
+                p.data = dummy
+        except Exception:
+            logger.warning("Failed to clear module parameters during backend.shutdown", exc_info=True)
 
 
 def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend]):

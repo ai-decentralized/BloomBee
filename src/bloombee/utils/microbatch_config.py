@@ -28,7 +28,7 @@ ENV_ENABLE_GPU_MULTIPLEXING = "BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
-DEFAULT_MICRO_BATCH_SIZE = 8 # Default micro-batch size for pipeline overlap
+DEFAULT_MICRO_BATCH_SIZE = 0 # Default micro-batch size for pipeline overlap
 
 
 def _is_microbatch_flag_enabled() -> bool:
