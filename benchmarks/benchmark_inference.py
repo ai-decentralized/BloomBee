@@ -172,10 +172,12 @@ def benchmark_inference(process_idx, args, result_pipe):
     if decode_target_steps <= 0:
         raise ValueError("decode_target_steps must be > 0")
 
-    total_max_length = prompt_length + decode_target_steps
+    # Reserve cache for the full requested sequence length, but optionally stop
+    # the benchmark loop early for shorter experimental runs.
+    total_max_length = prompt_length + requested_seq_len
     logger.info(
         f"{process_idx=} prompt_length={prompt_length}, requested_seq_len={requested_seq_len}, "
-        f"decode_target_steps={decode_target_steps}, total_max_length={total_max_length}"
+        f"decode_target_steps={decode_target_steps}, reserved_max_length={total_max_length}"
     )
     
     step_times = []
@@ -190,7 +192,7 @@ def benchmark_inference(process_idx, args, result_pipe):
             f"RequestedSeqLen={requested_seq_len} | DecodeTargetSteps={decode_target_steps}"
         )
         
-        for step in range(requested_seq_len):
+        for step in range(decode_target_steps):
             step_start_time = perf_counter()
             
             # For the first step, pass input_ids; for subsequent steps, generate() will use session state

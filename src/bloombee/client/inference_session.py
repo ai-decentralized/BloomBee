@@ -559,8 +559,35 @@ class InferenceSession:
         if draft_tokens is not None and is_spec_dec:
             inputs = self._restore_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
         # logger.info(f"after _recover_hidden_states: {inputs}")
-        outputs = inputs 
-        
+        outputs = inputs
+        # A retried downstream server session may resend full history to rebuild its
+        # server-side cache, which means the final stage can legitimately return
+        # hidden states for the whole cached prefix instead of only the current
+        # step's token(s). The caller of InferenceSession.step() expects outputs
+        # for the logical current input only, so trim the recovered full-history
+        # output back to the current token increment.
+        if (
+            torch.is_tensor(outputs)
+            and outputs.ndim == 3
+            and n_input_tokens > 0
+            and outputs.shape[1] > n_input_tokens
+        ):
+            logger.warning(
+                "Final stage returned full-history hidden states after session recovery; "
+                f"slicing seq_len from {outputs.shape[1]} to current_step_tokens={n_input_tokens}"
+            )
+            outputs = outputs[:, -n_input_tokens:, :]
+        elif (
+            torch.is_tensor(outputs)
+            and outputs.ndim == 3
+            and n_input_tokens > 0
+            and outputs.shape[1] < n_input_tokens
+        ):
+            raise RuntimeError(
+                "Final stage returned fewer tokens than requested for the current step: "
+                f"outputs.shape={tuple(outputs.shape)}, current_step_tokens={n_input_tokens}"
+            )
+
         # 🔍 CLIENT DEBUG: Log inference step end
         inference_step_end = time.perf_counter()
         inference_step_duration = (inference_step_end - inference_step_start) * 1000  # ms

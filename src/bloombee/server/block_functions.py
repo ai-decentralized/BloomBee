@@ -1673,8 +1673,16 @@ async def iterate_rpc_inference(
 
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
-        assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
-        
+        if hypo_ids.dtype != torch.int64:
+            if hypo_ids.numel() == 0:
+                logger.warning(
+                    "Coercing empty hypo_ids placeholder from "
+                    f"{hypo_ids.dtype} to torch.int64 in full-batch path"
+                )
+                hypo_ids = hypo_ids.to(dtype=torch.int64)
+            else:
+                raise AssertionError(f"hypo ids must be int64, got {hypo_ids.dtype}")
+
         # Add Cross-GPU Transfer Latency measurement
         cross_gpu_start_time = perf_counter()
         start_compute_time = perf_counter()  # Initialize compute time tracking
