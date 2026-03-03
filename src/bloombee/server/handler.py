@@ -1886,8 +1886,9 @@ class TransformerConnectionHandler(ConnectionHandler):
             # Log cross-GPU transfer start
             logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
-            # Sending hidden states serialized with output_schema to avoid double serialization
-            next_tensors = [serialized_outputs] + request.tensors[2:]
+            # Sending hidden states serialized with output_schema to avoid double serialization.
+            # `serialized_outputs` is already a sequence of runtime_pb2.Tensor objects.
+            next_tensors = list(serialized_outputs) + list(request.tensors[2:])
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
             next_metadata["sender_blocks"] = sender_blocks

@@ -323,7 +323,7 @@ class Server:
         self.policy = Policy(
             gpu_batch_size, num_gpu_batches,  # one working slot = one gpu_batch_size chunk
             100, 0,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent, cache_cpu_percent
+            50, 50,                   # cache_gpu_percent, cache_cpu_percent
             100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
