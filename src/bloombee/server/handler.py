@@ -1887,8 +1887,13 @@ class TransformerConnectionHandler(ConnectionHandler):
             logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
             # Sending hidden states serialized with output_schema to avoid double serialization.
-            # `serialized_outputs` is already a sequence of runtime_pb2.Tensor objects.
-            next_tensors = list(serialized_outputs) + list(request.tensors[2:])
+            # `serialized_outputs` already contains:
+            #   [hidden_states, keep_indices, need_pruning_next]
+            # The original request tensor at index 2 is the *old* need_pruning flag,
+            # so we must skip it when forwarding to the next stage or all subsequent
+            # tensor slots shift by one (prompts becomes a scalar, hypo_ids becomes
+            # the old prompts tensor, etc.).
+            next_tensors = list(serialized_outputs) + list(request.tensors[3:])
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
             next_metadata["sender_blocks"] = sender_blocks
