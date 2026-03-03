@@ -2186,7 +2186,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
                 f"serialize_ms={sender_serialize_ms:.3f} "
                 f"pre_send_wait_pending=1 "
-                f"sem_wait_ms={float(sender_sem_wait_ms):.3f}"
+                f"sem_wait_ms={float(sem_wait_time):.3f}"
             )
             
             # Track task to prevent garbage collection

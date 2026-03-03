@@ -4,6 +4,7 @@ import contextvars
 import math
 import os
 import struct
+import threading
 import time
 import zlib
 from contextlib import contextmanager
@@ -43,8 +44,20 @@ _MISSING_ZSTD_WARNING_EMITTED = False
 _COMP_PROFILE_ENV = "BLOOMBEE_COMP_RATIO_PROFILE"
 _COMP_TIMING_PROFILE_ENV = "BLOOMBEE_COMP_TIMING_PROFILE"
 _COMP_DETAIL_PROFILE_ENV = "BLOOMBEE_COMP_DETAIL_PROFILE"
+_COMP_RESEARCH_PROFILE_ENV = "BLOOMBEE_COMP_RESEARCH_PROFILE"
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
+)
+_COMP_RESEARCH_LOCK = threading.Lock()
+_COMP_RESEARCH_TOTAL_SAMPLES = 0
+_COMP_RESEARCH_BUCKETS: Dict[str, Dict[str, float]] = {}
+_COMP_RESEARCH_BUCKET_ORDER = (
+    "<4KB",
+    "4KB-49KB",
+    "49KB-80KB",
+    "80KB-200KB",
+    "200KB-1MB",
+    ">=1MB",
 )
 
 
@@ -155,6 +168,18 @@ def comp_detail_profile_enabled() -> bool:
     return _get_env_bool(_COMP_DETAIL_PROFILE_ENV, "0")
 
 
+def comp_research_profile_enabled() -> bool:
+    """
+    Enable lightweight rolling compression scaling summaries.
+    This is cheaper than COMP_DETAIL and intended for online cost/benefit analysis.
+    """
+    return _get_env_bool(_COMP_RESEARCH_PROFILE_ENV, "1")
+
+
+def _comp_research_log_every() -> int:
+    return max(1, _get_env_int("BLOOMBEE_COMP_SUMMARY_LOG_EVERY", 128))
+
+
 def _new_transport_profile() -> Dict[str, float]:
     return {
         "serialize_calls": 0.0,
@@ -215,6 +240,18 @@ def summarize_transport_profile(stats: Optional[Dict[str, float]]) -> Dict[str, 
     wire = float(summary["serialize_wire_bytes"])
     summary["serialize_ratio"] = wire / raw
     summary["serialize_savings"] = 1.0 - summary["serialize_ratio"]
+    summary["serialize_saved_bytes"] = max(0.0, raw - wire)
+    summary["compress_saved_kb_per_ms"] = (
+        (summary["serialize_saved_bytes"] / 1024.0) / summary["compress_ms"]
+        if summary["compress_ms"] > 0
+        else 0.0
+    )
+    summary["compress_only_break_even_bw_mbps"] = _break_even_bandwidth_mbps(
+        summary["serialize_saved_bytes"], summary["compress_ms"]
+    )
+    summary["wrapper_only_break_even_bw_mbps"] = _break_even_bandwidth_mbps(
+        summary["serialize_saved_bytes"], summary["serialize_wrapper_ms"]
+    )
 
     draw = max(float(summary["deserialize_wire_bytes"]), 1.0)
     draw_out = float(summary["deserialize_raw_bytes"])
@@ -258,6 +295,10 @@ def log_transport_profile_event(
         f"deserialize_raw_bytes={int(summary['deserialize_raw_bytes'])} "
         f"serialize_ratio={summary['serialize_ratio']:.6f} "
         f"serialize_savings={summary['serialize_savings']:.6f} "
+        f"serialize_saved_bytes={int(summary['serialize_saved_bytes'])} "
+        f"compress_saved_kb_per_ms={summary['compress_saved_kb_per_ms']:.6f} "
+        f"compress_only_break_even_bw_mbps={summary['compress_only_break_even_bw_mbps']:.3f} "
+        f"wrapper_only_break_even_bw_mbps={summary['wrapper_only_break_even_bw_mbps']:.3f} "
         f"compress_input_bytes={int(summary['compress_input_bytes'])} "
         f"compress_output_bytes={int(summary['compress_output_bytes'])} "
         f"decompress_input_bytes={int(summary['decompress_input_bytes'])} "
@@ -353,6 +394,106 @@ def _compression_type_name(compression_type: runtime_pb2.CompressionType) -> str
         return runtime_pb2.CompressionType.Name(int(compression_type))
     except Exception:
         return str(int(compression_type)) if compression_type is not None else "unknown"
+
+
+def _size_bucket_label(raw_bytes: int) -> str:
+    raw_i = max(0, int(raw_bytes))
+    if raw_i < 4 * 1024:
+        return "<4KB"
+    if raw_i < 49 * 1024:
+        return "4KB-49KB"
+    if raw_i < 80 * 1024:
+        return "49KB-80KB"
+    if raw_i < 200 * 1024:
+        return "80KB-200KB"
+    if raw_i < 1024 * 1024:
+        return "200KB-1MB"
+    return ">=1MB"
+
+
+def _break_even_bandwidth_mbps(saved_bytes: float, overhead_ms: float) -> float:
+    saved_f = max(0.0, float(saved_bytes))
+    overhead_f = max(0.0, float(overhead_ms))
+    if saved_f <= 0.0 or overhead_f <= 0.0:
+        return 0.0
+    return (saved_f * 8.0) / (overhead_f / 1000.0) / 1_000_000.0
+
+
+def _new_comp_research_bucket() -> Dict[str, float]:
+    return {
+        "samples": 0.0,
+        "applied": 0.0,
+        "raw_bytes": 0.0,
+        "wire_bytes": 0.0,
+        "saved_bytes": 0.0,
+        "compress_ms": 0.0,
+        "wrapper_ms": 0.0,
+        "break_even_bw_mbps": 0.0,
+    }
+
+
+def _record_comp_research_event(
+    *,
+    raw_bytes: int,
+    wire_bytes: int,
+    wrap_info: Dict[str, object],
+) -> None:
+    if not comp_research_profile_enabled():
+        return
+    raw_i = max(0, int(raw_bytes))
+    wire_i = max(0, int(wire_bytes))
+    bucket = _size_bucket_label(raw_i)
+    compress_ms = max(0.0, float(wrap_info.get("compress_elapsed_ms", 0.0) or 0.0))
+    wrapper_ms = max(0.0, float(wrap_info.get("wrapper_elapsed_ms", 0.0) or 0.0))
+    saved_bytes = max(0, raw_i - wire_i)
+    break_even_bw_mbps = _break_even_bandwidth_mbps(saved_bytes, compress_ms)
+
+    with _COMP_RESEARCH_LOCK:
+        global _COMP_RESEARCH_TOTAL_SAMPLES
+        stats = _COMP_RESEARCH_BUCKETS.setdefault(bucket, _new_comp_research_bucket())
+        stats["samples"] += 1.0
+        stats["applied"] += float(int(wrap_info.get("applied", 0) or 0))
+        stats["raw_bytes"] += float(raw_i)
+        stats["wire_bytes"] += float(wire_i)
+        stats["saved_bytes"] += float(saved_bytes)
+        stats["compress_ms"] += compress_ms
+        stats["wrapper_ms"] += wrapper_ms
+        stats["break_even_bw_mbps"] += break_even_bw_mbps
+        _COMP_RESEARCH_TOTAL_SAMPLES += 1
+
+        if _COMP_RESEARCH_TOTAL_SAMPLES % _comp_research_log_every() != 0:
+            return
+
+        parts = []
+        for label in _COMP_RESEARCH_BUCKET_ORDER:
+            bucket_stats = _COMP_RESEARCH_BUCKETS.get(label)
+            if not bucket_stats or bucket_stats["samples"] <= 0:
+                continue
+            sample_count = max(bucket_stats["samples"], 1.0)
+            raw_sum = max(bucket_stats["raw_bytes"], 1.0)
+            avg_ratio = bucket_stats["wire_bytes"] / raw_sum
+            avg_saved_bytes = bucket_stats["saved_bytes"] / sample_count
+            avg_comp_ms = bucket_stats["compress_ms"] / sample_count
+            avg_wrapper_ms = bucket_stats["wrapper_ms"] / sample_count
+            avg_break_even_bw_mbps = bucket_stats["break_even_bw_mbps"] / sample_count
+            apply_rate = bucket_stats["applied"] / sample_count
+            parts.append(
+                f"{label}:n={int(sample_count)}"
+                f",apply={apply_rate:.3f}"
+                f",R={avg_ratio:.6f}"
+                f",saved_kb={avg_saved_bytes / 1024.0:.2f}"
+                f",comp_ms={avg_comp_ms:.3f}"
+                f",wrap_ms={avg_wrapper_ms:.3f}"
+                f",be_bw={avg_break_even_bw_mbps:.3f}"
+            )
+        if parts:
+            logger.info(
+                "[COMP_SCALING_SUMMARY] "
+                f"total_samples={_COMP_RESEARCH_TOTAL_SAMPLES} "
+                f"lossless={int(_lossless_send_enabled())} "
+                f"algo={_lossless_algo()} "
+                + " | ".join(parts)
+            )
 
 
 def _sample_tensor_value_profile(tensor: Optional[torch.Tensor], max_values: int = 4096) -> Dict[str, float]:
@@ -463,6 +604,15 @@ def _log_comp_detail_event(
         wire_len = int(len(wire_buffer))
         ratio = (float(wire_len) / float(raw_len)) if raw_len > 0 else 1.0
         savings = 1.0 - ratio
+        saved_bytes = max(0, raw_len - wire_len)
+        size_bucket = _size_bucket_label(raw_len)
+        compress_elapsed_ms = max(0.0, float(wrap_info.get("compress_elapsed_ms", 0.0) or 0.0))
+        wrapper_elapsed_ms = max(0.0, float(wrap_info.get("wrapper_elapsed_ms", 0.0) or 0.0))
+        compress_saved_kb_per_ms = (
+            (saved_bytes / 1024.0) / compress_elapsed_ms if compress_elapsed_ms > 0.0 else 0.0
+        )
+        compress_only_break_even_bw_mbps = _break_even_bandwidth_mbps(saved_bytes, compress_elapsed_ms)
+        wrapper_only_break_even_bw_mbps = _break_even_bandwidth_mbps(saved_bytes, wrapper_elapsed_ms)
         tensor_stats = _sample_tensor_value_profile(tensor)
         byte_stats = _sample_buffer_profile(raw_buffer)
         shape = tuple(int(dim) for dim in tensor.shape) if torch.is_tensor(tensor) else ()
@@ -476,8 +626,15 @@ def _log_comp_detail_event(
             f"lossless_algo={wrap_info.get('algo_name', _lossless_algo())} "
             f"lossless_raw_bytes={raw_len} "
             f"lossless_wire_bytes={wire_len} "
+            f"lossless_saved_bytes={saved_bytes} "
             f"lossless_ratio={ratio:.6f} "
             f"lossless_savings={savings:.6f} "
+            f"size_bucket={size_bucket} "
+            f"compress_elapsed_ms={compress_elapsed_ms:.6f} "
+            f"wrapper_elapsed_ms={wrapper_elapsed_ms:.6f} "
+            f"compress_saved_kb_per_ms={compress_saved_kb_per_ms:.6f} "
+            f"compress_only_break_even_bw_mbps={compress_only_break_even_bw_mbps:.6f} "
+            f"wrapper_only_break_even_bw_mbps={wrapper_only_break_even_bw_mbps:.6f} "
             f"lossless_compressed_bytes={int(wrap_info.get('compressed_bytes', 0))} "
             f"lossless_wrapped_bytes={int(wrap_info.get('wrapped_bytes', wire_len))} "
             f"lossless_net_gain_bytes={int(wrap_info.get('net_gain_bytes', max(0, raw_len - wire_len)))} "
@@ -608,6 +765,8 @@ def _wrap_serialized_tensor_impl(
         "net_gain_bytes": 0,
         "min_bytes": _lossless_min_bytes(),
         "min_gain_bytes": _lossless_min_gain_bytes(),
+        "compress_elapsed_ms": 0.0,
+        "wrapper_elapsed_ms": 0.0,
     }
     wrap_t0 = time.perf_counter()
     try:
@@ -626,7 +785,9 @@ def _wrap_serialized_tensor_impl(
             info["reason"] = "already_wrapped"
             return serialized_tensor, info
 
+        compress_t0 = time.perf_counter()
         algo_id, compressed = _compress_buffer(raw)
+        info["compress_elapsed_ms"] = (time.perf_counter() - compress_t0) * 1000.0
         info["compressed_bytes"] = int(len(compressed))
         if algo_id == 0:
             info["reason"] = "compressor_not_applied"
@@ -649,7 +810,9 @@ def _wrap_serialized_tensor_impl(
         _record_transport_profile("serialize_wrapper_applied_calls", 1.0)
         return wrapped, info
     finally:
-        _record_transport_profile("serialize_wrapper_ms", (time.perf_counter() - wrap_t0) * 1000.0)
+        wrapper_elapsed_ms = (time.perf_counter() - wrap_t0) * 1000.0
+        info["wrapper_elapsed_ms"] = wrapper_elapsed_ms
+        _record_transport_profile("serialize_wrapper_ms", wrapper_elapsed_ms)
 
 
 def wrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_pb2.Tensor:
@@ -710,6 +873,11 @@ def serialize_torch_tensor(
     _record_transport_profile("serialize_raw_bytes", float(len(serialized.buffer)))
     wrapped, wrap_info = _wrap_serialized_tensor_impl(serialized)
     _record_transport_profile("serialize_wire_bytes", float(len(wrapped.buffer)))
+    _record_comp_research_event(
+        raw_bytes=len(serialized.buffer),
+        wire_bytes=len(wrapped.buffer),
+        wrap_info=wrap_info,
+    )
     _log_comp_detail_event(
         tensor=tensor,
         compression_type=compression_type,

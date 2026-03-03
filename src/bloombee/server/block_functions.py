@@ -129,6 +129,26 @@ def _estimate_bandwidth_mbps(total_bytes: Any, elapsed_ms: Any) -> float:
     return (bytes_f * 8.0) / (ms_f / 1000.0) / 1_000_000.0
 
 
+def _interval_overlap_ms_from_us(
+    range_start_us: int,
+    range_end_us: int,
+    window_start_us: int,
+    window_end_us: int,
+) -> float:
+    if (
+        range_start_us <= 0
+        or range_end_us <= range_start_us
+        or window_start_us <= 0
+        or window_end_us <= window_start_us
+    ):
+        return 0.0
+    overlap_start_us = max(range_start_us, window_start_us)
+    overlap_end_us = min(range_end_us, window_end_us)
+    if overlap_end_us <= overlap_start_us:
+        return 0.0
+    return (overlap_end_us - overlap_start_us) / 1000.0
+
+
 def _as_python_bool(value: Any) -> bool:
     """Safely normalize scalar/tensor flags to a Python bool."""
     if value is None:
@@ -1057,6 +1077,8 @@ async def iterate_rpc_inference(
                     clock_uncorrected_pair_count = 0
                     clock_offset_abs_sum_ms = 0.0
                     clock_rtt_max_ms = 0.0
+                    total_next_sender_serialize_ms = 0.0
+                    hidden_next_sender_serialize_ms = 0.0
                     
                     # For each pair (MB_n on this stage, MB_{n+1} on previous stage),
                     # compute strict overlap as interval intersection:
@@ -1078,6 +1100,12 @@ async def iterate_rpc_inference(
                             
                             stage1_next_start_us = _to_int(next_mb_data.get('prev_stage_compute_start_us'), 0)
                             stage1_next_end_us = _to_int(next_mb_data.get('prev_stage_compute_end_us'), 0)
+                            stage1_next_sender_serialize_start_us = _to_int(
+                                next_mb_data.get('sender_serialize_start_us'), 0
+                            )
+                            stage1_next_sender_serialize_end_us = _to_int(
+                                next_mb_data.get('sender_serialize_end_us'), 0
+                            )
                             stage1_next_clock_offset_us = _to_int(next_mb_data.get('prev_stage_clock_offset_us'), 0)
                             stage1_next_clock_rtt_us = max(0, _to_int(next_mb_data.get('prev_stage_clock_rtt_us'), 0))
                             stage1_next_clock_samples = _to_int(next_mb_data.get('prev_stage_clock_samples'), 0)
@@ -1101,6 +1129,10 @@ async def iterate_rpc_inference(
                             if stage1_next_clock_samples > 0:
                                 stage1_next_start_us += stage1_next_clock_offset_us
                                 stage1_next_end_us += stage1_next_clock_offset_us
+                                if stage1_next_sender_serialize_start_us > 0:
+                                    stage1_next_sender_serialize_start_us += stage1_next_clock_offset_us
+                                if stage1_next_sender_serialize_end_us > 0:
+                                    stage1_next_sender_serialize_end_us += stage1_next_clock_offset_us
                                 clock_corrected_pair_count += 1
                                 clock_offset_abs_sum_ms += abs(stage1_next_clock_offset_us) / 1000.0
                                 clock_rtt_max_ms = max(clock_rtt_max_ms, stage1_next_clock_rtt_us / 1000.0)
@@ -1117,6 +1149,22 @@ async def iterate_rpc_inference(
                                 continue
 
                             total_comparable_stage2_compute_ms += this_compute_ms
+                            next_sender_serialize_total_ms = (
+                                max(0.0, (stage1_next_sender_serialize_end_us - stage1_next_sender_serialize_start_us) / 1000.0)
+                                if (
+                                    stage1_next_sender_serialize_start_us > 0
+                                    and stage1_next_sender_serialize_end_us > stage1_next_sender_serialize_start_us
+                                )
+                                else 0.0
+                            )
+                            next_sender_serialize_hidden_ms = _interval_overlap_ms_from_us(
+                                this_compute_start_us,
+                                this_compute_end_us,
+                                stage1_next_sender_serialize_start_us,
+                                stage1_next_sender_serialize_end_us,
+                            )
+                            total_next_sender_serialize_ms += next_sender_serialize_total_ms
+                            hidden_next_sender_serialize_ms += next_sender_serialize_hidden_ms
 
                             overlap_start_us = max(this_compute_start_us, stage1_next_start_us)
                             overlap_end_us = min(this_compute_end_us, stage1_next_end_us)
@@ -1152,6 +1200,7 @@ async def iterate_rpc_inference(
                         stage2_queue_wait_pre_ms = float(overlap_accum.get('queue_wait_pre_ms', 0.0))
                         stage2_queue_wait_inter_ms = float(overlap_accum.get('queue_wait_inter_ms', 0.0))
                         stage2_deserialize_sum_ms = float(overlap_accum.get('deserialize_ms_sum', 0.0))
+                        stage2_decompress_sum_ms = float(overlap_accum.get('decompress_ms_sum', 0.0))
                         stage2_elapsed_to_summary_ms = (
                             (perf_counter() - overlap_accum.get('step_start_time', step_receive_time)) * 1000.0
                         )
@@ -1170,6 +1219,14 @@ async def iterate_rpc_inference(
                         stage2_queue_wait_pre_wire_receive_ms = 0.0
                         stage2_queue_wait_pre_receiver_dispatch_ms = 0.0
                         stage2_queue_wait_pre_breakdown_ready = 0
+                        next_sender_serialize_exposed_ms = max(
+                            0.0, total_next_sender_serialize_ms - hidden_next_sender_serialize_ms
+                        )
+                        next_sender_serialize_hidden_pct = (
+                            (hidden_next_sender_serialize_ms / total_next_sender_serialize_ms) * 100.0
+                            if total_next_sender_serialize_ms > 0.0
+                            else 0.0
+                        )
 
                         mb0_data = overlap_summary.get(0, {})
                         mb0_wait_start_us = _to_int(mb0_data.get('this_stage_queue_wait_start_us'), 0)
@@ -1350,6 +1407,10 @@ async def iterate_rpc_inference(
                         overlap_accum['queue_wait_pre_wire_receive_ms'] = stage2_queue_wait_pre_wire_receive_ms
                         overlap_accum['queue_wait_pre_receiver_dispatch_ms'] = stage2_queue_wait_pre_receiver_dispatch_ms
                         overlap_accum['queue_wait_pre_breakdown_ready'] = stage2_queue_wait_pre_breakdown_ready
+                        overlap_accum['next_sender_serialize_total_ms'] = total_next_sender_serialize_ms
+                        overlap_accum['next_sender_serialize_hidden_ms'] = hidden_next_sender_serialize_ms
+                        overlap_accum['next_sender_serialize_exposed_ms'] = next_sender_serialize_exposed_ms
+                        overlap_accum['next_sender_serialize_hidden_pct'] = next_sender_serialize_hidden_pct
                         overlap_efficiency = (total_overlap_ms / total_stage2_compute_ms) * 100
                         strict_efficiency = (
                             (total_overlap_ms / total_comparable_stage2_compute_ms) * 100
@@ -1384,6 +1445,12 @@ async def iterate_rpc_inference(
                             f"Stage2_queue_wait_pre_breakdown_ready={stage2_queue_wait_pre_breakdown_ready}, "
                             f"Stage2_queue_wait_inter={stage2_queue_wait_inter_ms:.1f}ms, "
                             f"Stage2_deserialize={stage2_deserialize_sum_ms:.1f}ms, "
+                            f"Stage2_decompress_on_critical_path={stage2_decompress_sum_ms:.1f}ms, "
+                            f"Stage2_decompress_hidden=0.0ms, "
+                            f"Stage1_next_sender_serialize_total={total_next_sender_serialize_ms:.1f}ms, "
+                            f"Stage1_next_sender_serialize_hidden={hidden_next_sender_serialize_ms:.1f}ms, "
+                            f"Stage1_next_sender_serialize_exposed={next_sender_serialize_exposed_ms:.1f}ms, "
+                            f"Stage1_next_sender_serialize_hidden_pct={next_sender_serialize_hidden_pct:.1f}%, "
                             f"Stage2_critical_path={stage2_critical_path_ms:.1f}ms, "
                             f"Stage2_full_path={stage2_full_path_ms:.1f}ms, "
                             f"Stage2_residual={stage2_residual_path_ms:.1f}ms, "
@@ -1463,6 +1530,10 @@ async def iterate_rpc_inference(
                 queue_wait_pre_wire_receive_ms = float(accum.get('queue_wait_pre_wire_receive_ms', 0.0))
                 queue_wait_pre_receiver_dispatch_ms = float(accum.get('queue_wait_pre_receiver_dispatch_ms', 0.0))
                 queue_wait_pre_breakdown_ready = int(accum.get('queue_wait_pre_breakdown_ready', 0) or 0)
+                next_sender_serialize_total_ms = float(accum.get('next_sender_serialize_total_ms', 0.0))
+                next_sender_serialize_hidden_ms = float(accum.get('next_sender_serialize_hidden_ms', 0.0))
+                next_sender_serialize_exposed_ms = float(accum.get('next_sender_serialize_exposed_ms', 0.0))
+                next_sender_serialize_hidden_pct = float(accum.get('next_sender_serialize_hidden_pct', 0.0))
                 merge_residual_ms = merge_total_ms - (
                     deserialize_sum_ms + compute_sum_ms + merge_serialize_ms
                 )
@@ -1502,6 +1573,12 @@ async def iterate_rpc_inference(
                     f"queue_wait_pre_wire_receive={queue_wait_pre_wire_receive_ms:.2f}ms "
                     f"queue_wait_pre_receiver_dispatch={queue_wait_pre_receiver_dispatch_ms:.2f}ms "
                     f"queue_wait_pre_breakdown_ready={queue_wait_pre_breakdown_ready} "
+                    f"next_sender_serialize_total={next_sender_serialize_total_ms:.2f}ms "
+                    f"next_sender_serialize_hidden={next_sender_serialize_hidden_ms:.2f}ms "
+                    f"next_sender_serialize_exposed={next_sender_serialize_exposed_ms:.2f}ms "
+                    f"next_sender_serialize_hidden_pct={next_sender_serialize_hidden_pct:.2f}% "
+                    f"decompress_on_critical_path={decompress_sum_ms:.2f}ms "
+                    f"decompress_hidden=0.00ms "
                     f"queue_wait_inter={queue_wait_inter_ms:.2f}ms "
                     f"full_path={full_path_ms:.2f}ms "
                     f"residual_to_full={residual_to_full_ms:.2f}ms "
