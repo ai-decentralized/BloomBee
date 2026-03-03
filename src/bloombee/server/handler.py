@@ -18,11 +18,8 @@ from hivemind import (
     MSGPackSerializer,
     P2PContext,
     PeerID,
-    deserialize_tensor_stream,
-    deserialize_torch_tensor,
     nested_flatten,
     nested_pack,
-    serialize_torch_tensor,
 )
 from hivemind.moe.server.connection_handler import ConnectionHandler
 from hivemind.p2p.p2p_daemon import DEFAULT_MAX_MSG_SIZE
@@ -39,6 +36,7 @@ from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backw
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.convert_block import QuantType
+from bloombee.utils.lossless_transport import deserialize_tensor_stream, deserialize_torch_tensor, serialize_torch_tensor
 
 logger = get_logger(__name__)
 

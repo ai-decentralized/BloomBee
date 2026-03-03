@@ -133,8 +133,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             spec_trees = drafter.build_trees_parallel(
                 current_input_ids, seq_lengths, beam_width, max_tree_depth, 
             )
-            # t2 = time.perf_counter()
-            # logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
+            t2 = time.perf_counter()
+            logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
             # logger.info(f"spec_trees, {spec_trees}")
             
             # 2. Verify trees using distributed inference
@@ -150,8 +150,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 seq_lengths=seq_lengths,
             )
             
-            # t3 = time.perf_counter()
-            # logger.info(f"Step {step_idx}: Verified trees with distributed inference in {t3 - t2:.4f} seconds")
+            t3 = time.perf_counter()
+            logger.info(f"Step {step_idx}: Verified trees with distributed inference in {t3 - t2:.4f} seconds")
             
             # logger.info(f"verified_tokens_positions: {verified_tokens_positions}")
             
