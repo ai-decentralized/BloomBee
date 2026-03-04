@@ -217,6 +217,19 @@ class _ServerInferenceSession:
         server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
         compression = server_side_inference_schema[0].compression
         inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
+        transport_phase = "spec_decode" if is_spec_dec else ("prefill" if not self.stepped else "decode")
+        tensor_debug_names = (
+            "hidden_states",
+            "keep_indices",
+            "need_pruning",
+            "prompts",
+            "hypo_ids",
+            "tree_attention_mask",
+            "kv_cache_position_ids",
+            "draft_tokens",
+            "prefill_length",
+            "is_spec_dec",
+        )
 
         # TODO: create more explicit way to check servers schema and client's structure
         # assert len(input_tensors) >= len(
@@ -232,9 +245,17 @@ class _ServerInferenceSession:
             serialized_tensors = [
                 serialize_torch_tensor(
                     tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
-                    proto.compression
+                    proto.compression,
+                    debug_context={
+                        "phase": transport_phase,
+                        "tensor_name": tensor_debug_names[idx] if idx < len(tensor_debug_names) else f"arg_{idx}",
+                        "source": "client",
+                        "channel": "rpc_inference",
+                        "blocks": f"{self.span.start}:{self.span.end}",
+                        "batch": int(logical_full_batch_size),
+                    },
                 )
-                for tensor, proto in zip(input_tensors, inference_schema)
+                for idx, (tensor, proto) in enumerate(zip(input_tensors, inference_schema))
             ]
             serialized_metadata = MSGPackSerializer.dumps(request_metadata)
 
@@ -296,7 +317,11 @@ class _ServerInferenceSession:
             step_id=step_id,
             batch_size=int(logical_full_batch_size),
             stats=transport_profile,
-            extra={"peer": str(self.span.peer_id)},
+            extra={
+                "peer": str(self.span.peer_id),
+                "phase": transport_phase,
+                "seq_tokens": int(inputs.shape[1]) if inputs.ndim >= 2 else 1,
+            },
         )
         # assert (
         #     outputs[0].shape == inputs.shape

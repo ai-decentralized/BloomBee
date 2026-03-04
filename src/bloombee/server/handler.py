@@ -2019,23 +2019,50 @@ class TransformerConnectionHandler(ConnectionHandler):
             outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
             sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
             serialize_start_us = self._now_us()
+            transport_phase = "prefill" if mb_hidden.ndim >= 2 and int(mb_hidden.shape[1]) > 1 else "decode"
+            sender_blocks_str = str(metadata.get("sender_blocks", "unknown"))
+            push_blocks = f"{sender_blocks_str}->{next_start}:{next_end}"
             with transport_profile_scope() as push_transport_profile:
                 serialized_hidden = serialize_torch_tensor(
                     mb_hidden.to(outputs_schema[0].dtype),
                     outputs_schema[0].compression,
-                    allow_inplace=True
+                    allow_inplace=True,
+                    debug_context={
+                        "phase": transport_phase,
+                        "tensor_name": "hidden_states",
+                        "source": "server",
+                        "channel": "rpc_push_microbatch",
+                        "blocks": push_blocks,
+                        "batch": int(mb_size),
+                    },
                 )
                 if mb_keep_indices is not None:
                     serialized_keep = serialize_torch_tensor(
                         mb_keep_indices.to(torch.int64),
                         outputs_schema[1].compression if len(outputs_schema) > 1 else runtime_pb2.CompressionType.NONE,
-                        allow_inplace=True
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": transport_phase,
+                            "tensor_name": "keep_indices",
+                            "source": "server",
+                            "channel": "rpc_push_microbatch",
+                            "blocks": push_blocks,
+                            "batch": int(mb_size),
+                        },
                     )
                 else:
                     serialized_keep = serialize_torch_tensor(
                         torch.arange(mb_hidden.shape[1], dtype=torch.int64),
                         runtime_pb2.CompressionType.NONE,
-                        allow_inplace=True
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": transport_phase,
+                            "tensor_name": "keep_indices",
+                            "source": "server",
+                            "channel": "rpc_push_microbatch",
+                            "blocks": push_blocks,
+                            "batch": int(mb_size),
+                        },
                     )
             serialize_end_us = self._now_us()
             sender_serialize_ms = max(0.0, (serialize_end_us - serialize_start_us) / 1000.0)
@@ -2044,29 +2071,36 @@ class TransformerConnectionHandler(ConnectionHandler):
                 if sender_compute_end_us > 0 and serialize_start_us >= sender_compute_end_us
                 else -1.0
             )
-            sender_blocks = str(metadata.get("sender_blocks", "unknown"))
             log_comp_ratio_event(
                 logger,
                 source="server",
                 channel="rpc_push_microbatch",
-                blocks=f"{sender_blocks}->{next_start}:{next_end}",
+                blocks=push_blocks,
                 step_id=str(metadata.get("step_id", "unknown")),
                 batch_size=int(mb_size),
                 tensor_name="hidden_states",
                 raw_bytes=tensor_raw_nbytes(mb_hidden),
                 wire_bytes=len(serialized_hidden.buffer),
                 nnz_ratio=tensor_nnz_ratio(mb_hidden),
-                extra={"mb_idx": int(mb_idx)},
+                extra={
+                    "mb_idx": int(mb_idx),
+                    "phase": transport_phase,
+                    "seq_tokens": int(mb_hidden.shape[1]) if mb_hidden.ndim >= 2 else 1,
+                },
             )
             log_transport_profile_event(
                 logger,
                 source="server",
                 channel="rpc_push_microbatch",
-                blocks=f"{sender_blocks}->{next_start}:{next_end}",
+                blocks=push_blocks,
                 step_id=str(metadata.get("step_id", "unknown")),
                 batch_size=int(mb_size),
                 stats=push_transport_profile,
-                extra={"mb_idx": int(mb_idx)},
+                extra={
+                    "mb_idx": int(mb_idx),
+                    "phase": transport_phase,
+                    "seq_tokens": int(mb_hidden.shape[1]) if mb_hidden.ndim >= 2 else 1,
+                },
             )
             activation_raw_bytes = int(metadata.get("activation_raw_bytes", tensor_raw_nbytes(mb_hidden)))
             activation_wire_bytes = len(serialized_hidden.buffer)

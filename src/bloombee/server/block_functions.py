@@ -1483,13 +1483,29 @@ async def iterate_rpc_inference(
                 
                 need_pruning_next = torch.tensor(0)
                 merge_serialize_start = perf_counter()
+                transport_phase = (
+                    "prefill" if merged_hidden_states.ndim >= 2 and int(merged_hidden_states.shape[1]) > 1 else "decode"
+                )
+                output_debug_names = ("hidden_states", "keep_indices", "need_pruning_next")
                 with transport_profile_scope() as merge_transport_profile:
                     output_tensors = [
-                        serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-                        for result, proto in zip(
+                        serialize_torch_tensor(
+                            result.to(proto.dtype),
+                            proto.compression,
+                            allow_inplace=True,
+                            debug_context={
+                                "phase": transport_phase,
+                                "tensor_name": output_debug_names[idx] if idx < len(output_debug_names) else f"output_{idx}",
+                                "source": "server",
+                                "channel": "rpc_inference_mb_merge",
+                                "blocks": _block_span_from_uids(requested_uids),
+                                "batch": int(merged_hidden_states.shape[0]) if merged_hidden_states.ndim >= 1 else 1,
+                            },
+                        )
+                        for idx, (result, proto) in enumerate(zip(
                             (merged_hidden_states, merged_keep_indices, need_pruning_next), 
                             nested_flatten(requested_backends[-1].outputs_schema)
-                        )
+                        ))
                     ]
                 merge_transport_summary = summarize_transport_profile(merge_transport_profile)
                 log_comp_ratio_event(
@@ -1503,6 +1519,10 @@ async def iterate_rpc_inference(
                     raw_bytes=tensor_raw_nbytes(merged_hidden_states),
                     wire_bytes=len(output_tensors[0].buffer) if output_tensors else 0,
                     nnz_ratio=tensor_nnz_ratio(merged_hidden_states),
+                    extra={
+                        "phase": transport_phase,
+                        "seq_tokens": int(merged_hidden_states.shape[1]) if merged_hidden_states.ndim >= 2 else 1,
+                    },
                 )
                 merge_serialize_ms = (perf_counter() - merge_serialize_start) * 1000.0
                 merge_total_ms = (perf_counter() - accum.get('step_start_time', step_receive_time)) * 1000.0
@@ -1598,6 +1618,8 @@ async def iterate_rpc_inference(
                         "decompress_sum_ms": f"{decompress_sum_ms:.3f}",
                         "deserialize_unwrap_sum_ms": f"{deserialize_unwrap_sum_ms:.3f}",
                         "deserialize_core_sum_ms": f"{deserialize_core_sum_ms:.3f}",
+                        "phase": transport_phase,
+                        "seq_tokens": int(merged_hidden_states.shape[1]) if merged_hidden_states.ndim >= 2 else 1,
                     },
                 )
                 # Cleanup accumulator
@@ -2357,10 +2379,26 @@ async def iterate_rpc_inference(
         
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)
+        transport_phase = "prefill" if hidden_states.ndim >= 2 and int(hidden_states.shape[1]) > 1 else "decode"
+        output_debug_names = ("hidden_states", "keep_indices", "need_pruning_next")
         with transport_profile_scope() as full_serialize_profile:
             output_tensors = [
-                serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-                for result, proto in zip((hidden_states, keep_indices, need_pruning_next), nested_flatten(requested_backends[-1].outputs_schema))
+                serialize_torch_tensor(
+                    result.to(proto.dtype),
+                    proto.compression,
+                    allow_inplace=True,
+                    debug_context={
+                        "phase": transport_phase,
+                        "tensor_name": output_debug_names[idx] if idx < len(output_debug_names) else f"output_{idx}",
+                        "source": "server",
+                        "channel": "rpc_inference_final",
+                        "blocks": _block_span_from_uids(requested_uids),
+                        "batch": int(hidden_states.shape[0]) if hidden_states.ndim >= 1 else 1,
+                    },
+                )
+                for idx, (result, proto) in enumerate(
+                    zip((hidden_states, keep_indices, need_pruning_next), nested_flatten(requested_backends[-1].outputs_schema))
+                )
             ]
         full_serialize_summary = summarize_transport_profile(full_serialize_profile)
         log_comp_ratio_event(
@@ -2374,6 +2412,10 @@ async def iterate_rpc_inference(
             raw_bytes=tensor_raw_nbytes(hidden_states),
             wire_bytes=len(output_tensors[0].buffer) if output_tensors else 0,
             nnz_ratio=tensor_nnz_ratio(hidden_states),
+            extra={
+                "phase": transport_phase,
+                "seq_tokens": int(hidden_states.shape[1]) if hidden_states.ndim >= 2 else 1,
+            },
         )
         serialize_end = perf_counter()
         serialize_time = (serialize_end - serialize_start) * 1000  # ms
@@ -2441,7 +2483,11 @@ async def iterate_rpc_inference(
                 "decompress_input_bytes": full_deserialize_summary.get("decompress_input_bytes", 0.0),
                 "decompress_output_bytes": full_deserialize_summary.get("decompress_output_bytes", 0.0),
             },
-            extra={"mode": execution_mode},
+            extra={
+                "mode": execution_mode,
+                "phase": transport_phase,
+                "seq_tokens": int(hidden_states.shape[1]) if hidden_states.ndim >= 2 else 1,
+            },
         )
         
         # [MBPIPE] Record stage timing for cross-stage overlap decisions

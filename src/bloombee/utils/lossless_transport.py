@@ -504,6 +504,15 @@ def _sample_tensor_value_profile(tensor: Optional[torch.Tensor], max_values: int
         "tensor_sample_mean": 0.0,
         "tensor_sample_std": 0.0,
         "tensor_sample_abs_mean": 0.0,
+        "tensor_sample_min": 0.0,
+        "tensor_sample_max": 0.0,
+        "tensor_sample_abs_p50": 0.0,
+        "tensor_sample_abs_p90": 0.0,
+        "tensor_sample_abs_p99": 0.0,
+        "fp16_roundtrip_mae": 0.0,
+        "fp16_roundtrip_p99_abs_err": 0.0,
+        "fp16_roundtrip_max_abs_err": 0.0,
+        "fp16_roundtrip_rel_mae": 0.0,
         "tensor_sample_size": 0.0,
     }
     if tensor is None or not torch.is_tensor(tensor):
@@ -513,12 +522,14 @@ def _sample_tensor_value_profile(tensor: Optional[torch.Tensor], max_values: int
         if flat.numel() <= 0:
             return profile
         sample = flat[: min(int(flat.numel()), int(max_values))]
+        is_floating = bool(torch.is_floating_point(sample))
         if sample.device.type != "cpu":
             sample = sample.to("cpu")
         sample = sample.to(torch.float32)
         sample_n = int(sample.numel())
         if sample_n <= 0:
             return profile
+        abs_sample = sample.abs()
         zero_ratio = float((sample == 0).sum().item()) / float(sample_n)
         pos_ratio = float((sample > 0).sum().item()) / float(sample_n)
         if sample_n <= 512:
@@ -526,6 +537,20 @@ def _sample_tensor_value_profile(tensor: Optional[torch.Tensor], max_values: int
         else:
             rounded = torch.round(sample * 1000.0) / 1000.0
             unique_ratio = float(torch.unique(rounded).numel()) / float(sample_n)
+        abs_p50 = float(torch.quantile(abs_sample, 0.50).item())
+        abs_p90 = float(torch.quantile(abs_sample, 0.90).item())
+        abs_p99 = float(torch.quantile(abs_sample, 0.99).item())
+        fp16_roundtrip_mae = 0.0
+        fp16_roundtrip_p99_abs_err = 0.0
+        fp16_roundtrip_max_abs_err = 0.0
+        fp16_roundtrip_rel_mae = 0.0
+        if is_floating:
+            fp16_roundtrip = sample.to(torch.float16).to(torch.float32)
+            abs_err = (fp16_roundtrip - sample).abs()
+            fp16_roundtrip_mae = float(abs_err.mean().item())
+            fp16_roundtrip_p99_abs_err = float(torch.quantile(abs_err, 0.99).item())
+            fp16_roundtrip_max_abs_err = float(abs_err.max().item())
+            fp16_roundtrip_rel_mae = float((abs_err / abs_sample.clamp_min(1e-8)).mean().item())
         profile.update(
             {
                 "tensor_zero_ratio": zero_ratio,
@@ -534,6 +559,15 @@ def _sample_tensor_value_profile(tensor: Optional[torch.Tensor], max_values: int
                 "tensor_sample_mean": float(sample.mean().item()),
                 "tensor_sample_std": float(sample.std(unbiased=False).item()),
                 "tensor_sample_abs_mean": float(sample.abs().mean().item()),
+                "tensor_sample_min": float(sample.min().item()),
+                "tensor_sample_max": float(sample.max().item()),
+                "tensor_sample_abs_p50": abs_p50,
+                "tensor_sample_abs_p90": abs_p90,
+                "tensor_sample_abs_p99": abs_p99,
+                "fp16_roundtrip_mae": fp16_roundtrip_mae,
+                "fp16_roundtrip_p99_abs_err": fp16_roundtrip_p99_abs_err,
+                "fp16_roundtrip_max_abs_err": fp16_roundtrip_max_abs_err,
+                "fp16_roundtrip_rel_mae": fp16_roundtrip_rel_mae,
                 "tensor_sample_size": float(sample_n),
             }
         )
@@ -596,6 +630,7 @@ def _log_comp_detail_event(
     raw_buffer: bytes,
     wire_buffer: bytes,
     wrap_info: Dict[str, object],
+    debug_context: Optional[Dict[str, object]] = None,
 ) -> None:
     if not comp_detail_profile_enabled():
         return
@@ -649,6 +684,15 @@ def _log_comp_detail_event(
             f"tensor_sample_mean={tensor_stats['tensor_sample_mean']:.6f} "
             f"tensor_sample_std={tensor_stats['tensor_sample_std']:.6f} "
             f"tensor_sample_abs_mean={tensor_stats['tensor_sample_abs_mean']:.6f} "
+            f"tensor_sample_min={tensor_stats['tensor_sample_min']:.6f} "
+            f"tensor_sample_max={tensor_stats['tensor_sample_max']:.6f} "
+            f"tensor_sample_abs_p50={tensor_stats['tensor_sample_abs_p50']:.6f} "
+            f"tensor_sample_abs_p90={tensor_stats['tensor_sample_abs_p90']:.6f} "
+            f"tensor_sample_abs_p99={tensor_stats['tensor_sample_abs_p99']:.6f} "
+            f"fp16_roundtrip_mae={tensor_stats['fp16_roundtrip_mae']:.6f} "
+            f"fp16_roundtrip_p99_abs_err={tensor_stats['fp16_roundtrip_p99_abs_err']:.6f} "
+            f"fp16_roundtrip_max_abs_err={tensor_stats['fp16_roundtrip_max_abs_err']:.6f} "
+            f"fp16_roundtrip_rel_mae={tensor_stats['fp16_roundtrip_rel_mae']:.6f} "
             f"tensor_sample_size={int(tensor_stats['tensor_sample_size'])} "
             f"byte_sample_size={int(byte_stats['byte_sample_size'])} "
             f"byte_zero_ratio={byte_stats['byte_zero_ratio']:.6f} "
@@ -658,6 +702,9 @@ def _log_comp_detail_event(
             f"byte_adj_repeat_ratio={byte_stats['byte_adj_repeat_ratio']:.6f} "
             f"byte_entropy_bits={byte_stats['byte_entropy_bits']:.6f}"
         )
+        if debug_context:
+            for k, v in debug_context.items():
+                msg += f" {k}={v}"
         logger.info(msg)
     except Exception:
         return
@@ -858,6 +905,7 @@ def serialize_torch_tensor(
     compression_type: runtime_pb2.CompressionType = runtime_pb2.CompressionType.NONE,
     info=None,
     allow_inplace: bool = False,
+    debug_context: Optional[Dict[str, object]] = None,
     **kwargs,
 ) -> runtime_pb2.Tensor:
     t0 = time.perf_counter()
@@ -884,6 +932,7 @@ def serialize_torch_tensor(
         raw_buffer=serialized.buffer,
         wire_buffer=wrapped.buffer,
         wrap_info=wrap_info,
+        debug_context=debug_context,
     )
     return wrapped
 
