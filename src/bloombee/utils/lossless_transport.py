@@ -4,6 +4,7 @@ import contextvars
 import math
 import os
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -45,6 +46,13 @@ _COMP_PROFILE_ENV = "BLOOMBEE_COMP_RATIO_PROFILE"
 _COMP_TIMING_PROFILE_ENV = "BLOOMBEE_COMP_TIMING_PROFILE"
 _COMP_DETAIL_PROFILE_ENV = "BLOOMBEE_COMP_DETAIL_PROFILE"
 _COMP_RESEARCH_PROFILE_ENV = "BLOOMBEE_COMP_RESEARCH_PROFILE"
+_COMP_BIT_PROFILE_ENV = "BLOOMBEE_COMP_BIT_PROFILE"
+_COMP_STRIDE_PROFILE_ENV = "BLOOMBEE_COMP_STRIDE_PROFILE"
+_ACT_DIST_PROFILE_ENV = "BLOOMBEE_ACT_DIST_PROFILE"
+_DEBUG_TENSOR_NAMES_ENV = "BLOOMBEE_DEBUG_TENSOR_NAMES"
+_WIRE_TRUNCATE_FP16_ENV = "BLOOMBEE_WIRE_TRUNCATE_FP16"
+_WIRE_TRUNCATE_TARGETS_ENV = "BLOOMBEE_WIRE_TRUNCATE_TARGETS"
+_WIRE_TRUNCATE_PHASES_ENV = "BLOOMBEE_WIRE_TRUNCATE_PHASES"
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
 )
@@ -59,6 +67,7 @@ _COMP_RESEARCH_BUCKET_ORDER = (
     "200KB-1MB",
     ">=1MB",
 )
+_SER_LAYOUT_LOGGED_DTYPES: set[str] = set()
 
 
 def _get_env_bool(name: str, default: str = "0") -> bool:
@@ -174,6 +183,108 @@ def comp_research_profile_enabled() -> bool:
     This is cheaper than COMP_DETAIL and intended for online cost/benefit analysis.
     """
     return _get_env_bool(_COMP_RESEARCH_PROFILE_ENV, "1")
+
+
+def comp_bit_profile_enabled() -> bool:
+    """
+    Enable bit-level floating-point profiling (sign/exponent/mantissa) on sampled tensors.
+    """
+    return _get_env_bool(_COMP_BIT_PROFILE_ENV, "0")
+
+
+def comp_stride_profile_enabled() -> bool:
+    """
+    Enable strided/chunk repeat diagnostics to inspect alignment-sensitive byte patterns.
+    """
+    return _get_env_bool(_COMP_STRIDE_PROFILE_ENV, "0")
+
+
+def act_dist_profile_enabled() -> bool:
+    """
+    Enable activation magnitude decade histogram logs (10x bins).
+    """
+    return _get_env_bool(_ACT_DIST_PROFILE_ENV, "0")
+
+
+@lru_cache(maxsize=1)
+def _debug_tensor_names() -> set[str]:
+    raw = os.environ.get(_DEBUG_TENSOR_NAMES_ENV, "hidden_states")
+    names = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    return names or {"hidden_states"}
+
+
+def _is_debug_target_tensor(
+    tensor: Optional[torch.Tensor],
+    debug_context: Optional[Dict[str, object]],
+) -> bool:
+    if tensor is None or not torch.is_tensor(tensor):
+        return False
+    if not torch.is_floating_point(tensor):
+        return False
+    if debug_context is None:
+        return False
+    tensor_name = str(debug_context.get("tensor_name", "")).strip().lower()
+    names = _debug_tensor_names()
+    return "*" in names or tensor_name in names
+
+
+def wire_truncate_fp16_enabled() -> bool:
+    """
+    If enabled, selected FP32 tensors are truncated to FP16 before serialization.
+    """
+    return _get_env_bool(_WIRE_TRUNCATE_FP16_ENV, "0")
+
+
+@lru_cache(maxsize=1)
+def _wire_truncate_targets() -> List[str]:
+    raw = os.environ.get(_WIRE_TRUNCATE_TARGETS_ENV, "client:rpc_inference:hidden_states")
+    return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+@lru_cache(maxsize=1)
+def _wire_truncate_phases() -> set[str]:
+    raw = os.environ.get(_WIRE_TRUNCATE_PHASES_ENV, "prefill,decode,spec_decode")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _match_target_pattern(actual: str, pattern: str) -> bool:
+    return pattern in ("*", "") or actual == pattern
+
+
+def _context_matches_wire_target(debug_context: Optional[Dict[str, object]]) -> bool:
+    if not debug_context:
+        return False
+    source = str(debug_context.get("source", "")).strip().lower()
+    channel = str(debug_context.get("channel", "")).strip().lower()
+    tensor_name = str(debug_context.get("tensor_name", "")).strip().lower()
+    phase = str(debug_context.get("phase", "")).strip().lower()
+    phases = _wire_truncate_phases()
+    if phases and phase and phase not in phases:
+        return False
+    for spec in _wire_truncate_targets():
+        parts = spec.split(":")
+        if len(parts) != 3:
+            continue
+        if (
+            _match_target_pattern(source, parts[0])
+            and _match_target_pattern(channel, parts[1])
+            and _match_target_pattern(tensor_name, parts[2])
+        ):
+            return True
+    return False
+
+
+def _should_wire_truncate_fp16(
+    tensor: Optional[torch.Tensor],
+    debug_context: Optional[Dict[str, object]],
+) -> bool:
+    if not wire_truncate_fp16_enabled():
+        return False
+    if tensor is None or not torch.is_tensor(tensor):
+        return False
+    if tensor.dtype != torch.float32:
+        return False
+    return _context_matches_wire_target(debug_context)
 
 
 def _comp_research_log_every() -> int:
@@ -623,6 +734,396 @@ def _sample_buffer_profile(buffer: bytes, max_bytes: int = 4096) -> Dict[str, fl
     return profile
 
 
+def _entropy_from_counts(counts: Iterable[int], total: int) -> float:
+    if total <= 0:
+        return 0.0
+    entropy = 0.0
+    denom = float(total)
+    for c in counts:
+        if c <= 0:
+            continue
+        p = float(c) / denom
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def _sample_fp_bit_profile(tensor: Optional[torch.Tensor], max_values: int = 4096) -> Dict[str, object]:
+    profile: Dict[str, object] = {
+        "fp_bits": 0,
+        "fp_sample_size": 0,
+        "fp_sign_one_ratio": 0.0,
+        "fp_exp_unique": 0,
+        "fp_exp_top1": -1,
+        "fp_exp_top1_ratio": 0.0,
+        "fp_exp_entropy_bits": 0.0,
+        "fp_exp_adj_repeat_ratio": 0.0,
+        "fp_exp_zero_ratio": 0.0,
+        "fp_exp_all_ones_ratio": 0.0,
+        "fp_mantissa_zero_ratio": 0.0,
+        "fp_exp_topk": "",
+    }
+    if tensor is None or not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
+        return profile
+    try:
+        flat = tensor.detach().reshape(-1)
+        if flat.numel() <= 0:
+            return profile
+        sample = flat[: min(int(flat.numel()), int(max_values))]
+        if sample.device.type != "cpu":
+            sample = sample.to("cpu")
+        sample = sample.contiguous()
+        sample_n = int(sample.numel())
+        if sample_n <= 0:
+            return profile
+
+        if sample.dtype == torch.float32:
+            bits = sample.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+            sign = (bits >> 31) & 0x1
+            exponent = (bits >> 23) & 0xFF
+            mantissa = bits & 0x7FFFFF
+            exp_cardinality = 256
+            exp_all_ones = 0xFF
+            fp_bits = 32
+        elif sample.dtype == torch.float16:
+            bits = sample.view(torch.int16).to(torch.int64) & 0xFFFF
+            sign = (bits >> 15) & 0x1
+            exponent = (bits >> 10) & 0x1F
+            mantissa = bits & 0x3FF
+            exp_cardinality = 32
+            exp_all_ones = 0x1F
+            fp_bits = 16
+        else:
+            # We only do exact bit-lane attribution for FP16/FP32.
+            return profile
+
+        exp_counts = torch.bincount(exponent.to(torch.int64), minlength=exp_cardinality)
+        exp_total = int(exp_counts.sum().item())
+        exp_top_k = min(4, exp_cardinality)
+        exp_top_vals, exp_top_idx = torch.topk(exp_counts, k=exp_top_k)
+        exp_top_parts: List[str] = []
+        for idx_i, cnt_i in zip(exp_top_idx.tolist(), exp_top_vals.tolist()):
+            if cnt_i <= 0:
+                continue
+            exp_top_parts.append(f"{int(idx_i)}:{(float(cnt_i) / float(sample_n)):.4f}")
+
+        adj_repeat = float((exponent[1:] == exponent[:-1]).sum().item()) / float(max(1, sample_n - 1))
+
+        profile.update(
+            {
+                "fp_bits": fp_bits,
+                "fp_sample_size": sample_n,
+                "fp_sign_one_ratio": float(sign.float().mean().item()),
+                "fp_exp_unique": int((exp_counts > 0).sum().item()),
+                "fp_exp_top1": int(exp_top_idx[0].item()) if exp_top_vals.numel() > 0 else -1,
+                "fp_exp_top1_ratio": (float(exp_top_vals[0].item()) / float(sample_n)) if exp_top_vals.numel() > 0 else 0.0,
+                "fp_exp_entropy_bits": _entropy_from_counts(exp_counts.tolist(), exp_total),
+                "fp_exp_adj_repeat_ratio": adj_repeat,
+                "fp_exp_zero_ratio": float((exponent == 0).float().mean().item()),
+                "fp_exp_all_ones_ratio": float((exponent == exp_all_ones).float().mean().item()),
+                "fp_mantissa_zero_ratio": float((mantissa == 0).float().mean().item()),
+                "fp_exp_topk": ",".join(exp_top_parts),
+            }
+        )
+    except Exception:
+        return profile
+    return profile
+
+
+def _fp_layout_description(dtype: Optional[torch.dtype]) -> str:
+    if dtype == torch.float32:
+        # For little-endian IEEE-754 FP32 values:
+        # lane0=b0 (mantissa bits 0..7)
+        # lane1=b1 (mantissa bits 8..15)
+        # lane2=b2 (mantissa bits 16..22 + exponent bit 0)
+        # lane3=b3 (exponent bits 1..7 + sign bit)
+        return "fp32_le lanes:0=m[0:8],1=m[8:16],2=m[16:23]+e0,3=e[1:8]+s"
+    if dtype == torch.float16:
+        # For little-endian IEEE-754 FP16 values:
+        # lane0=b0 (mantissa bits 0..7)
+        # lane1=b1 (mantissa bits 8..9 + exponent bits 0..4 + sign bit)
+        return "fp16_le lanes:0=m[0:8],1=m[8:10]+e[0:5]+s"
+    return ""
+
+
+def _log_serial_layout_once(dtype: Optional[torch.dtype]) -> None:
+    if dtype is None:
+        return
+    dtype_name = str(dtype).replace("torch.", "")
+    if dtype_name in _SER_LAYOUT_LOGGED_DTYPES:
+        return
+    layout = _fp_layout_description(dtype)
+    if not layout:
+        return
+    _SER_LAYOUT_LOGGED_DTYPES.add(dtype_name)
+    logger.info(
+        "[SER_LAYOUT] "
+        f"dtype={dtype_name} "
+        f"byteorder={sys.byteorder} "
+        f"mapping=\"{layout}\""
+    )
+
+
+def _sample_strided_pattern_profile(
+    buffer: bytes,
+    *,
+    elem_size: int,
+    max_bytes: int = 16384,
+) -> Dict[str, object]:
+    profile: Dict[str, object] = {
+        "stride_elem_size": int(elem_size),
+        "stride_sample_bytes": 0,
+        "stride_best_repeat_offset": -1,
+        "stride_best_repeat_ratio": 0.0,
+        "stride_offset0_repeat_ratio": 0.0,
+        "stride_repeat_by_offset": "",
+        "stride_adj_eq_by_offset": "",
+        "stride_lane_entropy": "",
+        "stride_lane_zero_ratio": "",
+    }
+    if not buffer or elem_size <= 0:
+        return profile
+    sample = memoryview(buffer)[: min(len(buffer), int(max_bytes))]
+    n = int(len(sample))
+    if n < elem_size:
+        return profile
+    profile["stride_sample_bytes"] = n
+
+    repeat_parts: List[str] = []
+    adj_parts: List[str] = []
+    lane_entropy_parts: List[str] = []
+    lane_zero_parts: List[str] = []
+    best_offset = -1
+    best_repeat = -1.0
+
+    for offset in range(elem_size):
+        chunk_count = (n - offset) // elem_size
+        if chunk_count <= 0:
+            repeat_parts.append(f"o{offset}:0.0000")
+            adj_parts.append(f"o{offset}:0.0000")
+            continue
+        seen: set[bytes] = set()
+        prev_chunk: Optional[bytes] = None
+        adj_eq = 0
+        for i in range(chunk_count):
+            st = offset + i * elem_size
+            chunk = bytes(sample[st : st + elem_size])
+            if prev_chunk is not None and chunk == prev_chunk:
+                adj_eq += 1
+            prev_chunk = chunk
+            seen.add(chunk)
+        repeat_ratio = 1.0 - (float(len(seen)) / float(chunk_count))
+        adj_ratio = float(adj_eq) / float(max(1, chunk_count - 1))
+        repeat_parts.append(f"o{offset}:{repeat_ratio:.4f}")
+        adj_parts.append(f"o{offset}:{adj_ratio:.4f}")
+        if repeat_ratio > best_repeat:
+            best_repeat = repeat_ratio
+            best_offset = offset
+
+        lane = sample[offset:n:elem_size]
+        lane_n = int(len(lane))
+        if lane_n > 0:
+            counts = [0] * 256
+            for b in lane:
+                counts[int(b)] += 1
+            lane_entropy = _entropy_from_counts(counts, lane_n)
+            lane_zero_ratio = float(counts[0]) / float(lane_n)
+            lane_entropy_parts.append(f"o{offset}:{lane_entropy:.4f}")
+            lane_zero_parts.append(f"o{offset}:{lane_zero_ratio:.4f}")
+
+    profile["stride_best_repeat_offset"] = int(best_offset)
+    profile["stride_best_repeat_ratio"] = max(0.0, float(best_repeat))
+    profile["stride_offset0_repeat_ratio"] = float(best_repeat if elem_size == 1 else 0.0)
+    if elem_size > 1:
+        # Extract o0 from assembled parts.
+        for part in repeat_parts:
+            if part.startswith("o0:"):
+                profile["stride_offset0_repeat_ratio"] = float(part.split(":")[1])
+                break
+    profile["stride_repeat_by_offset"] = ",".join(repeat_parts)
+    profile["stride_adj_eq_by_offset"] = ",".join(adj_parts)
+    profile["stride_lane_entropy"] = ",".join(lane_entropy_parts)
+    profile["stride_lane_zero_ratio"] = ",".join(lane_zero_parts)
+    return profile
+
+
+def _sample_abs_decade_histogram(
+    tensor: Optional[torch.Tensor],
+    max_values: int = 4096,
+) -> Dict[str, object]:
+    profile: Dict[str, object] = {
+        "act_sample_size": 0,
+        "act_abs_zero_ratio": 0.0,
+        "act_abs_lt_0_1_count": 0,
+        "act_abs_ge_1000_count": 0,
+        "act_abs_lt_0_1_ratio": 0.0,
+        "act_abs_ge_1000_ratio": 0.0,
+        "act_abs_bin_counts": "",
+        "act_abs_bin_ratio": "",
+        "act_abs_decade_hist": "",
+        "act_abs_decade_peak": "",
+    }
+    if tensor is None or not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
+        return profile
+    try:
+        flat = tensor.detach().reshape(-1)
+        if flat.numel() <= 0:
+            return profile
+        sample = flat[: min(int(flat.numel()), int(max_values))]
+        if sample.device.type != "cpu":
+            sample = sample.to("cpu")
+        sample = sample.to(torch.float32)
+        abs_sample = sample.abs()
+        sample_n = int(abs_sample.numel())
+        if sample_n <= 0:
+            return profile
+        zero_count = int((abs_sample == 0).sum().item())
+        bins = (
+            ("0.1~1", 0.1, 1.0),
+            ("1~10", 1.0, 10.0),
+            ("10~100", 10.0, 100.0),
+            ("100~1000", 100.0, 1000.0),
+        )
+        counts: List[int] = []
+        labels: List[str] = []
+        for label, lo, hi in bins:
+            cnt = int(((abs_sample >= lo) & (abs_sample < hi)).sum().item())
+            labels.append(label)
+            counts.append(cnt)
+
+        low_tail = int((abs_sample < 0.1).sum().item())
+        high_tail = int((abs_sample >= 1000.0).sum().item())
+
+        ratio_parts: List[str] = []
+        count_parts: List[str] = []
+        peak_idx = -1
+        peak_val = -1
+        denom = float(max(1, sample_n))
+        for idx, (label, cnt) in enumerate(zip(labels, counts)):
+            ratio = float(cnt) / denom
+            ratio_parts.append(f"{label}:{ratio:.6f}")
+            count_parts.append(f"{label}:{cnt}")
+            if cnt > peak_val:
+                peak_val = cnt
+                peak_idx = idx
+
+        profile.update(
+            {
+                "act_sample_size": sample_n,
+                "act_abs_zero_ratio": float(zero_count) / float(sample_n),
+                "act_abs_lt_0_1_count": low_tail,
+                "act_abs_ge_1000_count": high_tail,
+                "act_abs_lt_0_1_ratio": float(low_tail) / float(sample_n),
+                "act_abs_ge_1000_ratio": float(high_tail) / float(sample_n),
+                "act_abs_bin_counts": ",".join(count_parts),
+                "act_abs_bin_ratio": ",".join(ratio_parts),
+                "act_abs_decade_hist": ",".join(ratio_parts),
+                "act_abs_decade_peak": labels[peak_idx] if peak_idx >= 0 else "",
+            }
+        )
+    except Exception:
+        return profile
+    return profile
+
+
+def _log_comp_bit_event(
+    *,
+    tensor: Optional[torch.Tensor],
+    debug_context: Optional[Dict[str, object]],
+) -> None:
+    if not comp_bit_profile_enabled():
+        return
+    if not _is_debug_target_tensor(tensor, debug_context):
+        return
+    _log_serial_layout_once(tensor.dtype if torch.is_tensor(tensor) else None)
+    fp = _sample_fp_bit_profile(tensor)
+    if int(fp.get("fp_sample_size", 0) or 0) <= 0:
+        return
+    msg = (
+        "[COMP_BIT] "
+        f"fp_bits={int(fp.get('fp_bits', 0))} "
+        f"fp_sample_size={int(fp.get('fp_sample_size', 0))} "
+        f"fp_sign_one_ratio={float(fp.get('fp_sign_one_ratio', 0.0)):.6f} "
+        f"fp_exp_unique={int(fp.get('fp_exp_unique', 0))} "
+        f"fp_exp_top1={int(fp.get('fp_exp_top1', -1))} "
+        f"fp_exp_top1_ratio={float(fp.get('fp_exp_top1_ratio', 0.0)):.6f} "
+        f"fp_exp_entropy_bits={float(fp.get('fp_exp_entropy_bits', 0.0)):.6f} "
+        f"fp_exp_adj_repeat_ratio={float(fp.get('fp_exp_adj_repeat_ratio', 0.0)):.6f} "
+        f"fp_exp_zero_ratio={float(fp.get('fp_exp_zero_ratio', 0.0)):.6f} "
+        f"fp_exp_all_ones_ratio={float(fp.get('fp_exp_all_ones_ratio', 0.0)):.6f} "
+        f"fp_mantissa_zero_ratio={float(fp.get('fp_mantissa_zero_ratio', 0.0)):.6f} "
+        f"fp_exp_topk={fp.get('fp_exp_topk', '')}"
+    )
+    if debug_context:
+        for k, v in debug_context.items():
+            msg += f" {k}={v}"
+    logger.info(msg)
+
+
+def _log_stride_pattern_event(
+    *,
+    tensor: Optional[torch.Tensor],
+    raw_buffer: bytes,
+    debug_context: Optional[Dict[str, object]],
+) -> None:
+    if not comp_stride_profile_enabled():
+        return
+    if not _is_debug_target_tensor(tensor, debug_context):
+        return
+    if tensor is None or not torch.is_tensor(tensor):
+        return
+    elem_size = int(tensor.element_size())
+    if elem_size <= 0:
+        return
+    stride = _sample_strided_pattern_profile(raw_buffer, elem_size=elem_size)
+    msg = (
+        "[COMP_ZSTD_STRIDE] "
+        f"elem_size={int(stride.get('stride_elem_size', 0))} "
+        f"sample_bytes={int(stride.get('stride_sample_bytes', 0))} "
+        f"best_repeat_offset={int(stride.get('stride_best_repeat_offset', -1))} "
+        f"best_repeat_ratio={float(stride.get('stride_best_repeat_ratio', 0.0)):.6f} "
+        f"offset0_repeat_ratio={float(stride.get('stride_offset0_repeat_ratio', 0.0)):.6f} "
+        f"repeat_by_offset={stride.get('stride_repeat_by_offset', '')} "
+        f"adj_eq_by_offset={stride.get('stride_adj_eq_by_offset', '')} "
+        f"lane_entropy={stride.get('stride_lane_entropy', '')} "
+        f"lane_zero_ratio={stride.get('stride_lane_zero_ratio', '')}"
+    )
+    if debug_context:
+        for k, v in debug_context.items():
+            msg += f" {k}={v}"
+    logger.info(msg)
+
+
+def _log_activation_distribution_event(
+    *,
+    tensor: Optional[torch.Tensor],
+    debug_context: Optional[Dict[str, object]],
+) -> None:
+    if not act_dist_profile_enabled():
+        return
+    if not _is_debug_target_tensor(tensor, debug_context):
+        return
+    dist = _sample_abs_decade_histogram(tensor)
+    if int(dist.get("act_sample_size", 0) or 0) <= 0:
+        return
+    msg = (
+        "[ACT_DIST] "
+        f"act_sample_size={int(dist.get('act_sample_size', 0))} "
+        f"act_abs_zero_ratio={float(dist.get('act_abs_zero_ratio', 0.0)):.6f} "
+        f"act_abs_lt_0_1_count={int(dist.get('act_abs_lt_0_1_count', 0))} "
+        f"act_abs_lt_0_1_ratio={float(dist.get('act_abs_lt_0_1_ratio', 0.0)):.6f} "
+        f"act_abs_ge_1000_count={int(dist.get('act_abs_ge_1000_count', 0))} "
+        f"act_abs_ge_1000_ratio={float(dist.get('act_abs_ge_1000_ratio', 0.0)):.6f} "
+        f"act_abs_bin_counts={dist.get('act_abs_bin_counts', '')} "
+        f"act_abs_bin_ratio={dist.get('act_abs_bin_ratio', '')} "
+        f"act_abs_decade_peak={dist.get('act_abs_decade_peak', '')} "
+        f"act_abs_decade_hist={dist.get('act_abs_decade_hist', '')}"
+    )
+    if debug_context:
+        for k, v in debug_context.items():
+            msg += f" {k}={v}"
+    logger.info(msg)
+
+
 def _log_comp_detail_event(
     *,
     tensor: Optional[torch.Tensor],
@@ -706,6 +1207,9 @@ def _log_comp_detail_event(
             for k, v in debug_context.items():
                 msg += f" {k}={v}"
         logger.info(msg)
+        _log_comp_bit_event(tensor=tensor, debug_context=debug_context)
+        _log_stride_pattern_event(tensor=tensor, raw_buffer=raw_buffer, debug_context=debug_context)
+        _log_activation_distribution_event(tensor=tensor, debug_context=debug_context)
     except Exception:
         return
 
@@ -908,9 +1412,32 @@ def serialize_torch_tensor(
     debug_context: Optional[Dict[str, object]] = None,
     **kwargs,
 ) -> runtime_pb2.Tensor:
+    effective_tensor = tensor
+    effective_debug_context = dict(debug_context) if debug_context else None
+    if _should_wire_truncate_fp16(tensor, debug_context):
+        try:
+            effective_tensor = tensor.to(torch.float16)
+            if effective_debug_context is None:
+                effective_debug_context = {}
+            effective_debug_context["wire_cast"] = "fp32_to_fp16_truncate"
+            effective_debug_context["wire_src_dtype"] = str(tensor.dtype).replace("torch.", "")
+            effective_debug_context["wire_dst_dtype"] = "float16"
+            if debug_context:
+                logger.info(
+                    "[WIRE_CAST] "
+                    "action=fp32_to_fp16_truncate "
+                    f"source={debug_context.get('source', '')} "
+                    f"channel={debug_context.get('channel', '')} "
+                    f"tensor_name={debug_context.get('tensor_name', '')} "
+                    f"phase={debug_context.get('phase', '')} "
+                    f"shape={tuple(int(dim) for dim in tensor.shape)}"
+                )
+        except Exception:
+            effective_tensor = tensor
+
     t0 = time.perf_counter()
     serialized = _serialize_torch_tensor(
-        tensor,
+        effective_tensor,
         compression_type=compression_type,
         info=info,
         allow_inplace=allow_inplace,
@@ -927,12 +1454,12 @@ def serialize_torch_tensor(
         wrap_info=wrap_info,
     )
     _log_comp_detail_event(
-        tensor=tensor,
+        tensor=effective_tensor,
         compression_type=compression_type,
         raw_buffer=serialized.buffer,
         wire_buffer=wrapped.buffer,
         wrap_info=wrap_info,
-        debug_context=debug_context,
+        debug_context=effective_debug_context,
     )
     return wrapped
 
