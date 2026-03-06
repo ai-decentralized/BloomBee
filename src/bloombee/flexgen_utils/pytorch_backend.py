@@ -22,6 +22,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 import logging
 from hivemind.utils import get_logger
+from bloombee.utils.debug import dprint
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -50,7 +51,7 @@ def see_memory_usage(message, force=True):
 	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
 	logger +=   'Max Memory Allocated: ' + str(
 		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-	print(logger)
+	dprint(logger)
  
  
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -487,7 +488,7 @@ class TorchDevice:
         head_dim = h // n_head
         scaling = head_dim ** -0.5
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
-        print('mha hidden size ', hidden.shape)
+        dprint('mha hidden size ', hidden.shape)
         # shape: (b, s, h)
         q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
         k = F.linear(hidden, w_k.data, bias=b_k.data)
@@ -991,9 +992,9 @@ class TorchDevice:
                 f.write(f"  cur_mem: {cur_mem/GB:.4f} GB, "
                         f" peak_mem: {peak_mem/GB:.4f} GB\n")
         else:
-            print(f"TorchDevice: {self.name}")
-            print(f"  cur_mem: {cur_mem/GB:.4f} GB, "
-                  f" peak_mem: {peak_mem/GB:.4f} GB")
+            dprint(f"TorchDevice: {self.name}")
+            dprint(f"  cur_mem: {cur_mem/GB:.4f} GB, "
+                   f" peak_mem: {peak_mem/GB:.4f} GB")
 
         return cur_mem, peak_mem
 
@@ -1011,7 +1012,7 @@ class TorchDisk:
         self.device_type = DeviceType.DISK
         # TorchCompressedDevice = compression.TorchCompressedDevice
         self.compressed_device = TorchCompressedDevice(self)
-        print('TorchDisk, self.compressed_device ', self.compressed_device)
+        dprint('TorchDisk, self.compressed_device ', self.compressed_device)
 
         if os.path.exists(self.path):
             assert os.path.isdir(self.path)

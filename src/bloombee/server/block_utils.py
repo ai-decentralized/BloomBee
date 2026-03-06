@@ -12,6 +12,7 @@ from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
+from bloombee.utils.debug import dprint
 
 
 def resolve_block_dtype(config: PretrainedConfig, dtype: Union[str, torch.dtype]) -> torch.dtype:
@@ -63,7 +64,7 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
     They will not be passed to other block constructors.
     """
     if config.block_class == WrappedMixtralBlock:
-        print('server/block_utils.py config.block_class == WrappedMixtralBlock ')
+        dprint('server/block_utils.py config.block_class == WrappedMixtralBlock ')
         config = PreTrainedModel._autoset_attn_implementation(config)
         return config.block_class(config, layer_idx)
     # config.block_class == WrappedLlamaBlock in distributedllamaconfig in config.py

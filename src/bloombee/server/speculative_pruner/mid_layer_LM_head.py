@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import os
 import numpy as np
 
+from bloombee.utils.debug import dprint
+
+
 class MidLMHead(nn.Module):
     def __init__(self, hidden_size, vocab_size):
         super().__init__()
@@ -14,7 +17,7 @@ class MidLMHead(nn.Module):
             path = os.path.join(path, "lm_head.weight")
         w = np.load(path)
         self.weight.data.copy_(torch.from_numpy(w).to(torch.float32))
-        print(f"[OK] Initialized with pretrained weights: {self.weight.shape}")
+        dprint(f"[OK] Initialized with pretrained weights: {self.weight.shape}")
 
     def forward(self, hidden_states):
         return F.linear(hidden_states, self.weight)

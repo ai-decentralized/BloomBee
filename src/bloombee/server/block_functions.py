@@ -40,6 +40,7 @@ from bloombee.utils.microbatch_schema import (
     create_microbatch_result_metadata,
     MBPIPE_SCHEMA_PREFIX,
 )
+from bloombee.utils.debug import dprint
 
 # [MBPIPE] Cross-stage streaming push support
 _cross_stage_push_callback = None  # Will be set by handler for cross-stage streaming
@@ -52,7 +53,7 @@ def print_time_now(s):
     current_utc_datetime = datetime.now(timezone.utc)  
     # Format the datetime to the desired string format  
     formatted_utc_time = current_utc_datetime.strftime('%Y-%m-%d %H:%M:%S.%f %Z')  
-    print('\t\t\t'+s+" UTC Time: "+ str(formatted_utc_time) )  
+    dprint('\t\t\t'+s+" UTC Time: "+ str(formatted_utc_time) )  
     
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
@@ -261,13 +262,12 @@ async def run_rpc_forward(
         if i > 0:  # Only measure transfer between different backends
             estimated_transfer_time = backend_total_time - task_processing_time
             s1_to_s2_transfer_times.append(estimated_transfer_time)
-            logger.info(f"[S1_TO_S2_TRANSFER] Backend {i} | "
+            logger.debug(f"[S1_TO_S2_TRANSFER] Backend {i} | "
                        f"Estimated Transfer Time: {estimated_transfer_time:.2f}ms | "
                        f"Total Backend Time: {backend_total_time:.2f}ms | "
                        f"Pure Processing: {task_processing_time:.2f}ms")
         
-        # Log processing latency for each backend
-        logger.info(f"[PROCESSING_LATENCY] Backend {i} | "
+        logger.debug(f"[PROCESSING_LATENCY] Backend {i} | "
                    f"Task Processing: {task_processing_time:.2f}ms | "
                    f"Total Backend Time: {backend_total_time:.2f}ms | "
                    f"Hidden States Shape: {hidden_states.shape}")
@@ -277,20 +277,18 @@ async def run_rpc_forward(
             hidden_states.ndim == 3
         ), f"inputs to {type(backend)} must be a list with a single 3d tensor of hidden states"
 
-    # Calculate total Cross-GPU Transfer Latency
     cross_gpu_end_time = perf_counter()
     cross_gpu_latency = (cross_gpu_end_time - cross_gpu_start_time) * 1000
     
-    # Calculate S1->S2 transfer statistics
     if s1_to_s2_transfer_times:
         s1_to_s2_mean = sum(s1_to_s2_transfer_times) / len(s1_to_s2_transfer_times)
         s1_to_s2_total = sum(s1_to_s2_transfer_times)
-        logger.info(f"[S1_TO_S2_TRANSFER_SUMMARY] "
+        logger.debug(f"[S1_TO_S2_TRANSFER_SUMMARY] "
                    f"Average Transfer: {s1_to_s2_mean:.2f}ms | "
                    f"Total Transfer: {s1_to_s2_total:.2f}ms | "
                    f"Transfer Count: {len(s1_to_s2_transfer_times)}")
     
-    logger.info(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
+    logger.debug(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
                f"Backends: {len(requested_backends)} | "
                f"Output Shape: {hidden_states.shape}")
 
@@ -1331,7 +1329,7 @@ async def iterate_rpc_inference(
                             f"(preserve full spec context)"
                         )
                     if enable_cross_stage and log_mb_detail:
-                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled: {len(next_servers)} downstream stages")
+                        logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled: {len(next_servers)} downstream stages")
                     
                     async def process_microbatch_merged(mb_idx: int, mb_start: int, mb_end: int, total_mb: int):
                         """Process a single micro-batch through merged pool with GPU memory reuse."""
@@ -1581,7 +1579,7 @@ async def iterate_rpc_inference(
                         launch_overhead_ratio = (total_launch_overhead / total_elapsed * 100) if total_elapsed > 0 else 0
                         
                         start_pos_for_log = step_metadata.get("start_from_position") if isinstance(step_metadata, dict) else "unknown"
-                        logger.info(
+                        logger.debug(
                             f"[MBPIPE_SUMMARY] step={start_pos_for_log} mb={len(kv_timing_stats)} "
                             f"compute={total_compute:.1f}ms elapsed={total_elapsed:.1f}ms "
                             f"wait={total_wait_overhead:.1f}ms({wait_overhead_ratio:.1f}%) "
@@ -1589,15 +1587,15 @@ async def iterate_rpc_inference(
                             f"efficiency={compute_efficiency:.1f}%"
                         )
                         if log_mb_detail:
-                            logger.info(f"[MBPIPE_SUMMARY] Total prefetch wait: {total_prefetch_wait:.1f}ms ({total_prefetch_wait_calls} calls)")
-                            logger.info(f"[MBPIPE_SUMMARY] Total offload wait: {total_offload_wait:.1f}ms ({total_offload_wait_calls} calls)")
-                            logger.info(f"[MBPIPE_SUMMARY] Total prefetch launch: {total_prefetch_launch:.1f}ms ({total_prefetch_launch_calls} calls)")
-                            logger.info(f"[MBPIPE_SUMMARY] Total offload launch: {total_offload_launch:.1f}ms ({total_offload_launch_calls} calls)")
+                            logger.debug(f"[MBPIPE_SUMMARY] Total prefetch wait: {total_prefetch_wait:.1f}ms ({total_prefetch_wait_calls} calls)")
+                            logger.debug(f"[MBPIPE_SUMMARY] Total offload wait: {total_offload_wait:.1f}ms ({total_offload_wait_calls} calls)")
+                            logger.debug(f"[MBPIPE_SUMMARY] Total prefetch launch: {total_prefetch_launch:.1f}ms ({total_prefetch_launch_calls} calls)")
+                            logger.debug(f"[MBPIPE_SUMMARY] Total offload launch: {total_offload_launch:.1f}ms ({total_offload_launch_calls} calls)")
                         if verbose_mb:
-                            logger.info(f"[MBPIPE_SUMMARY] ----- Per Micro-Batch Breakdown -----")
+                            logger.debug(f"[MBPIPE_SUMMARY] ----- Per Micro-Batch Breakdown -----")
                             for stat in kv_timing_stats:
                                 mb_eff = (stat['compute_ms'] / stat['total_ms'] * 100) if stat['total_ms'] > 0 else 0
-                                logger.info(f"[MBPIPE_SUMMARY] MB{stat['mb_idx']}: "
+                                logger.debug(f"[MBPIPE_SUMMARY] MB{stat['mb_idx']}: "
                                            f"compute={stat['compute_ms']:.1f}ms, "
                                            f"prefetch_wait={stat['prefetch_wait_ms']:.1f}ms({stat['prefetch_wait_calls']}), "
                                            f"offload_wait={stat['offload_wait_ms']:.1f}ms({stat['offload_wait_calls']}), "
@@ -1650,7 +1648,7 @@ async def iterate_rpc_inference(
                             f"(preserve full spec context)"
                         )
                     if enable_cross_stage:
-                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled (separate_pools): {len(next_servers)} downstream stages")
+                        logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled (separate_pools): {len(next_servers)} downstream stages")
                     
                     async def process_microbatch(mb_idx: int, mb_start: int, mb_end: int):
                         """Process a single micro-batch through all backends."""
@@ -1715,7 +1713,7 @@ async def iterate_rpc_inference(
                                 cross_stage_push_fn(push_hidden, push_keep, push_metadata)
                             )
                             cross_stage_push_tasks.append(push_task)
-                            logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
+                            logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
                         
                         return mb_hidden, mb_keep_idx
                     
@@ -1790,12 +1788,12 @@ async def iterate_rpc_inference(
                         if i > 0:
                             estimated_transfer_time = backend_total_time - task_processing_time
                             s1_to_s2_transfer_times.append(estimated_transfer_time)
-                            logger.info(f"[S1_TO_S2_TRANSFER] Backend {i} | "
+                            logger.debug(f"[S1_TO_S2_TRANSFER] Backend {i} | "
                                        f"Estimated Transfer Time: {estimated_transfer_time:.2f}ms | "
                                        f"Total Backend Time: {backend_total_time:.2f}ms | "
                                        f"Pure Processing: {task_processing_time:.2f}ms")
                         
-                        logger.info(f"[PROCESSING_LATENCY] Backend {i} | "
+                        logger.debug(f"[PROCESSING_LATENCY] Backend {i} | "
                                    f"Task Processing: {task_processing_time:.2f}ms | "
                                    f"Total Backend Time: {backend_total_time:.2f}ms | "
                                    f"Hidden States Shape: {hidden_states.shape}")
@@ -1803,7 +1801,7 @@ async def iterate_rpc_inference(
                     if s1_to_s2_transfer_times:
                         s1_to_s2_mean = sum(s1_to_s2_transfer_times) / len(s1_to_s2_transfer_times)
                         s1_to_s2_total = sum(s1_to_s2_transfer_times)
-                        logger.info(f"[S1_TO_S2_TRANSFER_SUMMARY] "
+                        logger.debug(f"[S1_TO_S2_TRANSFER_SUMMARY] "
                                    f"Average Transfer: {s1_to_s2_mean:.2f}ms | "
                                    f"Total Transfer: {s1_to_s2_total:.2f}ms | "
                                    f"Transfer Count: {len(s1_to_s2_transfer_times)}")
@@ -1811,7 +1809,7 @@ async def iterate_rpc_inference(
                     cross_gpu_end_time = perf_counter()
                     cross_gpu_latency = (cross_gpu_end_time - cross_gpu_start_time) * 1000
                     
-                    logger.info(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
+                    logger.debug(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
                                f"Backends: {len(requested_backends)} | "
                                f"Output Shape: {hidden_states.shape}")
             
@@ -1861,34 +1859,49 @@ async def iterate_rpc_inference(
         step_total_time = (step_end_time - step_receive_time) * 1000  # ms
         step_residual_ms = step_total_time - (deserialize_time + compute_time + serialize_time)
         step_total_with_queue_ms = step_total_time + queue_wait_ms
+
+        # Critical path analysis: compute vs communication ratio
+        t_gpu2cpu_ms = serialize_time
+        t_cpu2gpu_ms = deserialize_time
+        data_bytes = hidden_states.nelement() * hidden_states.element_size()
+        compute_pct = (compute_time / step_total_time * 100) if step_total_time > 0 else 0.0
+        comm_overhead_ms = t_gpu2cpu_ms + t_cpu2gpu_ms
+        comm_overhead_pct = (comm_overhead_ms / step_total_time * 100) if step_total_time > 0 else 0.0
+        bw_gpu2cpu_gbps = (data_bytes / (t_gpu2cpu_ms / 1000) / 1e9) if t_gpu2cpu_ms > 0 else 0.0
+
         logger.info(
             f"[STEP_TIMING_BREAKDOWN] step_id={step_id_for_log} mode={execution_mode} "
             f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
-                f"deserialize={deserialize_time:.2f}ms compute={compute_time:.2f}ms "
-                f"serialize={serialize_time:.2f}ms residual={step_residual_ms:.2f}ms "
-                f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
-                f"cross_gpu_window={cross_gpu_receive_time:.2f}ms "
-                f"batch={batch_size} seq_inc={token_increment} raw_seq={length_increment} is_spec_dec={int(bool(is_spec_dec))}"
-            )
+            f"t_cpu2gpu={t_cpu2gpu_ms:.2f}ms compute={compute_time:.2f}ms "
+            f"t_gpu2cpu={t_gpu2cpu_ms:.2f}ms residual={step_residual_ms:.2f}ms "
+            f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
+            f"compute_pct={compute_pct:.1f}% mem_copy_pct={comm_overhead_pct:.1f}% "
+            f"data_bytes={data_bytes} bw_gpu2cpu={bw_gpu2cpu_gbps:.2f}GB/s "
+            f"batch={batch_size} seq_inc={token_increment} raw_seq={length_increment} is_spec_dec={int(bool(is_spec_dec))}"
+        )
+
+        # Pass timing data to handler for [COMM_BREAKDOWN] log
+        if isinstance(step_metadata, dict):
+            step_metadata["_serialize_ms"] = t_gpu2cpu_ms
+            step_metadata["_compute_ms"] = compute_time
+            step_metadata["_data_bytes"] = data_bytes
+            step_metadata["_step_total_ms"] = step_total_time
         
         # [MBPIPE] Record stage timing for cross-stage overlap decisions
         try:
-            # Extract stage ID safely from UIDs (format: "prefix.block_idx")
             first_uid = str(requested_uids[0]) if requested_uids else "unknown"
             last_uid = str(requested_uids[-1]) if requested_uids else "unknown"
-            # Try to extract block indices
             first_idx = first_uid.split('.')[-1] if '.' in first_uid else "0"
             last_idx = last_uid.split('.')[-1] if '.' in last_uid else "0"
             stage_id = f"blocks_{first_idx}_{last_idx}"
             
             log_stage_timing(
                 logger, stage_id,
-                compute_time_ms=step_total_time - cross_gpu_receive_time,  # Compute time (excluding comm)
-                comm_time_ms=cross_gpu_receive_time,  # Communication time (if any)
+                compute_time_ms=step_total_time - cross_gpu_receive_time,
+                comm_time_ms=cross_gpu_receive_time,
                 component="iterate_rpc_inference"
             )
         except Exception as e:
-            # Don't let timing logging break the main flow
             logger.debug(f"{MBPIPE_LOG_PREFIX} Failed to log stage timing: {e}")
         
         yield output_tensors, can_push, step_metadata

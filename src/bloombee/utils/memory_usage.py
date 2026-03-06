@@ -5,6 +5,8 @@ from pynvml import *
 from typing import Optional
 import logging
 
+from bloombee.utils.debug import dprint
+
 # [MBPIPE_DEBUG] Create a dedicated logger for micro-batch memory debugging
 _mbpipe_mem_logger = logging.getLogger('bloombee.mbpipe_memory')
 _mbpipe_mem_logger.setLevel(logging.INFO)
@@ -221,7 +223,7 @@ def see_memory_usage(message: str, force: bool = True):
 	logger += f"Nvidia-smi: {stats['nvidia_smi_used']:.2f} GB\n"
 	logger += f"Memory Allocated: {stats['torch_allocated']:.2f} GB\n"
 	logger += f"Max Memory Allocated: {stats['torch_max_allocated']:.2f} GB\n"
-	print(logger)
+	dprint(logger)
 
 def memlog_enabled() -> bool:
 	"""Return True if memory logging is enabled via env var BB_MEMLOG."""
@@ -250,12 +252,12 @@ def profile_weight_init(func):
 		
 		# Calculate and print memory usage
 		memory_used = final_memory - initial_memory
-		print(f"\nWeight Initialization Memory Profile:")
-		print(f"Initial Memory: {initial_memory:.2f} GB")
-		print(f"Final Memory: {final_memory:.2f} GB")
-		print(f"Memory Used: {memory_used:.2f} GB")
-		print(f"PyTorch Allocated: {final_stats['torch_allocated']:.2f} GB")
-		print(f"PyTorch Max Allocated: {final_stats['torch_max_allocated']:.2f} GB")
+		dprint(f"\nWeight Initialization Memory Profile:")
+		dprint(f"Initial Memory: {initial_memory:.2f} GB")
+		dprint(f"Final Memory: {final_memory:.2f} GB")
+		dprint(f"Memory Used: {memory_used:.2f} GB")
+		dprint(f"PyTorch Allocated: {final_stats['torch_allocated']:.2f} GB")
+		dprint(f"PyTorch Max Allocated: {final_stats['torch_max_allocated']:.2f} GB")
 		
 		return result
 	return wrapper 

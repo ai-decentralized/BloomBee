@@ -3,6 +3,9 @@
 import time
 from collections import defaultdict
 
+from bloombee.utils.debug import dprint
+
+
 class Timers:
     """Group of timers."""
 
@@ -35,7 +38,7 @@ class Timers:
     def log(self, name, normalizer=1.0):
         """Log a timer."""
         elapsed_time = self.timers[name]
-        print(f"{name}: {elapsed_time/normalizer:.2f}")
+        dprint(f"{name}: {elapsed_time/normalizer:.2f}")
 
     def log_all(self, normalizer=1.0):
         """Log all timers."""

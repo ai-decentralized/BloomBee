@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from bloombee.server.speculative_pruner.mid_layer_LM_head import MidLMHead
+from bloombee.utils.debug import dprint
 
 class LM_head_trainer:
     def __init__(
@@ -79,4 +80,4 @@ class LM_head_trainer:
             'optimizer_state_dict': self.optimizer_head.state_dict(),
         }
         torch.save(checkpoint, path)
-        print(f"[SUCCESS] Checkpoint saved to {path}")
+        dprint(f"[SUCCESS] Checkpoint saved to {path}")

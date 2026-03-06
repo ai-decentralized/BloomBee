@@ -2,6 +2,8 @@ import torch
 from pynvml.smi import nvidia_smi
 from pynvml import *
 
+from bloombee.utils.debug import dprint
+
 def nvidia_smi_usage():
 	logger = ''
 	nvmlInit()
@@ -35,7 +37,7 @@ def see_memory_usage(message, force=True):
 
 
 	
-	print(logger)
+	dprint(logger)
 
 
 # input("Press Any Key To Continue ..")

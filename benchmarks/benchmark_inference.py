@@ -184,39 +184,47 @@ def benchmark_inference(process_idx, args, result_pipe):
             step_latency_ms = (step_end_time - step_start_time) * 1000
             step_latencies.append(step_latency_ms)
             
-            # Enhanced logging for cross-GPU analysis
-            logger.info(f"[STEP_LATENCY] Process={process_idx} | Step={step} | "
-                       f"Latency={step_latency_ms:.2f}ms | BatchSize={batch_size}")
             logger.debug(f"{process_idx=} {step=} After generate, outputs.shape={outputs.shape}")
             
-            # Log generated tokens for all sequences in the batch
             log_step_tokens = (
                 args.log_all_tokens
                 or step < 2
                 or step == args.seq_len - 1
                 or (args.token_log_every > 0 and step % args.token_log_every == 0)
             )
+            token_line = ""
             if log_step_tokens:
-                for batch_idx in range(outputs.shape[0]):
-                    new_token_id = outputs[batch_idx][-1].item()
-                    new_token_text = tokenizer.decode([new_token_id])
-                    logger.info(
-                        f"[TOKEN] process={process_idx} step={step} batch[{batch_idx}] "
-                        f"token='{new_token_text}' id={new_token_id}"
-                    )
+                token_ids = [outputs[b][-1].item() for b in range(outputs.shape[0])]
+                token_texts = [tokenizer.decode([tid]) for tid in token_ids]
+                parts = []
+                i = 0
+                while i < len(token_texts):
+                    txt = token_texts[i]
+                    count = 1
+                    while i + count < len(token_texts) and token_texts[i + count] == txt:
+                        count += 1
+                    display = repr(txt)
+                    parts.append(f"{display}x{count}" if count > 1 else display)
+                    i += count
+                token_line = " | tokens=[" + " ".join(parts) + "]"
             
             temp_result_tokens = torch.cat([temp_result_tokens, outputs[:, -1:]], dim=1)
 
             if step >= args.warmup_steps:
                 step_times.append(perf_counter() - step_start_time)
                 speed = 1 / np.mean(step_times)
-                # Report speed per sequence (total tokens / time) 
                 effective_speed = speed * batch_size
-                logger.info(f"{process_idx=} {step=} {speed=:.2f} tokens/sec/sequence, effective={effective_speed:.2f} tokens/sec")
-                
-                # Collect latencies for analysis
+                logger.info(
+                    f"[STEP] P{process_idx} step={step} | {step_latency_ms:.1f}ms | "
+                    f"{speed:.2f} tok/s/seq ({effective_speed:.1f} tok/s){token_line}"
+                )
                 cross_gpu_latencies.append(step_latency_ms)
                 server_processing_latencies.append(step_latency_ms)
+            else:
+                logger.info(
+                    f"[STEP] P{process_idx} step={step} | {step_latency_ms:.1f}ms | "
+                    f"(warmup){token_line}"
+                )
         
         # Calculate and log statistics
         warmup_latencies = step_latencies[args.warmup_steps:]

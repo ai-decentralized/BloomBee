@@ -442,7 +442,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         #     offload_logger.info(f"   - new_kvs[0] device: {new_kvs[0].device}")
                         
                     except Exception as e:
-                        print(f' ERROR in module.forward: {type(e).__name__}: {e}')
+                        logger.error(f'ERROR in module.forward: {type(e).__name__}: {e}')
                         import traceback
                         traceback.print_exc()
                         return (hidden_states, None)
