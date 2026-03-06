@@ -19,6 +19,7 @@ from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo, RPCInfo
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.lossless_transport import deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.debug import dprint
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import pack_args_kwargs
 
@@ -110,7 +111,7 @@ class _ServerInferenceSession:
           if specified, deep prompts should have shape [num_layers, batch_size, prefix_len, hid_size]
         """
         step_start_time = perf_counter()
-        print('step start ..... ')
+        dprint('step start ..... ')
             
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
@@ -136,13 +137,13 @@ class _ServerInferenceSession:
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         # print('use server to server true/false? : ', self.config.use_server_to_server)
         # print('stepped ', self.stepped)
-        print('self._position ', self._position)
+        dprint('self._position ', self._position)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
         if self._position is not None:
             request_metadata["start_from_position"] = self._position
         elif self.config.use_server_to_server: # it didn't come to this condition when it use "elif"
-            print('use server to server') 
+            dprint('use server to server') 
             next_servers = self._collect_next_servers()
             # print('next_servers', next_servers)
             if next_servers:
@@ -162,8 +163,8 @@ class _ServerInferenceSession:
             server_side_inference_schema
         ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
-        print('input tensors ',input_tensors)
-        print('input tensors[0].size() ',input_tensors[0].size())
+        dprint('input tensors ',input_tensors)
+        dprint('input tensors[0].size() ',input_tensors[0].size())
         outputs_serialized = RemoteExpertWorker.run_coroutine(
             self._step(
                 runtime_pb2.ExpertRequest(
@@ -183,8 +184,8 @@ class _ServerInferenceSession:
 
         self._position += n_input_tokens
         step_end_time = perf_counter()
-        print('step total time(sec) ',  step_end_time-step_start_time)
-        print()
+        dprint('step total time(sec) ',  step_end_time-step_start_time)
+        dprint()
         return outputs[0]
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:

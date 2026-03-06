@@ -10,6 +10,8 @@ from typing import Tuple, Union, Optional, Any, Sequence, List
 import numpy as np
 import torch
 
+from bloombee.utils.debug import dprint
+
 
 KB = 1 << 10
 MB = 1 << 20
@@ -147,7 +149,7 @@ def torch_mem_stats():
             continue
         visited_data.add(data_ptr)
 
-        print(tensor.shape, tensor.data_ptr())
+        dprint(tensor.shape, tensor.data_ptr())
 
         numel = tensor.numel()
         total_numel += numel
@@ -219,7 +221,7 @@ def vector_gather(vectors, indices):
 
 
 def run_cmd(cmd):
-    print(cmd)
+    dprint(cmd)
     os.system(cmd)
 
 

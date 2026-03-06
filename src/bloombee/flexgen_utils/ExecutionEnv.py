@@ -8,6 +8,7 @@ import os
 from typing import Tuple, Union, Optional, Any, Sequence, List
 # fix recursive import
 from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
+from bloombee.utils.debug import dprint
 
 import numpy as np
 import torch
@@ -26,7 +27,7 @@ class ExecutionEnv:
             gpu = TorchDevice("cpu")  # Use CPU for the 'gpu' slot
         else:
             gpu = TorchDevice("cuda:0")
-        print('ExecutionEnv: gpu ', gpu)
+        dprint('ExecutionEnv: gpu ', gpu)
         cpu = TorchDevice("cpu")
         disk = TorchDisk(offload_dir)
         return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))

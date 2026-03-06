@@ -13,6 +13,8 @@ import os
 import numpy as np
 from tqdm import tqdm
 
+from bloombee.utils.debug import dprint
+
 @dataclasses.dataclass(frozen=True)
 class LlamaConfig:
     name: str="llama-7b"
@@ -82,7 +84,7 @@ def download_llama_weights_old(model_name, path):
     else:
         raise ValueError("Invalid model name: {model_name}")
 
-    print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
+    dprint(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
           f"The downloading and cpu loading can take dozens of minutes. "
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
@@ -94,7 +96,7 @@ def download_llama_weights_old(model_name, path):
 
     os.makedirs(path, exist_ok=True)
 
-    print(f"Convert the weights to numpy format under {path} ...")
+    dprint(f"Convert the weights to numpy format under {path} ...")
     if "llama" in model_name:
         for name, param in tqdm(list(model.model.named_parameters())):
             param_path = os.path.join(path, name)
@@ -144,7 +146,7 @@ def download_llama_weights(model_name, path):
     from huggingface_hub import snapshot_download
     import torch
 
-    print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
+    dprint(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
           f"The downloading and cpu loading can take dozens of minutes. "
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")

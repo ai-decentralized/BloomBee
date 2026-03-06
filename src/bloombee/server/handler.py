@@ -237,6 +237,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._session_queues: Dict[str, asyncio.Queue] = {}
         self._session_handlers: Dict[str, int] = {}
         
+        self._session_timing: Dict[str, list] = {}
+
         # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
         # Key: (session_id, step_id) -> Queue holding individual micro-batches
         self._mb_queues: Dict[tuple, asyncio.Queue] = {}
@@ -459,7 +461,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             total_request_size = sum(request_tensor_sizes) + request_metadata_size
             recv_time_ms = (recv_end - recv_start) * 1000
             
-            logger.info(f"[NETWORK_RX] SERVER_RECV | "
+            logger.debug(f"[NETWORK_RX] SERVER_RECV | "
                        f"tensor_size={sum(request_tensor_sizes)/1024:.2f}KB | "
                        f"metadata_size={request_metadata_size}B | "
                        f"total={total_request_size/1024:.2f}KB | "
@@ -566,7 +568,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     # [MBPIPE_FIX] If using micro-batch pipeline, DO NOT override batch_size with full_batch_size
                     # We want to allocate cache ONLY for the micro-batch size to enable GPU multiplexing
                     elif is_microbatch_enabled() and streaming_full_batch_size > batch_size:
-                        logger.info(f"[MBPIPE_FIX] Micro-batch enabled: Keeping batch_size={batch_size} (micro-batch size) "
+                        logger.debug(f"[MBPIPE_FIX] Micro-batch enabled: Keeping batch_size={batch_size} (micro-batch size) "
                                     f"instead of full_batch_size={streaming_full_batch_size} to enable GPU multiplexing")
                     elif streaming_full_batch_size > batch_size:
                         logger.info(f"{MBPIPE_LOG_PREFIX} [STREAMING_DECODE] Detected streaming micro-batch (LEGACY), "
@@ -586,7 +588,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     # we allocate only micro_batch_size slots and multiplex on GPU.
                     if is_microbatch_enabled():
                         micro_batch_size = get_micro_batch_size()
-                        logger.info(f"[MBPIPE_FIX] Non-streaming: logical batch_size={batch_size}, "
+                        logger.debug(f"[MBPIPE_FIX] Non-streaming: logical batch_size={batch_size}, "
                                     f"physical alloc will use micro_batch_size={micro_batch_size} in _allocate_cache")
                     else:
                         logger.debug(f"[MB_DEBUG] NOT streaming decode, using original batch_size={batch_size}")
@@ -684,7 +686,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             )
                         
                         cross_stage_push_microbatch = _cross_stage_push_wrapper
-                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
+                        logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
                     
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
@@ -732,7 +734,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             # [MBPIPE] Skip _push_outputs if data was already sent via cross-stage micro-batch push
                             cross_stage_pushed = step_metadata.get("cross_stage_pushed", False) if step_metadata else False
                             if cross_stage_pushed:
-                                logger.info(f"{MBPIPE_LOG_PREFIX} Skipping _push_outputs: data sent via cross-stage micro-batch push")
+                                logger.debug(f"{MBPIPE_LOG_PREFIX} Skipping _push_outputs: data sent via cross-stage micro-batch push")
                             elif output_buffer is not None and output_buffer.is_running:
                                 # Non-blocking put into buffer - actual send happens in background
                                 try:
@@ -769,7 +771,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             if isinstance(step_metadata, dict)
                             else "unknown"
                         )
-                        logger.info(
+                        logger.debug(
                             f"[HANDLER_STEP_TIMING] step_id={step_id_for_log} "
                             f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
                             f"push_schedule={push_schedule_ms:.2f}ms "
@@ -777,8 +779,15 @@ class TransformerConnectionHandler(ConnectionHandler):
                             f"handler_total={handler_step_total_ms:.2f}ms "
                             f"can_push={int(bool(can_push))}"
                         )
-                        # print('runtime_pb2.ExpertResponse push outputs respond time', end_ExpertResponse_time-start_ExpertResponse_time) ###
-                        # print_time_now('')
+                        if isinstance(step_metadata, dict) and session_id:
+                            rec = {
+                                "compute_ms": float(step_metadata.get("_compute_ms", 0)),
+                                "t_gpu2cpu_ms": float(step_metadata.get("_serialize_ms", 0)),
+                                "step_total_ms": float(step_metadata.get("_step_total_ms", 0)),
+                                "data_bytes": int(step_metadata.get("_data_bytes", 0)),
+                                "queue_wait_ms": queue_wait_ms,
+                            }
+                            self._session_timing.setdefault(session_id, []).append(rec)
                         
                     end_iterate_rpc_inference_time=perf_counter() ###
                     # print('mean push time ', np.mean(push_time[4:])) ###
@@ -801,15 +810,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                         cache_manager = requested_backends[0].cache_manager
                         if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
                             cache_manager.clear_offload_state()
-                            logger.info(f"[MBPIPE_FIX] Cleared offload state after request completion")
+                            logger.debug(f"[MBPIPE_FIX] Cleared offload state after request completion")
                 except Exception as e:
                     logger.warning(f"[MBPIPE_FIX] Failed to clear offload state: {e}")
 
                 self._log_request("rpc_inference.close", requested_uids, context)
-                # print_time_now('')
-                # print('end of  rpc_inference ..........')  ###
-                end_time_rpc_infer = perf_counter() ###
-                # print('rpc_inference total time(sec) ', end_time_rpc_infer - start_time) ###
+                end_time_rpc_infer = perf_counter()
+                self._emit_timing_summary(session_id, requested_uids)
             
 
     @contextlib.contextmanager
@@ -828,6 +835,50 @@ class TransformerConnectionHandler(ConnectionHandler):
             for other_index, other_queue in enumerate(self._handler_event_queues):
                 if other_index != self._handler_index:
                     other_queue.put_nowait((Event.END_SESSION, session_id, self._handler_index))
+
+    def _emit_timing_summary(self, session_id: str, requested_uids):
+        records = self._session_timing.pop(session_id, [])
+        if not records:
+            return
+        warmup = 1
+        decode_records = records[warmup:] if len(records) > warmup else records
+        if not decode_records:
+            return
+
+        blocks_desc = "unknown"
+        if requested_uids:
+            first = str(requested_uids[0]).split(".")[-1] if "." in str(requested_uids[0]) else "0"
+            last = str(requested_uids[-1]).split(".")[-1] if "." in str(requested_uids[-1]) else "?"
+            blocks_desc = f"{first}:{int(last)+1}"
+
+        compute_arr = np.array([r["compute_ms"] for r in decode_records])
+        gpu2cpu_arr = np.array([r["t_gpu2cpu_ms"] for r in decode_records])
+        step_arr = np.array([r["step_total_ms"] for r in decode_records])
+        queue_arr = np.array([r["queue_wait_ms"] for r in decode_records])
+        data_arr = np.array([r["data_bytes"] for r in decode_records])
+
+        total_compute = compute_arr.sum()
+        total_step = step_arr.sum()
+        total_gpu2cpu = gpu2cpu_arr.sum()
+        total_mem_copy = gpu2cpu_arr.sum() + np.sum([0])  # t_gpu2cpu only for this server
+        compute_ratio = (total_compute / total_step * 100) if total_step > 0 else 0
+        memcopy_ratio = (total_gpu2cpu / total_step * 100) if total_step > 0 else 0
+        avg_bw = (data_arr.mean() / (gpu2cpu_arr.mean() / 1000) / 1e9) if gpu2cpu_arr.mean() > 0 else 0
+
+        n = len(decode_records)
+        logger.info(
+            f"[TIMING_SUMMARY] blocks={blocks_desc} steps={n} (excl {warmup} warmup)\n"
+            f"  compute : mean={compute_arr.mean():.1f}ms  median={np.median(compute_arr):.1f}ms  "
+            f"p95={np.percentile(compute_arr,95):.1f}ms  min={compute_arr.min():.1f}ms  max={compute_arr.max():.1f}ms\n"
+            f"  gpu2cpu : mean={gpu2cpu_arr.mean():.2f}ms  median={np.median(gpu2cpu_arr):.2f}ms  "
+            f"p95={np.percentile(gpu2cpu_arr,95):.2f}ms  max={gpu2cpu_arr.max():.2f}ms\n"
+            f"  step_total: mean={step_arr.mean():.1f}ms  median={np.median(step_arr):.1f}ms  "
+            f"p95={np.percentile(step_arr,95):.1f}ms  min={step_arr.min():.1f}ms  max={step_arr.max():.1f}ms\n"
+            f"  queue_wait: mean={queue_arr.mean():.1f}ms  median={np.median(queue_arr):.1f}ms  "
+            f"p95={np.percentile(queue_arr,95):.1f}ms  max={queue_arr.max():.1f}ms\n"
+            f"  ratio: compute={compute_ratio:.1f}%  mem_copy(gpu2cpu)={memcopy_ratio:.1f}%  "
+            f"avg_bw(gpu2cpu)={avg_bw:.2f}GB/s  data_per_step={data_arr.mean()/1024:.1f}KB"
+        )
 
     def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest):
         handler_index = self._session_handlers.get(session_id)
@@ -1336,7 +1387,6 @@ class TransformerConnectionHandler(ConnectionHandler):
     async def _push_outputs(
         self, request: runtime_pb2.ExpertRequest, serialized_outputs: runtime_pb2.Tensor, metadata: dict
     ) -> None:
-        # print('_push_outputs metadata ', metadata)
         push_start_time = perf_counter()
         try:
             next_servers = metadata.get("next_servers")
@@ -1349,10 +1399,8 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_peer_id = PeerID.from_base58(next_peer_id)
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
 
-            # Log cross-GPU transfer start
-            logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
+            logger.debug(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
-            # Sending hidden states serialized with output_schema to avoid double serialization
             next_tensors = [serialized_outputs] + request.tensors[2:]
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
@@ -1360,20 +1408,25 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_metadata["clock_sync_sender_send_us"] = sender_send_us
 
             stub = self.get_stub(self._p2p, next_peer_id)
-            transfer_start = perf_counter()
-            
-            # [NETWORK_TIMING] Measure data size being pushed
             push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
             push_metadata_bytes = len(MSGPackSerializer.dumps(next_metadata))
-            
-            response = await stub.rpc_push(
-                runtime_pb2.ExpertRequest(
-                    uid=next_uid,
-                    tensors=next_tensors,
-                    metadata=MSGPackSerializer.dumps(next_metadata),
-                ),
-                timeout=self.request_timeout,
+
+            # T(CPU→NIC): time from push_start to rpc_push call (metadata prep, stub creation, protobuf assembly)
+            cpu2nic_prep_start = perf_counter()
+            rpc_request = runtime_pb2.ExpertRequest(
+                uid=next_uid,
+                tensors=next_tensors,
+                metadata=MSGPackSerializer.dumps(next_metadata),
             )
+            cpu2nic_prep_end = perf_counter()
+            t_cpu2nic_ms = (cpu2nic_prep_end - push_start_time) * 1000
+
+            # T(NIC→NIC): actual network round-trip (rpc_push)
+            nic2nic_start = perf_counter()
+            response = await stub.rpc_push(rpc_request, timeout=self.request_timeout)
+            nic2nic_end = perf_counter()
+            t_nic2nic_ms = (nic2nic_end - nic2nic_start) * 1000
+
             sender_ack_us = self._now_us()
             self._update_clock_sync_from_rpc_response(
                 peer_id=next_peer_id_str,
@@ -1382,11 +1435,41 @@ class TransformerConnectionHandler(ConnectionHandler):
                 response=response,
             )
             
-            transfer_end = perf_counter()
-            transfer_time_ms = (transfer_end - transfer_start) * 1000
-            
-            # [NETWORK_TIMING] Log server-to-server transfer
-            logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "
+            transfer_time_ms = (nic2nic_end - push_start_time) * 1000
+
+            # T(GPU→CPU) from compute step (serialize time)
+            t_gpu2cpu_ms = float(metadata.get("_serialize_ms", 0.0))
+            compute_ms = float(metadata.get("_compute_ms", 0.0))
+            data_bytes = int(metadata.get("_data_bytes", 0))
+            step_total_ms = float(metadata.get("_step_total_ms", 0.0))
+
+            total_comm_ms = t_gpu2cpu_ms + t_cpu2nic_ms + t_nic2nic_ms
+            gpu2cpu_pct = (t_gpu2cpu_ms / total_comm_ms * 100) if total_comm_ms > 0 else 0.0
+            cpu2nic_pct = (t_cpu2nic_ms / total_comm_ms * 100) if total_comm_ms > 0 else 0.0
+            nic2nic_pct = (t_nic2nic_ms / total_comm_ms * 100) if total_comm_ms > 0 else 0.0
+
+            critical_path_ms = compute_ms + total_comm_ms
+            compute_critical_pct = (compute_ms / critical_path_ms * 100) if critical_path_ms > 0 else 0.0
+            comm_critical_pct = (total_comm_ms / critical_path_ms * 100) if critical_path_ms > 0 else 0.0
+
+            bw_nic_mbps = (push_tensor_bytes / (t_nic2nic_ms / 1000) / 1e6) if t_nic2nic_ms > 0 else 0.0
+            bw_gpu2cpu_gbps = (data_bytes / (t_gpu2cpu_ms / 1000) / 1e9) if t_gpu2cpu_ms > 0 else 0.0
+
+            step_id = metadata.get("step_id", "unknown")
+            logger.info(
+                f"[COMM_BREAKDOWN] step_id={step_id} "
+                f"to_blocks={next_start}:{next_end} "
+                f"T(GPU→CPU)={t_gpu2cpu_ms:.2f}ms({gpu2cpu_pct:.1f}%) "
+                f"T(CPU→NIC)={t_cpu2nic_ms:.2f}ms({cpu2nic_pct:.1f}%) "
+                f"T(NIC→NIC)={t_nic2nic_ms:.2f}ms({nic2nic_pct:.1f}%) "
+                f"total_comm={total_comm_ms:.2f}ms "
+                f"compute={compute_ms:.2f}ms "
+                f"critical_path: compute={compute_critical_pct:.1f}% comm={comm_critical_pct:.1f}% "
+                f"BW(NIC)={bw_nic_mbps:.1f}MB/s BW(GPU→CPU)={bw_gpu2cpu_gbps:.1f}GB/s "
+                f"wire_bytes={push_tensor_bytes}"
+            )
+
+            logger.debug(f"[NETWORK_S2S] PUSH_COMPLETE | "
                        f"from_blocks={self.dht_prefix} | to_blocks={next_start}:{next_end} | "
                        f"tensor_size={push_tensor_bytes/1024:.2f}KB | "
                        f"metadata_size={push_metadata_bytes}B | "
