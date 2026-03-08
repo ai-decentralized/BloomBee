@@ -7,7 +7,7 @@ import uuid
 from typing import AsyncIterator, List, Optional, Tuple
 
 import torch
-from hivemind import MSGPackSerializer, anext, deserialize_torch_tensor, get_logger, serialize_torch_tensor
+from hivemind import MSGPackSerializer, anext, get_logger
 from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
 from hivemind.p2p import P2P
 from hivemind.proto import runtime_pb2
@@ -19,6 +19,7 @@ from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo,
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import pack_args_kwargs, normalize_arg
+from bloombee.utils.lossless_transport import deserialize_tensor_stream, deserialize_torch_tensor, serialize_torch_tensor
 
 logger = get_logger(__name__)
 

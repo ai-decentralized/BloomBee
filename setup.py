@@ -54,7 +54,7 @@ setup(
         "tokenizers>=0.13.3",  
         "transformers==4.43.1",  
         "speedtest-cli==2.1.3",  
-        "hivemind @ git+https://github.com/learning-at-home/hivemind.git@213bff98a62accb91f254e2afdccbf1d69ebdea9",  
+        "hivemind",  
         "tensor_parallel==1.0.23",  
         "humanfriendly",  
         "async-timeout>=4.0.2",  
