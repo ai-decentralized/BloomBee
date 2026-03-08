@@ -305,19 +305,31 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self.init_weight(j)
 
     def init_weight(self, j):
-        # Get model name from llama_config.name if available, otherwise use a default
-        if hasattr(self.llama_config, 'name') and self.llama_config.name:
-            model_name = self.llama_config.name
-        elif hasattr(self.llama_config, '_name_or_path') and self.llama_config._name_or_path:
-            model_name = os.path.basename(self.llama_config._name_or_path.rstrip('/'))
-        else:
-            # Fallback to a default model name - use correct Hugging Face identifier
-            model_name = "llama-30b"  # Remove -hf suffix as huggyllama repos don't use it
-        
-        # Ensure model_name is not empty and remove -hf suffix if present
+        # Get model name from config - HF config may use different attribute names
+        model_name = None
+        for attr in ('name', 'name_or_path', '_name_or_path'):
+            if hasattr(self.llama_config, attr):
+                val = getattr(self.llama_config, attr)
+                if val and isinstance(val, str):
+                    model_name = os.path.basename(val.rstrip('/'))
+                    break
+
+        # Fallback: infer from architecture (hidden_size, num_hidden_layers, intermediate_size)
         if not model_name or model_name == '.':
-            model_name = "llama-30b"
-        
+            h = getattr(self.llama_config, 'hidden_size', 0)
+            L = getattr(self.llama_config, 'num_hidden_layers', 0)
+            I = getattr(self.llama_config, 'intermediate_size', 0)
+            if (h, L) == (4096, 32):
+                model_name = "llama-7b"
+            elif (h, L) == (5120, 40):
+                model_name = "llama-13b"
+            elif (h, L) == (6656, 60):
+                model_name = "llama-30b"
+            elif (h, L) == (8192, 80):
+                model_name = "llama-70b" if I == 28672 else "llama-65b"
+            else:
+                model_name = "llama-65b"  # safest default for 80-layer 8192 models
+
         # Remove -hf suffix if present, as huggyllama repos don't use it
         if model_name.endswith('-hf'):
             model_name = model_name[:-3]
