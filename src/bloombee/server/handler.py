@@ -1401,7 +1401,8 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             logger.debug(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
-            next_tensors = [serialized_outputs] + request.tensors[2:]
+            # Sending hidden states serialized with output_schema to avoid double serialization
+            next_tensors = [serialized_outputs] + request.tensors[3:]
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
             sender_send_us = self._now_us()

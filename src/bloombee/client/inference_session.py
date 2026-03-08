@@ -466,7 +466,7 @@ class InferenceSession:
         block_idx = 0
         inference_step_start = time.perf_counter()
         batch_size = inputs.shape[0] if inputs.ndim >= 1 else 1
-        if tree_attention_mask is not None and prefill_length is not None:
+        if prefill_length is not None:
             self.prefill_length = prefill_length.to(inputs.device)
         else:
             self.prefill_length = torch.zeros(batch_size, device=inputs.device)
@@ -540,8 +540,11 @@ class InferenceSession:
         self._position += n_input_tokens
         # logger.info(f"keep_indices: {keep_indices}")
         # logger.info(f"before _recover_hidden_states: {inputs}")
+        # t0 = time.perf_counter()
         if draft_tokens is not None and is_spec_dec:
             inputs = self._restore_hidden_states(inputs, self.keep_indices, draft_tokens.shape[1])
+        # t1 = time.perf_counter()
+        # logger.info(f"_restore_hidden_states took {(t1 - t0) * 1000:.2f} ms")
         # logger.info(f"after _recover_hidden_states: {inputs}")
         outputs = inputs 
         

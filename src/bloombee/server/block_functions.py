@@ -59,7 +59,7 @@ def print_time_now(s):
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
 # Note: NF4 refers to FlexGen's 4-bit group quantization, not bitsandbytes
-MAX_SHORT_INFERENCE_TOKENS = 128
+MAX_SHORT_INFERENCE_TOKENS = 81920
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
 logger = get_logger(__name__)
@@ -1179,7 +1179,6 @@ async def iterate_rpc_inference(
 
         hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
         draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
-        batch_size, length_increment, _ = hidden_states.shape
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
         if not hidden_states.is_contiguous():
@@ -1214,6 +1213,8 @@ async def iterate_rpc_inference(
         
         if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
+            
+        batch_size, length_increment, _ = hidden_states.shape
         
         # if is_spec_dec and not need_pruning:
             

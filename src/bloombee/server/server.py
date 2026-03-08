@@ -124,9 +124,9 @@ class Server:
         custom_module_path=None,
         update_period: float = 60,
         expiration: Optional[float] = None,
-        request_timeout: float = 3 * 60,
-        session_timeout: float = 30 * 60,
-        step_timeout: float = 5 * 60,
+        request_timeout: float = 30 * 60,
+        session_timeout: float = 3000 * 60,
+        step_timeout: float = 1000 * 60,
         prefetch_batches: int = 1,
         sender_threads: int = 1,
         balance_quality: float = 0.75,
@@ -243,7 +243,7 @@ class Server:
 
         is_multiquery_attn = self.block_config.num_key_value_groups > 1
         if max_batch_size is None:
-            max_batch_size = 8192 if is_multiquery_attn else 2048
+            max_batch_size = 8192 if is_multiquery_attn else 8192
         if inference_max_length is None:
             inference_max_length = 8192 if is_multiquery_attn else 4096
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
@@ -323,7 +323,7 @@ class Server:
         
         # Create configuration
         config = PruningConfig(
-            method=PruningMethod.SIMPLE_PROBABILITY,
+            method=PruningMethod.ADAPTIVE_NEURAL,
             neural_threshold=0.5,
             simple_threshold=0.1
         )

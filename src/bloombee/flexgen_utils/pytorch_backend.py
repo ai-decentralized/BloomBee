@@ -747,7 +747,7 @@ class TorchDevice:
         # logger.info(f"tgt_s: {tgt_s}")
         
         if rotary_position_ids is not None:
-            freqs_slice = freq_cis[-tgt_s:]
+            freqs_slice = freq_cis
         else:
             freqs_slice = freq_cis[src_s - tgt_s: src_s]
         
