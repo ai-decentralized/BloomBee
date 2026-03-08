@@ -97,13 +97,21 @@ sys.stdout.buffer.write(buf.getvalue())
 sys.stdout.buffer.flush()
 os._exit(0)
 """.strip()
-    proc = subprocess.run(
-        [sys.executable, "-c", child_code, str(path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
-    return np.load(io.BytesIO(proc.stdout), allow_pickle=False)
+    last_error: subprocess.CalledProcessError | None = None
+    for _attempt in range(3):
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", child_code, str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            return np.load(io.BytesIO(proc.stdout), allow_pickle=False)
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"failed to load tensor from {path}")
 
 
 def load_tensor(path: Path) -> np.ndarray:
