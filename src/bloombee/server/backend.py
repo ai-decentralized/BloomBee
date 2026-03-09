@@ -8,7 +8,6 @@ from time import perf_counter
 import torch
 import traceback
 import numpy as np
-from hivemind import BatchTensorDescriptor, TensorDescriptor
 from hivemind.moe.expert_uid import ExpertUID
 from hivemind.moe.server.module_backend import ModuleBackend
 from hivemind.utils import get_logger
@@ -20,6 +19,7 @@ from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
 from bloombee.utils.microbatch_config import (

@@ -97,9 +97,14 @@ def main():
 
     reachability_protocol = ReachabilityProtocol.attach_to_dht(dht, await_ready=True)
 
-    while True:
-        dht.run_coroutine(report_status, return_future=False)
-        time.sleep(args.refresh_period)
+    try:
+        while True:
+            dht.run_coroutine(report_status, return_future=False)
+            time.sleep(args.refresh_period)
+    finally:
+        if reachability_protocol is not None:
+            reachability_protocol.shutdown()
+        dht.shutdown()
 
 
 if __name__ == "__main__":

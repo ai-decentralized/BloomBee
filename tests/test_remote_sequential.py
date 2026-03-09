@@ -1,13 +1,13 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from hivemind import DHT, BatchTensorDescriptor, get_logger
 from hivemind.proto import runtime_pb2
 
 from bloombee import AutoDistributedConfig
 from bloombee.client import RemoteSequenceManager, RemoteSequential
 from bloombee.data_structures import UID_DELIMITER
 from bloombee.server.from_pretrained import load_pretrained_block
+from bloombee.utils.hivemind_compat import BatchTensorDescriptor, DHT, get_logger
 from test_utils import *
 
 logger = get_logger(__name__)

@@ -5,7 +5,6 @@ from contextvars import ContextVar
 from typing import Optional, Union
 
 import torch
-from hivemind import DHT, get_logger
 from torch import nn
 
 from bloombee.client.config import ClientConfig
@@ -13,6 +12,7 @@ from bloombee.client.inference_session import InferenceSession
 from bloombee.client.routing import RemoteSequenceManager
 from bloombee.client.sequential_autograd import _RemoteSequentialAutogradFunction
 from bloombee.data_structures import UID_DELIMITER
+from bloombee.utils.hivemind_compat import DHT, get_logger
 
 logger = get_logger(__name__)
 

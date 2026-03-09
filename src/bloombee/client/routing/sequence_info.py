@@ -2,9 +2,8 @@ import dataclasses
 import time
 from typing import Iterable, List, Optional, Tuple
 
-from hivemind import get_logger
-
 from bloombee.data_structures import ModuleUID, RemoteModuleInfo, RemoteSpanInfo, ServerState
+from bloombee.utils.hivemind_compat import get_logger
 from bloombee.utils.dht import compute_spans
 
 logger = get_logger(__name__)

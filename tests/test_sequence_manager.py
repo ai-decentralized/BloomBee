@@ -3,11 +3,11 @@ import time
 
 import pytest
 import torch
-from hivemind import DHT, get_logger
 
 from bloombee import AutoDistributedConfig
 from bloombee.client import RemoteSequenceManager, RemoteSequential
 from bloombee.data_structures import UID_DELIMITER
+from bloombee.utils.hivemind_compat import DHT, get_logger
 from test_utils import *
 
 logger = get_logger(__name__)

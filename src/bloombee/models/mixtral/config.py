@@ -1,7 +1,6 @@
 import os
 from typing import Optional, Union
 
-from hivemind import get_logger
 from transformers.models.mixtral import MixtralConfig
 from transformers.models.mixtral.modeling_mixtral import MixtralAttention
 
@@ -9,6 +8,7 @@ from bloombee.client.config import ClientConfig
 from bloombee.client.lm_head import LMHeadConfig
 from bloombee.client.ptune import PTuneConfig
 from bloombee.models.mixtral.block import WrappedMixtralBlock
+from bloombee.utils.hivemind_compat import get_logger
 
 logger = get_logger(__name__)
 

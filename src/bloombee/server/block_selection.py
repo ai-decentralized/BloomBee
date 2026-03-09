@@ -1,9 +1,9 @@
 from typing import Dict, List
 
 import numpy as np
-from hivemind import PeerID, get_logger
 
 from bloombee.data_structures import RemoteModuleInfo, RemoteSpanInfo, ServerState
+from bloombee.utils.hivemind_compat import PeerID, get_logger
 from bloombee.utils.dht import compute_spans
 
 logger = get_logger(__name__)
