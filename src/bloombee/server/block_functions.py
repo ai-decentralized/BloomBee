@@ -1897,8 +1897,8 @@ async def iterate_rpc_inference(
             
             log_stage_timing(
                 logger, stage_id,
-                compute_time_ms=step_total_time - cross_gpu_receive_time,
-                comm_time_ms=cross_gpu_receive_time,
+                compute_time_ms=compute_time,
+                comm_time_ms=comm_overhead_ms,
                 component="iterate_rpc_inference"
             )
         except Exception as e:

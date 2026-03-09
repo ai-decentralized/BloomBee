@@ -231,6 +231,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._session_handlers: Dict[str, int] = {}
         
         self._session_timing: Dict[str, list] = {}
+        self._session_comm_timing: Dict[str, Dict[str, Dict[str, float]]] = {}
 
         # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
         # Key: (session_id, step_id) -> Queue holding individual micro-batches
@@ -390,6 +391,53 @@ class TransformerConnectionHandler(ConnectionHandler):
             "clock_sync_receiver_ack_us": int(self._now_us()),
         }
         return runtime_pb2.ExpertResponse(metadata=MSGPackSerializer.dumps(ack_metadata))
+
+    def _extract_rpc_push_timing(
+        self,
+        response: Optional[runtime_pb2.ExpertResponse],
+        *,
+        sender_send_us: int,
+        sender_ack_us: int,
+        fallback_rtt_ms: float,
+    ) -> Dict[str, float]:
+        result = {
+            "end_to_end_rtt_ms": max(0.0, float(sender_ack_us - sender_send_us) / 1000.0),
+            "network_rtt_ms": max(0.0, float(fallback_rtt_ms)),
+            "receiver_processing_ms": 0.0,
+        }
+        if response is None or not response.metadata:
+            return result
+
+        try:
+            response_meta = MSGPackSerializer.loads(response.metadata)
+        except Exception:
+            return result
+        if not isinstance(response_meta, dict):
+            return result
+
+        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
+        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
+        if receiver_recv_us <= 0 or receiver_ack_us < receiver_recv_us or sender_ack_us < sender_send_us:
+            return result
+
+        receiver_processing_ms = max(0.0, float(receiver_ack_us - receiver_recv_us) / 1000.0)
+        end_to_end_rtt_ms = max(0.0, float(sender_ack_us - sender_send_us) / 1000.0)
+        network_rtt_ms = max(0.0, end_to_end_rtt_ms - receiver_processing_ms)
+        return {
+            "end_to_end_rtt_ms": end_to_end_rtt_ms,
+            "network_rtt_ms": network_rtt_ms,
+            "receiver_processing_ms": receiver_processing_ms,
+        }
+
+    @staticmethod
+    def _normalize_serialized_tensors(
+        tensors: Union[runtime_pb2.Tensor, Sequence[runtime_pb2.Tensor]]
+    ) -> List[runtime_pb2.Tensor]:
+        normalized = list(tensors) if isinstance(tensors, (list, tuple)) else [tensors]
+        if any(not hasattr(tensor, "buffer") for tensor in normalized):
+            bad_types = [type(tensor).__name__ for tensor in normalized]
+            raise TypeError(f"Expected serialized runtime_pb2.Tensor objects, got {bad_types}")
+        return normalized
 
 
     async def add_p2p_handlers(self, *args, **kwargs) -> None:
@@ -774,6 +822,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         )
                         if isinstance(step_metadata, dict) and session_id:
                             rec = {
+                                "step_id": step_id_for_log,
                                 "compute_ms": float(step_metadata.get("_compute_ms", 0)),
                                 "t_gpu2cpu_ms": float(step_metadata.get("_serialize_ms", 0)),
                                 "step_total_ms": float(step_metadata.get("_step_total_ms", 0)),
@@ -831,6 +880,7 @@ class TransformerConnectionHandler(ConnectionHandler):
 
     def _emit_timing_summary(self, session_id: str, requested_uids):
         records = self._session_timing.pop(session_id, [])
+        comm_records = self._session_comm_timing.pop(session_id, {})
         if not records:
             return
         warmup = 1
@@ -858,6 +908,36 @@ class TransformerConnectionHandler(ConnectionHandler):
         memcopy_ratio = (total_gpu2cpu / total_step * 100) if total_step > 0 else 0
         avg_bw = (data_arr.mean() / (gpu2cpu_arr.mean() / 1000) / 1e9) if gpu2cpu_arr.mean() > 0 else 0
 
+        comm_summary = "\n  s2s_comm : no downstream push samples"
+        matched_comm_records = [comm_records[r["step_id"]] for r in decode_records if r.get("step_id") in comm_records]
+        if matched_comm_records:
+            cpu2nic_arr = np.array([r["t_cpu2nic_ms"] for r in matched_comm_records])
+            nic2nic_arr = np.array([r["t_nic2nic_ms"] for r in matched_comm_records])
+            push_e2e_arr = np.array([r["push_e2e_ms"] for r in matched_comm_records])
+            receiver_proc_arr = np.array([r["receiver_processing_ms"] for r in matched_comm_records])
+            wire_arr = np.array([r["wire_bytes"] for r in matched_comm_records])
+
+            total_cpu2nic = cpu2nic_arr.sum()
+            total_nic2nic = nic2nic_arr.sum()
+            total_comm = total_gpu2cpu + total_cpu2nic + total_nic2nic
+            gpu2cpu_comm_ratio = (total_gpu2cpu / total_comm * 100) if total_comm > 0 else 0
+            cpu2nic_ratio = (total_cpu2nic / total_comm * 100) if total_comm > 0 else 0
+            nic2nic_ratio = (total_nic2nic / total_comm * 100) if total_comm > 0 else 0
+            avg_nic_bw = (wire_arr.mean() / (nic2nic_arr.mean() / 1000) / 1e6) if nic2nic_arr.mean() > 0 else 0
+
+            comm_summary = (
+                f"\n  cpu2nic : mean={cpu2nic_arr.mean():.2f}ms  median={np.median(cpu2nic_arr):.2f}ms  "
+                f"p95={np.percentile(cpu2nic_arr,95):.2f}ms  max={cpu2nic_arr.max():.2f}ms"
+                f"\n  nic2nic : mean={nic2nic_arr.mean():.2f}ms  median={np.median(nic2nic_arr):.2f}ms  "
+                f"p95={np.percentile(nic2nic_arr,95):.2f}ms  max={nic2nic_arr.max():.2f}ms"
+                f"\n  push_e2e: mean={push_e2e_arr.mean():.2f}ms  median={np.median(push_e2e_arr):.2f}ms  "
+                f"p95={np.percentile(push_e2e_arr,95):.2f}ms  max={push_e2e_arr.max():.2f}ms"
+                f"\n  recv_proc: mean={receiver_proc_arr.mean():.2f}ms  median={np.median(receiver_proc_arr):.2f}ms  "
+                f"p95={np.percentile(receiver_proc_arr,95):.2f}ms  max={receiver_proc_arr.max():.2f}ms"
+                f"\n  s2s_ratio: gpu2cpu={gpu2cpu_comm_ratio:.1f}%  cpu2nic={cpu2nic_ratio:.1f}%  "
+                f"nic2nic={nic2nic_ratio:.1f}%  avg_bw(nic)={avg_nic_bw:.1f}MB/s  wire_per_push={wire_arr.mean()/1024:.1f}KB"
+            )
+
         n = len(decode_records)
         logger.info(
             f"[TIMING_SUMMARY] blocks={blocks_desc} steps={n} (excl {warmup} warmup)\n"
@@ -871,6 +951,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"p95={np.percentile(queue_arr,95):.1f}ms  max={queue_arr.max():.1f}ms\n"
             f"  ratio: compute={compute_ratio:.1f}%  mem_copy(gpu2cpu)={memcopy_ratio:.1f}%  "
             f"avg_bw(gpu2cpu)={avg_bw:.2f}GB/s  data_per_step={data_arr.mean()/1024:.1f}KB"
+            f"{comm_summary}"
         )
 
     def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest):
@@ -1378,7 +1459,10 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
 
     async def _push_outputs(
-        self, request: runtime_pb2.ExpertRequest, serialized_outputs: runtime_pb2.Tensor, metadata: dict
+        self,
+        request: runtime_pb2.ExpertRequest,
+        serialized_outputs: Sequence[runtime_pb2.Tensor],
+        metadata: dict,
     ) -> None:
         push_start_time = perf_counter()
         try:
@@ -1394,22 +1478,23 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             logger.debug(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
 
-            next_tensors = [serialized_outputs] + request.tensors[2:]
+            normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
+            next_tensors = normalized_outputs + list(request.tensors[3:])
             next_metadata = metadata.copy()
-            next_metadata.update(session_id=next_session_id, next_servers=next_servers[2:], pushed=True)
+            next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
             sender_send_us = self._now_us()
             next_metadata["clock_sync_sender_send_us"] = sender_send_us
 
             stub = self.get_stub(self._p2p, next_peer_id)
             push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
-            push_metadata_bytes = len(MSGPackSerializer.dumps(next_metadata))
+            serialized_next_metadata = MSGPackSerializer.dumps(next_metadata)
+            push_metadata_bytes = len(serialized_next_metadata)
 
             # T(CPU→NIC): time from push_start to rpc_push call (metadata prep, stub creation, protobuf assembly)
-            cpu2nic_prep_start = perf_counter()
             rpc_request = runtime_pb2.ExpertRequest(
                 uid=next_uid,
                 tensors=next_tensors,
-                metadata=MSGPackSerializer.dumps(next_metadata),
+                metadata=serialized_next_metadata,
             )
             cpu2nic_prep_end = perf_counter()
             t_cpu2nic_ms = (cpu2nic_prep_end - push_start_time) * 1000
@@ -1418,9 +1503,17 @@ class TransformerConnectionHandler(ConnectionHandler):
             nic2nic_start = perf_counter()
             response = await stub.rpc_push(rpc_request, timeout=self.request_timeout)
             nic2nic_end = perf_counter()
-            t_nic2nic_ms = (nic2nic_end - nic2nic_start) * 1000
 
             sender_ack_us = self._now_us()
+            rpc_timing = self._extract_rpc_push_timing(
+                response,
+                sender_send_us=sender_send_us,
+                sender_ack_us=sender_ack_us,
+                fallback_rtt_ms=(nic2nic_end - nic2nic_start) * 1000,
+            )
+            t_nic2nic_ms = float(rpc_timing["network_rtt_ms"])
+            push_e2e_ms = float(rpc_timing["end_to_end_rtt_ms"])
+            receiver_processing_ms = float(rpc_timing["receiver_processing_ms"])
             self._update_clock_sync_from_rpc_response(
                 peer_id=next_peer_id_str,
                 sender_send_us=sender_send_us,
@@ -1449,12 +1542,23 @@ class TransformerConnectionHandler(ConnectionHandler):
             bw_gpu2cpu_gbps = (data_bytes / (t_gpu2cpu_ms / 1000) / 1e9) if t_gpu2cpu_ms > 0 else 0.0
 
             step_id = metadata.get("step_id", "unknown")
+            session_id = metadata.get("session_id")
+            if session_id and step_id != "unknown":
+                self._session_comm_timing.setdefault(session_id, {})[step_id] = {
+                    "t_cpu2nic_ms": float(t_cpu2nic_ms),
+                    "t_nic2nic_ms": float(t_nic2nic_ms),
+                    "push_e2e_ms": float(push_e2e_ms),
+                    "receiver_processing_ms": float(receiver_processing_ms),
+                    "wire_bytes": float(push_tensor_bytes),
+                }
             logger.info(
                 f"[COMM_BREAKDOWN] step_id={step_id} "
                 f"to_blocks={next_start}:{next_end} "
                 f"T(GPU→CPU)={t_gpu2cpu_ms:.2f}ms({gpu2cpu_pct:.1f}%) "
                 f"T(CPU→NIC)={t_cpu2nic_ms:.2f}ms({cpu2nic_pct:.1f}%) "
                 f"T(NIC→NIC)={t_nic2nic_ms:.2f}ms({nic2nic_pct:.1f}%) "
+                f"push_e2e={push_e2e_ms:.2f}ms "
+                f"recv_proc={receiver_processing_ms:.2f}ms "
                 f"total_comm={total_comm_ms:.2f}ms "
                 f"compute={compute_ms:.2f}ms "
                 f"critical_path: compute={compute_critical_pct:.1f}% comm={comm_critical_pct:.1f}% "
@@ -1540,7 +1644,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # Serialize the micro-batch hidden states
             outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
-            
+            serialize_start = perf_counter()
             serialized_hidden = serialize_torch_tensor(
                 mb_hidden.to(outputs_schema[0].dtype),
                 outputs_schema[0].compression,
@@ -1560,11 +1664,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                     runtime_pb2.CompressionType.NONE,
                     allow_inplace=True
                 )
+            serialize_end = perf_counter()
+            t_gpu2cpu_ms = (serialize_end - serialize_start) * 1000.0
             
             # Build metadata for micro-batch push
             push_metadata = {
                 "session_id": next_session_id,
-                "next_servers": next_servers[2:] if len(next_servers) > 2 else [],
+                "next_servers": next_servers[1:] if len(next_servers) > 1 else [],
                 "pushed": True,
                 # [MBPIPE] Micro-batch specific fields
                 "is_microbatch_push": True,
@@ -1607,11 +1713,14 @@ class TransformerConnectionHandler(ConnectionHandler):
             # [ASYNC_PUSH] Fire-and-forget: don't await RPC response
             # This allows Stage 1 compute to continue immediately while data is sent in background
             push_metadata["clock_sync_sender_send_us"] = self._now_us()
+            serialized_push_metadata = MSGPackSerializer.dumps(push_metadata)
             rpc_request = runtime_pb2.ExpertRequest(
                 uid=next_uid,
                 tensors=[serialized_hidden, serialized_keep],
-                metadata=MSGPackSerializer.dumps(push_metadata),
+                metadata=serialized_push_metadata,
             )
+            t_cpu2nic_ms = (perf_counter() - serialize_end) * 1000.0
+            push_tensor_bytes = len(serialized_hidden.buffer) + len(serialized_keep.buffer)
             
             # [PHASE2] Flow control: limit concurrent pending pushes to prevent queue buildup
             # Initialize semaphore lazily (max 4 concurrent pushes)
@@ -1644,6 +1753,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                     mb_idx,
                     push_start_time,
                     next_peer_id_str,
+                    step_id=push_metadata.get("step_id"),
+                    to_blocks=f"{next_start}:{next_end}",
+                    t_gpu2cpu_ms=t_gpu2cpu_ms,
+                    t_cpu2nic_ms=t_cpu2nic_ms,
+                    wire_bytes=push_tensor_bytes,
                     release_semaphore=acquired_semaphore,
                 )
             )
@@ -1670,6 +1784,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         mb_idx: int,
         queue_start_time: float,
         peer_id: str,
+        step_id: Optional[str],
+        to_blocks: str,
+        t_gpu2cpu_ms: float,
+        t_cpu2nic_ms: float,
+        wire_bytes: int,
         *,
         release_semaphore: bool = True,
     ) -> None:
@@ -1693,6 +1812,12 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             response = await stub.rpc_push(request, timeout=self.request_timeout)
             sender_ack_us = self._now_us()
+            rpc_timing = self._extract_rpc_push_timing(
+                response,
+                sender_send_us=sender_send_us,
+                sender_ack_us=sender_ack_us,
+                fallback_rtt_ms=(perf_counter() - send_start) * 1000,
+            )
             self._update_clock_sync_from_rpc_response(
                 peer_id=peer_id,
                 sender_send_us=sender_send_us,
@@ -1701,9 +1826,26 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
             total_time = (perf_counter() - queue_start_time) * 1000
             send_time = (perf_counter() - send_start) * 1000
+            t_nic2nic_ms = float(rpc_timing["network_rtt_ms"])
+            push_e2e_ms = float(rpc_timing["end_to_end_rtt_ms"])
+            receiver_processing_ms = float(rpc_timing["receiver_processing_ms"])
+            total_comm_ms = t_gpu2cpu_ms + t_cpu2nic_ms + t_nic2nic_ms
+            bw_nic_mbps = (wire_bytes / (t_nic2nic_ms / 1000) / 1e6) if t_nic2nic_ms > 0 else 0.0
             logger.debug(
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} sent: "
                 f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms"
+            )
+            logger.info(
+                f"[COMM_BREAKDOWN_MB] step_id={step_id or 'unknown'} mb_idx={mb_idx} "
+                f"to_blocks={to_blocks} "
+                f"T(GPU→CPU)={t_gpu2cpu_ms:.2f}ms "
+                f"T(CPU→NIC)={t_cpu2nic_ms:.2f}ms "
+                f"T(NIC→NIC)={t_nic2nic_ms:.2f}ms "
+                f"push_e2e={push_e2e_ms:.2f}ms "
+                f"recv_proc={receiver_processing_ms:.2f}ms "
+                f"total_comm={total_comm_ms:.2f}ms "
+                f"BW(NIC)={bw_nic_mbps:.1f}MB/s "
+                f"wire_bytes={wire_bytes}"
             )
         except Exception as e:
             logger.warning(
@@ -2042,11 +2184,20 @@ class TransformerConnectionHandler(ConnectionHandler):
             # This helps release shared memory used by temporary Python objects
             gc.collect()
             
-            # Clear CUDA cache if available (this may free some shared memory)
-            if torch.cuda.is_available():
+            # Never trigger CUDA lazy init from a forked worker just to clean up warmup buffers.
+            # In Hivemind workers this can raise "Cannot re-initialize CUDA in forked subprocess".
+            if not torch.cuda.is_available():
+                logger.debug("Cleaned up temporary shared memory after warmup phase")
+                return
+
+            in_bad_fork = bool(getattr(torch.cuda, "_is_in_bad_fork", lambda: False)())
+            if in_bad_fork:
+                logger.debug("Skipping CUDA warmup cleanup in forked subprocess")
+                return
+
+            # Only touch CUDA if this process already has an initialized context.
+            if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
-                # Synchronize to ensure cleanup is complete
-                torch.cuda.synchronize()
             
             logger.debug("Cleaned up temporary shared memory after warmup phase")
         except Exception as e:
