@@ -6,7 +6,7 @@ if platform.system() == "Darwin":
     os.environ.setdefault("no_proxy", "*")
     os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
 
-import hivemind
+import hivemind.compression.base as hivemind_compression_base
 import transformers
 from packaging import version
 
@@ -26,7 +26,7 @@ if not os.getenv("BLOOMBEE_IGNORE_DEPENDENCY_VERSION"):
 
 def _override_bfloat16_mode_default():
     if os.getenv("USE_LEGACY_BFLOAT16") is None:
-        hivemind.compression.base.USE_LEGACY_BFLOAT16 = False
+        hivemind_compression_base.USE_LEGACY_BFLOAT16 = False
 
 
 _initialize_logs()

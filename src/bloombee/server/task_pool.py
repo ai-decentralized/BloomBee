@@ -8,8 +8,9 @@ from queue import PriorityQueue
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
-from hivemind import get_logger
 from hivemind.utils.mpfuture import ALL_STATES, MPFuture
+
+from bloombee.utils.hivemind_compat import get_logger
 
 logger = get_logger(__name__)
 

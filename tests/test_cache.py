@@ -7,13 +7,13 @@ from typing import Optional
 import pytest
 import pytest_asyncio  # make sure the module exists; otherwise the test will be skipped
 import torch
-from hivemind import TensorDescriptor
 
 from types import SimpleNamespace
 from bloombee.flexgen_utils.pytorch_backend import TorchDevice
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.compression import CompressionConfig
+from bloombee.utils.hivemind_compat import TensorDescriptor
 
 from bloombee.server.memory_cache import AllocationFailed, MemoryCache
 from bloombee.server.memory_cache_manager import KVCacheManager

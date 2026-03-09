@@ -2,9 +2,9 @@ import peft
 import pytest
 import torch
 import transformers
-from hivemind import get_logger
 
 from bloombee import AutoDistributedModelForCausalLM
+from bloombee.utils.hivemind_compat import get_logger
 from test_utils import *
 
 logger = get_logger(__name__)

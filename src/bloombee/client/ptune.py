@@ -4,9 +4,9 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from hivemind import get_logger
 from transformers import PretrainedConfig
 
+from bloombee.utils.hivemind_compat import get_logger
 from bloombee.utils.misc import DUMMY
 
 logger = get_logger(__name__)

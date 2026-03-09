@@ -27,8 +27,31 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "setuptools==65.5.0" wheel grpcio-tools
-          pip install --no-build-isolation -e ".[dev]"
+          python -m pip install wheel grpcio-tools
+          git clone https://github.com/learning-at-home/hivemind.git /tmp/hivemind
+          git -C /tmp/hivemind checkout 4bd43b77895019b20d18d81d0d0c1a5ab9a10847
+          python - <<'PY'
+          from pathlib import Path
+          pyproject = Path("/tmp/hivemind/pyproject.toml")
+          text = pyproject.read_text()
+          old = 'license = "MIT"'
+          new = 'license = {text = "MIT"}'
+          if old not in text:
+              raise SystemExit("Expected Hivemind pyproject license field not found")
+          pyproject.write_text(text.replace(old, new, 1))
+
+          for path in (Path("setup.py"), Path("setup.cfg")):
+              lines = path.read_text().splitlines()
+              filtered = [
+                  line
+                  for line in lines
+                  if "hivemind @ git+https://github.com/learning-at-home/hivemind.git@4bd43b77895019b20d18d81d0d0c1a5ab9a10847"
+                  not in line
+              ]
+              path.write_text("\n".join(filtered) + "\n")
+          PY
+          python -m pip install --no-build-isolation --no-deps /tmp/hivemind
+          python -m pip install --no-build-isolation -e ".[dev]"
 
       - name: Run cache tests
         run: |

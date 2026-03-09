@@ -2,7 +2,7 @@ import dataclasses
 import os
 from typing import Optional, Sequence, Union
 
-from hivemind import PeerID
+from bloombee.utils.hivemind_compat import PeerID
 
 from bloombee.constants import PUBLIC_INITIAL_PEERS
 
