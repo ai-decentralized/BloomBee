@@ -6,8 +6,9 @@ from typing import Any, Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 import torch
 import pydantic
 import torch
-from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
+
+from bloombee.utils.hivemind_compat import PeerID
 
 # 避免循环导入，使用TYPE_CHECKING
 if TYPE_CHECKING:

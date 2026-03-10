@@ -13,8 +13,6 @@ from weakref import WeakMethod
 
 import dijkstar
 import numpy as np
-from hivemind import DHT, P2P, MSGPackSerializer, PeerID
-from hivemind.dht.node import Blacklist
 from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
@@ -25,6 +23,7 @@ from bloombee.client.routing.spending_policy import NoSpendingPolicy
 from bloombee.data_structures import ModuleUID, RemoteSpanInfo, ServerState
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.dht import get_remote_module_infos
+from bloombee.utils.hivemind_compat import Blacklist, DHT, MSGPackSerializer, P2P, PeerID
 from bloombee.utils.ping import PingAggregator
 from bloombee.utils.random import sample_up_to
 
@@ -56,6 +55,14 @@ class SequenceManagerState:
         return len(self.sequence_info)
 
 
+@dataclasses.dataclass
+class _SharedSequenceManagerResources:
+    refcount: int = 1
+    owns_dht: bool = False
+    owns_p2p: bool = False
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock, repr=False)
+
+
 class RemoteSequenceManager:
     """
     Sequence manager is a thread that keeps track of remote servers that hold the specified sequence of blocks.
@@ -75,6 +82,7 @@ class RemoteSequenceManager:
         *,
         dht: Optional[DHT] = None,
         state: Optional[SequenceManagerState] = None,
+        _shared_resources: Optional[_SharedSequenceManagerResources] = None,
     ):
         assert config.initial_peers or dht is not None, "Please specify `config.initial_peers` or `dht`"
         assert config.dht_prefix, "Could not find dht_prefix in config, please create model with dht_prefix=..."
@@ -84,7 +92,9 @@ class RemoteSequenceManager:
         if state is None:
             state = SequenceManagerState()
         self.state = state
+        self._closed = False
 
+        created_dht = dht is None
         if dht is None:
             dht = DHT(
                 initial_peers=config.initial_peers,
@@ -96,8 +106,16 @@ class RemoteSequenceManager:
         assert isinstance(dht, DHT) and dht.is_alive(), "`dht` must be a running hivemind.DHT instance"
         self.dht = dht
 
+        created_p2p = state.p2p is None
         if state.p2p is None:
             state.p2p = RemoteExpertWorker.run_coroutine(dht.replicate_p2p())
+
+        if _shared_resources is None:
+            _shared_resources = _SharedSequenceManagerResources(owns_dht=created_dht, owns_p2p=created_p2p)
+        else:
+            with _shared_resources.lock:
+                _shared_resources.refcount += 1
+        self._shared_resources = _shared_resources
 
         self.lock_changes = threading.Lock()
         self._thread = _SequenceManagerUpdateThread(config.update_period, WeakMethod(self._update))
@@ -328,7 +346,13 @@ class RemoteSequenceManager:
         assert isinstance(ix, (int, slice))
         if not isinstance(ix, slice):
             ix = slice(int(ix), int(ix) + 1, 1)
-        return type(self)(self.config, self.block_uids[ix], dht=self.dht, state=self.state[ix])
+        return type(self)(
+            self.config,
+            self.block_uids[ix],
+            dht=self.dht,
+            state=self.state[ix],
+            _shared_resources=self._shared_resources,
+        )
 
     def update(self, *, wait: bool):
         """Run an asynchronous update in background as soon as possible"""
@@ -487,7 +511,44 @@ class RemoteSequenceManager:
         )
 
     def shutdown(self):
+        if self._closed:
+            return
+
+        self._closed = True
         self._thread.shutdown()
+
+        should_close_resources = False
+        owns_dht = False
+        owns_p2p = False
+        with self._shared_resources.lock:
+            self._shared_resources.refcount -= 1
+            if self._shared_resources.refcount == 0:
+                should_close_resources = True
+                owns_dht = self._shared_resources.owns_dht
+                owns_p2p = self._shared_resources.owns_p2p
+
+        if not should_close_resources:
+            return
+
+        if owns_p2p and self.state.p2p is not None:
+            try:
+                RemoteExpertWorker.run_coroutine(self.state.p2p.shutdown())
+            except BaseException:
+                logger.debug("Failed to shut down replicated P2P instance cleanly", exc_info=True)
+            finally:
+                self.state.p2p = None
+
+        if owns_dht and self.dht is not None:
+            try:
+                self.dht.shutdown()
+            except BaseException:
+                logger.debug("Failed to shut down DHT cleanly", exc_info=True)
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except BaseException:
+            pass
 
 
 class _SequenceManagerUpdateThread(threading.Thread):

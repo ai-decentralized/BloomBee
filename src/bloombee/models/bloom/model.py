@@ -1,9 +1,7 @@
 from typing import Optional
 
-import hivemind
 import torch
 import torch.nn as nn
-from hivemind.utils.logging import get_logger
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.models.bloom import BloomForCausalLM, BloomForSequenceClassification, BloomModel, BloomPreTrainedModel
@@ -14,6 +12,7 @@ from bloombee.client.ptune import PTuneMixin
 from bloombee.client.remote_generation import RemoteGenerationMixin, RemotePastKeyValues
 from bloombee.client.remote_sequential import RemoteSequential
 from bloombee.models.bloom.config import DistributedBloomConfig
+from bloombee.utils.hivemind_compat import DHT, get_logger
 
 logger = get_logger(__name__)
 
@@ -26,7 +25,7 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
 
     config_class = DistributedBloomConfig
 
-    def __init__(self, config: DistributedBloomConfig, *, dht: Optional[hivemind.DHT] = None):
+    def __init__(self, config: DistributedBloomConfig, *, dht: Optional[DHT] = None):
         n_layer, config.num_hidden_layers = config.num_hidden_layers, 0  # Prevent initialization
         super().__init__(config)
         assert len(self.h) == 0

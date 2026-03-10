@@ -19,11 +19,9 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
 if "TORCH_SHOW_CPP_STACKTRACES" not in os.environ:
     os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "0"
 
-import hivemind
 import psutil
 import torch
 import torch.mps
-from hivemind import DHT, MAX_DHT_TIME_DISCREPANCY_SECONDS, BatchTensorDescriptor, get_dht_time
 from hivemind.moe.server.layers import add_custom_models_from_file
 from hivemind.moe.server.runtime import Runtime
 from hivemind.proto.runtime_pb2 import CompressionType
@@ -38,6 +36,13 @@ from bloombee.server.backend import TransformerBackend, merge_inference_pools_in
 from bloombee.server.block_utils import get_block_size, resolve_block_dtype
 from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.server.handler import TransformerConnectionHandler
+from bloombee.utils.hivemind_compat import (
+    BatchTensorDescriptor,
+    DHT,
+    MAX_DHT_TIME_DISCREPANCY_SECONDS,
+    PeerID,
+    get_dht_time,
+)
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
@@ -970,7 +975,7 @@ class ModuleAnnouncerThread(threading.Thread):
         if state == ServerState.OFFLINE:
             self.join()
 
-    def _ping_next_servers(self) -> Dict[hivemind.PeerID, float]:
+    def _ping_next_servers(self) -> Dict[PeerID, float]:
         module_infos = get_remote_module_infos(self.dht, self.next_uids, latest=True)
         middle_servers = {peer_id for info in module_infos[:-1] for peer_id in info.servers}
         pinged_servers = set(sample_up_to(middle_servers, self.max_pinged))

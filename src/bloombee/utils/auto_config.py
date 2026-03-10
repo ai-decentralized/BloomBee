@@ -2,9 +2,9 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Type, Union
 
-from hivemind import get_logger
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 
+from bloombee.utils.hivemind_compat import get_logger
 from bloombee.utils.hf_auth import always_needs_auth
 
 logger = get_logger(__name__)

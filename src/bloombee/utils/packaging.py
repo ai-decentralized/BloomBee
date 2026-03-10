@@ -1,7 +1,8 @@
 from typing import Any, Dict, List, Tuple
 
 import torch
-from hivemind import nested_flatten, nested_pack
+
+from bloombee.utils.hivemind_compat import nested_flatten, nested_pack
 
 # TODO: Move functions to hivemind
 

@@ -18,14 +18,14 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -
 ENV PATH="/opt/conda/bin:${PATH}"
 
 RUN conda install python~=3.10.12 pip && \
-    pip install --no-cache-dir "torch>=1.12" && \
+    python -m pip install --no-cache-dir "torch>=1.12" && \
     conda clean --all && rm -rf ~/.cache/pip
 
 VOLUME /cache
 ENV BLOOMBEE_CACHE=/cache
 
 COPY . bloombee/
-RUN pip install --no-cache-dir -e bloombee
+RUN python -m pip install --no-cache-dir -e bloombee
 
 WORKDIR /home/bloombee/
 CMD bash

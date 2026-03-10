@@ -54,7 +54,7 @@ except ImportError:
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from hivemind import get_logger
+from bloombee.utils.hivemind_compat import get_logger
 
 logger = get_logger(__name__)
 

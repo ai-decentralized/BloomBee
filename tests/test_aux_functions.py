@@ -3,10 +3,10 @@ import sys
 
 import pytest
 import torch
-from hivemind import nested_compare, nested_flatten
 
 from bloombee import AutoDistributedConfig
 from bloombee.server.throughput import measure_compute_rps
+from bloombee.utils.hivemind_compat import nested_compare, nested_flatten
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import pack_args_kwargs, unpack_args_kwargs

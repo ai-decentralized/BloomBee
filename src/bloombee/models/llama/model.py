@@ -1,10 +1,8 @@
 from typing import Optional
 
-import hivemind
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from hivemind.utils.logging import get_logger
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama import LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel, LlamaPreTrainedModel
@@ -15,6 +13,7 @@ from bloombee.client.ptune import PTuneMixin
 from bloombee.client.remote_generation import RemoteGenerationMixin, RemotePastKeyValues
 from bloombee.client.remote_sequential import RemoteSequential
 from bloombee.models.llama.config import DistributedLlamaConfig
+from bloombee.utils.hivemind_compat import DHT, get_logger
 
 logger = get_logger(__name__)
 
@@ -28,7 +27,7 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
 
     config_class = DistributedLlamaConfig
 
-    def __init__(self, config: DistributedLlamaConfig, *, dht: Optional[hivemind.DHT] = None):
+    def __init__(self, config: DistributedLlamaConfig, *, dht: Optional[DHT] = None):
         n_layer, config.num_hidden_layers = config.num_hidden_layers, 0  # Prevent initialization
         super().__init__(config)
         assert len(self.layers) == 0
