@@ -8,13 +8,11 @@ from functools import partial
 from typing import Optional
 
 import requests
-from hivemind.dht import DHT, DHTNode
 from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
-from hivemind.p2p import P2P, P2PContext, PeerID, ServicerBase
 from hivemind.proto import dht_pb2
-from hivemind.utils import get_logger
 
 from bloombee.constants import REACHABILITY_API_URL
+from bloombee.utils.hivemind_compat import DHT, DHTNode, P2P, P2PContext, PeerID, ServicerBase, get_logger
 
 logger = get_logger(__name__)
 
@@ -129,6 +127,7 @@ class ReachabilityProtocol(ServicerBase):
         ready = Future()
 
         async def _serve_with_probe():
+            common_p2p = None
             try:
                 common_p2p = await dht.replicate_p2p()
                 protocol._event_loop = asyncio.get_event_loop()
@@ -150,8 +149,16 @@ class ReachabilityProtocol(ServicerBase):
                 if not ready.done():
                     ready.set_exception(e)
             finally:
+                if common_p2p is not None:
+                    try:
+                        await common_p2p.shutdown()
+                    except BaseException:
+                        logger.debug("Failed to shut down shared reachability P2P cleanly", exc_info=True)
                 if protocol is not None and protocol.probe is not None:
-                    await protocol.probe.shutdown()
+                    try:
+                        await protocol.probe.shutdown()
+                    except BaseException:
+                        logger.debug("Failed to shut down reachability probe cleanly", exc_info=True)
                 logger.debug("Reachability service shut down")
 
         threading.Thread(target=partial(asyncio.run, _serve_with_probe()), daemon=True).start()

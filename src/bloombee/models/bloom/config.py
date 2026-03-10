@@ -1,7 +1,6 @@
 import os
 from typing import Optional, Union
 
-from hivemind import get_logger
 from transformers.models.bloom import BloomConfig
 from transformers.models.bloom.modeling_bloom import BloomAttention
 
@@ -9,6 +8,7 @@ from bloombee.client.config import ClientConfig
 from bloombee.client.lm_head import LMHeadConfig
 from bloombee.client.ptune import PTuneConfig
 from bloombee.models.bloom.block import WrappedBloomBlock
+from bloombee.utils.hivemind_compat import get_logger
 
 logger = get_logger(__name__)
 

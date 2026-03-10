@@ -7,7 +7,6 @@ from collections import deque
 from typing import List, Optional, Sequence, Tuple
 
 import torch
-from hivemind import MSGPackSerializer
 from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
 from hivemind.utils.logging import get_logger
 
@@ -15,6 +14,7 @@ from bloombee.client.remote_forward_backward import run_remote_backward, run_rem
 from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, RemoteSpanInfo
 from bloombee.server.handler import TransformerConnectionHandler
+from bloombee.utils.hivemind_compat import MSGPackSerializer
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import pack_args_kwargs
 

@@ -5,9 +5,10 @@ from typing import Union
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from hivemind import get_logger
 from torch import nn
 from transformers import PretrainedConfig
+
+from bloombee.utils.hivemind_compat import get_logger
 
 logger = get_logger(__name__)
 

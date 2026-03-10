@@ -2,7 +2,6 @@
 import os
 from typing import Optional, Union
 
-from hivemind import get_logger
 from transformers.models.{{ hf_model_key }} import {{ config_class }}
 from transformers.models.{{ hf_model_key }}.modeling_{{ hf_model_key }} import {{ hf_attention_class }}
 
@@ -10,6 +9,7 @@ from bloombee.client.config import ClientConfig
 from bloombee.client.lm_head import LMHeadConfig
 from bloombee.client.ptune import PTuneConfig
 from bloombee.models.{{ model_name }}.block import Wrapped{{ M }}Block
+from bloombee.utils.hivemind_compat import get_logger
 
 logger = get_logger(__name__)
 
