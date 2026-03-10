@@ -42,6 +42,7 @@ from bloombee.flexgen_utils.task import Task
 from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice, DeviceType, general_copy
 from bloombee.flexgen_utils.compression import TorchCompressedDevice, general_copy_compressed
 from bloombee.flexgen_utils.utils import torch_dtype_to_np_dtype
+from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 import numpy as np
 
 logger = get_logger(__name__)
@@ -53,7 +54,11 @@ offload_logger.setLevel(logging.INFO)
 
 def _is_verbose_kv_alloc_logs() -> bool:
     """Enable detailed KV allocation logs with BLOOMBEE_VERBOSE_KV_LOGS=1."""
-    return os.environ.get("BLOOMBEE_VERBOSE_KV_LOGS", "0") == "1"
+    return get_env_bool_with_debug_fallback(
+        "BLOOMBEE_VERBOSE_KV_LOGS",
+        default=False,
+        groups=("kv_cache",),
+    )
 
 
 class MemoryCache:

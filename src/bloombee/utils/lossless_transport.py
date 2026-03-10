@@ -21,6 +21,8 @@ from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 from hivemind.utils.streaming import combine_from_streaming
 
+from bloombee.utils.debug_config import get_env_bool_with_debug_fallback, is_log_channel_enabled
+
 try:
     from bloombee.utils import lossless_wrapper_config as _lossless_cfg
 except Exception:
@@ -185,24 +187,36 @@ def _lossless_min_gain_bytes() -> int:
 def comp_ratio_profile_enabled() -> bool:
     """
     Enable per-tensor compression ratio profiling logs.
-    Default is enabled for research runs.
+    BLOOMBEE_DEBUG=1 or BLOOMBEE_DEBUG_COMPRESSION=1 enables it by default.
     """
-    return _get_env_bool(_COMP_PROFILE_ENV, "1")
+    return get_env_bool_with_debug_fallback(
+        _COMP_PROFILE_ENV,
+        default=False,
+        groups=("compression",),
+    )
 
 
 def comp_timing_profile_enabled() -> bool:
     """
     Enable detailed compression/decompression timing profiling.
     """
-    return _get_env_bool(_COMP_TIMING_PROFILE_ENV, "1")
+    return get_env_bool_with_debug_fallback(
+        _COMP_TIMING_PROFILE_ENV,
+        default=False,
+        groups=("compression",),
+    )
 
 
 def comp_detail_profile_enabled() -> bool:
     """
     Enable heavyweight per-tensor compression diagnostics.
-    Default is on for compression experiments.
+    BLOOMBEE_DEBUG=1 or BLOOMBEE_DEBUG_COMPRESSION=1 enables it by default.
     """
-    return _get_env_bool(_COMP_DETAIL_PROFILE_ENV, "1")
+    return get_env_bool_with_debug_fallback(
+        _COMP_DETAIL_PROFILE_ENV,
+        default=False,
+        groups=("compression",),
+    )
 
 
 def comp_research_profile_enabled() -> bool:
@@ -210,28 +224,44 @@ def comp_research_profile_enabled() -> bool:
     Enable lightweight rolling compression scaling summaries.
     This is cheaper than COMP_DETAIL and intended for online cost/benefit analysis.
     """
-    return _get_env_bool(_COMP_RESEARCH_PROFILE_ENV, "1")
+    return get_env_bool_with_debug_fallback(
+        _COMP_RESEARCH_PROFILE_ENV,
+        default=False,
+        groups=("compression",),
+    )
 
 
 def comp_bit_profile_enabled() -> bool:
     """
     Enable bit-level floating-point profiling (sign/exponent/mantissa) on sampled tensors.
     """
-    return _get_env_bool(_COMP_BIT_PROFILE_ENV, "1")
+    return get_env_bool_with_debug_fallback(
+        _COMP_BIT_PROFILE_ENV,
+        default=False,
+        groups=("compression",),
+    )
 
 
 def comp_stride_profile_enabled() -> bool:
     """
     Enable strided/chunk repeat diagnostics to inspect alignment-sensitive byte patterns.
     """
-    return _get_env_bool(_COMP_STRIDE_PROFILE_ENV, "1")
+    return get_env_bool_with_debug_fallback(
+        _COMP_STRIDE_PROFILE_ENV,
+        default=False,
+        groups=("compression",),
+    )
 
 
 def act_dist_profile_enabled() -> bool:
     """
     Enable activation magnitude decade histogram logs (10x bins).
     """
-    return _get_env_bool(_ACT_DIST_PROFILE_ENV, "1")
+    return get_env_bool_with_debug_fallback(
+        _ACT_DIST_PROFILE_ENV,
+        default=False,
+        groups=("compression",),
+    )
 
 
 def comp_zipnn_profile_enabled() -> bool:
@@ -243,9 +273,11 @@ def comp_zipnn_profile_enabled() -> bool:
         default = "1" if bool(int(cfg_val)) else "0"
     except Exception:
         default = "1" if bool(cfg_val) else "0"
-    if _allow_env_override():
-        return _get_env_bool(_COMP_ZIPNN_PROFILE_ENV, default)
-    return default == "1"
+    return get_env_bool_with_debug_fallback(
+        _COMP_ZIPNN_PROFILE_ENV,
+        default=(default == "1"),
+        groups=("compression",),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -1372,6 +1404,8 @@ def _log_zipnn_compare_event(
     zipnn_info: Optional[Dict[str, object]],
     debug_context: Optional[Dict[str, object]],
 ) -> None:
+    if not is_log_channel_enabled("zipnn_logs"):
+        return
     selected_algo = str(wrap_info.get("algo_name", _lossless_algo()))
     if not comp_zipnn_profile_enabled() and selected_algo != "zipnn":
         return

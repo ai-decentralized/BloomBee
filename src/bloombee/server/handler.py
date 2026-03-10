@@ -31,6 +31,7 @@ from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritiz
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.hivemind_compat import DHT, MSGPackSerializer, P2PContext, PeerID, nested_flatten, nested_pack
 from bloombee.utils.convert_block import QuantType
+from bloombee.utils.debug_config import is_log_channel_enabled
 from bloombee.utils.lossless_transport import (
     deserialize_tensor_stream,
     deserialize_torch_tensor,
@@ -409,6 +410,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._listener_task: Optional[asyncio.Task] = None
         self._session_queues: Dict[str, asyncio.Queue] = {}
         self._session_handlers: Dict[str, int] = {}
+        self._session_timing: Dict[str, list] = {}
+        self._session_comm_timing: Dict[str, Dict[str, Dict[str, float]]] = {}
         
         # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
         # Key: (session_id, step_id) -> Queue holding individual micro-batches
@@ -1145,14 +1148,26 @@ class TransformerConnectionHandler(ConnectionHandler):
                             if isinstance(step_metadata, dict)
                             else "unknown"
                         )
-                        logger.info(
-                            f"[HANDLER_STEP_TIMING] step_id={step_id_for_log} "
-                            f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
-                            f"push_schedule={push_schedule_ms:.2f}ms "
-                            f"response_emit={response_emit_ms:.2f}ms "
-                            f"handler_total={handler_step_total_ms:.2f}ms "
-                            f"can_push={int(bool(can_push))}"
-                        )
+                        if is_log_channel_enabled("handler_step_timing_logs"):
+                            logger.info(
+                                f"[HANDLER_STEP_TIMING] step_id={step_id_for_log} "
+                                f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
+                                f"push_schedule={push_schedule_ms:.2f}ms "
+                                f"response_emit={response_emit_ms:.2f}ms "
+                                f"handler_total={handler_step_total_ms:.2f}ms "
+                                f"can_push={int(bool(can_push))}"
+                            )
+                        if isinstance(step_metadata, dict) and session_id:
+                            self._session_timing.setdefault(session_id, []).append(
+                                {
+                                    "step_id": step_id_for_log,
+                                    "compute_ms": float(step_metadata.get("_compute_ms", 0.0)),
+                                    "t_gpu2cpu_ms": float(step_metadata.get("_serialize_ms", 0.0)),
+                                    "step_total_ms": float(step_metadata.get("_step_total_ms", 0.0)),
+                                    "data_bytes": int(step_metadata.get("_data_bytes", 0)),
+                                    "queue_wait_ms": queue_wait_ms,
+                                }
+                            )
                         # print('runtime_pb2.ExpertResponse push outputs respond time', end_ExpertResponse_time-start_ExpertResponse_time) ###
                         # print_time_now('')
                         
@@ -1185,6 +1200,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                     logger.warning(f"[MBPIPE_FIX] Failed to clear offload state: {e}")
 
                 self._log_request("rpc_inference.close", requested_uids, context)
+                if session_id:
+                    self._emit_timing_summary(session_id, requested_uids)
                 # print_time_now('')
                 # print('end of  rpc_inference ..........')  ###
                 end_time_rpc_infer = perf_counter() ###
@@ -1207,6 +1224,114 @@ class TransformerConnectionHandler(ConnectionHandler):
             for other_index, other_queue in enumerate(self._handler_event_queues):
                 if other_index != self._handler_index:
                     other_queue.put_nowait((Event.END_SESSION, session_id, self._handler_index))
+
+    def _emit_timing_summary(self, session_id: str, requested_uids) -> None:
+        records = self._session_timing.pop(session_id, [])
+        comm_records = self._session_comm_timing.pop(session_id, {})
+        if not records:
+            return
+
+        warmup = 1
+        decode_records = records[warmup:] if len(records) > warmup else records
+        if not decode_records:
+            return
+
+        blocks_desc = self._uids_to_block_span_label(requested_uids)
+        compute_arr = np.array([r["compute_ms"] for r in decode_records], dtype=np.float64)
+        gpu2cpu_arr = np.array([r["t_gpu2cpu_ms"] for r in decode_records], dtype=np.float64)
+        step_arr = np.array([r["step_total_ms"] for r in decode_records], dtype=np.float64)
+        queue_arr = np.array([r["queue_wait_ms"] for r in decode_records], dtype=np.float64)
+        data_arr = np.array([r["data_bytes"] for r in decode_records], dtype=np.float64)
+
+        total_compute = float(compute_arr.sum())
+        total_step = float(step_arr.sum())
+        total_gpu2cpu = float(gpu2cpu_arr.sum())
+        compute_ratio = (total_compute / total_step * 100.0) if total_step > 0 else 0.0
+        memcopy_ratio = (total_gpu2cpu / total_step * 100.0) if total_step > 0 else 0.0
+        avg_bw = (data_arr.mean() / (gpu2cpu_arr.mean() / 1000.0) / 1e9) if gpu2cpu_arr.mean() > 0 else 0.0
+
+        comm_summary = "\n  s2s_comm : no downstream push samples"
+        matched_comm_records = [comm_records[r["step_id"]] for r in decode_records if r.get("step_id") in comm_records]
+        if matched_comm_records:
+            cpu2nic_arr = np.array([r["t_cpu2nic_ms"] for r in matched_comm_records], dtype=np.float64)
+            nic2nic_arr = np.array([r["t_nic2nic_ms"] for r in matched_comm_records], dtype=np.float64)
+            push_e2e_arr = np.array([r["push_e2e_ms"] for r in matched_comm_records], dtype=np.float64)
+            receiver_proc_arr = np.array([r["receiver_processing_ms"] for r in matched_comm_records], dtype=np.float64)
+            wire_arr = np.array([r["wire_bytes"] for r in matched_comm_records], dtype=np.float64)
+
+            total_cpu2nic = float(cpu2nic_arr.sum())
+            total_nic2nic = float(nic2nic_arr.sum())
+            total_comm = total_gpu2cpu + total_cpu2nic + total_nic2nic
+            gpu2cpu_comm_ratio = (total_gpu2cpu / total_comm * 100.0) if total_comm > 0 else 0.0
+            cpu2nic_ratio = (total_cpu2nic / total_comm * 100.0) if total_comm > 0 else 0.0
+            nic2nic_ratio = (total_nic2nic / total_comm * 100.0) if total_comm > 0 else 0.0
+            avg_nic_bw = (wire_arr.mean() / (nic2nic_arr.mean() / 1000.0) / 1e6) if nic2nic_arr.mean() > 0 else 0.0
+
+            comm_summary = (
+                f"\n  cpu2nic : mean={cpu2nic_arr.mean():.2f}ms  median={np.median(cpu2nic_arr):.2f}ms  "
+                f"p95={np.percentile(cpu2nic_arr,95):.2f}ms  max={cpu2nic_arr.max():.2f}ms"
+                f"\n  nic2nic : mean={nic2nic_arr.mean():.2f}ms  median={np.median(nic2nic_arr):.2f}ms  "
+                f"p95={np.percentile(nic2nic_arr,95):.2f}ms  max={nic2nic_arr.max():.2f}ms"
+                f"\n  push_e2e: mean={push_e2e_arr.mean():.2f}ms  median={np.median(push_e2e_arr):.2f}ms  "
+                f"p95={np.percentile(push_e2e_arr,95):.2f}ms  max={push_e2e_arr.max():.2f}ms"
+                f"\n  recv_proc: mean={receiver_proc_arr.mean():.2f}ms  median={np.median(receiver_proc_arr):.2f}ms  "
+                f"p95={np.percentile(receiver_proc_arr,95):.2f}ms  max={receiver_proc_arr.max():.2f}ms"
+                f"\n  s2s_ratio: gpu2cpu={gpu2cpu_comm_ratio:.1f}%  cpu2nic={cpu2nic_ratio:.1f}%  "
+                f"nic2nic={nic2nic_ratio:.1f}%  avg_bw(nic)={avg_nic_bw:.1f}MB/s  wire_per_push={wire_arr.mean()/1024.0:.1f}KB"
+            )
+
+        n = len(decode_records)
+        logger.info(
+            f"[TIMING_SUMMARY] blocks={blocks_desc} steps={n} (excl {warmup} warmup)\n"
+            f"  compute : mean={compute_arr.mean():.1f}ms  median={np.median(compute_arr):.1f}ms  "
+            f"p95={np.percentile(compute_arr,95):.1f}ms  min={compute_arr.min():.1f}ms  max={compute_arr.max():.1f}ms\n"
+            f"  gpu2cpu : mean={gpu2cpu_arr.mean():.2f}ms  median={np.median(gpu2cpu_arr):.2f}ms  "
+            f"p95={np.percentile(gpu2cpu_arr,95):.2f}ms  max={gpu2cpu_arr.max():.2f}ms\n"
+            f"  step_total: mean={step_arr.mean():.1f}ms  median={np.median(step_arr):.1f}ms  "
+            f"p95={np.percentile(step_arr,95):.1f}ms  min={step_arr.min():.1f}ms  max={step_arr.max():.1f}ms\n"
+            f"  queue_wait: mean={queue_arr.mean():.1f}ms  median={np.median(queue_arr):.1f}ms  "
+            f"p95={np.percentile(queue_arr,95):.1f}ms  max={queue_arr.max():.1f}ms\n"
+            f"  ratio: compute={compute_ratio:.1f}%  mem_copy(gpu2cpu)={memcopy_ratio:.1f}%  "
+            f"avg_bw(gpu2cpu)={avg_bw:.2f}GB/s  data_per_step={data_arr.mean()/1024.0:.1f}KB"
+            f"{comm_summary}"
+        )
+
+    def _extract_rpc_push_timing(
+        self,
+        response: Optional[runtime_pb2.ExpertResponse],
+        *,
+        sender_send_us: int,
+        sender_ack_us: int,
+        fallback_rtt_ms: float,
+    ) -> Dict[str, float]:
+        result = {
+            "end_to_end_rtt_ms": max(0.0, float(sender_ack_us - sender_send_us) / 1000.0),
+            "network_rtt_ms": max(0.0, float(fallback_rtt_ms)),
+            "receiver_processing_ms": 0.0,
+        }
+        if response is None or not response.metadata:
+            return result
+
+        try:
+            response_meta = MSGPackSerializer.loads(response.metadata)
+        except Exception:
+            return result
+        if not isinstance(response_meta, dict):
+            return result
+
+        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
+        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
+        if receiver_recv_us <= 0 or receiver_ack_us < receiver_recv_us or sender_ack_us < sender_send_us:
+            return result
+
+        receiver_processing_ms = max(0.0, float(receiver_ack_us - receiver_recv_us) / 1000.0)
+        end_to_end_rtt_ms = max(0.0, float(sender_ack_us - sender_send_us) / 1000.0)
+        network_rtt_ms = max(0.0, end_to_end_rtt_ms - receiver_processing_ms)
+        return {
+            "end_to_end_rtt_ms": end_to_end_rtt_ms,
+            "network_rtt_ms": network_rtt_ms,
+            "receiver_processing_ms": receiver_processing_ms,
+        }
 
     def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest):
         handler_index = self._session_handlers.get(session_id)
@@ -1860,6 +1985,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         raise_on_error: bool = False,
     ) -> None:
         # print('_push_outputs metadata ', metadata)
+        push_start_time = perf_counter()
         next_peer_id = None
         next_session_id = None
         next_start = None
@@ -1877,7 +2003,10 @@ class TransformerConnectionHandler(ConnectionHandler):
             sender_blocks = self._uids_to_block_span_label(request.uid)
 
             # Log cross-GPU transfer start
-            logger.info(f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
+            if is_log_channel_enabled("cross_gpu_transfer_logs"):
+                logger.info(
+                    f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}"
+                )
 
             # Sending hidden states serialized with output_schema to avoid double serialization.
             # `serialized_outputs` already contains:
@@ -1917,16 +2046,35 @@ class TransformerConnectionHandler(ConnectionHandler):
                 timeout=self.request_timeout,
             )
             sender_ack_us = self._now_us()
+            transfer_end = perf_counter()
+            transfer_time_ms = (transfer_end - transfer_start) * 1000
+            rpc_timing = self._extract_rpc_push_timing(
+                response,
+                sender_send_us=sender_send_us,
+                sender_ack_us=sender_ack_us,
+                fallback_rtt_ms=transfer_time_ms,
+            )
             self._update_clock_sync_from_rpc_response(
                 peer_id=next_peer_id_str,
                 sender_send_us=sender_send_us,
                 sender_ack_us=sender_ack_us,
                 response=response,
             )
-            
-            transfer_end = perf_counter()
-            transfer_time_ms = (transfer_end - transfer_start) * 1000
             transfer_bw_mbps = self._calc_mbps(push_tensor_bytes + push_metadata_bytes, transfer_time_ms)
+            t_cpu2nic_ms = max(0.0, (transfer_start - push_start_time) * 1000.0)
+            t_nic2nic_ms = float(rpc_timing["network_rtt_ms"])
+            push_e2e_ms = float(rpc_timing["end_to_end_rtt_ms"])
+            receiver_processing_ms = float(rpc_timing["receiver_processing_ms"])
+            step_id = metadata.get("step_id", "unknown")
+            session_id = metadata.get("session_id")
+            if session_id and step_id != "unknown":
+                self._session_comm_timing.setdefault(session_id, {})[step_id] = {
+                    "t_cpu2nic_ms": float(t_cpu2nic_ms),
+                    "t_nic2nic_ms": float(t_nic2nic_ms),
+                    "push_e2e_ms": float(push_e2e_ms),
+                    "receiver_processing_ms": float(receiver_processing_ms),
+                    "wire_bytes": float(push_tensor_bytes),
+                }
             
             # [NETWORK_TIMING] Log server-to-server transfer
             logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "

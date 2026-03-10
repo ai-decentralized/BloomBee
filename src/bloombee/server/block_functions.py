@@ -30,6 +30,7 @@ from bloombee.utils.lossless_transport import (
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -80,7 +81,11 @@ offload_logger.setLevel(logging.INFO)
 
 def _mbpipe_verbose_enabled() -> bool:
     """Enable full per-micro-batch logs via BLOOMBEE_MBPIPE_VERBOSE=1."""
-    return os.environ.get("BLOOMBEE_MBPIPE_VERBOSE", "0") == "1"
+    return get_env_bool_with_debug_fallback(
+        "BLOOMBEE_MBPIPE_VERBOSE",
+        default=False,
+        groups=("microbatch",),
+    )
 
 
 def _should_log_mb_detail(step_metadata: Optional[Dict[str, Any]]) -> bool:
@@ -2512,6 +2517,14 @@ async def iterate_rpc_inference(
         except Exception as e:
             # Don't let timing logging break the main flow
             logger.debug(f"{MBPIPE_LOG_PREFIX} Failed to log stage timing: {e}")
+
+        if isinstance(step_metadata, dict):
+            step_metadata["_compute_ms"] = float(compute_time)
+            step_metadata["_serialize_ms"] = float(serialize_time)
+            step_metadata["_step_total_ms"] = float(step_total_time)
+            step_metadata["_data_bytes"] = int(
+                sum(len(t.buffer) for t in output_tensors) if output_tensors is not None else 0
+            )
         
         yield output_tensors, can_push, step_metadata
         # print('output_tensors ',output_tensors)

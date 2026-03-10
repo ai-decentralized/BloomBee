@@ -17,6 +17,7 @@ from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo, RPCInfo
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.hivemind_compat import MSGPackSerializer, anext, get_logger
+from bloombee.utils.debug_config import is_log_channel_enabled
 from bloombee.utils.lossless_transport import (
     deserialize_torch_tensor,
     serialize_torch_tensor,
@@ -188,7 +189,9 @@ class _ServerInferenceSession:
             normalize_arg(prefill_length),
             normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
         )
-        logger.info(f"_ServerInferenceSession  step id {step_id}")
+        client_inference_logs_enabled = is_log_channel_enabled("client_inference_logs")
+        if client_inference_logs_enabled:
+            logger.info(f"_ServerInferenceSession  step id {step_id}")
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
@@ -267,11 +270,12 @@ class _ServerInferenceSession:
             metadata_bytes = len(serialized_metadata)
             total_send_bytes = total_tensor_bytes + metadata_bytes
 
-            logger.info(f"[NETWORK_TX] SEND_START | step_id={step_id} | "
-                       f"tensor_size={total_tensor_bytes/1024:.2f}KB | "
-                       f"metadata_size={metadata_bytes}B | "
-                       f"total={total_send_bytes/1024:.2f}KB | "
-                       f"serialize_time={serialize_time_ms:.2f}ms")
+            if client_inference_logs_enabled:
+                logger.info(f"[NETWORK_TX] SEND_START | step_id={step_id} | "
+                           f"tensor_size={total_tensor_bytes/1024:.2f}KB | "
+                           f"metadata_size={metadata_bytes}B | "
+                           f"total={total_send_bytes/1024:.2f}KB | "
+                           f"serialize_time={serialize_time_ms:.2f}ms")
 
             # [NETWORK_TIMING] Measure network round-trip time
             network_start = time.perf_counter()
@@ -298,17 +302,19 @@ class _ServerInferenceSession:
         # [NETWORK_TIMING] Measure received data size
         total_recv_bytes = sum(len(t.buffer) for t in outputs_serialized.tensors)
         
-        logger.info(f"[NETWORK_TX] RECV_END | step_id={step_id} | "
-                   f"recv_size={total_recv_bytes/1024:.2f}KB | "
-                   f"network_rtt={network_rtt_ms:.2f}ms | "
-                   f"deserialize_time={deserialize_time_ms:.2f}ms")
+        if client_inference_logs_enabled:
+            logger.info(f"[NETWORK_TX] RECV_END | step_id={step_id} | "
+                       f"recv_size={total_recv_bytes/1024:.2f}KB | "
+                       f"network_rtt={network_rtt_ms:.2f}ms | "
+                       f"deserialize_time={deserialize_time_ms:.2f}ms")
         
         # [NETWORK_TIMING] Summary log
         total_time_ms = serialize_time_ms + network_rtt_ms + deserialize_time_ms
-        logger.info(f"[NETWORK_TX] SUMMARY | step_id={step_id} | "
-                   f"send={total_send_bytes/1024:.2f}KB | recv={total_recv_bytes/1024:.2f}KB | "
-                   f"serialize={serialize_time_ms:.2f}ms | network={network_rtt_ms:.2f}ms | "
-                   f"deserialize={deserialize_time_ms:.2f}ms | total={total_time_ms:.2f}ms")
+        if client_inference_logs_enabled:
+            logger.info(f"[NETWORK_TX] SUMMARY | step_id={step_id} | "
+                       f"send={total_send_bytes/1024:.2f}KB | recv={total_recv_bytes/1024:.2f}KB | "
+                       f"serialize={serialize_time_ms:.2f}ms | network={network_rtt_ms:.2f}ms | "
+                       f"deserialize={deserialize_time_ms:.2f}ms | total={total_time_ms:.2f}ms")
         log_transport_profile_event(
             logger,
             source="client",
@@ -328,7 +334,8 @@ class _ServerInferenceSession:
         # ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"
 
         self._position += n_input_tokens
-        logger.info(f"server inference session self._position: {self._position}")
+        if client_inference_logs_enabled:
+            logger.info(f"server inference session self._position: {self._position}")
         return outputs
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
@@ -557,7 +564,10 @@ class InferenceSession:
                     # 🔍 CLIENT DEBUG: Log server span processing end
                     span_end_time = time.perf_counter()
                     span_duration = (span_end_time - span_start_time) * 1000  # ms
-                    logger.info(f"[CLIENT_SERVER_END] ServerIdx={server_idx} | Blocks={server_session.span.start}:{server_session.span.end} | Duration={span_duration:.2f}ms")
+                    if is_log_channel_enabled("client_inference_logs"):
+                        logger.info(
+                            f"[CLIENT_SERVER_END] ServerIdx={server_idx} | Blocks={server_session.span.start}:{server_session.span.end} | Duration={span_duration:.2f}ms"
+                        )
                     # print('inputs ', inputs)
                     # print('inputs.shape ', inputs.shape)
                     server_idx += 1
@@ -616,8 +626,11 @@ class InferenceSession:
         # 🔍 CLIENT DEBUG: Log inference step end
         inference_step_end = time.perf_counter()
         inference_step_duration = (inference_step_end - inference_step_start) * 1000  # ms
-        logger.info(f"[CLIENT_INFERENCE_END] Position={self._position} | Duration={inference_step_duration:.2f}ms | Servers={server_idx}")
-        logger.info("="*80)
+        if is_log_channel_enabled("client_inference_logs"):
+            logger.info(
+                f"[CLIENT_INFERENCE_END] Position={self._position} | Duration={inference_step_duration:.2f}ms | Servers={server_idx}"
+            )
+            logger.info("=" * 80)
         
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         # print('client inference session outputs ', outputs.shape)

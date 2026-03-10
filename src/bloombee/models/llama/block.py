@@ -32,6 +32,7 @@ from transformers import AutoTokenizer
 import os
 from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage, log_mem
 from bloombee.utils.debug import dprint
+from bloombee.utils.debug_config import is_log_channel_enabled
 from hivemind.utils import get_logger
 
 # Global tokenizer singleton - avoid creating duplicate tokenizers for each layer
@@ -588,11 +589,12 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                         # self.load_hidden(i, j, k)
                         if j == 0 and past_key_value is not None:
                             if not getattr(self, "_kv_source_probe_emitted", False):
-                                logger.info(
-                                    "[KV_SOURCE_PROBE] WrappedLlamaBlock decode seeds cache_read_buf directly "
-                                    "from past_key_value; self.load_cache() is bypassed in this path, so active "
-                                    "decode KV does not come from cache_home."
-                                )
+                                if is_log_channel_enabled("kv_source_probe_logs"):
+                                    logger.info(
+                                        "[KV_SOURCE_PROBE] WrappedLlamaBlock decode seeds cache_read_buf directly "
+                                        "from past_key_value; self.load_cache() is bypassed in this path, so active "
+                                        "decode KV does not come from cache_home."
+                                    )
                                 self._kv_source_probe_emitted = True
 
                             past_key, past_value = past_key_value

@@ -18,8 +18,14 @@ from typing import Tuple, List, Optional, Sequence, Any
 
 import torch
 
+from bloombee.utils.debug_config import is_log_channel_enabled
+
 # Prefix for all micro-batch pipeline logs
 MBPIPE_LOG_PREFIX = "[MBPIPE]"
+
+
+def mbpipe_info_logs_enabled() -> bool:
+    return is_log_channel_enabled("microbatch_logs")
 
 # Environment variable names
 ENV_ENABLE_MICROBATCH = "BLOOMBEE_ENABLE_MICROBATCH_PIPELINE"
@@ -152,6 +158,8 @@ def log_config(logger: logging.Logger, context: str = "") -> None:
         logger: The logger to use for output.
         context: Optional context string to include in the log message.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     enabled = is_microbatch_enabled()
     micro_batch_size = get_micro_batch_size()
     path = get_current_path()
@@ -174,6 +182,8 @@ def log_memory_savings_diagnosis(logger: logging.Logger, batch_size: int = 8) ->
         logger: The logger to use for output.
         batch_size: The client's batch size for analysis.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     enabled = is_microbatch_enabled()
     micro_batch_size = get_micro_batch_size()
     gpu_multiplexing = is_microbatch_gpu_multiplexing_enabled()
@@ -226,6 +236,8 @@ def log_path_entry(logger: logging.Logger, component: str, batch_size: int = 0) 
         component: Name of the component logging this entry (e.g., "handler", "backend").
         batch_size: Optional batch size being processed.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     path = get_current_path()
     micro_batch_size = get_micro_batch_size()
     
@@ -253,6 +265,8 @@ def log_microbatch_runtime_info(
         num_blocks: Number of transformer blocks.
         context: Optional context string.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     enabled = is_microbatch_enabled()
     micro_batch_size = get_micro_batch_size()
     gpu_multiplexing = is_microbatch_gpu_multiplexing_enabled()
@@ -428,6 +442,8 @@ def log_microbatch_split(
         component: Optional component name for context.
     """
     micro_batch_size = get_micro_batch_size()
+    if not mbpipe_info_logs_enabled():
+        return
     context = f" ({component})" if component else ""
     logger.info(
         f"{MBPIPE_LOG_PREFIX} Split{context}: "
@@ -451,6 +467,8 @@ def log_microbatch_merge(
         merged_batch_size: Final merged batch size.
         component: Optional component name for context.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     context = f" ({component})" if component else ""
     logger.info(
         f"{MBPIPE_LOG_PREFIX} Merge{context}: "
@@ -661,7 +679,8 @@ def log_stage_timing(
     if comm_time_ms > 0:
         tracker.record_stage_comm(stage_id, comm_time_ms)
         tracker.record_cross_stage_comm(comm_time_ms)
-    
+    if not mbpipe_info_logs_enabled():
+        return
     context = f" ({component})" if component else ""
     use_buffer, buffer_pos = tracker.should_use_buffer()
     

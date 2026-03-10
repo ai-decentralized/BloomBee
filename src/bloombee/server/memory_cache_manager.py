@@ -15,6 +15,7 @@ from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
 
 from bloombee.data_structures import Handle
 from bloombee.utils.asyncio import shield_and_wait
+from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.misc import get_size_in_bytes
 
 from transformers import PretrainedConfig
@@ -66,7 +67,11 @@ class KVCacheManager:
         # Logging control:
         # - default keeps high-frequency KV/offload/prefetch traces at DEBUG
         # - set BLOOMBEE_VERBOSE_KV_LOGS=1 to restore verbose INFO traces
-        self._verbose_kv_logs = os.environ.get("BLOOMBEE_VERBOSE_KV_LOGS", "0") == "1"
+        self._verbose_kv_logs = get_env_bool_with_debug_fallback(
+            "BLOOMBEE_VERBOSE_KV_LOGS",
+            default=False,
+            groups=("kv_cache",),
+        )
         self._kv_log_once_keys = set()
         logger.info(
             "[KVCACHE_OFFLOAD] KV transfer mode: %s (%s; set BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER=0/1 to override)",
