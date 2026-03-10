@@ -318,6 +318,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             f"batch_offset={inference_info.batch_offset}, "
                             f"micro_batch_size={inference_info.micro_batch_size}, "
                             f"full_batch_size={inference_info.full_batch_size}")
+                
                 if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
                     k_pkv, v_pkv, cache_len = self.cache_manager.select_cache_without_reorder(
                         kv_cache_position_ids, 
@@ -367,9 +368,17 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # Add offset to cached base tensor (avoids creating new tensor)
                     position_ids = self._position_ids_cache[cache_key] + (cache_len + offset)
                     if self._is_spec_decoding:
-                        rotary_position_ids = self._create_tree_position_ids_with_invalid_cache(2, 4, inference_info.prefill_length - 1, kv_cache_position_ids, "cuda")
+                        rotary_position_ids = self._create_tree_position_ids_with_invalid_cache(
+                            width=2,
+                            depth=4,
+                            prefill_length=inference_info.prefill_length - 1,
+                            kv_cache_position_ids=kv_cache_position_ids,
+                            batch_offset=inference_info.batch_offset,
+                            device="cuda",
+                            target_seq_len=seq_len)
                     else:
                         rotary_position_ids = None
+                    
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
                         # print(f' About to call module.forward with position_ids...')
@@ -417,7 +426,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # self.cache_manager.update_cache_batched(new_kvs, kv_valid_lengths)
                     self.cache_manager.update_cache_and_async_reorder(
                         new_kvs, 
-                        kv_cache_position_ids,
+                        self._slice_batch_aligned(kv_cache_position_ids, inference_info.batch_offset, inference_info.batch_offset + inference_info.micro_batch_size, inference_info.full_batch_size),
                         batch_offset=inference_info.batch_offset,
                         full_batch_size=inference_info.full_batch_size,
                         micro_batch_size=inference_info.micro_batch_size,
@@ -645,13 +654,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         depth: int, 
         prefill_length: torch.Tensor,          # (B,) 每个 batch 的实际 prompt 长度
         kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len) 或 None, -1 是 padding
+        batch_offset,
         device: torch.device,
+        target_seq_len: Optional[int] = None,  # 目标序列长度（hidden states 的长度）
     ) -> torch.Tensor:
-        """
-        为新的 tree tokens 生成 position ids
-        
-        关键：position 基于有效 token 数量，不是 cache 物理长度
-        """
         B = prefill_length.shape[0]
         
         if isinstance(device, str):
@@ -674,23 +680,36 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         prefill_length = prefill_length.to(device)
         
         if is_prefill:
-            # Prefill 阶段（不变）
+            # Prefill 阶段
+            # 使用 target_seq_len 作为总长度（如果提供），否则使用 max_prefill_len + tree_len
             max_prefill_len = prefill_length.max().item()
-            total_len = max_prefill_len + tree_len
+            
+            if target_seq_len is not None:
+                total_len = target_seq_len
+                # 从 target_seq_len 反推 prompt 部分的长度
+                prompt_part_len = target_seq_len - tree_len
+            else:
+                total_len = max_prefill_len + tree_len
+                prompt_part_len = max_prefill_len
+            
             full_position_ids = torch.zeros(B, total_len, dtype=torch.long, device=device)
             
-            prefill_positions = torch.arange(max_prefill_len, dtype=torch.long, device=device)
-            full_position_ids[:, :max_prefill_len] = prefill_positions.unsqueeze(0)
+            # Prompt 部分的 position ids
+            if prompt_part_len > 0:
+                prefill_positions = torch.arange(prompt_part_len, dtype=torch.long, device=device)
+                full_position_ids[:, :prompt_part_len] = prefill_positions.unsqueeze(0)
             
+            # Tree 部分的 position ids
+            # tree_base 是每个 batch 的 prompt 结束位置
             tree_base = prefill_length.unsqueeze(1)
-            full_position_ids[:, max_prefill_len:] = tree_base + tree_position_ids.unsqueeze(0)
+            full_position_ids[:, prompt_part_len:] = tree_base + tree_position_ids.unsqueeze(0)
             
             return full_position_ids
         
         else:
             # Generation 阶段：基于有效 token 数量计算 position
             kv_cache_position_ids = kv_cache_position_ids.to(device)
-            
+            kv_cache_position_ids = self._slice_batch_aligned(kv_cache_position_ids, batch_offset, batch_offset + B, kv_cache_position_ids.shape[0])
             valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
             
             # 计算每个 batch 的有效 token 数量
@@ -699,213 +718,54 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             first_valid_idx = valid_mask.int().argmax(dim=1)
             root_positions = kv_cache_position_ids[batch_indices, first_valid_idx]  # (B,)
             
-            tree_valid_counts = valid_mask.sum(dim=1)  # (B,) kv_cache_position_ids 中有效值数量
+            tree_valid_counts = valid_mask.sum(dim=1)  # (B,)
             
             # 有效 token 总数 = root_position + tree_valid_counts
-            # （因为 root_position 本身也在 kv_cache_position_ids 中，所以不需要 +1）
             effective_token_counts = root_positions + tree_valid_counts  # (B,)
             
             # 新 token 的 base position = 有效 token 总数
             base_positions = effective_token_counts  # (B,)
             
             # 生成 position_ids
+            # 如果指定了 target_seq_len，使用它；否则使用 tree_len
+            if target_seq_len is not None:
+                actual_tree_len = target_seq_len
+                # 如果 target_seq_len > tree_len，需要扩展 tree_position_ids
+                if actual_tree_len > tree_len:
+                    # 扩展时用最后一个值填充（或者其他逻辑）
+                    extended_tree = torch.zeros(actual_tree_len, dtype=torch.long, device=device)
+                    extended_tree[:tree_len] = tree_position_ids
+                    # 填充剩余部分（保持最后的深度）
+                    if tree_len > 0:
+                        extended_tree[tree_len:] = tree_position_ids[-1]
+                    tree_position_ids = extended_tree
+                elif actual_tree_len < tree_len:
+                    tree_position_ids = tree_position_ids[:actual_tree_len]
+            
             position_ids = base_positions.unsqueeze(1) + tree_position_ids.unsqueeze(0)
             
             return position_ids
-    
-    def _update_kv_cache_position_ids(self, kv_cache_position_ids, keep_indices):
-        if kv_cache_position_ids is None or keep_indices is None:
-            return None
         
-        if not torch.is_tensor(keep_indices):
-            keep_indices = torch.tensor(keep_indices, device=kv_cache_position_ids.device)
-
-        mapping = {int(k.item()): i for i, k in enumerate(keep_indices)}
-        new_ids = torch.tensor(
-            [mapping.get(int(x.item()), -1) for x in kv_cache_position_ids],
-            device=kv_cache_position_ids.device
-        )
-        return new_ids
-
-    def _create_attention_mask(
+    def _slice_batch_aligned(
         self,
-        tree_attention_mask: Optional[torch.Tensor],
-        *,
-        src_len: int,                # prefix_len + tree_len
-        past_key_values_length: int,
-        kv_valid_lengths: Optional[torch.Tensor] = None,  # [B] 每个 batch 的有效 KV 长度（后续轮次用）
-        prefill_lengths: Optional[torch.Tensor] = None,   # [B] 每个 batch 的实际 prefill 长度（首轮用）
-        device: torch.device,
-    ) -> Optional[torch.Tensor]:
-        if tree_attention_mask is None or is_dummy(tree_attention_mask):
-            return None
-        
-        # logger.info(f"tree_attention_mask: {tree_attention_mask.shape}")
-        # logger.info(f"src_len: {src_len}")
-        # logger.info(f"past_key_values_length: {past_key_values_length}")
-        # logger.info(f"kv_valid_lengths: {kv_valid_lengths}")
-        # logger.info(f"prefill_lengths: {prefill_lengths}")
-
-        tree_mask = tree_attention_mask
-        tree_len = tree_mask.size(1)
-        B = tree_mask.size(0)
-        prefix_len = src_len - tree_len  # 最大 prefix 长度（包含 padding）
-        current_token_count = src_len - past_key_values_length
-        
-        if current_token_count <= 0:
-            return None
-        
-        if past_key_values_length == 0:
-            # ============ 首轮：处理 prefill_lengths ============
-            full_mask = torch.zeros(B, src_len, src_len, dtype=torch.bool, device=device)
-            
-            # 如果没有提供 prefill_lengths，假设所有 batch 的 prefill 长度相同
-            if prefill_lengths is None:
-                prefill_lengths = torch.full((B,), prefix_len, dtype=torch.long, device=device)
-            
-            if prefix_len > 0:
-                # 位置索引
-                row_idx = torch.arange(prefix_len, device=device).view(1, -1, 1)   # [1, prefix_len, 1]
-                col_idx = torch.arange(prefix_len, device=device).view(1, 1, -1)   # [1, 1, prefix_len]
-                prefill_lens = prefill_lengths.view(B, 1, 1)  # [B, 1, 1]
-                
-                # causal mask: row >= col
-                # 有效 mask: row < prefill_lengths AND col < prefill_lengths
-                causal_mask = row_idx >= col_idx  # [1, prefix_len, prefix_len]
-                row_valid = row_idx < prefill_lens  # [B, prefix_len, 1]
-                col_valid = col_idx < prefill_lens  # [B, 1, prefix_len]
-                
-                prefix_mask = causal_mask & row_valid & col_valid  # [B, prefix_len, prefix_len]
-                full_mask[:, :prefix_len, :prefix_len] = prefix_mask
-            
-            if prefix_len > 0 and tree_len > 0:
-                # tree tokens attend to prefix（只到有效 prefill 位置）
-                col_idx = torch.arange(prefix_len, device=device).view(1, 1, -1)  # [1, 1, prefix_len]
-                prefill_lens = prefill_lengths.view(B, 1, 1)  # [B, 1, 1]
-                col_valid = col_idx < prefill_lens  # [B, 1, prefix_len]
-                col_valid = col_valid.expand(B, tree_len, prefix_len)  # [B, tree_len, prefix_len]
-                full_mask[:, prefix_len:, :prefix_len] = col_valid
-
-            if tree_len > 0:
-                full_mask[:, prefix_len:, prefix_len:] = tree_mask
-            
-            return full_mask
-        
-        else:
-            # ============ 后续轮次：处理 kv_valid_lengths ============
-            current_mask = torch.zeros(B, current_token_count, src_len, dtype=torch.bool, device=device)
-            start_pos = past_key_values_length
-            
-            if start_pos < prefix_len:
-                prefix_tokens = min(current_token_count, prefix_len - start_pos)
-                for i in range(prefix_tokens):
-                    current_mask[:, i, :start_pos + i + 1] = True
-
-                if current_token_count > prefix_tokens:
-                    tree_tokens = current_token_count - prefix_tokens
-                    current_mask[:, prefix_tokens:, :prefix_len] = True
-                    current_mask[:, prefix_tokens:, prefix_len:] = tree_mask[:, :tree_tokens, :]
-            else:
-                tree_start = start_pos - prefix_len
-                if prefix_len > 0:
-                    current_mask[:, :, :prefix_len] = True
-                current_mask[:, :, prefix_len:] = tree_mask[:, tree_start:tree_start + current_token_count, :]
-            
-            # 应用 kv_valid_lengths mask
-            if kv_valid_lengths is not None:
-                current_mask = self._apply_kv_valid_mask(current_mask, kv_valid_lengths, past_key_values_length, device)
-            
-            return current_mask
-        
-        
-    def _create_attention_mask_with_invalid_positions(
-        self,
-        tree_attention_mask: torch.Tensor,    # (B, seq_len, total_len) 已包含 cache/prompt 部分
-        kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len), -1 是 padding，可能为 None
-        seq_len: int,                          # 新 token 数量，包含 root
-        cache_len: int,                        # cache 长度（prefill 阶段为 0）
-        prefill_lengths: Optional[torch.Tensor],  # (B,) 不再需要，可以移除
-        device: torch.device,
-    ) -> torch.Tensor:
+        value: Any,
+        mb_start: int,
+        mb_end: int,
+        full_batch_size: int,
+    ) -> Any:
         """
-        处理 attention mask，在 generation 阶段屏蔽 cache 中的空洞位置
+        Slice tensor-like request fields only if they are batch-aligned.
+        Non-tensor / scalar / already-global fields are returned as-is.
         """
-        if isinstance(device, str):
-            device = torch.device(device)
-        
-        # 确保 tree_attention_mask 是 bool 类型
-        tree_attention_mask = tree_attention_mask.to(device)
-        if tree_attention_mask.dtype != torch.bool:
-            tree_attention_mask = tree_attention_mask.bool()
-        
-        # Prefill 阶段：直接使用
-        if kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0 or cache_len == 0:
-            return tree_attention_mask
-        
-        # Generation 阶段：屏蔽 cache 空洞
-        B = tree_attention_mask.size(0)
-        kv_cache_position_ids = kv_cache_position_ids.to(device)
-        full_mask = tree_attention_mask.clone()
-        
-        valid_mask = kv_cache_position_ids >= 0
-        batch_indices = torch.arange(B, device=device)
-        cache_positions = torch.arange(cache_len, device=device)
-        
-        # 计算 cache 有效位置
-        cache_valid_mask = torch.zeros(B, cache_len, dtype=torch.bool, device=device)
-        
-        # Prefix: [0, root_position]
-        first_valid_idx = valid_mask.int().argmax(dim=1)
-        root_positions = kv_cache_position_ids[batch_indices, first_valid_idx]
-        cache_valid_mask |= (cache_positions.unsqueeze(0) <= root_positions.unsqueeze(1))
-        
-        # kv_cache_position_ids 中的有效位置
-        positions = kv_cache_position_ids.clone()
-        positions[~valid_mask] = 0
-        batch_idx = batch_indices.unsqueeze(1).expand_as(positions)
-        cache_valid_mask[batch_idx[valid_mask], positions[valid_mask]] = True
-        
-        # 应用到 mask
-        full_mask[:, :, :cache_len] &= cache_valid_mask.unsqueeze(1)
-        
-        return full_mask
-
-
-    def _apply_kv_valid_mask(
-        self,
-        mask: torch.Tensor,
-        kv_valid_lengths: torch.Tensor,
-        kv_len: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        将 kv_valid_lengths 应用到 mask 上，屏蔽每个 batch 超出有效长度的 KV 位置
-        """
-        if kv_len <= 0:
-            return mask
-        
-        B = mask.shape[0]
-        key_len = mask.shape[2]
-        actual_kv_len = min(kv_len, key_len)
-        if actual_kv_len <= 0:
-            return mask
-
-        kv_valid_lengths = self._normalize_kv_valid_lengths(
-            kv_valid_lengths=kv_valid_lengths,
-            batch_size=B,
-            max_kv_len=actual_kv_len,
-            device=device,
-        )
-        
-        # [1, actual_kv_len]
-        kv_positions = torch.arange(actual_kv_len, device=device).unsqueeze(0)
-        
-        # [B, actual_kv_len] -> [B, 1, actual_kv_len]
-        kv_valid_mask = (kv_positions < kv_valid_lengths.view(B, 1)).unsqueeze(1)
-        
-        mask[:, :, :actual_kv_len] = mask[:, :, :actual_kv_len] & kv_valid_mask
-        
-        return mask
+        if value is None or not torch.is_tensor(value):
+            return value
+        if is_dummy(value):
+            return value
+        if value.ndim == 0:
+            return value
+        if value.shape[0] == full_batch_size:
+            return value[mb_start:mb_end].contiguous()
+        return value
 
     def _normalize_kv_valid_lengths(
         self,

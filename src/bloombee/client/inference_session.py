@@ -559,97 +559,64 @@ class InferenceSession:
     
     def _restore_hidden_states(
         self,
-        flattened_hidden_states: torch.Tensor,  # [N_total_valid, H] or [B, L_keep/full, H]
-        keep_indices: torch.Tensor,  # [B, max_keep_len]，padding 为 -1
-        original_seq_len: int,  # 原始序列长度
+        flattened_hidden_states: torch.Tensor,
+        keep_indices: torch.Tensor,
+        original_seq_len: int,
     ) -> torch.Tensor:
         """
         将铺平的 hidden states 还原为 [B, original_seq_len, hidden_size]
         
         Args:
-            flattened_hidden_states:
-                - [N_total_valid, hidden_size] 铺平后的有效 hidden states
-                - [B, max_keep_len, hidden_size] 每 batch 的压缩 hidden states
-                - [B, original_seq_len, hidden_size] 已经是完整长度（将原样返回）
+            flattened_hidden_states: [N_total_valid, hidden_size] 铺平后的有效 hidden states
             keep_indices: [B, max_keep_len] 每个 batch 的 keep indices，padding 为 -1
             original_seq_len: 原始序列长度
         
         Returns:
             restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
         """
-        if keep_indices is None:
-            return flattened_hidden_states
-
-        if keep_indices.ndim != 2:
-            raise RuntimeError(
-                f"keep_indices must be 2D [B, L_keep], got shape={tuple(keep_indices.shape)}"
-            )
-
         batch_size, max_keep_len = keep_indices.shape
-        hidden_size = flattened_hidden_states.shape[-1]
         device = flattened_hidden_states.device
         dtype = flattened_hidden_states.dtype
-
-        # only keep legal destination positions; ignore invalid/out-of-range safely
-        valid_mask = (keep_indices >= 0) & (keep_indices < original_seq_len)
-        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
-        valid_batch_idx = batch_idx[valid_mask]
-        valid_seq_idx = keep_indices[valid_mask].to(torch.int64)
-        n_valid = int(valid_mask.sum().item())
-
-        if flattened_hidden_states.ndim == 3:
-            if flattened_hidden_states.shape[0] != batch_size:
-                # Spec last-block path may return packed valid states as [1, N_valid, H].
-                # Treat it as flattened valid tokens if token count matches n_valid.
-                if flattened_hidden_states.shape[0] == 1 and batch_size > 1:
-                    packed_valid = flattened_hidden_states.squeeze(0)
-                    if packed_valid.shape[0] != n_valid:
-                        raise RuntimeError(
-                            "restore_hidden_states packed valid token count mismatch: "
-                            f"hidden_states.shape={tuple(flattened_hidden_states.shape)}, "
-                            f"expected_valid={n_valid}, "
-                            f"keep_indices.shape={tuple(keep_indices.shape)}"
-                        )
-                    valid_hidden_states = packed_valid
-                else:
-                    raise RuntimeError(
-                        "restore_hidden_states batch mismatch: "
-                        f"hidden_states.shape={tuple(flattened_hidden_states.shape)}, "
-                        f"keep_indices.shape={tuple(keep_indices.shape)}"
-                    )
-            else:
-                # already full-length [B, original_seq_len, H], no restore needed
-                if flattened_hidden_states.shape[1] == original_seq_len:
-                    return flattened_hidden_states
-
-                if flattened_hidden_states.shape[1] != max_keep_len:
-                    raise RuntimeError(
-                        "restore_hidden_states seq mismatch: "
-                        f"hidden_states.shape={tuple(flattened_hidden_states.shape)}, "
-                        f"keep_indices.shape={tuple(keep_indices.shape)}, "
-                        f"original_seq_len={original_seq_len}"
-                    )
-                valid_hidden_states = flattened_hidden_states[valid_mask]
-
-        elif flattened_hidden_states.ndim == 2:
-            valid_hidden_states = flattened_hidden_states
-            if valid_hidden_states.shape[0] != n_valid:
-                raise RuntimeError(
-                    "restore_hidden_states valid token count mismatch: "
-                    f"hidden_states.shape={tuple(valid_hidden_states.shape)}, "
-                    f"expected_valid={n_valid}, "
-                    f"keep_indices.shape={tuple(keep_indices.shape)}"
-                )
+        
+        # 处理不同维度的输入
+        if flattened_hidden_states.ndim == 2:
+            # [N_total_valid, hidden_size] -> 直接使用
+            flat_hidden = flattened_hidden_states
+            hidden_size = flattened_hidden_states.shape[-1]
+        elif flattened_hidden_states.ndim == 3:
+            # [num_micro_batches, N_valid_per_mb, hidden_size] -> 合并前两维
+            num_mb, n_valid_per_mb, hidden_size = flattened_hidden_states.shape
+            flat_hidden = flattened_hidden_states.reshape(-1, hidden_size)  # [num_mb * N_valid_per_mb, hidden_size]
         else:
-            raise RuntimeError(
-                "restore_hidden_states expects hidden_states to be 2D or 3D, "
-                f"got shape={tuple(flattened_hidden_states.shape)}"
-            )
-
+            raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
+        
+        # 创建输出 tensor，用 0 填充
         restored_hidden_states = torch.zeros(
-            batch_size, original_seq_len, hidden_size, dtype=dtype, device=device
+            batch_size, original_seq_len, hidden_size,
+            dtype=dtype, device=device
         )
-        restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = valid_hidden_states
+        
+        # 创建有效 mask: [B, max_keep_len]
+        valid_mask = keep_indices >= 0
+        
+        # 创建 batch 索引: [B, max_keep_len]
+        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
+        
+        # 取出有效部分的索引
+        valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
+        valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
+        
+        # 验证维度匹配
+        n_total_valid = valid_mask.sum().item()
+        if flat_hidden.shape[0] != n_total_valid:
+            raise ValueError(
+                f"Dimension mismatch: flattened_hidden_states has {flat_hidden.shape[0]} elements, "
+                f"but keep_indices has {n_total_valid} valid entries"
+            )
+        
+        # 写入还原位置
+        restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flat_hidden
+        
         return restored_hidden_states
     
     def _update_sequence(self, server_idx: int, block_idx: int, attempt_no: int) -> int:

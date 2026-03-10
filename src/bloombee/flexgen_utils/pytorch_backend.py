@@ -670,7 +670,11 @@ class TorchDevice:
         k = k.view(bsz, q_len, num_attention_heads, head_dim)
         v = v.view(bsz, q_len, num_attention_heads, head_dim)
         
-        q, k = apply_rotary_emb(q, k, freqs_cis=freq_cis[:q_len])
+        if rotary_position_ids is not None:
+            freqs_slice = freq_cis
+        else:
+            freqs_slice = freq_cis[:q_len]
+        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
         
         # (b * n_head, s, d), (b * n_head, d, s), (b * n_head, s, d)
         q = q.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
