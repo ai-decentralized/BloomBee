@@ -31,6 +31,7 @@ from bloombee.flexgen_utils.task import Task
 from transformers import AutoTokenizer
 import os
 from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage, log_mem
+from bloombee.utils.debug import dprint
 from hivemind.utils import get_logger
 
 # Global tokenizer singleton - avoid creating duplicate tokenizers for each layer
@@ -53,9 +54,9 @@ def get_global_tokenizer(model_name='llama-7b'):
                 legacy=False
             )
             _global_tokenizer.pad_token = '[PAD]'
-            print(f"[TOKENIZER_INIT] Global tokenizer initialized for {hf_model_name}")
+            dprint(f"[TOKENIZER_INIT] Global tokenizer initialized for {hf_model_name}")
         except Exception as e:
-            print(f"[TOKENIZER_INIT] Failed to initialize global tokenizer: {e}")
+            dprint(f"[TOKENIZER_INIT] Failed to initialize global tokenizer: {e}")
             _global_tokenizer = None
     return _global_tokenizer
 
@@ -305,19 +306,31 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self.init_weight(j)
 
     def init_weight(self, j):
-        # Get model name from llama_config.name if available, otherwise use a default
-        if hasattr(self.llama_config, 'name') and self.llama_config.name:
-            model_name = self.llama_config.name
-        elif hasattr(self.llama_config, '_name_or_path') and self.llama_config._name_or_path:
-            model_name = os.path.basename(self.llama_config._name_or_path.rstrip('/'))
-        else:
-            # Fallback to a default model name - use correct Hugging Face identifier
-            model_name = "llama-30b"  # Remove -hf suffix as huggyllama repos don't use it
-        
-        # Ensure model_name is not empty and remove -hf suffix if present
+        # Get model name from config - HF config may use different attribute names
+        model_name = None
+        for attr in ('name', 'name_or_path', '_name_or_path'):
+            if hasattr(self.llama_config, attr):
+                val = getattr(self.llama_config, attr)
+                if val and isinstance(val, str):
+                    model_name = os.path.basename(val.rstrip('/'))
+                    break
+
+        # Fallback: infer from architecture (hidden_size, num_hidden_layers, intermediate_size)
         if not model_name or model_name == '.':
-            model_name = "llama-30b"
-        
+            h = getattr(self.llama_config, 'hidden_size', 0)
+            L = getattr(self.llama_config, 'num_hidden_layers', 0)
+            I = getattr(self.llama_config, 'intermediate_size', 0)
+            if (h, L) == (4096, 32):
+                model_name = "llama-7b"
+            elif (h, L) == (5120, 40):
+                model_name = "llama-13b"
+            elif (h, L) == (6656, 60):
+                model_name = "llama-30b"
+            elif (h, L) == (8192, 80):
+                model_name = "llama-70b" if I == 28672 else "llama-65b"
+            else:
+                model_name = "llama-65b"  # safest default for 80-layer 8192 models
+
         # Remove -hf suffix if present, as huggyllama repos don't use it
         if model_name.endswith('-hf'):
             model_name = model_name[:-3]
@@ -430,7 +443,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             if task_rebuild_start is not None:
                 task_rebuild_time = (time.time() - task_rebuild_start) * 1000
                 if task_rebuild_time > 1.0:  # Record only when it takes more than 1ms
-                    print(f"[BLOCK_PERF] Layer {self.layer_id} Task rebuild took: {task_rebuild_time:.3f}ms")
+                    dprint(f"[BLOCK_PERF] Layer {self.layer_id} Task rebuild took: {task_rebuild_time:.3f}ms")
 
         task = self._cached_task
 
@@ -451,19 +464,19 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self._cached_output_ids_shape = target_shape
             self._output_ids_prompt_initialized = False
             if verbose > 0:
-                print(f"[OUTPUT_IDS_PERF] Layer {self.layer_id}: Reallocated output_ids with shape {target_shape}")
+                dprint(f"[OUTPUT_IDS_PERF] Layer {self.layer_id}: Reallocated output_ids with shape {target_shape}")
         
         # Only copy prompt tokens when necessary (first time or task changed)
         if not self._output_ids_prompt_initialized:
             self._cached_output_ids[:, :prompt_len] = np.asarray(task.inputs)
             self._output_ids_prompt_initialized = True
             if verbose > 0:
-                print(f"[OUTPUT_IDS_PERF] Layer {self.layer_id}: Initialized prompt tokens ({prompt_len} tokens)")
+                dprint(f"[OUTPUT_IDS_PERF] Layer {self.layer_id}: Initialized prompt tokens ({prompt_len} tokens)")
         
         self.output_ids = self._cached_output_ids
         output_ids_time = (time.time() - output_ids_start) * 1000
         if output_ids_time > 1.0:
-            print(f"[OUTPUT_IDS_PERF] Layer {self.layer_id} output_ids setup took: {output_ids_time:.3f}ms")
+            dprint(f"[OUTPUT_IDS_PERF] Layer {self.layer_id} output_ids setup took: {output_ids_time:.3f}ms")
 
         # Smart cache clearing - avoid clearing every time
         cache_clear_start = time.time()
@@ -481,7 +494,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             
         cache_clear_time = (time.time() - cache_clear_start) * 1000
         if cache_clear_time > 2.0:
-            print(f"[FLEXGEN_PERF] Layer {self.layer_id} Cache clear took: {cache_clear_time:.3f}ms")
+            dprint(f"[FLEXGEN_PERF] Layer {self.layer_id} Cache clear took: {cache_clear_time:.3f}ms")
 
         # Smart hidden array reuse
         hidden_alloc_start = time.time()
@@ -495,7 +508,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             
         hidden_alloc_time = (time.time() - hidden_alloc_start) * 1000
         if hidden_alloc_time > 2.0:
-            print(f"[FLEXGEN_PERF] Layer {self.layer_id} Hidden array alloc took: {hidden_alloc_time:.3f}ms")
+            dprint(f"[FLEXGEN_PERF] Layer {self.layer_id} Hidden array alloc took: {hidden_alloc_time:.3f}ms")
 
         # TorchDevice object reuse
         device_wrap_start = time.time()
@@ -510,7 +523,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         
         device_wrap_time = (time.time() - device_wrap_start) * 1000
         if device_wrap_time > 2.0:
-            print(f"[FLEXGEN_PERF] Layer {self.layer_id} Device wrap took: {device_wrap_time:.3f}ms")
+            dprint(f"[FLEXGEN_PERF] Layer {self.layer_id} Device wrap took: {device_wrap_time:.3f}ms")
 
         # print(f"num_gpu_batches: {self.num_gpu_batches}")
         # print(f"input batch size: {hidden_states.shape[0]}")
@@ -524,7 +537,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
         cpu_workspace_time = (time.time() - cpu_workspace_start) * 1000
         if cpu_workspace_time > 5.0:
-            print(f"[FLEXGEN_PERF] Layer {self.layer_id} CPU workspace init took: {cpu_workspace_time:.3f}ms")
+            dprint(f"[FLEXGEN_PERF] Layer {self.layer_id} CPU workspace init took: {cpu_workspace_time:.3f}ms")
 
         debug_mode = kwargs.get('debug_mode', None)
         overlap = self.policy.overlap if hasattr(self.policy, 'overlap') else False
@@ -560,7 +573,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                         self.load_weight(i, j, k, overlap=False)
                 weight_load_time = (time.time() - weight_load_start) * 1000
                 if weight_load_time > 10.0:
-                    print(f"[FLEXGEN_PERF] Layer {self.layer_id} Weight loading took: {weight_load_time:.3f}ms")
+                    dprint(f"[FLEXGEN_PERF] Layer {self.layer_id} Weight loading took: {weight_load_time:.3f}ms")
 
                 final_outputs = []
                 generated_tokens_num = 0
@@ -676,7 +689,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
         individual_weight_time = (time.time() - individual_weight_start) * 1000
         if individual_weight_time > 5.0:
-            print(f"[FLEXGEN_PERF] Layer {self.layer_id} Individual weight load [j={j}, k={k}] took: {individual_weight_time:.3f}ms")
+            dprint(f"[FLEXGEN_PERF] Layer {self.layer_id} Individual weight load [j={j}, k={k}] took: {individual_weight_time:.3f}ms")
 
     def delete_weight(self, j, k):
         if k == 0:
@@ -704,7 +717,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
         cache_load_time = (time.time() - cache_load_start) * 1000
         if cache_load_time > 3.0:
-            print(f"[FLEXGEN_PERF] Layer {self.layer_id} Cache load [i={i}, j={j}, k={k}] took: {cache_load_time:.3f}ms")
+            dprint(f"[FLEXGEN_PERF] Layer {self.layer_id} Cache load [i={i}, j={j}, k={k}] took: {cache_load_time:.3f}ms")
 
 
     def store_cache(self, i, j, k, overlap=True):

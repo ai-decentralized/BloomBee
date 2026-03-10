@@ -28,6 +28,7 @@ from transformers import AutoTokenizer
 from bloombee.flexgen_utils.timer import timers
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from bloombee.utils.memory_usage import see_memory_usage, log_mem
+from bloombee.utils.debug import dprint
 
 from hivemind.utils import get_logger
 
@@ -107,7 +108,7 @@ class FLEX_LlamaRMSNorm(LlamaRMSNorm):  # put in flex_llama
             else:
                 self.loaded_weight.copy_(w.view_as(self.loaded_weight))
 
-        print("[OK] loaded norm weight from", path)
+        dprint("[OK] loaded norm weight from", path)
         
     
 class SimpleLMHead(nn.Module):
@@ -123,7 +124,7 @@ class SimpleLMHead(nn.Module):
         w = np.load(path)
         t = torch.from_numpy(w).to(torch.float32)
         self.weight = t
-        print("[OK] loaded lm_head.weight", t.shape)
+        dprint("[OK] loaded lm_head.weight", t.shape)
 
     def forward(self, hidden_states):
         # hidden_states: [B, T, H]
@@ -152,7 +153,7 @@ def get_choice(cur_percent, percents, choices):
 def init_weight_list(weight_specs, policy, env):
     
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
-    print('dev_percents :[ disk, cpu, gpu]', dev_percents)
+    dprint('dev_percents :[ disk, cpu, gpu]', dev_percents)
     dev_choices = [env.disk, env.cpu, env.gpu]
 
     sizes = [np.prod(spec[0]) for spec in weight_specs]
@@ -181,7 +182,7 @@ def init_weight_list(weight_specs, policy, env):
                 try:
                     weight.load_from_np_file(weight_specs[i][2])
                 except (FileNotFoundError, AttributeError) as e:
-                    print(f"Warning: Could not load weight from file {weight_specs[i][2]}: {e}")
+                    logger.warning(f"Could not load weight from file {weight_specs[i][2]}: {e}")
                     # If file does not exist or loading fails, use random initialization
                     weight.load_from_np(np.random.rand(*shape).astype(dtype))
             else:
@@ -197,7 +198,7 @@ def init_weight_list(weight_specs, policy, env):
                     try:
                         weight.load_from_np_file(weight_specs[i][2])
                     except (FileNotFoundError, AttributeError) as e:
-                        print(f"Warning: Could not load weight from file {weight_specs[i][2]}: {e}")
+                        logger.warning(f"Could not load weight from file {weight_specs[i][2]}: {e}")
                         # If file does not exist or loading fails, use random initialization
                         for i in range(2):
                             x = weight.data[i]
@@ -208,13 +209,13 @@ def init_weight_list(weight_specs, policy, env):
                         x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
             else:
                 # If compressed device is not available, fall back to non-compressed method
-                print(f"Warning: Compressed device not available, falling back to non-compressed allocation")
+                logger.warning("Compressed device not available, falling back to non-compressed allocation")
                 weight = home.allocate(shape, dtype, pin_memory=pin_memory)
                 if DUMMY_WEIGHT not in filename:
                     try:
                         weight.load_from_np_file(weight_specs[i][2])
                     except (FileNotFoundError, AttributeError) as e:
-                        print(f"Warning: Could not load weight from file {weight_specs[i][2]}: {e}")
+                        logger.warning(f"Could not load weight from file {weight_specs[i][2]}: {e}")
                         # If file does not exist or loading fails, use random initialization
                         weight.load_from_np(np.random.rand(*shape).astype(dtype))
                 else:
@@ -266,8 +267,8 @@ def load_weights_from_pytorch_model(model, policy, env, weight_home, block_index
         
         return weights
     except Exception as e:
-        print(f"Warning: Failed to initialize weights with FlexGen: {e}")
-        print("Falling back to direct parameter assignment")
+        logger.warning(f"Failed to initialize weights with FlexGen: {e}")
+        logger.warning("Falling back to direct parameter assignment")
         
         # If FlexGen initialization fails, use direct parameter assignment
         for name, param in model.named_parameters():
@@ -652,7 +653,7 @@ class FLEX_LlamaMLP(LlamaMLP):
 
     def init_weight(self, weight_home, path):
         intermediate_size, h, dtype = (self.config.intermediate_size, self.config.hidden_size, np.float16)
-        print('intermediate_size, h, dtype ', intermediate_size, h, dtype)
+        dprint('intermediate_size, h, dtype ', intermediate_size, h, dtype)
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
         weight_specs = [
             # 4 weight files
@@ -1264,19 +1265,19 @@ class LlamaLM:
                 timers("generate").costs.append(self.num_layers * batch_cost)
 
         # Debug the costs of individual functions
-        print(f"#layers: {self.num_layers}")
+        dprint(f"#layers: {self.num_layers}")
 
-        print(f"#batches prefill:  "
+        dprint(f"#batches prefill:  "
               f"{self.num_layers * self.num_gpu_batches}")
-        print(f"#batches decoding: "
+        dprint(f"#batches decoding: "
               f"{(self.task.gen_len - 1) * self.num_layers * self.num_gpu_batches}")
-        print(f"load_weight            (per-layer)"
+        dprint(f"load_weight            (per-layer)"
               f": {np.mean(timers('load_weight').costs):.6f} s")
         for stage in ["prefill", "decoding"]:
             for func in ["load_cache", "store_cache", "compute_layer"]:
                 name = func + "_" + stage
                 costs = timers(name).costs
-                print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
+                dprint(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
     def generation_loop_overlap_single_batch(self):
         # Prologue
@@ -1455,7 +1456,7 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
     return (input_ids[0],) * num_prompts
 
 def run_flexgen(args):
-    print(f"<run_flexgen>: args.model: {args.model}")
+    dprint(f"<run_flexgen>: args.model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
     tokenizer.pad_token = '[PAD]'
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
@@ -1485,11 +1486,11 @@ def run_flexgen(args):
     llama_config = get_llama_config(args.model)
     cache_size = llama_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = llama_config.hidden_bytes(num_prompts, prompt_len + gen_len)
-    print(f"model size: {llama_config.model_bytes()/GB:.3f} GB, "
+    dprint(f"model size: {llama_config.model_bytes()/GB:.3f} GB, "
           f"cache size: {cache_size/GB:.3f} GB, "
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
 
-    print("init weight...")
+    dprint("init weight...")
     model = LlamaLM(llama_config, env, args.path, policy)
     try:
         # print("warmup - generate")
@@ -1498,7 +1499,7 @@ def run_flexgen(args):
         #     max_new_tokens=1,
         #     debug_mode=args.debug_mode,
         #     verbose=args.verbose)
-        print("benchmark - generate")
+        dprint("benchmark - generate")
         timers("generate").reset()
         output_ids = model.generate(
             inputs,
@@ -1531,7 +1532,7 @@ def run_flexgen(args):
             show_str += f"{i}: {outputs[i]}\n"
             show_str += "-" * 70 + "\n"
         if args.verbose >= 2:
-            print(show_str)
+            dprint(show_str)
 
     gpu.print_stats()
     cpu.print_stats()
@@ -1547,7 +1548,7 @@ def run_flexgen(args):
         gpu_peak_mem, projected, prefill_latency, prefill_throughput,
         decode_latency, decode_throughput, total_latency, total_throughput)
     if args.verbose >= 1:
-        print(log_str)
+        dprint(log_str)
 
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="huggyllama/llama-7b",

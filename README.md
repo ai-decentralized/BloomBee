@@ -1,135 +1,346 @@
-<p align="center">  
-    <img src="figures/bloombee.jpg" alt="Bloombee Logo" /><br>  
+<p align="center">
+    <img src="figures/bloombee.jpg" alt="Bloombee Logo" /><br>
     Run large language models in a heterogeneous decentralized environment with offloading.<br>
     <br>
     <a href="https://pypi.org/project/bloombee/"><img src="https://img.shields.io/pypi/v/bloombee.svg?label=PyPI&color=green"></a>
     <a href="https://github.com/ai-decentralized/bloombee/actions"><img src="https://img.shields.io/github/actions/workflow/status/ai-decentralized/bloombee/pylint.yml?branch=main&label=Build"></a>
     <a href="https://discord.gg/Ypexx2rxt9"><img src="https://img.shields.io/discord/1267714065166241813?label=Discord&logo=discord&logoColor=white"></a>
-</p>  
+    <a href="https://github.com/ai-decentralized/bloombee/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ai-decentralized/bloombee?color=blue"></a>
+    <a href="https://pypi.org/project/bloombee/"><img src="https://img.shields.io/pypi/pyversions/bloombee"></a>
+    <a href="https://pypi.org/project/bloombee/"><img src="https://img.shields.io/pypi/dm/bloombee?label=Downloads"></a>
+    <a href="https://github.com/ai-decentralized/bloombee"><img src="https://img.shields.io/github/stars/ai-decentralized/bloombee?style=social"></a>
+</p>
 
-The rapid rise of generative AI has boosted demand for large language model (LLM) inference and fine-tuining services. While proprietary models are still favored, advancements in open-source LLMs have made them competitive. However, high costs and limited GPU resources hinder deployment. This work introduces BloomBee, a decentralized offline serving system that leverages idle GPU resources to provide cost-effective access to LLMs.
+The rapid rise of generative AI has boosted demand for large language model (LLM) inference and fine-tuning services. While proprietary models are still favored, advancements in open-source LLMs have made them competitive. However, high costs and limited GPU resources hinder deployment. BloomBee is a decentralized offline serving system that leverages idle GPU resources to provide cost-effective access to LLMs.
 
-We rely on global GPU sharing, which includes more consumer-grade GPUs. If your GPU can only manage a small portion of a large language model, like the Llama3.1 (405B) model, you can connect to a network of servers that load different parts of the model. In this network, you can request inference or fine-tuning services.
+Instead of requiring a single powerful machine, BloomBee splits a model's transformer blocks across multiple peers in a P2P network. If your GPU can only hold a small portion of a large model like LLaMA 3.1 (405B), you can join a network of servers each hosting different layers and collaboratively serve inference or fine-tuning requests.
 
 <p align="center">
     🚀 &nbsp;<b><a href="https://colab.research.google.com/drive/1BZn0KrEGaNA2dlzmCTtTIjJKx3bNzOMs#scrollTo=1Qhi4I2PSGgg">Try now in Colab</a></b>
 </p>
 
-## Installation
+## News
 
-#### From Pypi
-```
-pip install bloombee
-```
-#### From Source
-```bash  
-git clone https://github.com/ai-decentralized/BloomBee.git  
-cd BloomBee
-```
-Create and activate an environment (either one):
+- `2026/02/23` : Improve documentation, CI, and developer tooling (PR [#41](../../pull/41) by @dadaism).
+- `2026/02/19` : Support micro batching and lossless compression (PR [#39](../../pull/39) by @JiuChen0).
+- `2026/02/05` : Add batch support for speculative decoding and its pruning (PR [#38](../../pull/38) by @xiongxu1998).
+- `2026/01/13` : Spec dec (PR [#37](../../pull/37) by @xiongxu1998).
 
-```bash
-# Using venv
-python3 -m venv bloombee-venv && source bloombee-venv/bin/activate
+### More News
 
-# OR using conda (recommended)
-conda create -n bloombee python=3.10.16 && conda activate bloombee
-```
+- `2025/11/29` : Update a new template to support weight cache and batch (PR [#36](../../pull/36) by @TomekWei).
+- `2025/11/21` : Remove O(prompt_len) prompt copies (PR [#35](../../pull/35) by @JiuChen0).
+- `2025/11/12` : Optimize shared memory usage, clean up legacy quantization, and remove unused modules (PR [#34](../../pull/34) by @JiuChen0).
+- `2025/11/01` : Add multi-batch inference support, fix hivemind dependency, and improve installation process (PR [#27](../../pull/27) by @JiuChen0).
 
-Then install:
 
-```bash
-pip install -e .
-```
-## How to use BloomBee(<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
 
-#### 1. Start the main server  
-Start the DHT main node:
-```bash
-python -m bloombee.cli.run_dht --host_maddrs /ip4/0.0.0.0/tcp/31340 --identity_path bootstrapp1.id
-````
 
-After running, you will see output similar to:
 
-```
-[INFO] Running a DHT instance. To connect other peers to this one, use:
---initial_peers /ip4/10.0.4.215/tcp/31340/p2p/QmZtZJwF8G2qspQxEVxXfipV4fR7EgpfnkXdbbzaEooaVf
-```
 
-Copy **your own** full address (including the `/p2p/...` part).
-Each DHT node generates a unique Peer ID, so do **not** copy the example above.
+## Table of Contents
 
-You can provide this address as `--initial_peers` to connect workers or other backbone servers.
-
-> 💡 **Tip:**
-> If you want your swarm to be accessible outside of your local network,
-> ensure you have a **public IP address** or set up **port forwarding** correctly.
+- [How It Works](#how-it-works)
+- [Supported Models](#supported-models)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+  - [1. Start a Bootstrap Node](#1-start-a-bootstrap-node)
+  - [2. Start Worker Servers](#2-start-worker-servers)
+  - [3. Run Inference or Fine-tuning](#3-run-inference-or-fine-tuning)
+- [CLI Reference](#cli-reference)
+- [Python API](#python-api)
+- [Benchmarking](#benchmarking)
+- [Examples](#examples)
+- [Troubleshooting](#troubleshooting)
+- [Acknowledgements](#acknowledgements)
 
 ---
 
-#### 2. Connect the workers to the main BloomBee server
+## How It Works
 
-Set your main server address (replace with your actual output from step 1):
+BloomBee distributes a model's transformer layers across a peer-to-peer network:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  CLIENT (you)                                           │
+│  • Runs word embeddings and the LM head locally         │
+│  • Routes through remote layers via DHT                 │
+└──────────────────────┬──────────────────────────────────┘
+                       │ P2P (libp2p)
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+   ┌──────────┐  ┌──────────┐  ┌──────────┐
+   │ Worker A │  │ Worker B │  │ Worker C │
+   │ Layers   │  │ Layers   │  │ Layers   │
+   │  0 – 15  │  │ 16 – 31  │  │ 32 – 47  │
+   └──────────┘  └──────────┘  └──────────┘
+         Peers registered in DHT
+```
+
+A **DHT (Distributed Hash Table)** keeps track of which server hosts which layers. The client automatically discovers and routes through available peers. Servers are decentralized — anyone with a compatible GPU can join and contribute capacity.
+
+---
+
+## Supported Models
+
+| Model Family | Example HuggingFace IDs |
+|---|---|
+| **LLaMA / LLaMA 2 / LLaMA 3** | `meta-llama/Llama-2-7b-hf`, `meta-llama/Meta-Llama-3-8B` |
+| **BLOOM** | `bigscience/bloom-7b1`, `bigscience/bloom` |
+| **Falcon** | `tiiuae/falcon-7b`, `tiiuae/falcon-40b` |
+| **Mixtral** | `mistralai/Mixtral-8x7B-v0.1` |
+
+Any HuggingFace model with a matching architecture can be served. Use `AutoDistributedModelForCausalLM` to load a model automatically.
+
+---
+
+## Prerequisites
+
+- **Python** 3.8 or later
+- **PyTorch** 1.12 or later (with CUDA for GPU support)
+- A GPU with at least **~4 GB VRAM** to serve a portion of a model (workers)
+- A machine with internet access and, optionally, a public IP or port forwarding for external peer discovery
+
+> **Note:** The client machine does not need a GPU — only worker servers do.
+
+---
+
+## Installation
+
+#### From PyPI
+```bash
+pip install bloombee
+```
+
+#### From Source
+```bash
+git clone https://github.com/ai-decentralized/BloomBee.git
+cd BloomBee
+pip install .
+```
+
+---
+
+## Quick Start
+
+([Try in Colab](https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs))
+
+### 1. Start a Bootstrap Node
+
+A bootstrap node is a lightweight DHT peer that helps other nodes discover each other. Start one first:
 
 ```bash
-export BBSERVER=/ip4/10.0.4.215/tcp/31340/p2p/QmZtZJwF8G2qspQxEVxXfipV4fR7EgpfnkXdbbzaEooaVf
+python -m bloombee.cli.run_dht \
+  --host_maddrs /ip4/0.0.0.0/tcp/31340 \
+  --identity_path bootstrap.id
 ```
 
-Activate the BloomBee environment on each worker
-(you can reuse the environment created in **From Source**).
+You will see a line like:
 
-Each worker should be started **in a separate terminal** (or on a separate node)
-after activating its environment.
+```
+Mon 00 01:23:45.678 [INFO] Running a DHT instance. To connect other peers to this one, use:
+  --initial_peers /ip4/YOUR_IP/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ
+```
 
-Start the first worker to hold 16 blocks (e.g., 16 transformer layers):
+Copy this address — you'll pass it as `--initial_peers` to all workers and clients.
+
+> If you want your swarm accessible from outside your local network, make sure you have a **public IP address** or have **port forwarding** configured correctly.
+
+### 2. Start Worker Servers
+
+Export the bootstrap address for convenience:
 
 ```bash
-python -m bloombee.cli.run_server huggyllama/llama-7b \
-  --initial_peers $BBSERVER --num_blocks 16 --identity_path bootstrap_1.id
+export BBSERVER=/ip4/YOUR_IP/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ
 ```
 
-Start the second worker in another activated terminal:
+Start workers, each hosting a slice of the model. For a 32-layer model, you might split it across two servers:
 
 ```bash
-python -m bloombee.cli.run_server huggyllama/llama-7b \
-  --initial_peers $BBSERVER --num_blocks 16 --identity_path bootstrap_2.id
+# Worker 1: hosts 16 transformer layers
+python -m bloombee.cli.run_server meta-llama/Llama-2-7b-hf \
+  --initial_peers $BBSERVER \
+  --num_blocks 16 \
+  --identity_path worker_1.id
+
+# Worker 2: hosts the remaining 16 layers
+python -m bloombee.cli.run_server meta-llama/Llama-2-7b-hf \
+  --initial_peers $BBSERVER \
+  --num_blocks 16 \
+  --identity_path worker_2.id
 ```
 
-If you encounter network issues (e.g., connection resets),
-please verify your worker IP configurations in the relevant config files.
+Workers will automatically download their assigned model layers from HuggingFace on first run.
 
-**Optional:** If `bitsandbytes` causes a CUDA version error:
+### 3. Run Inference or Fine-tuning
+
+#### Inference
 
 ```bash
-cd ~
-git clone https://github.com/TimDettmers/bitsandbytes.git
-cd bitsandbytes && python setup.py install
+python benchmarks/benchmark_inference.py \
+  --model meta-llama/Llama-2-7b-hf \
+  --initial_peers $BBSERVER \
+  --torch_dtype float32 \
+  --seq_len 128
 ```
 
-Ensure your CUDA library path matches your environment.
+#### Fine-tuning
 
-
-
-#### 3. Run inference or finetune jobs
-
-#### Inference   
-```
-cd BloombBee/
-python benchmarks/benchmark_inference.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32 --seq_len 128
-```
-
-#### Finetune 
-
-```
-cd BloomBee/
-python benchmarks/benchmark_training.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32  --n_steps 20 --batch_size 32 --seq_len 128
+```bash
+python benchmarks/benchmark_training.py \
+  --model meta-llama/Llama-2-7b-hf \
+  --initial_peers $BBSERVER \
+  --torch_dtype float32 \
+  --n_steps 20 \
+  --batch_size 32 \
+  --seq_len 128
 ```
 
+---
 
-## Acknowledgements  
+## CLI Reference
 
-BloomBee is built upon a few popular libraries: 
+### `bloombee.cli.run_dht` — Bootstrap Node
 
-  - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.  
-  - [FlexLLMGen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.  
+Starts a lightweight DHT peer for peer discovery. Does not load any model.
+
+| Argument | Default | Description |
+|---|---|---|
+| `--host_maddrs` | — | Multiaddresses to listen on (e.g. `/ip4/0.0.0.0/tcp/31340`) |
+| `--identity_path` | — | Path to store/load this node's persistent identity key |
+| `--announce_maddrs` | — | Public multiaddresses to announce to other peers (useful behind NAT) |
+
+### `bloombee.cli.run_server` — Worker Server
+
+Loads and serves transformer blocks on a peer in the swarm.
+
+| Argument | Default | Description |
+|---|---|---|
+| `model` | *(required)* | HuggingFace model name or local path |
+| `--initial_peers` | — | Multiaddresses of bootstrap nodes to connect to |
+| `--num_blocks` | auto | Number of transformer layers to serve |
+| `--block_indices` | auto | Specific layer index range to serve (e.g. `0:16`) |
+| `--identity_path` | — | Path to store/load this peer's persistent identity key |
+| `--quant_type` | none | Quantization: `int8` (LLM.int8) or `nf4` (QLoRA 4-bit) |
+| `--torch_dtype` | auto | Model precision: `float32`, `float16`, `bfloat16` |
+| `--throughput` | `auto` | Reported throughput in tokens/sec; use `eval` to measure or `dry_run` to skip |
+| `--cache_dir` | — | Directory to cache downloaded model weights |
+| `--max_batch_size` | 2048 | Maximum number of tokens per forward batch |
+
+---
+
+## Python API
+
+BloomBee integrates with HuggingFace Transformers. Use the `Auto` classes to load a distributed model:
+
+```python
+from transformers import AutoTokenizer
+from bloombee import AutoDistributedModelForCausalLM
+
+model = AutoDistributedModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b-hf",
+    initial_peers=["/ip4/YOUR_IP/tcp/31340/p2p/Qm..."],
+)
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+
+inputs = tokenizer("The quick brown fox", return_tensors="pt")
+outputs = model.generate(**inputs, max_new_tokens=50)
+print(tokenizer.decode(outputs[0]))
+```
+
+For efficient multi-turn generation, reuse an inference session to avoid reprocessing past tokens:
+
+```python
+with model.transformer.h.inference_session(max_length=512) as sess:
+    for _ in range(20):
+        outputs = model.generate(max_new_tokens=1, session=sess)
+```
+
+Available auto classes:
+
+| Class | Use case |
+|---|---|
+| `AutoDistributedModelForCausalLM` | Text generation |
+| `AutoDistributedModelForSequenceClassification` | Classification / fine-tuning |
+| `AutoDistributedModel` | Raw transformer (no LM head) |
+
+---
+
+## Benchmarking
+
+Three benchmark scripts are provided in `benchmarks/`:
+
+```bash
+# Measure autoregressive inference throughput (tokens/sec)
+python benchmarks/benchmark_inference.py \
+  --model meta-llama/Llama-2-7b-hf \
+  --initial_peers $BBSERVER \
+  --seq_len 256
+
+# Measure forward pass throughput (tokens/sec)
+python benchmarks/benchmark_forward.py \
+  --model meta-llama/Llama-2-7b-hf \
+  --initial_peers $BBSERVER \
+  --batch_size 4 \
+  --seq_len 128
+
+# Measure training (forward + backward) throughput
+python benchmarks/benchmark_training.py \
+  --model meta-llama/Llama-2-7b-hf \
+  --initial_peers $BBSERVER \
+  --batch_size 4 \
+  --seq_len 128 \
+  --n_steps 20
+```
+
+---
+
+## Examples
+
+Jupyter notebook examples are in the `examples/` directory:
+
+| Notebook | Description |
+|---|---|
+| [prompt-tuning-sst2.ipynb](examples/prompt-tuning-sst2.ipynb) | Prompt-tune LLaMA for sentiment classification (SST-2) |
+| [prompt-tuning-personachat.ipynb](examples/prompt-tuning-personachat.ipynb) | Prompt-tune BLOOM for dialogue generation (PersonaChat) |
+
+---
+
+## Troubleshooting
+
+**Workers cannot find each other**
+- Ensure all workers use the same `--initial_peers` address.
+- If running across machines, verify the bootstrap node has a public IP and the port is open.
+- Use `--announce_maddrs` to explicitly advertise your public address if behind NAT.
+
+**`ModuleNotFoundError: No module named 'bloombee'`**
+- Run `pip install bloombee` or `pip install -e .` from the repository root.
+
+**Out of GPU memory on a worker**
+- Reduce `--num_blocks` to serve fewer layers.
+- Enable quantization: `--quant_type int8` or `--quant_type nf4`.
+- Use a smaller `--max_batch_size`.
+
+**`transformers` version mismatch**
+- BloomBee requires `transformers>=4.43.1,<4.44.0`. Install the pinned version:
+  ```bash
+  pip install "transformers>=4.43.1,<4.44.0"
+  ```
+
+**Slow inference / high latency**
+- Latency increases with the number of network hops between layers. Place workers on the same local network when possible.
+- Ensure workers report accurate throughput: use `--throughput eval` on the first run.
+
+---
+## Contribution
+Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/) and College of William&Mary. We welcome and appreciate any contribution to this open-source project.
+
+
+## Acknowledgements
+
+BloomBee is built upon the following open-source projects:
+
+  - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.
+  - [FlexLLMGen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.
   - [Petals](https://github.com/bigscience-workshop/petals) - A library for decentralized LLMs fine-tuning and inference without offloading.

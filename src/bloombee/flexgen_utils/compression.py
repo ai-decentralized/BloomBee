@@ -7,6 +7,7 @@ from bloombee.flexgen_utils.pytorch_backend import (TorchTensor, TorchDevice,
     TorchDisk, TorchMixedDevice, general_copy)
 from bloombee.flexgen_utils.utils import np_dtype_to_torch_dtype
 from bloombee.flexgen_utils.DeviceType import DeviceType
+from bloombee.utils.debug import dprint
 
 @dataclasses.dataclass
 class CompressionConfig:
@@ -341,8 +342,8 @@ def test_simulated_compression():
         num_bits=4, group_size=32, group_dim=0, symmetric=False)
     packed_data = compress(a, config)
     b = decompress(packed_data, config)
-    print(a[0])
-    print(b[0])
+    dprint(a[0])
+    dprint(b[0])
 
 
 def test_real_compression():
@@ -355,8 +356,8 @@ def test_real_compression():
     packed = dev.compress(a, config)
     b = dev.decompress(packed)
 
-    print(a.flatten())
-    print(b.flatten())
+    dprint(a.flatten())
+    dprint(b.flatten())
 
 
 def compress_cache(cache, config, task, policy):

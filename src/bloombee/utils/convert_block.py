@@ -8,29 +8,13 @@ from typing import Optional, Sequence
 import tensor_parallel as tp
 import torch
 import torch.nn as nn
-from hivemind.utils.logging import get_logger, use_hivemind_log_handler
+from hivemind.utils.logging import get_logger
 from tensor_parallel.slicing_configs import get_bloom_config
 from transformers import PretrainedConfig
 from pynvml import *
+from bloombee.utils.debug import dprint
 from bloombee.utils.memory_usage import see_memory_usage, log_mem
 
-# def see_memory_usage(message, force=True):
-# 	logger = ''
-# 	logger += message
-# 	nvmlInit()
-#  
-# 	# nvidia_smi.nvmlInit()
-# 	handle = nvmlDeviceGetHandleByIndex(0)
-# 	info = nvmlDeviceGetMemoryInfo(handle)
-# 	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-# 	
-# 	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-# 	logger +=   'Max Memory Allocated: ' + str(
-# 		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-# 	print(logger)
-
-logger = get_logger(__name__)
-use_hivemind_log_handler("in_root_logger")
 logger = get_logger(__name__)
 
 
@@ -119,8 +103,8 @@ def convert_block(
     tp_block = PipelineParallelWrapper(block, tensor_parallel_devices, output_device)
     # log_mem(f"{log_prefix} created PipelineParallel wrapper")
     
-    print('quant_type ', quant_type)
-    print('adapters ', adapters )
+    dprint('quant_type ', quant_type)
+    dprint('adapters ', adapters )
     if adapters:
         
         from bloombee.utils.peft import add_adapter_to_block, create_lora_adapter, load_peft
