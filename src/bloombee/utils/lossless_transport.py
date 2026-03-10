@@ -33,15 +33,25 @@ try:
 except Exception:
     _zstd = None
 
+try:
+    from zipnn import ZipNN as _ZipNN
+except Exception:
+    _ZipNN = None
+
 
 _MAGIC = b"BBLC"
 _VERSION = 1
 _ALGO_ZSTD = 1
 _ALGO_ZLIB = 2
+_ALGO_ZSTD_BYTE_SPLIT = 3
+_ALGO_ZIPNN = 4
 _HEADER_STRUCT = struct.Struct("!4sBBQ")
 _HEADER_SIZE = _HEADER_STRUCT.size
+_BYTE_SPLIT_PAYLOAD_STRUCT = struct.Struct("!BI")
+_BYTE_SPLIT_PAYLOAD_SIZE = _BYTE_SPLIT_PAYLOAD_STRUCT.size
 
 _MISSING_ZSTD_WARNING_EMITTED = False
+_MISSING_ZIPNN_WARNING_EMITTED = False
 _COMP_PROFILE_ENV = "BLOOMBEE_COMP_RATIO_PROFILE"
 _COMP_TIMING_PROFILE_ENV = "BLOOMBEE_COMP_TIMING_PROFILE"
 _COMP_DETAIL_PROFILE_ENV = "BLOOMBEE_COMP_DETAIL_PROFILE"
@@ -49,10 +59,13 @@ _COMP_RESEARCH_PROFILE_ENV = "BLOOMBEE_COMP_RESEARCH_PROFILE"
 _COMP_BIT_PROFILE_ENV = "BLOOMBEE_COMP_BIT_PROFILE"
 _COMP_STRIDE_PROFILE_ENV = "BLOOMBEE_COMP_STRIDE_PROFILE"
 _ACT_DIST_PROFILE_ENV = "BLOOMBEE_ACT_DIST_PROFILE"
+_COMP_ZIPNN_PROFILE_ENV = "BLOOMBEE_COMP_ZIPNN_PROFILE"
 _DEBUG_TENSOR_NAMES_ENV = "BLOOMBEE_DEBUG_TENSOR_NAMES"
 _WIRE_TRUNCATE_FP16_ENV = "BLOOMBEE_WIRE_TRUNCATE_FP16"
 _WIRE_TRUNCATE_TARGETS_ENV = "BLOOMBEE_WIRE_TRUNCATE_TARGETS"
 _WIRE_TRUNCATE_PHASES_ENV = "BLOOMBEE_WIRE_TRUNCATE_PHASES"
+_LOSSLESS_LAYOUT_ENV = "BLOOMBEE_LOSSLESS_LAYOUT"
+_LOSSLESS_LAYOUT_TARGETS_ENV = "BLOOMBEE_LOSSLESS_LAYOUT_TARGETS"
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
 )
@@ -68,6 +81,7 @@ _COMP_RESEARCH_BUCKET_ORDER = (
     ">=1MB",
 )
 _SER_LAYOUT_LOGGED_DTYPES: set[str] = set()
+_COMP_LOG_CFG_EMITTED = False
 
 
 def _get_env_bool(name: str, default: str = "0") -> bool:
@@ -107,6 +121,13 @@ def _warn_missing_zstd_once() -> None:
         _MISSING_ZSTD_WARNING_EMITTED = True
 
 
+def _warn_missing_zipnn_once() -> None:
+    global _MISSING_ZIPNN_WARNING_EMITTED
+    if not _MISSING_ZIPNN_WARNING_EMITTED:
+        logger.warning("ZipNN compare requested, but 'zipnn' is unavailable; skipping ZipNN diagnostics")
+        _MISSING_ZIPNN_WARNING_EMITTED = True
+
+
 def _lossless_send_enabled() -> bool:
     cfg_val = _get_cfg("ENABLE_LOSSLESS_WRAPPER", 0)
     if _allow_env_override() and "BLOOMBEE_LOSSLESS_WRAPPER" in os.environ:
@@ -132,6 +153,13 @@ def _lossless_level() -> int:
         return int(cfg_val)
     except Exception:
         return 3
+
+
+def _lossless_layout() -> str:
+    cfg_val = str(_get_cfg("LOSSLESS_LAYOUT", "byte_split"))
+    if _allow_env_override():
+        cfg_val = os.environ.get(_LOSSLESS_LAYOUT_ENV, cfg_val)
+    return str(cfg_val).strip().lower()
 
 
 def _lossless_min_bytes() -> int:
@@ -172,9 +200,9 @@ def comp_timing_profile_enabled() -> bool:
 def comp_detail_profile_enabled() -> bool:
     """
     Enable heavyweight per-tensor compression diagnostics.
-    Default is off because this can generate a lot of logs and a small amount of CPU overhead.
+    Default is on for compression experiments.
     """
-    return _get_env_bool(_COMP_DETAIL_PROFILE_ENV, "0")
+    return _get_env_bool(_COMP_DETAIL_PROFILE_ENV, "1")
 
 
 def comp_research_profile_enabled() -> bool:
@@ -189,21 +217,35 @@ def comp_bit_profile_enabled() -> bool:
     """
     Enable bit-level floating-point profiling (sign/exponent/mantissa) on sampled tensors.
     """
-    return _get_env_bool(_COMP_BIT_PROFILE_ENV, "0")
+    return _get_env_bool(_COMP_BIT_PROFILE_ENV, "1")
 
 
 def comp_stride_profile_enabled() -> bool:
     """
     Enable strided/chunk repeat diagnostics to inspect alignment-sensitive byte patterns.
     """
-    return _get_env_bool(_COMP_STRIDE_PROFILE_ENV, "0")
+    return _get_env_bool(_COMP_STRIDE_PROFILE_ENV, "1")
 
 
 def act_dist_profile_enabled() -> bool:
     """
     Enable activation magnitude decade histogram logs (10x bins).
     """
-    return _get_env_bool(_ACT_DIST_PROFILE_ENV, "0")
+    return _get_env_bool(_ACT_DIST_PROFILE_ENV, "1")
+
+
+def comp_zipnn_profile_enabled() -> bool:
+    """
+    Enable side-by-side ZipNN diagnostics on selected tensors without changing the actual wire format.
+    """
+    cfg_val = _get_cfg("COMP_ZIPNN_PROFILE", 0)
+    try:
+        default = "1" if bool(int(cfg_val)) else "0"
+    except Exception:
+        default = "1" if bool(cfg_val) else "0"
+    if _allow_env_override():
+        return _get_env_bool(_COMP_ZIPNN_PROFILE_ENV, default)
+    return default == "1"
 
 
 @lru_cache(maxsize=1)
@@ -251,17 +293,16 @@ def _match_target_pattern(actual: str, pattern: str) -> bool:
     return pattern in ("*", "") or actual == pattern
 
 
-def _context_matches_wire_target(debug_context: Optional[Dict[str, object]]) -> bool:
+def _context_matches_target_specs(
+    debug_context: Optional[Dict[str, object]],
+    target_specs: List[str],
+) -> bool:
     if not debug_context:
         return False
     source = str(debug_context.get("source", "")).strip().lower()
     channel = str(debug_context.get("channel", "")).strip().lower()
     tensor_name = str(debug_context.get("tensor_name", "")).strip().lower()
-    phase = str(debug_context.get("phase", "")).strip().lower()
-    phases = _wire_truncate_phases()
-    if phases and phase and phase not in phases:
-        return False
-    for spec in _wire_truncate_targets():
+    for spec in target_specs:
         parts = spec.split(":")
         if len(parts) != 3:
             continue
@@ -272,6 +313,26 @@ def _context_matches_wire_target(debug_context: Optional[Dict[str, object]]) -> 
         ):
             return True
     return False
+
+
+@lru_cache(maxsize=1)
+def _lossless_layout_targets() -> List[str]:
+    cfg_val = str(_get_cfg("LOSSLESS_LAYOUT_TARGETS", "*:*:hidden_states"))
+    if _allow_env_override():
+        cfg_val = os.environ.get(_LOSSLESS_LAYOUT_TARGETS_ENV, cfg_val)
+    return [item.strip().lower() for item in cfg_val.split(",") if item.strip()]
+
+
+def _context_matches_wire_target(debug_context: Optional[Dict[str, object]]) -> bool:
+    phase = str(debug_context.get("phase", "")).strip().lower() if debug_context else ""
+    phases = _wire_truncate_phases()
+    if phases and phase and phase not in phases:
+        return False
+    return _context_matches_target_specs(debug_context, _wire_truncate_targets())
+
+
+def _context_matches_lossless_layout_target(debug_context: Optional[Dict[str, object]]) -> bool:
+    return _context_matches_target_specs(debug_context, _lossless_layout_targets())
 
 
 def _should_wire_truncate_fp16(
@@ -1059,6 +1120,289 @@ def _log_comp_bit_event(
     logger.info(msg)
 
 
+def _log_comp_config_once() -> None:
+    global _COMP_LOG_CFG_EMITTED
+    if _COMP_LOG_CFG_EMITTED:
+        return
+    _COMP_LOG_CFG_EMITTED = True
+    logger.info(
+        "[COMP_LOG_CFG] "
+        f"module={__file__} "
+        f"lossless_enabled={int(_lossless_send_enabled())} "
+        f"algo={_lossless_algo()} "
+        f"layout={_lossless_layout()} "
+        f"detail={int(comp_detail_profile_enabled())} "
+        f"bit={int(comp_bit_profile_enabled())} "
+        f"stride={int(comp_stride_profile_enabled())} "
+        f"act={int(act_dist_profile_enabled())} "
+        f"zipnn={int(comp_zipnn_profile_enabled())} "
+        f"zipnn_available={int(_ZipNN is not None)} "
+        f"debug_tensors={','.join(sorted(_debug_tensor_names()))}"
+    )
+
+
+def _new_zipnn_compare_info() -> Dict[str, object]:
+    return {
+        "attempted": 0,
+        "available": int(_ZipNN is not None),
+        "supported": 0,
+        "lossless_verified": 0,
+        "reason": "disabled",
+        "dtype": "",
+        "payload_bytes": 0,
+        "wrapped_bytes": 0,
+        "saved_bytes": 0,
+        "ratio": 1.0,
+        "elapsed_ms": 0.0,
+        "break_even_bw_mbps": 0.0,
+        "selected_wire_bytes": 0,
+        "selected_delta_bytes": 0,
+        "better_than_selected": 0,
+    }
+    
+
+def _zipnn_dtype_name(tensor: Optional[torch.Tensor]) -> Optional[str]:
+    if tensor is None or not torch.is_tensor(tensor):
+        return None
+    if tensor.dtype == torch.float16:
+        return "float16"
+    if tensor.dtype == torch.bfloat16:
+        return "bfloat16"
+    if tensor.dtype == torch.float32:
+        return "float32"
+    return None
+
+
+@lru_cache(maxsize=8)
+def _get_zipnn_compressor(dtype_name: str, zstd_level: int):
+    if _ZipNN is None:
+        return None
+    return _ZipNN(
+        method="ZSTD",
+        input_format="byte",
+        bytearray_dtype=dtype_name,
+        compression_threshold=1.0,
+        zstd_level=zstd_level,
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_zipnn_decompressor():
+    if _ZipNN is None:
+        return None
+    return _ZipNN(method="ZSTD", input_format="byte")
+
+
+@lru_cache(maxsize=8)
+def _zipnn_lossless_dtype_supported(dtype_name: str) -> bool:
+    compressor = _get_zipnn_compressor(dtype_name, 3)
+    decompressor = _get_zipnn_decompressor()
+    if compressor is None or decompressor is None:
+        return False
+    raw = bytes(((idx * 73) + 11) & 0xFF for idx in range(4096))
+    try:
+        compressed = compressor.compress(raw)
+        restored = decompressor.decompress(compressed)
+    except Exception:
+        return False
+    return bytes(restored) == raw
+
+
+def _supports_zipnn_compare(
+    tensor: Optional[torch.Tensor],
+    compression_type: runtime_pb2.CompressionType,
+    raw_size: int,
+    debug_context: Optional[Dict[str, object]],
+) -> bool:
+    if _ZipNN is None:
+        return False
+    if compression_type != runtime_pb2.CompressionType.NONE:
+        return False
+    if tensor is None or not torch.is_tensor(tensor):
+        return False
+    dtype_name = _zipnn_dtype_name(tensor)
+    if dtype_name is None:
+        return False
+    if raw_size != tensor.numel() * tensor.element_size():
+        return False
+    if not _context_matches_lossless_layout_target(debug_context):
+        return False
+    return _zipnn_lossless_dtype_supported(dtype_name)
+
+
+def _supports_zipnn_transport(
+    tensor: Optional[torch.Tensor],
+    compression_type: runtime_pb2.CompressionType,
+    raw_size: int,
+    debug_context: Optional[Dict[str, object]],
+) -> bool:
+    return _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
+
+
+def _zipnn_skip_reason(
+    tensor: Optional[torch.Tensor],
+    compression_type: runtime_pb2.CompressionType,
+    raw_size: int,
+    debug_context: Optional[Dict[str, object]],
+) -> str:
+    if _ZipNN is None:
+        _warn_missing_zipnn_once()
+        return "zipnn_unavailable"
+    if compression_type != runtime_pb2.CompressionType.NONE:
+        return "zipnn_hivemind_compressed"
+    if tensor is None or not torch.is_tensor(tensor):
+        return "zipnn_missing_tensor"
+    dtype_name = _zipnn_dtype_name(tensor)
+    if dtype_name is None:
+        return "zipnn_unsupported_dtype"
+    if raw_size != tensor.numel() * tensor.element_size():
+        return "zipnn_size_mismatch"
+    if not _context_matches_lossless_layout_target(debug_context):
+        return "zipnn_target_mismatch"
+    if not _zipnn_lossless_dtype_supported(dtype_name):
+        return "zipnn_lossless_verification_failed"
+    return "zipnn_unsupported"
+
+
+def _profile_zipnn_candidate(
+    *,
+    tensor: Optional[torch.Tensor],
+    compression_type: runtime_pb2.CompressionType,
+    raw_buffer: bytes,
+    selected_wire_bytes: int,
+    debug_context: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    info = _new_zipnn_compare_info()
+    info["selected_wire_bytes"] = int(max(0, selected_wire_bytes))
+    if not comp_zipnn_profile_enabled():
+        return info
+    if _ZipNN is None:
+        info["reason"] = "zipnn_unavailable"
+        _warn_missing_zipnn_once()
+        return info
+    dtype_name = _zipnn_dtype_name(tensor)
+    if dtype_name is None:
+        info["reason"] = "unsupported_dtype"
+        return info
+    info["dtype"] = dtype_name
+    info["lossless_verified"] = int(_zipnn_lossless_dtype_supported(dtype_name))
+    if not _supports_zipnn_transport(tensor, compression_type, len(raw_buffer), debug_context):
+        if compression_type != runtime_pb2.CompressionType.NONE:
+            info["reason"] = "hivemind_compressed"
+        elif not info["lossless_verified"]:
+            info["reason"] = "lossless_verification_failed"
+        elif not _context_matches_lossless_layout_target(debug_context):
+            info["reason"] = "target_mismatch"
+        else:
+            info["reason"] = "unsupported"
+        return info
+
+    compressor = _get_zipnn_compressor(dtype_name, _lossless_level())
+    if compressor is None:
+        info["reason"] = "zipnn_unavailable"
+        return info
+
+    info["attempted"] = 1
+    info["supported"] = 1
+    t0 = time.perf_counter()
+    try:
+        payload = compressor.compress(raw_buffer)
+    except Exception:
+        info["reason"] = "compress_failed"
+        return info
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    payload_bytes = len(payload)
+    wrapped_bytes = _HEADER_SIZE + payload_bytes
+    saved_bytes = max(0, len(raw_buffer) - wrapped_bytes)
+    info.update(
+        {
+            "reason": "ok",
+            "payload_bytes": int(payload_bytes),
+            "wrapped_bytes": int(wrapped_bytes),
+            "saved_bytes": int(saved_bytes),
+            "ratio": (float(wrapped_bytes) / float(len(raw_buffer))) if raw_buffer else 1.0,
+            "elapsed_ms": float(elapsed_ms),
+            "break_even_bw_mbps": _break_even_bandwidth_mbps(saved_bytes, elapsed_ms),
+            "selected_delta_bytes": int(max(0, selected_wire_bytes) - wrapped_bytes),
+            "better_than_selected": int(wrapped_bytes < max(0, selected_wire_bytes)),
+        }
+    )
+    return info
+
+
+def _zipnn_info_from_selected_wrap(
+    *,
+    tensor: Optional[torch.Tensor],
+    raw_buffer: bytes,
+    wrap_info: Dict[str, object],
+) -> Dict[str, object]:
+    info = _new_zipnn_compare_info()
+    dtype_name = _zipnn_dtype_name(tensor)
+    wrapped_bytes = int(wrap_info.get("wrapped_bytes", 0) or 0)
+    payload_bytes = int(wrap_info.get("compressed_bytes", 0) or 0)
+    raw_len = len(raw_buffer)
+    saved_bytes = max(0, raw_len - wrapped_bytes)
+    info.update(
+        {
+            "attempted": 1,
+            "supported": 1,
+            "lossless_verified": int(bool(dtype_name) and _zipnn_lossless_dtype_supported(dtype_name)),
+            "reason": "selected",
+            "dtype": dtype_name or "",
+            "payload_bytes": payload_bytes,
+            "wrapped_bytes": wrapped_bytes,
+            "saved_bytes": saved_bytes,
+            "ratio": (float(wrapped_bytes) / float(raw_len)) if raw_len > 0 else 1.0,
+            "elapsed_ms": float(wrap_info.get("compress_elapsed_ms", 0.0) or 0.0),
+            "break_even_bw_mbps": _break_even_bandwidth_mbps(
+                saved_bytes, float(wrap_info.get("compress_elapsed_ms", 0.0) or 0.0)
+            ),
+            "selected_wire_bytes": wrapped_bytes,
+            "selected_delta_bytes": 0,
+            "better_than_selected": 0,
+        }
+    )
+    return info
+
+
+def _log_zipnn_compare_event(
+    *,
+    raw_bytes: int,
+    wrap_info: Dict[str, object],
+    zipnn_info: Optional[Dict[str, object]],
+    debug_context: Optional[Dict[str, object]],
+) -> None:
+    selected_algo = str(wrap_info.get("algo_name", _lossless_algo()))
+    if not comp_zipnn_profile_enabled() and selected_algo != "zipnn":
+        return
+    info = zipnn_info or _new_zipnn_compare_info()
+    msg = (
+        "[COMP_ZIPNN] "
+        f"attempted={int(info.get('attempted', 0))} "
+        f"available={int(info.get('available', 0))} "
+        f"supported={int(info.get('supported', 0))} "
+        f"lossless_verified={int(info.get('lossless_verified', 0))} "
+        f"reason={info.get('reason', 'unknown')} "
+        f"dtype={info.get('dtype', '')} "
+        f"raw_bytes={int(max(0, raw_bytes))} "
+        f"zipnn_payload_bytes={int(info.get('payload_bytes', 0))} "
+        f"zipnn_wrapped_bytes={int(info.get('wrapped_bytes', 0))} "
+        f"zipnn_saved_bytes={int(info.get('saved_bytes', 0))} "
+        f"zipnn_ratio={float(info.get('ratio', 1.0)):.6f} "
+        f"zipnn_elapsed_ms={float(info.get('elapsed_ms', 0.0)):.6f} "
+        f"zipnn_break_even_bw_mbps={float(info.get('break_even_bw_mbps', 0.0)):.6f} "
+        f"selected_algo={wrap_info.get('algo_name', _lossless_algo())} "
+        f"selected_layout={wrap_info.get('layout', 'plain')} "
+        f"selected_wire_bytes={int(info.get('selected_wire_bytes', 0))} "
+        f"zipnn_delta_vs_selected_bytes={int(info.get('selected_delta_bytes', 0))} "
+        f"zipnn_better_than_selected={int(info.get('better_than_selected', 0))}"
+    )
+    if debug_context:
+        for k, v in debug_context.items():
+            msg += f" {k}={v}"
+    logger.info(msg)
+
+
 def _log_stride_pattern_event(
     *,
     tensor: Optional[torch.Tensor],
@@ -1131,11 +1475,13 @@ def _log_comp_detail_event(
     raw_buffer: bytes,
     wire_buffer: bytes,
     wrap_info: Dict[str, object],
+    zipnn_info: Optional[Dict[str, object]] = None,
     debug_context: Optional[Dict[str, object]] = None,
 ) -> None:
     if not comp_detail_profile_enabled():
         return
     try:
+        _log_comp_config_once()
         raw_len = int(len(raw_buffer))
         wire_len = int(len(wire_buffer))
         ratio = (float(wire_len) / float(raw_len)) if raw_len > 0 else 1.0
@@ -1160,6 +1506,7 @@ def _log_comp_detail_event(
             f"lossless_applied={int(wrap_info.get('applied', 0))} "
             f"lossless_reason={wrap_info.get('reason', 'unknown')} "
             f"lossless_algo={wrap_info.get('algo_name', _lossless_algo())} "
+            f"lossless_layout={wrap_info.get('layout', 'plain')} "
             f"lossless_raw_bytes={raw_len} "
             f"lossless_wire_bytes={wire_len} "
             f"lossless_saved_bytes={saved_bytes} "
@@ -1173,6 +1520,12 @@ def _log_comp_detail_event(
             f"wrapper_only_break_even_bw_mbps={wrapper_only_break_even_bw_mbps:.6f} "
             f"lossless_compressed_bytes={int(wrap_info.get('compressed_bytes', 0))} "
             f"lossless_wrapped_bytes={int(wrap_info.get('wrapped_bytes', wire_len))} "
+            f"plain_wrapped_bytes={int(wrap_info.get('plain_wrapped_bytes', 0))} "
+            f"byte_split_wrapped_bytes={int(wrap_info.get('byte_split_wrapped_bytes', 0))} "
+            f"zipnn_compare_wrapped_bytes={int((zipnn_info or {}).get('wrapped_bytes', 0))} "
+            f"zipnn_compare_elapsed_ms={float((zipnn_info or {}).get('elapsed_ms', 0.0)):.6f} "
+            f"zipnn_compare_delta_vs_selected_bytes={int((zipnn_info or {}).get('selected_delta_bytes', 0))} "
+            f"zipnn_compare_better_than_selected={int((zipnn_info or {}).get('better_than_selected', 0))} "
             f"lossless_net_gain_bytes={int(wrap_info.get('net_gain_bytes', max(0, raw_len - wire_len)))} "
             f"min_bytes={int(wrap_info.get('min_bytes', _lossless_min_bytes()))} "
             f"min_gain_bytes={int(wrap_info.get('min_gain_bytes', _lossless_min_gain_bytes()))} "
@@ -1214,6 +1567,70 @@ def _log_comp_detail_event(
         return
 
 
+def _supports_byte_split_layout(
+    tensor: Optional[torch.Tensor],
+    compression_type: runtime_pb2.CompressionType,
+    raw_size: int,
+    debug_context: Optional[Dict[str, object]],
+) -> bool:
+    if _lossless_layout() != "byte_split":
+        return False
+    if _lossless_algo() != "zstd":
+        return False
+    if sys.byteorder != "little":
+        return False
+    if compression_type != runtime_pb2.CompressionType.NONE:
+        return False
+    if tensor is None or not torch.is_tensor(tensor):
+        return False
+    if tensor.dtype not in (torch.float16, torch.float32):
+        return False
+    if raw_size != tensor.numel() * tensor.element_size():
+        return False
+    return _context_matches_lossless_layout_target(debug_context)
+
+
+def _split_high_byte_lane(raw: bytes, elem_size: int) -> tuple[bytes, bytes]:
+    if elem_size == 2:
+        return raw[1::2], raw[0::2]
+    if elem_size == 4:
+        extracted = raw[3::4]
+        remaining = bytearray(len(raw) - len(extracted))
+        remaining[0::3] = raw[0::4]
+        remaining[1::3] = raw[1::4]
+        remaining[2::3] = raw[2::4]
+        return extracted, bytes(remaining)
+    raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
+
+
+def _reconstruct_high_byte_lane(extracted: bytes, remaining: bytes, elem_size: int, original_size: int) -> bytes:
+    if elem_size <= 0 or original_size % elem_size != 0:
+        raise ValueError(f"Invalid byte-split original_size={original_size} elem_size={elem_size}")
+    numel = original_size // elem_size
+    extracted_size = numel
+    remaining_size = original_size - extracted_size
+    if len(extracted) != extracted_size:
+        raise ValueError(f"Invalid extracted byte-split size: expected {extracted_size}, got {len(extracted)}")
+    if len(remaining) != remaining_size:
+        raise ValueError(f"Invalid remaining byte-split size: expected {remaining_size}, got {len(remaining)}")
+
+    if elem_size == 2:
+        out = bytearray(original_size)
+        out[0::2] = remaining
+        out[1::2] = extracted
+        return bytes(out)
+
+    if elem_size == 4:
+        out = bytearray(original_size)
+        out[0::4] = remaining[0::3]
+        out[1::4] = remaining[1::3]
+        out[2::4] = remaining[2::3]
+        out[3::4] = extracted
+        return bytes(out)
+
+    raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
+
+
 @lru_cache(maxsize=16)
 def _get_zstd_compressor(level: int):
     if _zstd is None:
@@ -1228,10 +1645,7 @@ def _get_zstd_decompressor():
     return _zstd.ZstdDecompressor()
 
 
-def _compress_buffer(raw: bytes) -> tuple[int, bytes]:
-    algo = _lossless_algo()
-    level = _lossless_level()
-
+def _compress_with_algo(raw: bytes, *, algo: str, level: int) -> tuple[int, bytes]:
     if algo in ("", "none", "off", "disabled"):
         return 0, raw
 
@@ -1260,11 +1674,33 @@ def _compress_buffer(raw: bytes) -> tuple[int, bytes]:
         _record_transport_profile("compress_output_bytes", float(len(compressed)))
         return _ALGO_ZLIB, compressed
 
-    logger.warning(f"Unknown BLOOMBEE_LOSSLESS_ALGO={algo!r}, disabling wrapper compression")
+    logger.warning(f"Unknown lossless wrapper algorithm={algo!r}, disabling wrapper compression")
     return 0, raw
 
 
-def _decompress_buffer(algo_id: int, payload: bytes, original_size: int) -> bytes:
+def _compress_buffer(raw: bytes) -> tuple[int, bytes]:
+    return _compress_with_algo(raw, algo=_lossless_algo(), level=_lossless_level())
+
+
+def _build_zipnn_wrapper(raw: bytes, *, tensor: torch.Tensor) -> bytes:
+    dtype_name = _zipnn_dtype_name(tensor)
+    if dtype_name is None:
+        raise ValueError("ZipNN wrapper requires float16/bfloat16/float32 tensor metadata")
+    compressor = _get_zipnn_compressor(dtype_name, _lossless_level())
+    if compressor is None:
+        _warn_missing_zipnn_once()
+        raise RuntimeError("ZipNN wrapper requires zipnn")
+    t0 = time.perf_counter()
+    payload = bytes(compressor.compress(raw))
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _record_transport_profile("compress_calls", 1.0)
+    _record_transport_profile("compress_ms", dt_ms)
+    _record_transport_profile("compress_input_bytes", float(len(raw)))
+    _record_transport_profile("compress_output_bytes", float(len(payload)))
+    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZIPNN, len(raw)) + payload
+
+
+def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> bytes:
     t0 = time.perf_counter()
     if algo_id == _ALGO_ZSTD:
         decompressor = _get_zstd_decompressor()
@@ -1273,6 +1709,11 @@ def _decompress_buffer(algo_id: int, payload: bytes, original_size: int) -> byte
         raw = decompressor.decompress(payload, max_output_size=original_size)
     elif algo_id == _ALGO_ZLIB:
         raw = zlib.decompress(payload)
+    elif algo_id == _ALGO_ZIPNN:
+        decompressor = _get_zipnn_decompressor()
+        if decompressor is None:
+            raise RuntimeError("Received ZipNN-wrapped tensor, but 'zipnn' is not installed")
+        raw = bytes(decompressor.decompress(payload))
     else:
         raise ValueError(f"Unknown lossless wrapper algorithm id: {algo_id}")
 
@@ -1284,6 +1725,54 @@ def _decompress_buffer(algo_id: int, payload: bytes, original_size: int) -> byte
     _record_transport_profile("decompress_input_bytes", float(len(payload)))
     _record_transport_profile("decompress_output_bytes", float(len(raw)))
     return raw
+
+
+def _decompress_buffer(algo_id: int, payload: bytes, original_size: int) -> bytes:
+    return _decompress_with_algo(algo_id, payload, original_size)
+
+
+def _build_plain_wrapper(raw: bytes) -> tuple[int, bytes]:
+    algo_id, compressed = _compress_buffer(raw)
+    if algo_id == 0:
+        return 0, raw
+    wrapped = _HEADER_STRUCT.pack(_MAGIC, _VERSION, algo_id, len(raw)) + compressed
+    return algo_id, wrapped
+
+
+def _build_zstd_byte_split_wrapper(raw: bytes, *, elem_size: int) -> bytes:
+    extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
+    extracted_algo, extracted_comp = _compress_with_algo(extracted_raw, algo="zstd", level=_lossless_level())
+    remaining_algo, remaining_comp = _compress_with_algo(remaining_raw, algo="zstd", level=_lossless_level())
+    if extracted_algo != _ALGO_ZSTD or remaining_algo != _ALGO_ZSTD:
+        raise RuntimeError("Byte-split wrapper requires zstd")
+
+    payload = (
+        _BYTE_SPLIT_PAYLOAD_STRUCT.pack(elem_size, len(extracted_comp))
+        + extracted_comp
+        + remaining_comp
+    )
+    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_BYTE_SPLIT, len(raw)) + payload
+
+
+def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes:
+    if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
+        raise ValueError("Byte-split payload is truncated")
+    elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
+    extracted_end = extracted_start + int(extracted_comp_size)
+    if extracted_end > len(payload):
+        raise ValueError("Byte-split payload extracted segment is truncated")
+
+    extracted_comp = payload[extracted_start:extracted_end]
+    remaining_comp = payload[extracted_end:]
+    if original_size % max(1, elem_size) != 0:
+        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+
+    extracted_raw_size = original_size // elem_size
+    remaining_raw_size = original_size - extracted_raw_size
+    extracted_raw = _decompress_with_algo(_ALGO_ZSTD, extracted_comp, extracted_raw_size)
+    remaining_raw = _decompress_with_algo(_ALGO_ZSTD, remaining_comp, remaining_raw_size)
+    return _reconstruct_high_byte_lane(extracted_raw, remaining_raw, elem_size, original_size)
 
 
 def _parse_wrapper(buffer: bytes, *, strict: bool = True):
@@ -1306,11 +1795,16 @@ def _parse_wrapper(buffer: bytes, *, strict: bool = True):
 
 def _wrap_serialized_tensor_impl(
     serialized_tensor: runtime_pb2.Tensor,
+    *,
+    tensor: Optional[torch.Tensor] = None,
+    compression_type: runtime_pb2.CompressionType = runtime_pb2.CompressionType.NONE,
+    debug_context: Optional[Dict[str, object]] = None,
 ) -> tuple[runtime_pb2.Tensor, Dict[str, object]]:
     info: Dict[str, object] = {
         "applied": 0,
         "reason": "disabled",
         "algo_name": _lossless_algo(),
+        "layout": "plain",
         "compressed_bytes": 0,
         "wrapped_bytes": len(serialized_tensor.buffer) if serialized_tensor is not None else 0,
         "net_gain_bytes": 0,
@@ -1318,6 +1812,9 @@ def _wrap_serialized_tensor_impl(
         "min_gain_bytes": _lossless_min_gain_bytes(),
         "compress_elapsed_ms": 0.0,
         "wrapper_elapsed_ms": 0.0,
+        "plain_wrapped_bytes": 0,
+        "byte_split_wrapped_bytes": 0,
+        "zipnn_wrapped_bytes": 0,
     }
     wrap_t0 = time.perf_counter()
     try:
@@ -1337,16 +1834,49 @@ def _wrap_serialized_tensor_impl(
             return serialized_tensor, info
 
         compress_t0 = time.perf_counter()
-        algo_id, compressed = _compress_buffer(raw)
+        candidates: List[tuple[str, int, bytes]] = []
+        selected_algo = _lossless_algo()
+
+        if selected_algo == "zipnn":
+            if _supports_zipnn_transport(tensor, compression_type, len(raw), debug_context):
+                try:
+                    zipnn_wrapped = _build_zipnn_wrapper(raw, tensor=tensor)
+                    candidates.append(("zipnn", _ALGO_ZIPNN, zipnn_wrapped))
+                    info["zipnn_wrapped_bytes"] = int(len(zipnn_wrapped))
+                except Exception:
+                    info["zipnn_wrapped_bytes"] = 0
+            if not candidates:
+                info["reason"] = _zipnn_skip_reason(tensor, compression_type, len(raw), debug_context)
+                return serialized_tensor, info
+        else:
+            plain_algo_id, plain_wrapped = _build_plain_wrapper(raw)
+            if plain_algo_id != 0:
+                candidates.append(("plain", plain_algo_id, plain_wrapped))
+                info["plain_wrapped_bytes"] = int(len(plain_wrapped))
+
+            if _supports_byte_split_layout(tensor, compression_type, len(raw), debug_context):
+                try:
+                    split_wrapped = _build_zstd_byte_split_wrapper(raw, elem_size=int(tensor.element_size()))
+                    candidates.append(("byte_split", _ALGO_ZSTD_BYTE_SPLIT, split_wrapped))
+                    info["byte_split_wrapped_bytes"] = int(len(split_wrapped))
+                except Exception:
+                    info["byte_split_wrapped_bytes"] = 0
+
         info["compress_elapsed_ms"] = (time.perf_counter() - compress_t0) * 1000.0
-        info["compressed_bytes"] = int(len(compressed))
-        if algo_id == 0:
+        if not candidates:
             info["reason"] = "compressor_not_applied"
             return serialized_tensor, info
 
-        wrapped_buffer = _HEADER_STRUCT.pack(_MAGIC, _VERSION, algo_id, len(raw)) + compressed
+        layout, algo_id, wrapped_buffer = min(candidates, key=lambda item: len(item[2]))
+        info["layout"] = layout
         info["wrapped_bytes"] = int(len(wrapped_buffer))
         info["net_gain_bytes"] = int(max(0, len(raw) - len(wrapped_buffer)))
+        info["compressed_bytes"] = int(max(0, len(wrapped_buffer) - _HEADER_SIZE))
+        if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
+            info["algo_name"] = "zstd_byte_split"
+        elif algo_id == _ALGO_ZIPNN:
+            info["algo_name"] = "zipnn"
+            info["layout"] = "zipnn"
 
         # Skip compression if it does not reduce payload enough to amortize header/CPU overhead.
         if len(wrapped_buffer) + _lossless_min_gain_bytes() >= len(raw):
@@ -1392,7 +1922,10 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
             return serialized_tensor
 
         algo_id, original_size, payload = parsed
-        raw_buffer = _decompress_buffer(algo_id, payload, original_size)
+        if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
+            raw_buffer = _decode_zstd_byte_split_payload(payload, original_size)
+        else:
+            raw_buffer = _decompress_buffer(algo_id, payload, original_size)
 
         unwrapped = runtime_pb2.Tensor()
         unwrapped.CopyFrom(serialized_tensor)
@@ -1446,7 +1979,26 @@ def serialize_torch_tensor(
     _record_transport_profile("serialize_calls", 1.0)
     _record_transport_profile("serialize_core_ms", (time.perf_counter() - t0) * 1000.0)
     _record_transport_profile("serialize_raw_bytes", float(len(serialized.buffer)))
-    wrapped, wrap_info = _wrap_serialized_tensor_impl(serialized)
+    wrapped, wrap_info = _wrap_serialized_tensor_impl(
+        serialized,
+        tensor=effective_tensor,
+        compression_type=compression_type,
+        debug_context=effective_debug_context,
+    )
+    if wrap_info.get("algo_name") == "zipnn":
+        zipnn_info = _zipnn_info_from_selected_wrap(
+            tensor=effective_tensor,
+            raw_buffer=serialized.buffer,
+            wrap_info=wrap_info,
+        )
+    else:
+        zipnn_info = _profile_zipnn_candidate(
+            tensor=effective_tensor,
+            compression_type=compression_type,
+            raw_buffer=serialized.buffer,
+            selected_wire_bytes=len(wrapped.buffer),
+            debug_context=effective_debug_context,
+        )
     _record_transport_profile("serialize_wire_bytes", float(len(wrapped.buffer)))
     _record_comp_research_event(
         raw_bytes=len(serialized.buffer),
@@ -1459,6 +2011,13 @@ def serialize_torch_tensor(
         raw_buffer=serialized.buffer,
         wire_buffer=wrapped.buffer,
         wrap_info=wrap_info,
+        zipnn_info=zipnn_info,
+        debug_context=effective_debug_context,
+    )
+    _log_zipnn_compare_event(
+        raw_bytes=len(serialized.buffer),
+        wrap_info=wrap_info,
+        zipnn_info=zipnn_info,
         debug_context=effective_debug_context,
     )
     return wrapped
