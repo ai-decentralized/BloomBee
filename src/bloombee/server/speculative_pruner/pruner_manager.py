@@ -6,6 +6,7 @@ import logging
 
 from bloombee.server.speculative_pruner.pruner_factory import SpeculativePrunerFactory
 from bloombee.server.speculative_pruner.utils import PruningMethod, PruningConfig
+from bloombee.server.speculative_pruner.lm_head_trainer import LM_head_trainer
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,9 @@ class SpeculativePrunerManager:
         self.pruned_tokens = 0
         self.iteration = 0
         self.middle_states = None
+        
+        train_lm_head_mode = True
+        self.lm_head_trainer = LM_head_trainer(hidden_size, vocab_size, device, config) if train_lm_head_mode else None
         
     def switch_method(self, method: Union[str, PruningMethod], keep_stats: bool = False):
         """Switch to a different pruning method"""
@@ -89,9 +93,15 @@ class SpeculativePrunerManager:
         self.iteration = self.iteration + 1
         return results
         
-    def train_model(self, final_logits, attention_mask, draft_tokens):
+    def train_model(self, middle_norm_hidden_states, final_logits, attention_mask, draft_tokens):
         if hasattr(self.pruner, 'train_step'):
             with torch.enable_grad():
-                self.pruner.train_step(self.middle_states, final_logits, attention_mask, draft_tokens)
+                self.pruner.train_step(middle_norm_hidden_states, final_logits, attention_mask, draft_tokens)
+                self.iteration = self.iteration + 1
+                
+    def train_lm_head(self, middle_hidden_states, final_hidden_states):
+        if self.lm_head_trainer is not None:
+            with torch.enable_grad():
+                self.lm_head_trainer.train_step(middle_hidden_states, final_hidden_states)
                 self.iteration = self.iteration + 1
         

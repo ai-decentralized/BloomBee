@@ -59,7 +59,7 @@ def print_time_now(s):
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
 # Note: NF4 refers to FlexGen's 4-bit group quantization, not bitsandbytes
-MAX_SHORT_INFERENCE_TOKENS = 128
+MAX_SHORT_INFERENCE_TOKENS = 81920
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
 logger = get_logger(__name__)
@@ -144,9 +144,7 @@ def _effective_token_increment(
             return default_inc
     if kv_cache_position_ids.numel() == 0:
         return 0
-    if kv_cache_position_ids.ndim >= 2:
-        return int(kv_cache_position_ids[0].numel())
-    return int(kv_cache_position_ids.numel())
+    return int(kv_cache_position_ids[0].numel())
 
 
 def _slice_batch_aligned(
@@ -382,9 +380,20 @@ def restore_hidden_states(
         restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
     """
     batch_size, max_keep_len = keep_indices.shape
-    hidden_size = flattened_hidden_states.shape[-1]
     device = flattened_hidden_states.device
     dtype = flattened_hidden_states.dtype
+    
+    # 处理不同维度的输入
+    if flattened_hidden_states.ndim == 2:
+        # [N_total_valid, hidden_size] -> 直接使用
+        flat_hidden = flattened_hidden_states
+        hidden_size = flattened_hidden_states.shape[-1]
+    elif flattened_hidden_states.ndim == 3:
+        # [num_micro_batches, N_valid_per_mb, hidden_size] -> 合并前两维
+        num_mb, n_valid_per_mb, hidden_size = flattened_hidden_states.shape
+        flat_hidden = flattened_hidden_states.reshape(-1, hidden_size)  # [num_mb * N_valid_per_mb, hidden_size]
+    else:
+        raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
     
     # 创建输出 tensor，用 0 填充
     restored_hidden_states = torch.zeros(
@@ -402,8 +411,16 @@ def restore_hidden_states(
     valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
     valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
     
+    # 验证维度匹配
+    n_total_valid = valid_mask.sum().item()
+    if flat_hidden.shape[0] != n_total_valid:
+        raise ValueError(
+            f"Dimension mismatch: flattened_hidden_states has {flat_hidden.shape[0]} elements, "
+            f"but keep_indices has {n_total_valid} valid entries"
+        )
+    
     # 写入还原位置
-    restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flattened_hidden_states
+    restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flat_hidden
     
     return restored_hidden_states
 
@@ -620,6 +637,9 @@ async def iterate_rpc_inference(
             ) = fill_microbatch_defaults(
                 mb_hidden_states, mb_keep_indices, request_context, len(requested_backends)
             )
+            
+            if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
+                hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
             
             # [MB_DEBUG] Log after fill_microbatch_defaults
             logger.debug(f"[MB_DEBUG] After fill_microbatch_defaults:")
@@ -1179,7 +1199,6 @@ async def iterate_rpc_inference(
 
         hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
         draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
-        batch_size, length_increment, _ = hidden_states.shape
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
         if not hidden_states.is_contiguous():
@@ -1210,25 +1229,18 @@ async def iterate_rpc_inference(
             )
         if not need_pruning and _as_python_bool(step_metadata.get("need_pruning", 0)):
             need_pruning = True
-        token_increment = _effective_token_increment(hidden_states, kv_cache_position_ids, is_spec_dec)
-        
+            
+        logger.info(f"hidden_states: {hidden_states.shape}")
+        logger.info(f"keep_indices: {keep_indices.shape}")
+        logger.info(f"draft_tokens: {draft_tokens.shape}")
+            
         if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
-        
-        # if is_spec_dec and not need_pruning:
             
-        #     prefill_len = draft_tokens.shape[-1] - tree_attention_mask.shape[-1]
-        #     attention_mask_indices = keep_indices[:, prefill_len:] - prefill_len
-        #     logger.info(f"keep_indices: {keep_indices}")
-        #     logger.info(f"draft_tokens: {draft_tokens}, tree_attention_mask: {tree_attention_mask.shape}")
-        #     logger.info(f"prefill_length: {prefill_length}, attention_mask_indices: {attention_mask_indices}")
-        #     idx = attention_mask_indices
-        #     idx_2d = idx.unsqueeze(-1).expand(-1, -1, tree_attention_mask.size(-1))
-        #     tree_attention_mask = torch.gather(tree_attention_mask, dim=1, index=idx_2d)
-        #     idx_3d = idx.unsqueeze(1).expand(-1, tree_attention_mask.size(1), -1)
-        #     tree_attention_mask = torch.gather(tree_attention_mask, dim=2, index=idx_3d)
-        #     logger.info(f"tree_attention_mask: {tree_attention_mask.shape}")
-
+        batch_size, length_increment, _ = hidden_states.shape
+                
+        token_increment = _effective_token_increment(hidden_states, kv_cache_position_ids, is_spec_dec)
+        
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
@@ -1295,7 +1307,7 @@ async def iterate_rpc_inference(
             if can_merge_pools:
                 # Merged pools path: all blocks processed in one call
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
-                if should_split_batch(batch_size) and not is_spec_dec:
+                if should_split_batch(batch_size):
                     execution_mode = "merged_microbatch"
                     # Micro-batch pipeline path: split batch, process with overlap
                     import asyncio
@@ -1359,7 +1371,7 @@ async def iterate_rpc_inference(
                         mb_hidden = hidden_states[mb_start:mb_end].clone()
                         mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
                         mb_tree_mask = _slice_batch_aligned(tree_attention_mask, mb_start, mb_end, batch_size)
-                        mb_kv_position_ids = _slice_batch_aligned(kv_cache_position_ids, mb_start, mb_end, batch_size)
+                        mb_kv_position_ids = kv_cache_position_ids
                         mb_draft_tokens = _slice_batch_aligned(draft_tokens, mb_start, mb_end, batch_size)
                         mb_prefill_length = _slice_batch_aligned(prefill_length, mb_start, mb_end, batch_size)
                         mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
@@ -1542,7 +1554,7 @@ async def iterate_rpc_inference(
                     micro_keep_list = [r[1] for r in results]
                     
                     hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
-                    keep_indices = micro_keep_list[-1] if micro_keep_list else None
+                    keep_indices = merge_microbatch_outputs(micro_keep_list, dim=0)
                     
                     # Calculate overlap statistics
                     total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
@@ -1662,7 +1674,7 @@ async def iterate_rpc_inference(
                         mb_hidden = hidden_states[mb_start:mb_end].clone()
                         mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
                         mb_tree_mask = _slice_batch_aligned(tree_attention_mask, mb_start, mb_end, batch_size)
-                        mb_kv_position_ids = _slice_batch_aligned(kv_cache_position_ids, mb_start, mb_end, batch_size)
+                        mb_kv_position_ids = kv_cache_position_ids
                         mb_draft_tokens = _slice_batch_aligned(draft_tokens, mb_start, mb_end, batch_size)
                         mb_prefill_length = _slice_batch_aligned(prefill_length, mb_start, mb_end, batch_size)
                         mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
@@ -1742,7 +1754,7 @@ async def iterate_rpc_inference(
                     micro_keep_list = [r[1] for r in results]
                     
                     hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
-                    keep_indices = micro_keep_list[-1] if micro_keep_list else None
+                    keep_indices = merge_microbatch_outputs(micro_keep_list, dim=0)
                     
                     # Calculate overlap statistics
                     total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
