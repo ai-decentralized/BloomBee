@@ -265,6 +265,40 @@ class Server:
         self.max_disk_space = max_disk_space
         self.adapters = adapters
 
+        ##############################################################
+        self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
+
+        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU
+        # [TRUE MICRO-BATCH MULTIPLEXING] When micro-batching is enabled:
+        # - gpu_batch_size = micro_batch_size (GPU only holds ONE micro-batch)
+        # - Other micro-batches stay 100% on CPU, swapped via offload/prefetch
+        # When disabled: use full batch_size for backwards compatibility
+        from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
+        mb_config = get_micro_batch_config()
+        micro_batch_size = get_micro_batch_size()
+
+        if mb_config['enabled']:
+            gpu_batch_size = micro_batch_size  # GPU only allocates for ONE micro-batch
+            logger.info(f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
+                        f"client can request up to batch_size={batch_size} (handled via offload/prefetch)")
+        else:
+            gpu_batch_size = batch_size  # Full batch for backwards compatibility
+            logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
+
+        self.policy = Policy(
+            gpu_batch_size, 1,        # gpu_batch_size controls GPU cache allocation
+            50, 50,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # cache_gpu_percent=100% (GPU cache only holds micro_batch_size slots)
+            100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
+            overlap=False, sep_layer=True, pin_weight=True,
+            cpu_cache_compute=False, attn_sparsity=1.0,
+            compress_weight=False,
+            comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
+            compress_cache=False,
+            comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
+        )
+        ##############################################################
+
         assert num_blocks is None or block_indices is None, "Please specify num_blocks or block_indices, not both"
         if num_blocks is None and block_indices is None:
             num_blocks = self._choose_num_blocks()
@@ -278,39 +312,6 @@ class Server:
             block_indices = range(start_block, end_block)
             num_blocks = len(block_indices)
         self.strict_block_indices, self.num_blocks = block_indices, num_blocks
-
-        ##############################################################
-        self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
-
-        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU
-        # [TRUE MICRO-BATCH MULTIPLEXING] When micro-batching is enabled:
-        # - gpu_batch_size = micro_batch_size (GPU only holds ONE micro-batch)
-        # - Other micro-batches stay 100% on CPU, swapped via offload/prefetch
-        # When disabled: use full batch_size for backwards compatibility
-        from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
-        mb_config = get_micro_batch_config()
-        micro_batch_size = get_micro_batch_size()
-        
-        if mb_config['enabled']:
-            gpu_batch_size = micro_batch_size  # GPU only allocates for ONE micro-batch
-            logger.info(f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
-                        f"client can request up to batch_size={batch_size} (handled via offload/prefetch)")
-        else:
-            gpu_batch_size = batch_size  # Full batch for backwards compatibility
-            logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
-        
-        self.policy = Policy(
-            gpu_batch_size, 1,        # gpu_batch_size controls GPU cache allocation
-            100, 0,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent=100% (GPU cache only holds micro_batch_size slots)
-            100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
-            overlap=False, sep_layer=True, pin_weight=True,
-            cpu_cache_compute=False, attn_sparsity=1.0,
-            compress_weight=False,
-            comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
-            compress_cache=False,
-            comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
-        )
         
         # Log compression configuration
         self.policy.log_batch_size_strategy()
@@ -424,7 +425,7 @@ class Server:
         # Estimate of GPU memory used in rpc_backward (2 GiB for BLOOM, proportional for other models)
         autograd_memory = 2 * gib * num_devices / 14336 * self.block_config.hidden_size
 
-        block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
+        block_size = get_block_size(self.block_config, "memory", self.env, self.policy, dtype=self.torch_dtype, quant_type=self.quant_type)
         total_memory_per_block = block_size + self._cache_bytes_per_block
         if self.adapters:
 
@@ -677,6 +678,7 @@ class ModuleContainer(threading.Thread):
                     token=token,
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
+                    policy=policy,
                 )
                 # see_memory_usage("-----------------------------------------sever: after convert_block  ")
                 is_last_block = block_index == block_indices[-1]
