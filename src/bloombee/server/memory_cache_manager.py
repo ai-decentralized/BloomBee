@@ -522,8 +522,13 @@ class KVCacheManager:
         # 2) (S, BH, D) -> (B, H, S, D) standard PKV view (zero-copy)
         H = getattr(self.block_config, "num_attention_heads", None)
         assert H is not None, "block_config.num_attention_heads is required"
-        assert (k_sbh.shape[1] % H) == 0, f"BH={k_sbh.shape[1]} not divisible by H={H}"
-        B = k_sbh.shape[1] // H
+        BH = k_sbh.shape[1]
+        # For MQA/GQA models (e.g. Falcon-7b with num_kv_heads=1), BH = B*num_kv_heads < num_attention_heads.
+        # Use BH as H in that case so B = BH/H = 1 is correct.
+        if BH < H:
+            H = BH
+        assert (BH % H) == 0, f"BH={BH} not divisible by H={H}"
+        B = BH // H
 
         def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:
             # (S, BH, D) -> (S, B, H, D) -> (B, H, S, D)
