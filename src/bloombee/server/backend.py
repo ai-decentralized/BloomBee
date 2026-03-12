@@ -446,7 +446,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     device=output_hidden_states.device,
                 )
                 
-                # t6 = time.perf_counter()
+                
                 # logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
                 
                 # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
@@ -461,16 +461,20 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
                     self.pruner_manager.train_model(middle_norm_hidden_states, final_logits, full_mask, inference_info.draft_tokens)
                     
-                training_lm_head_mode = True
+                training_lm_head_mode = False
                 if training_mode and training_lm_head_mode and self._is_spec_decoding and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
                     self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
                 
                 if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block:
-                    # norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    # keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    t6 = time.perf_counter()
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
+                    
+                    t7 = time.perf_counter()
+                    logger.info(f"prune_draft_tree spend: {t7 - t6}")
                     
                 if not training_mode and self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states
