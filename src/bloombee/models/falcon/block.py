@@ -196,7 +196,7 @@ class OptimizedFalconAttention(FalconAttention):
             # 3 x [batch_size, seq_length, num_heads, head_dim]
             (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
 
-        num_kv_heads = self.num_heads
+        num_kv_heads = self.num_heads if self.new_decoder_architecture else self.num_kv_heads
         batch_size, query_length, _, _ = query_layer.shape
 
         query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, query_length, self.head_dim)
@@ -345,6 +345,7 @@ class OptimizedFalconDecoderLayer(FalconDecoderLayer):
         head_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
+        **kwargs,  # absorb position_ids, rotary_position_ids and other unused args from backend
     ):
         residual = hidden_states
 
@@ -406,19 +407,24 @@ class WrappedFalconBlock(OptimizedFalconDecoderLayer):
         use_cache: bool = False,
         **kwargs,
     ):
-        assert attention_mask is None
-
         batch_size, seq_length = hidden_states.shape[:2]
 
         if layer_past is not None:
             layer_past = self._reorder_cache_from_bloom_to_falcon(layer_past)
+            # Cast cached KV to match the compute dtype (cache may store in float16/float32)
+            if layer_past[0].dtype != hidden_states.dtype:
+                layer_past = (layer_past[0].to(hidden_states.dtype), layer_past[1].to(hidden_states.dtype))
         past_length = 0 if layer_past is None else layer_past[0].shape[1]
         seq_length_with_past = seq_length + past_length
 
-        attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
+        padding_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
         if alibi is None and self.config.alibi:
-            alibi = build_alibi_tensor(attention_mask, num_heads=self.num_heads, dtype=hidden_states.dtype)
-        attention_mask = FalconModel._prepare_attn_mask(attention_mask, (batch_size, seq_length), past_length)
+            alibi = build_alibi_tensor(padding_mask, num_heads=self.num_heads, dtype=hidden_states.dtype)
+        # _prepare_attn_mask removed in newer transformers; build causal mask inline
+        # Shape: [batch, 1, seq_length, seq_length_with_past], True = masked (upper triangle)
+        causal_mask = torch.ones(seq_length, seq_length_with_past, device=hidden_states.device, dtype=torch.bool)
+        causal_mask = torch.triu(causal_mask, diagonal=past_length + 1)
+        attention_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
 
         outputs = super().forward(
             hidden_states,
@@ -432,7 +438,13 @@ class WrappedFalconBlock(OptimizedFalconDecoderLayer):
 
         if use_cache:
             present_key_value = outputs[-1]
-            present_key_value = self._reorder_cache_from_falcon_to_bloom(present_key_value)
+            # FalconAttention returns full KV (past+new concatenated).
+            # BloomBee's update_cache expects only the NEW tokens.
+            # past_length is computed earlier: past_length = 0 if layer_past is None else layer_past[0].shape[1]
+            pk, pv = present_key_value
+            pk = pk[:, past_length:, :]  # [B*num_kv_heads, new_seq_len, head_dim]
+            pv = pv[:, past_length:, :]
+            present_key_value = self._reorder_cache_from_falcon_to_bloom((pk, pv))
             outputs = outputs[:-1] + (present_key_value,)
 
         return outputs
@@ -440,8 +452,19 @@ class WrappedFalconBlock(OptimizedFalconDecoderLayer):
     def _reorder_cache_from_bloom_to_falcon(self, key_value: KVCache) -> KVCache:
         key_states, value_states = key_value
 
-        key_states = key_states.permute(0, 2, 1)
-        assert key_states.shape == value_states.shape  # Both are [batch_size * num_kv_heads, seq_len, head_dim]
+        if key_states.dim() == 4:
+            # cache_manager.select_cache() returns [B, H, S, D] standard HF format
+            # H here is num_attention_heads (cache allocation), but for MQA/GQA models
+            # (e.g. Falcon-7b multi_query=True) only num_kv_heads per batch were written.
+            # Slice to the actual KV heads before reshaping.
+            B, H, S, D = key_states.shape
+            num_kv_heads = 1 if (not self.config.new_decoder_architecture and getattr(self.config, 'multi_query', False)) else H
+            key_states = key_states[:, :num_kv_heads, :, :].reshape(B * num_kv_heads, S, D)
+            value_states = value_states[:, :num_kv_heads, :, :].reshape(B * num_kv_heads, S, D)
+        else:
+            # Legacy BloomBee internal format: key=[B*H, D, S], value=[B*H, S, D]
+            key_states = key_states.permute(0, 2, 1)
+            assert key_states.shape == value_states.shape  # Both are [batch_size * num_kv_heads, seq_len, head_dim]
 
         if self.config.new_decoder_architecture:
             key_states = self._expand_states(key_states)
