@@ -49,6 +49,7 @@ from bloombee.utils.microbatch_schema import (
 )
 
 logger = get_logger(__name__)
+_SESSION_TIMING_SUMMARY_KEY = "_session_timing_summary"
 
 
 # Create dedicated offloading debug logger
@@ -232,6 +233,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         
         self._session_timing: Dict[str, list] = {}
         self._session_comm_timing: Dict[str, Dict[str, Dict[str, float]]] = {}
+        self._session_background_push_tasks: Dict[str, set] = {}
 
         # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
         # Key: (session_id, step_id) -> Queue holding individual micro-batches
@@ -428,6 +430,21 @@ class TransformerConnectionHandler(ConnectionHandler):
     def _emit_unconditional_summary(message: str) -> None:
         print(message, flush=True)
 
+    def _track_session_push_task(self, session_id: Optional[str], task: asyncio.Task) -> None:
+        if not session_id:
+            return
+        session_tasks = self._session_background_push_tasks.setdefault(session_id, set())
+        session_tasks.add(task)
+        task.add_done_callback(session_tasks.discard)
+
+    async def _await_session_push_tasks(self, session_id: Optional[str]) -> None:
+        if not session_id:
+            return
+        pending = tuple(self._session_background_push_tasks.pop(session_id, set()))
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+
     def _extract_rpc_push_timing(
         self,
         response: Optional[runtime_pb2.ExpertResponse],
@@ -547,6 +564,7 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             requested_uids = self._check_uids(request.uid)
             self._log_request("rpc_inference.open", requested_uids, context)
+            session_summary = None
             try:
                 start_time = perf_counter()
                 
@@ -693,6 +711,7 @@ class TransformerConnectionHandler(ConnectionHandler):
 
                 
                 push_time = []
+                background_tasks = set()
                 
                 # [KVCACHE_DEBUG] Log before cache allocation
                 cache_alloc_start = perf_counter()
@@ -717,7 +736,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                         for i, handles in enumerate(cache_handles):
                             logger.debug(f"[KVCACHE_DEBUG] cache_handles[{i}]: {len(handles) if handles else 0} handles")
                     
-                    background_tasks = set()
                     step_=0
                     warmup_completed = False  # Track if warmup/prefill phase is completed
                     
@@ -898,9 +916,18 @@ class TransformerConnectionHandler(ConnectionHandler):
                 except Exception as e:
                     logger.warning(f"[MBPIPE_FIX] Failed to clear offload state: {e}")
 
+                if background_tasks:
+                    await asyncio.gather(*tuple(background_tasks), return_exceptions=True)
+                await self._await_session_push_tasks(session_id)
+
                 self._log_request("rpc_inference.close", requested_uids, context)
                 end_time_rpc_infer = perf_counter()
-                self._emit_timing_summary(session_id, requested_uids)
+                session_summary = self._emit_timing_summary(session_id, requested_uids)
+
+            if session_summary is not None:
+                yield runtime_pb2.ExpertResponse(
+                    metadata=MSGPackSerializer.dumps({_SESSION_TIMING_SUMMARY_KEY: session_summary})
+                )
             
 
     @contextlib.contextmanager
@@ -924,11 +951,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         records = self._session_timing.pop(session_id, [])
         comm_records = self._session_comm_timing.pop(session_id, {})
         if not records:
-            return
+            return None
         warmup = 1
         decode_records = records[warmup:] if len(records) > warmup else records
         if not decode_records:
-            return
+            return None
 
         blocks_desc = "unknown"
         if requested_uids:
@@ -966,6 +993,12 @@ class TransformerConnectionHandler(ConnectionHandler):
         push_e2e_mean = 0.0
         avg_nic_bw = 0.0
         comm_volume_kb = data_arr.mean() / 1024.0 if len(data_arr) > 0 else 0.0
+        total_cpu2nic = 0.0
+        total_nic2nic = 0.0
+        total_push_e2e = 0.0
+        total_receiver_proc = 0.0
+        total_wire_bytes = 0.0
+        receiver_proc_mean = 0.0
         matched_comm_records = [comm_records[r["step_id"]] for r in decode_records if r.get("step_id") in comm_records]
         if matched_comm_records:
             cpu2nic_arr = np.array([r["t_cpu2nic_ms"] for r in matched_comm_records])
@@ -974,8 +1007,8 @@ class TransformerConnectionHandler(ConnectionHandler):
             receiver_proc_arr = np.array([r["receiver_processing_ms"] for r in matched_comm_records])
             wire_arr = np.array([r["wire_bytes"] for r in matched_comm_records])
 
-            total_cpu2nic = cpu2nic_arr.sum()
-            total_nic2nic = nic2nic_arr.sum()
+            total_cpu2nic = float(cpu2nic_arr.sum())
+            total_nic2nic = float(nic2nic_arr.sum())
             total_comm = total_gpu2cpu + total_cpu2nic + total_nic2nic
             gpu2cpu_comm_ratio = (total_gpu2cpu / total_comm * 100) if total_comm > 0 else 0
             cpu2nic_ratio = (total_cpu2nic / total_comm * 100) if total_comm > 0 else 0
@@ -983,6 +1016,10 @@ class TransformerConnectionHandler(ConnectionHandler):
             cpu2nic_mean = float(cpu2nic_arr.mean())
             nic2nic_mean = float(nic2nic_arr.mean())
             push_e2e_mean = float(push_e2e_arr.mean())
+            total_push_e2e = float(push_e2e_arr.sum())
+            receiver_proc_mean = float(receiver_proc_arr.mean())
+            total_receiver_proc = float(receiver_proc_arr.sum())
+            total_wire_bytes = float(wire_arr.sum())
             avg_nic_bw = (wire_arr.mean() / (nic2nic_arr.mean() / 1000) / 1e6) if nic2nic_arr.mean() > 0 else 0
             comm_volume_kb = wire_arr.mean() / 1024.0 if len(wire_arr) > 0 else comm_volume_kb
 
@@ -1038,6 +1075,39 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         logger.info(timing_table_line)
         self._emit_unconditional_summary(timing_table_line)
+
+        return {
+            "blocks": blocks_desc,
+            "decode_steps": int(n),
+            "warmup_steps": int(warmup),
+            "mean_t_nic2cpu_ms": float(nic2cpu_arr.mean()),
+            "mean_t_cpu2gpu_ms": float(cpu2gpu_arr.mean()),
+            "mean_t_gpu_compute_ms": float(compute_arr.mean()),
+            "mean_t_gpu2cpu_ms": float(gpu2cpu_arr.mean()),
+            "mean_step_total_ms": float(step_arr.mean()),
+            "mean_queue_wait_ms": float(queue_arr.mean()),
+            "mean_data_bytes": float(data_arr.mean()) if len(data_arr) > 0 else 0.0,
+            "total_t_nic2cpu_ms": float(total_nic2cpu),
+            "total_t_cpu2gpu_ms": float(total_cpu2gpu),
+            "total_t_gpu_compute_ms": float(total_compute),
+            "total_t_gpu2cpu_ms": float(total_gpu2cpu),
+            "total_step_ms": float(total_step),
+            "total_data_bytes": float(data_arr.sum()) if len(data_arr) > 0 else 0.0,
+            "mean_t_cpu2nic_ms": float(cpu2nic_mean),
+            "mean_t_nic2nic_ms": float(nic2nic_mean),
+            "mean_net_latency_ms": float(push_e2e_mean),
+            "mean_receiver_processing_ms": float(receiver_proc_mean),
+            "mean_comm_volume_bytes": float(comm_volume_kb * 1024.0),
+            "mean_net_bandwidth_MBps": float(avg_nic_bw),
+            "total_t_cpu2nic_ms": float(total_cpu2nic),
+            "total_t_nic2nic_ms": float(total_nic2nic),
+            "total_net_latency_ms": float(total_push_e2e),
+            "total_receiver_processing_ms": float(total_receiver_proc),
+            "total_wire_bytes": float(total_wire_bytes),
+            "throughput_tok_s": float(throughput_tok_s),
+            "inference_latency_ms": float(inference_latency_ms),
+            "comm_sample_count": int(len(matched_comm_records)),
+        }
 
     def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest):
         handler_index = self._session_handlers.get(session_id)
@@ -1854,6 +1924,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 self._background_push_tasks = set()
             self._background_push_tasks.add(send_task)
             send_task.add_done_callback(self._background_push_tasks.discard)
+            self._track_session_push_task(metadata.get("session_id"), send_task)
             
             queue_time = (perf_counter() - push_start_time) * 1000
             logger.debug(f"{MBPIPE_LOG_PREFIX} Micro-batch push queued in {queue_time:.1f}ms (sending in background)")

@@ -4,7 +4,7 @@ import asyncio
 import itertools
 import time
 import uuid
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import torch
 from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
@@ -30,6 +30,7 @@ from bloombee.utils.microbatch_config import (
 )
 
 logger = get_logger(__name__)
+_SESSION_TIMING_SUMMARY_KEY = "_session_timing_summary"
 
 
 class _ServerInferenceSession:
@@ -64,6 +65,7 @@ class _ServerInferenceSession:
         self._position = 0
         self.history = None  # Used in case of server failures to regenerate attention caches on new servers
         self.next_session = None
+        self.final_timing_summary: Optional[Dict[str, Any]] = None
 
     @classmethod
     async def create(
@@ -321,6 +323,16 @@ class _ServerInferenceSession:
         if self.stepped:
             await self._inputs_queue.put(runtime_pb2.ExpertRequest())  # empty request will trigger end of session
             try:
+                final_response = await anext(self._outputs_stream)
+                if final_response.metadata:
+                    try:
+                        response_metadata = MSGPackSerializer.loads(final_response.metadata)
+                    except Exception:
+                        response_metadata = None
+                    if isinstance(response_metadata, dict):
+                        summary = response_metadata.get(_SESSION_TIMING_SUMMARY_KEY)
+                        if isinstance(summary, dict):
+                            self.final_timing_summary = summary
                 await anext(self._outputs_stream)
             except StopAsyncIteration:
                 pass
@@ -352,6 +364,8 @@ class InferenceSession:
         self.keep_indices = None
         self.prefill_length = 0
         self._step_count = 0  # Track step count for logging
+        self._timing_summary: Optional[Dict[str, Any]] = None
+        self._server_timing_summaries: List[Dict[str, Any]] = []
         
         # [MBPIPE] Log micro-batch pipeline configuration at client session creation
         mbpipe_log_config(logger, context="InferenceSession.__init__")
@@ -402,6 +416,51 @@ class InferenceSession:
                 session.__exit__(None, None, None)
             except Exception:
                 logger.debug("Caught exception while closing connection to server:", exc_info=True)
+
+    @property
+    def timing_summary(self) -> Optional[Dict[str, Any]]:
+        return self._timing_summary
+
+    @property
+    def server_timing_summaries(self) -> List[Dict[str, Any]]:
+        return list(self._server_timing_summaries)
+
+    def _aggregate_server_timing_summaries(self, summaries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not summaries:
+            return None
+        decode_steps = max(int(summary.get("decode_steps", 0)) for summary in summaries)
+        if decode_steps <= 0:
+            return None
+
+        total_t_gpu2cpu_ms = sum(float(summary.get("total_t_gpu2cpu_ms", 0.0)) for summary in summaries)
+        total_t_nic2cpu_ms = sum(float(summary.get("total_t_nic2cpu_ms", 0.0)) for summary in summaries)
+        total_t_cpu2gpu_ms = sum(float(summary.get("total_t_cpu2gpu_ms", 0.0)) for summary in summaries)
+        total_t_gpu_compute_ms = sum(float(summary.get("total_t_gpu_compute_ms", 0.0)) for summary in summaries)
+        total_t_cpu2nic_ms = sum(float(summary.get("total_t_cpu2nic_ms", 0.0)) for summary in summaries)
+        total_t_nic2nic_ms = sum(float(summary.get("total_t_nic2nic_ms", 0.0)) for summary in summaries)
+        total_net_latency_ms = sum(float(summary.get("total_net_latency_ms", 0.0)) for summary in summaries)
+        total_wire_bytes = sum(float(summary.get("total_wire_bytes", 0.0)) for summary in summaries)
+        total_data_bytes = sum(float(summary.get("total_data_bytes", 0.0)) for summary in summaries)
+        comm_volume_bytes = total_wire_bytes if total_wire_bytes > 0 else total_data_bytes
+        net_bandwidth_gbps = (
+            (total_wire_bytes * 8.0) / (total_net_latency_ms / 1000.0) / 1e9
+            if total_wire_bytes > 0 and total_net_latency_ms > 0
+            else 0.0
+        )
+
+        return {
+            "decode_steps": decode_steps,
+            "num_servers": len(summaries),
+            "t_gpu2cpu_ms": total_t_gpu2cpu_ms / decode_steps,
+            "t_cpu2nic_ms": total_t_cpu2nic_ms / decode_steps,
+            "t_nic2nic_ms": total_t_nic2nic_ms / decode_steps,
+            "t_nic2cpu_ms": total_t_nic2cpu_ms / decode_steps,
+            "t_cpu2gpu_ms": total_t_cpu2gpu_ms / decode_steps,
+            "t_gpu_compute_ms": total_t_gpu_compute_ms / decode_steps,
+            "net_latency_ms": total_net_latency_ms / decode_steps,
+            "comm_volume_bytes": comm_volume_bytes / decode_steps,
+            "net_bandwidth_gbps": net_bandwidth_gbps,
+        }
 
     def __enter__(self) -> "InferenceSession":
         assert not self._closed and not self._server_sessions
@@ -684,6 +743,12 @@ class InferenceSession:
         """Finish a given inference session, close the underlying connection"""
         if not self._closed:
             self._exit_server_sessions(self._server_sessions)
+            self._server_timing_summaries = [
+                session.final_timing_summary
+                for session in self._server_sessions
+                if isinstance(session.final_timing_summary, dict)
+            ]
+            self._timing_summary = self._aggregate_server_timing_summaries(self._server_timing_summaries)
             self._server_sessions.clear()
             self._closed = True
 
