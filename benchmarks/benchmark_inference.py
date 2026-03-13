@@ -14,19 +14,6 @@ from bloombee import AutoDistributedModelForCausalLM
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 
 logger = get_logger()
-_TIMING_KEYS = (
-    "t_gpu2cpu_ms",
-    "t_cpu2nic_ms",
-    "t_nic2nic_ms",
-    "t_nic2cpu_ms",
-    "t_cpu2gpu_ms",
-    "inference_latency_ms",
-    "throughput_tok_s",
-    "comm_volume_bytes",
-    "t_gpu_compute_ms",
-    "net_latency_ms",
-    "net_bandwidth_gbps",
-)
 
 # Set logging level to INFO to see all debug messages
 logging.basicConfig(
@@ -34,44 +21,6 @@ logging.basicConfig(
     format='%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-
-
-def _build_timing_table(session_summary, *, inference_latency_ms: float, throughput_tok_s: float):
-    summary = {key: 0.0 for key in _TIMING_KEYS}
-    if isinstance(session_summary, dict):
-        for key in summary:
-            summary[key] = float(session_summary.get(key, 0.0))
-    summary["inference_latency_ms"] = float(inference_latency_ms)
-    summary["throughput_tok_s"] = float(throughput_tok_s)
-    return summary
-
-
-def _format_timing_table_line(summary, *, label: str) -> str:
-    comm_volume_mb = float(summary.get("comm_volume_bytes", 0.0)) / (1024.0 * 1024.0)
-    return (
-        f"[TIMING_TABLE] {label} "
-        f"T_GPU->CPU={summary['t_gpu2cpu_ms']:.2f}ms "
-        f"T_CPU->NIC={summary['t_cpu2nic_ms']:.2f}ms "
-        f"T_NIC->NIC={summary['t_nic2nic_ms']:.2f}ms "
-        f"T_NIC->CPU={summary['t_nic2cpu_ms']:.2f}ms "
-        f"T_CPU->GPU={summary['t_cpu2gpu_ms']:.2f}ms "
-        f"InferenceLatency={summary['inference_latency_ms']:.2f}ms "
-        f"Throughput={summary['throughput_tok_s']:.2f}tok/s "
-        f"CommunicateVolume={comm_volume_mb:.4f}MB "
-        f"T_GPU_Compute={summary['t_gpu_compute_ms']:.2f}ms "
-        f"NetLatency={summary['net_latency_ms']:.2f}ms "
-        f"NetBandwidth={summary['net_bandwidth_gbps']:.4f}Gbps"
-    )
-
-
-def _average_timing_tables(tables):
-    valid_tables = [table for table in tables if isinstance(table, dict)]
-    if not valid_tables:
-        return None
-    return {
-        key: float(np.mean([table.get(key, 0.0) for table in valid_tables]))
-        for key in _TIMING_KEYS
-    }
 
 
 def main():
@@ -124,16 +73,9 @@ def main():
     results = [pipe_recv.recv() for _ in range(args.n_processes)]
     speeds = [r[0] for r in results]
     effective_speeds = [r[1] for r in results]
-    timing_tables = [r[2] for r in results]
-    
     avg_speed = np.mean(speeds)
     avg_effective_throughput = np.mean(effective_speeds)
     logger.info(f"Final result: throughput={avg_speed:.2f} tokens/sec/sequence, effective_throughput={avg_effective_throughput:.2f} tokens/sec")
-    avg_timing_table = _average_timing_tables(timing_tables)
-    if avg_timing_table is not None:
-        timing_line = _format_timing_table_line(avg_timing_table, label=f"Process=avg n={len(timing_tables)}")
-        logger.info(timing_line)
-        print(timing_line, flush=True)
 
 
 @torch.inference_mode()
@@ -348,16 +290,6 @@ def benchmark_inference(process_idx, args, result_pipe):
         # Fallback if no steps were measured (shouldn't happen in normal operation)
         speed = 0.0
     effective_speed = speed * batch_size
-    mean_latency_ms = float(np.mean(warmup_latencies)) if warmup_latencies else 0.0
-    session_timing_summary = getattr(sess, "timing_summary", None)
-    timing_table = _build_timing_table(
-        session_timing_summary,
-        inference_latency_ms=mean_latency_ms,
-        throughput_tok_s=effective_speed,
-    )
-    timing_line = _format_timing_table_line(timing_table, label=f"Process={process_idx}")
-    logger.info(timing_line)
-    print(timing_line, flush=True)
     
     # Show final generated text for each batch
     logger.info(f"\n{'='*80}")
@@ -368,7 +300,7 @@ def benchmark_inference(process_idx, args, result_pipe):
         logger.info(f"\nbatch[{batch_idx}] Full generated text:\n{full_text}\n")
     logger.info(f"{'='*80}\n")
     
-    result_pipe.send((speed, effective_speed, timing_table))
+    result_pipe.send((speed, effective_speed))
 
 
 if __name__ == "__main__":

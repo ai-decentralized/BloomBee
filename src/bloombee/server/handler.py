@@ -49,7 +49,6 @@ from bloombee.utils.microbatch_schema import (
 )
 
 logger = get_logger(__name__)
-_SESSION_TIMING_SUMMARY_KEY = "_session_timing_summary"
 
 
 # Create dedicated offloading debug logger
@@ -564,7 +563,6 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             requested_uids = self._check_uids(request.uid)
             self._log_request("rpc_inference.open", requested_uids, context)
-            session_summary = None
             try:
                 start_time = perf_counter()
                 
@@ -922,12 +920,7 @@ class TransformerConnectionHandler(ConnectionHandler):
 
                 self._log_request("rpc_inference.close", requested_uids, context)
                 end_time_rpc_infer = perf_counter()
-                session_summary = self._emit_timing_summary(session_id, requested_uids)
-
-            if session_summary is not None:
-                yield runtime_pb2.ExpertResponse(
-                    metadata=MSGPackSerializer.dumps({_SESSION_TIMING_SUMMARY_KEY: session_summary})
-                )
+                self._emit_timing_summary(session_id, requested_uids)
             
 
     @contextlib.contextmanager
@@ -951,11 +944,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         records = self._session_timing.pop(session_id, [])
         comm_records = self._session_comm_timing.pop(session_id, {})
         if not records:
-            return None
+            return
         warmup = 1
         decode_records = records[warmup:] if len(records) > warmup else records
         if not decode_records:
-            return None
+            return
 
         blocks_desc = "unknown"
         if requested_uids:
@@ -995,10 +988,6 @@ class TransformerConnectionHandler(ConnectionHandler):
         comm_volume_kb = data_arr.mean() / 1024.0 if len(data_arr) > 0 else 0.0
         total_cpu2nic = 0.0
         total_nic2nic = 0.0
-        total_push_e2e = 0.0
-        total_receiver_proc = 0.0
-        total_wire_bytes = 0.0
-        receiver_proc_mean = 0.0
         matched_comm_records = [comm_records[r["step_id"]] for r in decode_records if r.get("step_id") in comm_records]
         if matched_comm_records:
             cpu2nic_arr = np.array([r["t_cpu2nic_ms"] for r in matched_comm_records])
@@ -1016,10 +1005,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             cpu2nic_mean = float(cpu2nic_arr.mean())
             nic2nic_mean = float(nic2nic_arr.mean())
             push_e2e_mean = float(push_e2e_arr.mean())
-            total_push_e2e = float(push_e2e_arr.sum())
-            receiver_proc_mean = float(receiver_proc_arr.mean())
-            total_receiver_proc = float(receiver_proc_arr.sum())
-            total_wire_bytes = float(wire_arr.sum())
             avg_nic_bw = (wire_arr.mean() / (nic2nic_arr.mean() / 1000) / 1e6) if nic2nic_arr.mean() > 0 else 0
             comm_volume_kb = wire_arr.mean() / 1024.0 if len(wire_arr) > 0 else comm_volume_kb
 
@@ -1075,39 +1060,6 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         logger.info(timing_table_line)
         self._emit_unconditional_summary(timing_table_line)
-
-        return {
-            "blocks": blocks_desc,
-            "decode_steps": int(n),
-            "warmup_steps": int(warmup),
-            "mean_t_nic2cpu_ms": float(nic2cpu_arr.mean()),
-            "mean_t_cpu2gpu_ms": float(cpu2gpu_arr.mean()),
-            "mean_t_gpu_compute_ms": float(compute_arr.mean()),
-            "mean_t_gpu2cpu_ms": float(gpu2cpu_arr.mean()),
-            "mean_step_total_ms": float(step_arr.mean()),
-            "mean_queue_wait_ms": float(queue_arr.mean()),
-            "mean_data_bytes": float(data_arr.mean()) if len(data_arr) > 0 else 0.0,
-            "total_t_nic2cpu_ms": float(total_nic2cpu),
-            "total_t_cpu2gpu_ms": float(total_cpu2gpu),
-            "total_t_gpu_compute_ms": float(total_compute),
-            "total_t_gpu2cpu_ms": float(total_gpu2cpu),
-            "total_step_ms": float(total_step),
-            "total_data_bytes": float(data_arr.sum()) if len(data_arr) > 0 else 0.0,
-            "mean_t_cpu2nic_ms": float(cpu2nic_mean),
-            "mean_t_nic2nic_ms": float(nic2nic_mean),
-            "mean_net_latency_ms": float(push_e2e_mean),
-            "mean_receiver_processing_ms": float(receiver_proc_mean),
-            "mean_comm_volume_bytes": float(comm_volume_kb * 1024.0),
-            "mean_net_bandwidth_MBps": float(avg_nic_bw),
-            "total_t_cpu2nic_ms": float(total_cpu2nic),
-            "total_t_nic2nic_ms": float(total_nic2nic),
-            "total_net_latency_ms": float(total_push_e2e),
-            "total_receiver_processing_ms": float(total_receiver_proc),
-            "total_wire_bytes": float(total_wire_bytes),
-            "throughput_tok_s": float(throughput_tok_s),
-            "inference_latency_ms": float(inference_latency_ms),
-            "comm_sample_count": int(len(matched_comm_records)),
-        }
 
     def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest):
         handler_index = self._session_handlers.get(session_id)
