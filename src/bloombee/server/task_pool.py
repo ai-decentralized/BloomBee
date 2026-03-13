@@ -5,7 +5,7 @@ import time
 from concurrent.futures._base import PENDING
 from dataclasses import dataclass, field
 from queue import PriorityQueue
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from hivemind.utils.mpfuture import ALL_STATES, MPFuture
@@ -54,6 +54,7 @@ class PrioritizedTaskPool(threading.Thread):
         name: str,
         min_batch_size=1,
         device: Optional[torch.device] = None,
+        track_transfer_timing: bool = False,
         daemon=True,
         start=False,
     ):
@@ -64,11 +65,13 @@ class PrioritizedTaskPool(threading.Thread):
 
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
         self.device = device
+        self.track_transfer_timing = track_transfer_timing
 
         self.submitted_tasks = mp.SimpleQueue()  # interaction with ConnectionHandlers
         self._ordered_tasks = PriorityQueue()  # interaction with Runtime - only valid inside Runtime
 
         self._dispatched_tasks = {}
+        self._runtime_transfer_timings: Dict[int, Dict[str, float]] = {}
         self.batch_receiver, self.batch_sender = mp.Pipe(duplex=False)
         self._oldest_undispatched_timestamp = mp.Value(ctypes.c_double, 1.0)
         self.priority = float("inf"), float("inf")  # (first task priority, first task timestamp)
@@ -128,7 +131,13 @@ class PrioritizedTaskPool(threading.Thread):
         device = device if device is not None else self.device  # If device not specified, use default device 
         # print('-=-==-=-=-=-=- task pool: load_batch_to_runtime(): device ', device)
         task = self._ordered_tasks.get(block=True, timeout=timeout)  # Get next task from ordered task queue, may block until timeout 
-        batch_inputs = [_move_to_device_if_tensor(arg, device, share_memory=False) for arg in task.args]  # Move task arguments to specified device 
+        transfer_start = time.perf_counter()
+        batch_inputs = [_move_to_device_if_tensor(arg, device, share_memory=False) for arg in task.args]  # Move task arguments to specified device
+        if self.track_transfer_timing:
+            self._runtime_transfer_timings[task.uid] = {
+                "t_cpu2gpu_ms": (time.perf_counter() - transfer_start) * 1000.0,
+                "input_bytes": float(_estimate_tensor_bytes(task.args)),
+            }
         self._dispatched_tasks[task.uid] = task  # Mark task as dispatched 
         self.batch_receiver.recv()  # reduce the number of active batches
         if not self._ordered_tasks.empty():  # If there are remaining tasks  
@@ -138,7 +147,22 @@ class PrioritizedTaskPool(threading.Thread):
 
     def send_outputs_from_runtime(self, uid: int, batch_outputs: List[torch.Tensor]):
         """send results for a processed batch, previously loaded through load_batch_to_runtime"""
+        batch_outputs = list(batch_outputs)
+        transfer_start = time.perf_counter()
         batch_outputs = [_move_to_device_if_tensor(output, device="cpu", share_memory=True) for output in batch_outputs]
+        if self.track_transfer_timing:
+            runtime_timing = self._runtime_transfer_timings.pop(uid, {})
+            runtime_timing.update(
+                t_gpu2cpu_ms=(time.perf_counter() - transfer_start) * 1000.0,
+                output_bytes=float(_estimate_tensor_bytes(batch_outputs)),
+                runtime_transfer_valid=1,
+            )
+            if batch_outputs and isinstance(batch_outputs[-1], dict):
+                merged_timing = dict(batch_outputs[-1])
+                merged_timing.update(runtime_timing)
+                batch_outputs[-1] = merged_timing
+            else:
+                batch_outputs.append(runtime_timing)
         task = self._dispatched_tasks.pop(uid, None)
         if task is None:
             logger.error(
@@ -148,6 +172,7 @@ class PrioritizedTaskPool(threading.Thread):
             task.future.set_result(batch_outputs)
 
     def send_exception_from_runtime(self, uid: int, exception: BaseException):
+        self._runtime_transfer_timings.pop(uid, None)
         task = self._dispatched_tasks.pop(uid, None)
         if task is None:
             logger.error(
@@ -181,3 +206,11 @@ def _move_to_device_if_tensor(arg: Any, device: Union[torch.device, str], share_
         if share_memory:
             arg = arg.share_memory_()
     return arg
+
+
+def _estimate_tensor_bytes(values: Sequence[Any]) -> int:
+    total = 0
+    for value in values:
+        if isinstance(value, torch.Tensor):
+            total += value.numel() * value.element_size()
+    return total

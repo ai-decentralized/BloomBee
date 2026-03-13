@@ -109,7 +109,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         max_batch_size = self.forward_pool.max_batch_size
         device = self.module.devices[self.module.output_device_index]
         self.inference_pool = PrioritizedTaskPool(
-            self.inference_step, max_batch_size=max_batch_size, device=device, name=f"{self.name}_inference"
+            self.inference_step,
+            max_batch_size=max_batch_size,
+            device=device,
+            name=f"{self.name}_inference",
+            track_transfer_timing=True,
         )  # note: inference_pools may be merged later, see merge_inference_pools_inplace
         self.forward_pool = PrioritizedTaskPool(
             self.forward, max_batch_size=max_batch_size, device=device, name=f"{self.name}_forward"
@@ -956,6 +960,7 @@ def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend])
         max_batch_size=first_pool.max_batch_size,
         device=first_pool.device,
         name=f"merged_inference",
+        track_transfer_timing=True,
     )
     for backend in backends.values():
         assert not backend.inference_pool.is_alive()
