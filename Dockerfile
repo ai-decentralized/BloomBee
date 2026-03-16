@@ -8,6 +8,7 @@ ENV JUPYTER_PASSWORD=bloombee-dev
 ENV BLOOMBEE_CACHE=/home/user/.cache/bloombee
 
 WORKDIR /home/user
+USER root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
@@ -33,3 +34,4 @@ RUN python -m pip install --upgrade pip && \
 EXPOSE 22 8888 31340
 
 WORKDIR /home/user/BloomBee
+CMD ["/start.sh"]
