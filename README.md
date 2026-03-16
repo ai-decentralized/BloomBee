@@ -130,7 +130,7 @@ docker push <dockerhub-user>/bloombee:latest
 
 This repository also includes a GitHub Actions workflow at `.github/workflows/docker-image.yml` that can publish `linux/amd64` images to Docker Hub automatically after each push to `main` once `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` are configured as repository secrets. If you want to publish to an organization or a different repository name, set the optional `DOCKERHUB_REPOSITORY` repository variable (for example, `jiuchen0/bloombee`).
 
-This Docker image is tailored for Yotta Pods. It extends Yotta's official PyTorch image so SSH and Jupyter are already wired up when the pod starts, creates a conda environment named `bb` with Python 3.10, and preinstalls BloomBee in editable mode at `/home/user/BloomBee` so you can SSH in and develop immediately.
+This Docker image is tailored for Yotta Pods. It extends Yotta's official PyTorch image so SSH and Jupyter are already wired up when the pod starts, creates a conda environment named `bb` with Python 3.10, keeps the `.git` history inside the container for normal git workflows, and preinstalls BloomBee in editable mode at `/home/user/BloomBee` so you can SSH in and develop immediately.
 
 When launching a pod from Docker Hub:
 - Use `Public Image` if your Docker Hub repository is public. `Private Image` requires Docker Hub credentials in the platform UI.

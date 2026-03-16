@@ -46,9 +46,9 @@ RUN source "${CONDA_DIR}/etc/profile.d/conda.sh" && \
     python -m pip install --no-cache-dir --no-build-isolation -e /home/user/BloomBee && \
     conda clean --all -y && \
     rm -rf ~/.cache/pip /tmp/hivemind && \
-    mkdir -p /home/user/.cache/bloombee && \
+    mkdir -p /home/user/.cache/bloombee /home/user/.local && \
     printf '\nsource %s/etc/profile.d/conda.sh\nconda activate bb\n' "${CONDA_DIR}" >> /home/user/.bashrc && \
-    chown -R user:user /home/user/BloomBee /home/user/.cache /home/user/.bashrc
+    chown -R user:user /home/user/BloomBee /home/user/.cache /home/user/.local /home/user/.bashrc "${CONDA_DIR}/envs/bb"
 
 EXPOSE 22 8888 31340
 
