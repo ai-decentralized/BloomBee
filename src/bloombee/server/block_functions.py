@@ -3,7 +3,7 @@ This module implements server-side computations on served blocks: forward, backw
 """
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
 import os
 
 import torch
@@ -29,7 +29,6 @@ from bloombee.utils.lossless_transport import (
 )
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
-from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -72,6 +71,9 @@ MAX_SHORT_INFERENCE_TOKENS = 81920
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 
 # Create dedicated offloading debug logger
 import logging
@@ -509,7 +511,7 @@ async def iterate_rpc_inference(
     active_adapter: Optional[str],
     input_iterator: AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]],
     cache_handles: Sequence[Sequence[Handle]],
-    pruner_manager: SpeculativePrunerManager,
+    pruner_manager: Optional[SpeculativePrunerManager],
     *,
     max_length: int,
     prioritizer: TaskPrioritizerBase,
@@ -523,6 +525,7 @@ async def iterate_rpc_inference(
     start_iterate_rpc_infer_time = perf_counter()
     prefix_length = 0
     point_per_piece = points / max_length if max_length > 0 else 0.0
+    spec_pruner_enabled = pruner_manager is not None
     
     # [MBPIPE] Request context for caching mb0 data across micro-batches
     request_context: Optional[RequestContext] = None
@@ -708,7 +711,13 @@ async def iterate_rpc_inference(
             # Seed a per-step context explicitly so schema fallback does not emit warnings.
             if not request_context.is_initialized:
                 spec_from_metadata = _as_python_bool(step_metadata.get("is_spec_dec", 0))
+                if spec_from_metadata and not spec_pruner_enabled:
+                    spec_from_metadata = False
+                    step_metadata["is_spec_dec"] = False
                 pruning_from_metadata = _as_python_bool(step_metadata.get("need_pruning", 0))
+                if pruning_from_metadata and not spec_pruner_enabled:
+                    pruning_from_metadata = False
+                    step_metadata["need_pruning"] = False
                 request_context.cache_from_mb0(
                     prompts=[None] * len(requested_backends),
                     hypo_ids=torch.arange(mb_size, dtype=torch.int64, device=mb_hidden_states.device),
@@ -1742,6 +1751,15 @@ async def iterate_rpc_inference(
             )
         if not need_pruning and _as_python_bool(step_metadata.get("need_pruning", 0)):
             need_pruning = True
+        if is_spec_dec and not spec_pruner_enabled:
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} Speculative decoding disabled; "
+                f"using normal decode path for step_id={step_metadata.get('step_id')}"
+            )
+            is_spec_dec = False
+            need_pruning = False
+            step_metadata["is_spec_dec"] = False
+            step_metadata["need_pruning"] = False
             
         logger.info(f"hidden_states: {hidden_states.shape}")
         logger.info(f"keep_indices: {keep_indices.shape}")

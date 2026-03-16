@@ -104,4 +104,3 @@ class SpeculativePrunerManager:
             with torch.enable_grad():
                 self.lm_head_trainer.train_step(middle_hidden_states, final_hidden_states)
                 self.iteration = self.iteration + 1
-        

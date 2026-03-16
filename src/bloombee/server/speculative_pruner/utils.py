@@ -71,6 +71,5 @@ class NetworkCondition:
         #     packet_loss=base['packet_loss'] * (1 + random.uniform(-0.3, 0.3)),
         #     throughput=base['throughput'] * (1 + random.uniform(-0.15, 0.15))
         # )
-        
-        
-        
+
+

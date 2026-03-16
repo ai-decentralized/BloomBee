@@ -7,7 +7,7 @@ import sys
 from collections import deque
 from enum import Enum
 from itertools import chain
-from typing import Any, AsyncIterator, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from time import perf_counter
 import time
@@ -28,7 +28,6 @@ from bloombee.server.backend import TransformerBackend
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
-from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.hivemind_compat import DHT, MSGPackSerializer, P2PContext, PeerID, nested_flatten, nested_pack
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.debug_config import is_log_channel_enabled
@@ -60,6 +59,9 @@ from bloombee.utils.microbatch_schema import (
 )
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 
 
 # Create dedicated offloading debug logger
@@ -397,7 +399,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         step_timeout: float,
         task_prioritizer: TaskPrioritizerBase = DummyTaskPrioritizer(),
         quant_type: QuantType,
-        pruner_manager: SpeculativePrunerManager,
+        pruner_manager: Optional[SpeculativePrunerManager],
     ):
         super().__init__(dht, module_backends)
         for module_backend in self.module_backends.values():
@@ -486,6 +488,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._prioritizer = task_prioritizer
         self.quant_type = quant_type
         self.pruner_manager = pruner_manager
+        self._speculative_pruner_enabled = pruner_manager is not None
 
     @staticmethod
     def _now_us() -> int:
@@ -892,6 +895,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                     except Exception as e:
                         logger.debug(f"{MBPIPE_LOG_PREFIX} spec detection fallback failed: {e}")
                         is_spec_request = False
+                if is_spec_request and not self._speculative_pruner_enabled:
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} Speculative decoding requested but disabled on this server; "
+                        f"falling back to normal decode for session_id={session_id}"
+                    )
+                    is_spec_request = False
+                    metadata["is_spec_dec"] = False
+                    metadata["need_pruning"] = False
                 if not requested_uids:
                     raise ValueError("User must specify at least one block for inference, but got none")
                 assert isinstance(
@@ -2994,13 +3005,20 @@ class TransformerConnectionHandler(ConnectionHandler):
             # This helps release shared memory used by temporary Python objects
             gc.collect()
             
-            # Clear CUDA cache if available (this may free some shared memory)
-            if torch.cuda.is_available():
+            # In forked subprocesses, touching CUDA before it is initialized raises:
+            # "Cannot re-initialize CUDA in forked subprocess". This cleanup is best-effort,
+            # so only use CUDA APIs when the runtime is already initialized in this process.
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
                 # Synchronize to ensure cleanup is complete
                 torch.cuda.synchronize()
             
             logger.debug("Cleaned up temporary shared memory after warmup phase")
+        except RuntimeError as e:
+            if "cannot re-initialize cuda in forked subprocess" in str(e).lower():
+                logger.debug("Skipping warmup shared memory CUDA cleanup in forked subprocess")
+            else:
+                logger.debug(f"Failed to cleanup warmup shared memory: {e}", exc_info=True)
         except Exception as e:
             logger.debug(f"Failed to cleanup warmup shared memory: {e}", exc_info=True)
 

@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 # Optimize shared memory usage for systems with limited /dev/shm
 # Set environment variables before importing PyTorch to limit shared memory allocation
@@ -46,9 +46,6 @@ from bloombee.utils.hivemind_compat import (
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
-from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
-from bloombee.server.speculative_pruner.utils import PruningMethod
-from bloombee.server.speculative_pruner.utils import PruningConfig
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
@@ -94,6 +91,13 @@ offload_logger.setLevel(logging.INFO)
 # 	print(logger)
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+
+
+def _is_speculative_pruner_enabled() -> bool:
+    return os.environ.get("BLOOMBEE_ENABLE_SPECULATIVE_PRUNER", "0") == "1"
 
 
 class Server:
@@ -273,27 +277,39 @@ class Server:
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
-        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU
-        # [TRUE MICRO-BATCH MULTIPLEXING] When micro-batching is enabled:
-        # - gpu_batch_size = micro_batch_size (GPU only holds ONE micro-batch)
-        # - Other micro-batches stay 100% on CPU, swapped via offload/prefetch
-        # When disabled: use full batch_size for backwards compatibility
+        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU.
+        #
+        # Micro-batching has two distinct modes:
+        # - overlap_only: split execution for overlap, but keep full logical KV capacity
+        # - multiplexing: shrink active GPU KV capacity down to micro_batch_size
+        #
+        # Only multiplexing should reduce policy.gpu_batch_size. Overlap-only must keep
+        # full-batch capacity, otherwise handler._allocate_cache() will reject normal
+        # client batch sizes before the overlap path even starts.
         from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
         mb_config = get_micro_batch_config()
         micro_batch_size = get_micro_batch_size()
 
-        if mb_config['enabled']:
-            gpu_batch_size = micro_batch_size  # GPU only allocates for ONE micro-batch
-            logger.info(f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
-                        f"client can request up to batch_size={batch_size} (handled via offload/prefetch)")
+        if mb_config['enabled'] and mb_config.get('gpu_multiplexing', False):
+            gpu_batch_size = micro_batch_size
+            logger.info(
+                f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
+                f"client can request up to batch_size={batch_size} (handled via offload/prefetch)"
+            )
+        elif mb_config['enabled']:
+            gpu_batch_size = batch_size
+            logger.info(
+                f"[POLICY_MB_OVERLAP] GPU batch_size={gpu_batch_size} (full logical batch), "
+                f"micro_batch_size={micro_batch_size} used for overlap scheduling only"
+            )
         else:
-            gpu_batch_size = batch_size  # Full batch for backwards compatibility
+            gpu_batch_size = batch_size
             logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
 
         self.policy = Policy(
-            gpu_batch_size, 1,        # gpu_batch_size controls GPU cache allocation
+            gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
             50, 50,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent=100% (GPU cache only holds micro_batch_size slots)
+            100, 0,                   # cache_gpu_percent=100% (overlap-only keeps full logical cache on GPU)
             100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
@@ -323,21 +339,29 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
         
-        hidden_size = 4096
-        vocab_size = 32000
-        
-        # Create configuration
-        config = PruningConfig(
-            method=PruningMethod.ADAPTIVE_NEURAL,
-            neural_threshold=0.5,
-            simple_threshold=0.1
-        )
-        
-        self.pruner_manager = SpeculativePrunerManager(
-            hidden_size=hidden_size,
-            vocab_size=vocab_size,
-            config=config
-        )
+        self.pruner_manager = None
+        if _is_speculative_pruner_enabled():
+            from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+            from bloombee.server.speculative_pruner.utils import PruningConfig, PruningMethod
+
+            hidden_size = 4096
+            vocab_size = 32000
+            config = PruningConfig(
+                method=PruningMethod.ADAPTIVE_NEURAL,
+                neural_threshold=0.5,
+                simple_threshold=0.1
+            )
+            self.pruner_manager = SpeculativePrunerManager(
+                hidden_size=hidden_size,
+                vocab_size=vocab_size,
+                config=config
+            )
+            logger.info("Speculative pruner enabled")
+        else:
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} Speculative pruner disabled; "
+                f"set BLOOMBEE_ENABLE_SPECULATIVE_PRUNER=1 to enable it"
+            )
         
         ##############################################################
         

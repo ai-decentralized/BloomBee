@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from itertools import chain
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
 from time import perf_counter
 
 import torch
@@ -18,7 +18,6 @@ from transformers import PretrainedConfig
 from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
-from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
@@ -37,6 +36,9 @@ import time
 import threading
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 
 # Create dedicated offloading debug logger
 offload_logger = logging.getLogger('bloombee.offloading')
@@ -83,7 +85,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         *args,
         config: PretrainedConfig,
         cache_manager: KVCacheManager,
-        pruner_manager: SpeculativePrunerManager,
+        pruner_manager: Optional[SpeculativePrunerManager],
         is_last_block: bool,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
@@ -304,7 +306,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # Parse flags per request (not just first-ever call), otherwise spec/non-spec
                 # mode can get stuck after the first request served by this backend.
                 self._need_pruning = _flag_to_bool(inference_info.need_pruning)
-                self._is_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
+                requested_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
+                self._is_spec_decoding = requested_spec_decoding and self.pruner_manager is not None
+                if requested_spec_decoding and not self._is_spec_decoding:
+                    logger.debug(
+                        "%s speculative decoding requested but pruner is disabled; using normal decode path",
+                        self.name,
+                    )
+                    self._need_pruning = False
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
                 # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
