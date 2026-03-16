@@ -130,7 +130,7 @@ docker push <dockerhub-user>/bloombee:latest
 
 This repository also includes a GitHub Actions workflow at `.github/workflows/docker-image.yml` that can publish `linux/amd64` images to Docker Hub automatically after each push to `main` once `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` are configured as repository secrets. If you want to publish to an organization or a different repository name, set the optional `DOCKERHUB_REPOSITORY` repository variable (for example, `jiuchen0/bloombee`).
 
-This Docker image is tailored for Yotta Pods. It extends Yotta's official PyTorch image so SSH and Jupyter are already wired up when the pod starts, and it preinstalls BloomBee in editable mode at `/home/user/BloomBee` so you can SSH in and develop immediately.
+This Docker image is tailored for Yotta Pods. It extends Yotta's official PyTorch image so SSH and Jupyter are already wired up when the pod starts, creates a conda environment named `bb` with Python 3.10, and preinstalls BloomBee in editable mode at `/home/user/BloomBee` so you can SSH in and develop immediately.
 
 When launching a pod from Docker Hub:
 - Use `Public Image` if your Docker Hub repository is public. `Private Image` requires Docker Hub credentials in the platform UI.
@@ -138,7 +138,7 @@ When launching a pod from Docker Hub:
 - Do not override the container start command on Yotta Pods; let the base image start SSH and Jupyter for you.
 - Set `JUPYTER_PASSWORD` in the platform UI to your own password. The image includes a default for first boot, but overriding it is strongly recommended.
 - Expose ports `22` and `8888` for SSH and Jupyter, and add `31340/tcp` if the pod will run a DHT/bootstrap node or worker.
-- After SSH login, your working tree is already available at `/home/user/BloomBee`.
+- After SSH login, your working tree is already available at `/home/user/BloomBee`, and the `bb` conda environment is activated automatically.
 
 Example init command for a bootstrap node:
 
