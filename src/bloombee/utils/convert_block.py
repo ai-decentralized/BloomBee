@@ -5,6 +5,7 @@ import re
 from enum import Enum
 from typing import Optional, Sequence
 
+import numpy as np
 import tensor_parallel as tp
 import torch
 import torch.nn as nn
@@ -16,6 +17,61 @@ from bloombee.utils.debug import dprint
 from bloombee.utils.memory_usage import see_memory_usage, log_mem
 
 logger = get_logger(__name__)
+
+
+def _get_choice(cur_percent, percents, choices):
+    """Return which device a parameter belongs to based on its cumulative position.
+
+    Mirrors LLaMA's get_choice in flex_llama.py / from_pretrained.py.
+
+    Args:
+        cur_percent: Midpoint percentage (0-100) of this parameter in the full model.
+        percents:    Allocation percentages [disk%, cpu%, gpu%] that must sum to 100.
+        choices:     Corresponding device choices.
+    """
+    cum = np.cumsum(percents)
+    for i, boundary in enumerate(cum):
+        if cur_percent < boundary:
+            return choices[i]
+    return choices[-1]
+
+
+def _assign_param_devices(module, policy, gpu_device):
+    """Assign each named parameter to CPU or GPU using the same cumulative-midpoint
+    logic that LLaMA's FlexGen system uses (init_weight_list in flex_llama.py).
+
+    With policy.w_gpu_percent=50 / w_cpu_percent=50 the first ~50% of parameters
+    (by element count) are placed on CPU, the remaining ~50% on GPU.
+
+    Disk offload is not supported for standard HF modules; w_disk_percent is merged
+    into the CPU allocation instead.
+
+    Returns:
+        dict mapping parameter name → torch.device
+    """
+    cpu_device = torch.device('cpu')
+
+    param_list = list(module.named_parameters())
+    if not param_list:
+        return {}
+
+    sizes = np.array([p.numel() for _, p in param_list], dtype=np.float64)
+    sizes_cumsum = np.cumsum(sizes)
+    total = sizes_cumsum[-1]
+
+    # Merge disk% into CPU% (disk offload not implemented for HF blocks)
+    effective_cpu = getattr(policy, 'w_cpu_percent', 0) + getattr(policy, 'w_disk_percent', 0)
+    effective_gpu = getattr(policy, 'w_gpu_percent', 100)
+    # percents must sum to 100; the first bucket (0%) is a placeholder so that the
+    # cumulative sum aligns with [effective_cpu, 100] boundaries.
+    dev_percents = [0.0, float(effective_cpu), float(effective_gpu)]
+    dev_choices  = [cpu_device, cpu_device, gpu_device]
+
+    param_devices = {}
+    for i, (name, _) in enumerate(param_list):
+        mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / total * 100
+        param_devices[name] = _get_choice(mid_percent, dev_percents, dev_choices)
+    return param_devices
 
 
 class QuantType(Enum):
@@ -37,6 +93,7 @@ def convert_block(
     quant_type: QuantType,
     freeze: bool = True,
     adapters: Optional[Sequence[str]] = None,
+    policy=None,
     **kwargs,
 ) -> tp.TensorParallel:
     """
@@ -69,16 +126,100 @@ def convert_block(
     # Create a simple wrapper that provides TensorParallel interface for pipeline parallelism
     # but uses FlexGen's forward method directly
     class PipelineParallelWrapper:
-        def __init__(self, module, devices, output_device):
+        def __init__(self, module, devices, output_device, block_index=0, policy=None):
             self._module = module
             self.devices = devices
+            self.output_device = output_device
             self.output_device_index = 0  # Single device in pipeline parallelism
             self.module_shards = [module]  # Single shard per pipeline stage
-            
+
+            # Fine-grained per-parameter CPU/GPU split, mirroring LLaMA's FlexGen approach.
+            # FlexGen blocks use meta-device initially — skip them.
+            first_param = next(iter(module.parameters()), None)
+            is_hf_block = (
+                first_param is not None
+                and first_param.device.type != 'meta'
+                and output_device is not None
+            )
+
+            self._param_devices = {}   # name → torch.device
+            self._cpu_offload = False
+
+            if is_hf_block and policy is not None:
+                effective_cpu = (
+                    getattr(policy, 'w_cpu_percent', 0)
+                    + getattr(policy, 'w_disk_percent', 0)
+                )
+                if effective_cpu > 0:
+                    # Assign each parameter individually using cumulative-midpoint logic.
+                    # Buffers (e.g. rotary embedding inv_freq, lazy cos_cached/sin_cached)
+                    # are kept on GPU at all times to avoid device-mismatch issues with
+                    # lazily-registered buffers (registered during the first forward call).
+                    self._param_devices = _assign_param_devices(module, policy, output_device)
+                    pin = getattr(policy, 'pin_weight', False) and output_device.type == 'cuda'
+
+                    # Move parameters to their assigned device
+                    for name, param in module.named_parameters():
+                        target = self._param_devices[name]
+                        if target.type == 'cpu':
+                            if pin:
+                                param.data = param.data.cpu().pin_memory()
+                            else:
+                                param.data = param.data.cpu()
+                        else:
+                            param.data = param.data.to(output_device)
+
+                    # Always keep buffers on GPU so that lazily-registered buffers
+                    # (like Falcon's cos_cached / sin_cached) are created on GPU too.
+                    for buf_name, buf in list(module.named_buffers()):
+                        if buf is not None and buf.device.type != output_device.type:
+                            # Navigate to the submodule that owns this buffer and re-register
+                            parts = buf_name.split('.')
+                            submod = module
+                            for part in parts[:-1]:
+                                submod = getattr(submod, part)
+                            submod.register_buffer(parts[-1], buf.to(output_device), persistent=False)
+
+                    self._cpu_offload = any(
+                        d.type == 'cpu' for d in self._param_devices.values()
+                    )
+                    n_cpu = sum(1 for d in self._param_devices.values() if d.type == 'cpu')
+                    n_gpu = len(self._param_devices) - n_cpu
+                    logger.info(
+                        f"[block {block_index}] Per-parameter CPU offload: "
+                        f"{n_cpu}/{len(self._param_devices)} params on CPU, "
+                        f"{n_gpu}/{len(self._param_devices)} params on GPU "
+                        f"(w_gpu={getattr(policy,'w_gpu_percent',100)}%, "
+                        f"w_cpu={getattr(policy,'w_cpu_percent',0)}%)"
+                    )
+                else:
+                    # All weights on GPU
+                    module.to(output_device)
+            elif is_hf_block:
+                module.to(output_device)
+
         def forward(self, *args, **kwargs):
-            # Use FlexGen's forward method directly
+            if self._cpu_offload:
+                # Move CPU-resident parameters to GPU before forward.
+                # Buffers stay on GPU permanently (see __init__).
+                for name, param in self._module.named_parameters():
+                    if self._param_devices.get(name, self.output_device).type == 'cpu':
+                        param.data = param.data.to(self.output_device, non_blocking=True)
+                if self.output_device.type == 'cuda':
+                    torch.cuda.synchronize(self.output_device)
+
+                result = self._module.forward(*args, **kwargs)
+
+                # Restore CPU params asynchronously after forward
+                for name, param in self._module.named_parameters():
+                    if self._param_devices.get(name, self.output_device).type == 'cpu':
+                        param.data = param.data.to('cpu', non_blocking=True)
+                return result
             return self._module.forward(*args, **kwargs)
             
+        def parameters(self, *args, **kwargs):
+            return self._module.parameters(*args, **kwargs)
+
         def named_parameters(self, *args, **kwargs):
             return self._module.named_parameters(*args, **kwargs)
             
@@ -86,15 +227,21 @@ def convert_block(
             return self._module.named_buffers(*args, **kwargs)
         
         def rms_norm(self, *args, **kwargs):
-            return self._module.rms_norm(*args, **kwargs)
-        
+            if hasattr(self._module, 'rms_norm'):
+                return self._module.rms_norm(*args, **kwargs)
+            return None
+
         def load_lm_head(self, *args, **kwargs):
-            return self._module.load_lm_head(*args, **kwargs)
-        
+            if hasattr(self._module, 'load_lm_head'):
+                return self._module.load_lm_head(*args, **kwargs)
+            # No-op for non-FlexGen models (Falcon, Mixtral)
+
         def lm_head_forward(self, *args, **kwargs):
-            return self._module.lm_head_forward(*args, **kwargs)
+            if hasattr(self._module, 'lm_head_forward'):
+                return self._module.lm_head_forward(*args, **kwargs)
+            return None
     
-    tp_block = PipelineParallelWrapper(block, tensor_parallel_devices, output_device)
+    tp_block = PipelineParallelWrapper(block, tensor_parallel_devices, output_device, block_index=block_index, policy=policy)
     # log_mem(f"{log_prefix} created PipelineParallel wrapper")
     
     dprint('quant_type ', quant_type)

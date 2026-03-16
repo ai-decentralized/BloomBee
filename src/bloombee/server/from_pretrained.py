@@ -24,6 +24,7 @@ from transformers.utils import get_file_from_repo
 
 from bloombee.constants import DTYPE_MAP
 from bloombee.models.mixtral import WrappedMixtralBlock
+from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.server.block_utils import get_model_block, resolve_block_dtype
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.disk_cache import DEFAULT_CACHE_DIR, allow_cache_reads, allow_cache_writes, free_disk_space_for
@@ -69,27 +70,53 @@ def load_pretrained_block(
         config = AutoDistributedConfig.from_pretrained(model_name, use_auth_token=token)
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
-    
+
     assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
     torch_dtype = resolve_block_dtype(config, torch_dtype)
-    
-    with init_empty_weights():
-        logger.debug('load_pretrained_block: init_empty_weights()')
+
+    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral)
+    _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock)
+
+    if _is_hf_model:
+        # For HF-based models: create block normally (weights on CPU) then load state dict
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
-    
-    # Skip HuggingFace weight loading - use FlexGen weight management only
-    # This prevents duplicate weight allocation (HF + FlexGen)
-    # log_mem(f"[FlexGen] skipping HF weight loading for block={block_index} - using FlexGen weights only")
-    
-    # # Use FlexGen weight loading方式
-    # try:
-    #     load_weights_from_pytorch_model(block, policy, env, weight_home, block_index)
-    #     logger.info(f"Loaded {model_name} block {block_index} with FlexGen weight management")
-    # except Exception as e:
-    #     logger.warning(f"Failed to load weights with FlexGen: {e}")
-    #     logger.info(f"Loaded {model_name} block {block_index} with direct parameter assignment")
-    
+        block = _load_hf_block_weights(
+            block, model_name, block_index, config,
+            token=token, cache_dir=cache_dir, max_disk_space=max_disk_space, torch_dtype=torch_dtype,
+        )
+    else:
+        # For FlexGen-based models (Llama): weights are managed by FlexGen at runtime
+        with init_empty_weights():
+            logger.debug('load_pretrained_block: init_empty_weights()')
+            block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
+
     return block
+
+
+def _load_hf_block_weights(
+    block: nn.Module,
+    model_name: str,
+    block_index: int,
+    config: PretrainedConfig,
+    *,
+    token: Optional[Union[str, bool]],
+    cache_dir: str,
+    max_disk_space: Optional[int],
+    torch_dtype: torch.dtype,
+) -> nn.Module:
+    """Load HF state dict weights into a block for non-FlexGen models (Falcon, Mixtral)."""
+    block_prefix = f"{config.block_prefix}.{block_index}."
+    logger.info(f"Loading HF weights for {block_prefix} from {model_name}")
+    state_dict = _load_state_dict_from_repo(
+        model_name,
+        block_prefix,
+        token=token,
+        cache_dir=cache_dir,
+        max_disk_space=max_disk_space,
+    )
+    # state_dict keys already have block_prefix stripped, e.g. "self_attention.query_key_value.weight"
+    block.load_state_dict(state_dict, strict=False)
+    return block.to(dtype=torch_dtype)
 
 
 StateDict = Dict[str, torch.Tensor]

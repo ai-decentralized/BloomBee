@@ -5,6 +5,7 @@ from accelerate import init_empty_weights
 from transformers import PretrainedConfig, PreTrainedModel
 
 from bloombee.models.mixtral.block import WrappedMixtralBlock
+from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import get_size_in_bytes
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -41,7 +42,8 @@ def get_block_size(
         ), 'get_block_size(..., location="memory") requires to specify dtype and quant_type for calculations'
 
     with init_empty_weights(include_buffers=False):
-        block = get_model_block(config, env, policy)
+        dummy_weight_home = array_1d(2, ValueHolder)
+        block = get_model_block(config, env, policy, dummy_weight_home, "/tmp")
         n_params = sum(param.numel() for param in block.parameters())
 
     if location == "memory":
@@ -59,14 +61,18 @@ def get_block_size(
 
 def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
     """
-    The function to create a model block based on the block class
-    kwargs argument **only** is necessary for specific classes, like Mixtral.
-    They will not be passed to other block constructors.
+    The function to create a model block based on the block class.
+    - Mixtral: takes (config, layer_idx), no FlexGen args
+    - Falcon:  takes (config) only, no layer_idx, no FlexGen args
+    - Llama:   takes (config, layer_idx, env, policy, weight_home, path) — FlexGen-based
     """
     if config.block_class == WrappedMixtralBlock:
         dprint('server/block_utils.py config.block_class == WrappedMixtralBlock ')
         config = PreTrainedModel._autoset_attn_implementation(config)
         return config.block_class(config, layer_idx)
+    elif config.block_class == WrappedFalconBlock:
+        dprint('server/block_utils.py config.block_class == WrappedFalconBlock ')
+        return config.block_class(config)
     # config.block_class == WrappedLlamaBlock in distributedllamaconfig in config.py
     # print('server/block_utils.py get_model_block() : config', config)
     res = config.block_class(config, layer_idx, env, policy, weight_home, path)  # go to block.py class OptimizedLlamaDecoderLayer

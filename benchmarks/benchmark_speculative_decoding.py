@@ -22,6 +22,7 @@ sys.path.insert(0, _SRC_STR)
 
 from bloombee import AutoDistributedSpeculativeModel
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
+from bloombee.models.llama.spec_decoding_drafter import MultiSSMDrafter
 
 logger = get_logger()
 
@@ -57,92 +58,77 @@ def main():
 @torch.inference_mode()
 def benchmark_inference(process_idx, args, result_pipe):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    ssm = AutoModelForCausalLM.from_pretrained("JackFram/llama-68m")
-    ssm = ssm.to(device).eval()
-    # warm up ssm to reduce inference later
-    with torch.no_grad():
-        dummy_input = torch.ones(1, 8, dtype=torch.long, device=device)
-        ssm(dummy_input, attention_mask=torch.ones_like(dummy_input))
-
+    
+    drafter = MultiSSMDrafter(
+        ssm_model_name="JackFram/llama-68m",
+        num_workers=1,
+        device="cuda"
+    )
     model = AutoDistributedSpeculativeModel.from_pretrained(
         args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype]
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    # 配置参数
-    batch_size = getattr(args, 'batch_size', 10)
-    num_iterations = getattr(args, 'num_iterations', 1)
-
-    # 加载数据集
+    
+    batch_size = getattr(args, 'batch_size', 8)
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
+    indices = random.sample(range(len(dataset)), batch_size)
+    sampled = dataset.select(indices)
+    test_prompts = []
+    # for item in sampled:
+        # test_prompts.append(item["instruction"])
+        
+    base_prompt = (
+        "Quantum mechanics explains the behavior of particles at very small scales. "
+        "Neural networks learn patterns by adjusting weights through backpropagation. "
+        "Distributed systems require robust consensus mechanisms to maintain state. "
+        "Optimization algorithms like gradient descent are fundamental to machine learning. "
+        "Transformer architectures rely on attention mechanisms to capture dependencies. "
+        "Reinforcement learning optimizes actions by maximizing cumulative rewards. "
+        "Bayesian inference updates beliefs based on observed evidence and prior knowledge. "
+        "Convex optimization problems guarantee global minima under certain conditions. "
+        "Signal processing extracts meaningful information from noisy measurements. "
+    )
+    prompts = [
+        f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
+        for i in range(batch_size)
+    ]
+    test_prompts = prompts
 
-    # 统计信息
-    all_speeds = []
-    all_times = []
-    all_generated_tokens = []
+    tokenizer.pad_token = tokenizer.eos_token
+    input_ids = tokenizer(test_prompts, return_tensors="pt", padding=True).to(device)["input_ids"]
 
-    for iteration in range(num_iterations):
-        logger.info(f"=" * 50)
-        logger.info(f"Iteration {iteration + 1}/{num_iterations}")
-        logger.info(f"=" * 50)
+    result = ""
+    start_time = perf_counter()
+    result = model.generate(input_ids=input_ids, drafter=drafter)
+    time = perf_counter() - start_time
+    generated_tokens_nums = []
+    for i in range(batch_size):
+        prompt_mask = input_ids[i].ne(tokenizer.pad_token_id)
+        prompt_length = prompt_mask.sum().item()
+        result_mask = result[i].ne(tokenizer.pad_token_id) & result[i].ne(0)
+        result_length = result_mask.sum().item()
+        generated_tokens_num = result_length - prompt_length
+        generated_tokens_nums.append(generated_tokens_num)
+        
+        logger.info(f"result: {result[i]}")
+    
+    avg_generated_tokens = sum(generated_tokens_nums) / batch_size
+    speed = avg_generated_tokens / time
 
-        # 随机采样 batch_size 条数据
-        indices = random.sample(range(len(dataset)), batch_size)
-        sampled = dataset.select(indices)
-        test_prompts = [item["instruction"] for item in sampled]
+    decoded_results = tokenizer.batch_decode(result, skip_special_tokens=True)
 
-        # Tokenize
-        input_ids = tokenizer(test_prompts, return_tensors="pt", padding=True).to(device)["input_ids"]
+    logger.info(f"benchmark_inference batch size: {batch_size}")
+    logger.info(f"Total time: {time:.4f}s, Average speed: {speed:.2f} tokens/s")
+    logger.info(f"Generated tokens per sample: {generated_tokens_nums}")
 
-        # 推理
-        start_time = perf_counter()
-        result = model.generate(input_ids=input_ids, ssm=ssm)
-        time_elapsed = perf_counter() - start_time
-
-        # 计算生成的 token 数
-        generated_tokens_nums = []
-        for i in range(batch_size):
-            prompt_length = input_ids[i].ne(tokenizer.pad_token_id).sum().item()
-            result_length = result[i].ne(tokenizer.pad_token_id).sum().item()
-            generated_tokens_num = result_length - prompt_length
-            generated_tokens_nums.append(generated_tokens_num)
-
-        avg_generated_tokens = sum(generated_tokens_nums) / batch_size
-        speed = avg_generated_tokens / time_elapsed
-
-        all_speeds.append(speed)
-        all_times.append(time_elapsed)
-        all_generated_tokens.extend(generated_tokens_nums)
-
-        # 解码结果
-        decoded_results = tokenizer.batch_decode(result, skip_special_tokens=True)
-
-        # 打印本次迭代结果
-        logger.info(f"Iteration {iteration + 1} - Time: {time_elapsed:.4f}s, Speed: {speed:.2f} tokens/s")
-        logger.info(f"Generated tokens per sample: {generated_tokens_nums}")
-
-        for i, (prompt, decoded_result) in enumerate(zip(test_prompts, decoded_results)):
-            logger.info(f"  Sample {i}:")
-            logger.info(f"    Prompt: {prompt[:100]}...")  # 截断显示
-            logger.info(f"    Result: {decoded_result[:200]}...")  # 截断显示
-            logger.info(f"    Generated tokens: {generated_tokens_nums[i]}")
-
-    # 汇总统计
-    logger.info(f"=" * 50)
-    logger.info(f"Summary ({num_iterations} iterations, batch_size={batch_size})")
-    logger.info(f"=" * 50)
-    logger.info(f"Average speed: {sum(all_speeds) / len(all_speeds):.2f} tokens/s")
-    logger.info(f"Min speed: {min(all_speeds):.2f} tokens/s")
-    logger.info(f"Max speed: {max(all_speeds):.2f} tokens/s")
-    logger.info(f"Average time per batch: {sum(all_times) / len(all_times):.4f}s")
-    logger.info(f"Total samples processed: {num_iterations * batch_size}")
-    logger.info(f"Average tokens generated per sample: {sum(all_generated_tokens) / len(all_generated_tokens):.2f}")
-
-    # 返回平均速度
-    avg_speed = sum(all_speeds) / len(all_speeds)
-    result_pipe.send(avg_speed)
+    for i, (prompt, decoded_result) in enumerate(zip(test_prompts, decoded_results)):
+        logger.info(f"Sample {i}:")
+        logger.info(f"  Prompt: {prompt}")
+        logger.info(f"  Result: {decoded_result}")
+        logger.info(f"  Generated tokens: {generated_tokens_nums[i]}")
+    
+    
+    result_pipe.send(speed)
 
 
 if __name__ == "__main__":
