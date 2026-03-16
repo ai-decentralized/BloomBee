@@ -33,6 +33,7 @@ RUN if ! command -v conda >/dev/null 2>&1; then \
     conda create -n bb python=3.10 -y
 
 COPY . /home/user/BloomBee
+COPY docker/start-yotta-dev.sh /usr/local/bin/start-yotta-dev.sh
 
 RUN source "${CONDA_DIR}/etc/profile.d/conda.sh" && \
     conda activate bb && \
@@ -46,12 +47,14 @@ RUN source "${CONDA_DIR}/etc/profile.d/conda.sh" && \
     python -m pip install --no-cache-dir --no-build-isolation -e /home/user/BloomBee && \
     conda clean --all -y && \
     rm -rf ~/.cache/pip /tmp/hivemind && \
-    mkdir -p /home/user/.cache/bloombee /home/user/.local /home/user/.cursor-server && \
+    mkdir -p /home/user/.cache/bloombee /home/user/.local /home/user/.cursor-server /home/user/.vscode-server /home/user/.vscode-remote /home/user/.npm-global && \
     printf '\nsource %s/etc/profile.d/conda.sh\nconda activate bb\n' "${CONDA_DIR}" >> /home/user/.bashrc && \
+    printf '\nexport PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"\n' >> /home/user/.bashrc && \
+    chmod +x /usr/local/bin/start-yotta-dev.sh && \
     chown -R user:user /home/user /opt/conda/envs/bb && \
     chmod 755 /home/user
 
 EXPOSE 22 8888 31340
 
 WORKDIR /home/user/BloomBee
-CMD ["/start.sh"]
+CMD ["/usr/local/bin/start-yotta-dev.sh"]
