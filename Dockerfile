@@ -1,4 +1,4 @@
-FROM yottalabsai/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04-2025081902
+FROM yottalabsai/pytorch:2.9.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 LABEL maintainer="Yotta Labs"
 LABEL repository="bloombee"
 ARG HIVEMIND_REF=4bd43b77895019b20d18d81d0d0c1a5ab9a10847
