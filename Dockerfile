@@ -26,8 +26,10 @@ RUN if ! command -v conda >/dev/null 2>&1; then \
       bash /tmp/install_miniconda.sh -b -p "${CONDA_DIR}" && \
       rm -f /tmp/install_miniconda.sh; \
     fi && \
-    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
-    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
+    if conda --help 2>/dev/null | grep -q '\btos\b'; then \
+      conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+      conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r; \
+    fi && \
     conda create -n bb python=3.10 -y
 
 COPY . /home/user/BloomBee
