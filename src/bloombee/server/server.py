@@ -317,7 +317,6 @@ class Server:
             block_indices = range(start_block, end_block)
             num_blocks = len(block_indices)
         self.strict_block_indices, self.num_blocks = block_indices, num_blocks
-        
         # Log compression configuration
         self.policy.log_batch_size_strategy()
 

@@ -57,6 +57,7 @@ class ActivationMetadata:
     inference_prefix_length: int
     batch_size: int
     seq_len: int
+    phase: str
 
 
 class RealActivationDumper:
@@ -86,6 +87,14 @@ class RealActivationDumper:
         self.enabled = os.environ.get("BLOOMBEE_DUMP_ACTIVATIONS", "0") == "1"
         self.output_dir = Path(os.environ.get("BLOOMBEE_ACTIVATION_DIR", "/tmp/real_activations"))
         self.max_samples = int(os.environ.get("BLOOMBEE_ACTIVATION_SAMPLES", "20"))
+        raw_phases = os.environ.get("BLOOMBEE_ACTIVATION_PHASES", "prefill,decode")
+        self.allowed_phases = {
+            item.strip().lower()
+            for item in raw_phases.split(",")
+            if item.strip()
+        }
+        if not self.allowed_phases:
+            self.allowed_phases = {"prefill", "decode"}
         
         self.saved_count = 0
         self.step_count = 0
@@ -94,13 +103,23 @@ class RealActivationDumper:
         
         if self.enabled:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"[ACTIVATION_DUMPER] Enabled: output_dir={self.output_dir}, max_samples={self.max_samples}")
+            logger.info(
+                "[ACTIVATION_DUMPER] Enabled: "
+                f"output_dir={self.output_dir}, "
+                f"max_samples={self.max_samples}, "
+                f"phases={sorted(self.allowed_phases)}"
+            )
         else:
             logger.debug("[ACTIVATION_DUMPER] Disabled. Set BLOOMBEE_DUMP_ACTIVATIONS=1 to enable.")
     
-    def should_capture(self) -> bool:
+    def should_capture(self, phase: str) -> bool:
         """Check if we should capture the current step."""
-        return self.enabled and self.saved_count < self.max_samples
+        return self.enabled and self.saved_count < self.max_samples and phase in self.allowed_phases
+
+    @staticmethod
+    def infer_phase(seq_len: int) -> str:
+        # In current inference flow, seq_len==1 corresponds to decode and seq_len>1 to prefill.
+        return "decode" if int(seq_len) == 1 else "prefill"
     
     def capture(
         self,
@@ -123,11 +142,13 @@ class RealActivationDumper:
         Returns:
             Path to saved file, or None if not captured
         """
-        if not self.should_capture():
+        seq_len = hidden_states.shape[1] if hidden_states.ndim >= 2 else 1
+        phase = self.infer_phase(seq_len)
+        if not self.should_capture(phase):
             return None
         
         with self._save_lock:
-            if self.saved_count >= self.max_samples:
+            if self.saved_count >= self.max_samples or phase not in self.allowed_phases:
                 return None
                 
             self.step_count += 1
@@ -169,6 +190,7 @@ class RealActivationDumper:
                 inference_prefix_length=prefix_length,
                 batch_size=batch_size,
                 seq_len=seq_len,
+                phase=phase,
             )
             
             self.metadata_list.append(asdict(metadata))
@@ -176,6 +198,7 @@ class RealActivationDumper:
             
             logger.info(
                 f"[ACTIVATION_DUMPER] Captured: {filename} | "
+                f"phase={phase} | "
                 f"shape={list(tensor.shape)} | size={metadata.size_bytes/1024:.1f}KB | "
                 f"mean={metadata.mean:.4f} | std={metadata.std:.4f}"
             )
@@ -302,6 +325,7 @@ if __name__ == "__main__":
 export BLOOMBEE_DUMP_ACTIVATIONS=1
 export BLOOMBEE_ACTIVATION_DIR=/tmp/real_activations
 export BLOOMBEE_ACTIVATION_SAMPLES=20
+export BLOOMBEE_ACTIVATION_PHASES=decode
 """)
     elif args.test:
         os.environ["BLOOMBEE_DUMP_ACTIVATIONS"] = "1"

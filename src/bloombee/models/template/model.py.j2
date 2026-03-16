@@ -1,10 +1,8 @@
 {% set M = class_prefix %}
 from typing import Optional
 
-import hivemind
 import torch
 import torch.nn as nn
-from hivemind.utils.logging import get_logger
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.{{ hf_model_key }} import {{ hf_causal_lm_class }}, {{ hf_seq_cls_class }}, {{ hf_model_class }}, {{ hf_pretrained_class }}
@@ -15,6 +13,7 @@ from bloombee.client.ptune import PTuneMixin
 from bloombee.client.remote_generation import RemoteGenerationMixin, RemotePastKeyValues
 from bloombee.client.remote_sequential import RemoteSequential
 from bloombee.models.{{ model_name }}.config import Distributed{{ M }}Config
+from bloombee.utils.hivemind_compat import DHT, get_logger
 
 logger = get_logger(__name__)
 
@@ -27,7 +26,7 @@ class Distributed{{ M }}Model(FromPretrainedMixin, PTuneMixin, {{ hf_model_class
 
     config_class = Distributed{{ M }}Config
 
-    def __init__(self, config: Distributed{{ M }}Config, *, dht: Optional[hivemind.DHT] = None):
+    def __init__(self, config: Distributed{{ M }}Config, *, dht: Optional[DHT] = None):
         n_layer, config.num_hidden_layers = config.num_hidden_layers, 0  # Prevent initialization
         super().__init__(config)
         assert len(self.{{ layers_attr }}) == 0

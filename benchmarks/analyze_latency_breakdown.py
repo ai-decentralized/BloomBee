@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import re
 import statistics
 from collections import Counter, defaultdict
@@ -38,7 +39,16 @@ STEP_TIMING_BREAKDOWN_RE = re.compile(
     r"serialize=(?P<serialize_ms>-?[0-9.]+)ms residual=(?P<residual_ms>-?[0-9.]+)ms "
     r"step_total=(?P<step_total_ms>-?[0-9.]+)ms total_with_queue=(?P<total_with_queue_ms>-?[0-9.]+)ms "
     r"cross_gpu_window=(?P<cross_gpu_window_ms>-?[0-9.]+)ms "
-    r"batch=(?P<batch>\d+) seq_inc=(?P<seq_inc>\d+) is_spec_dec=(?P<is_spec_dec>\d+)"
+    r"batch=(?P<batch>\d+) seq_inc=(?P<seq_inc>-?\d+)"
+    r"(?: raw_seq=(?P<raw_seq>-?\d+))? is_spec_dec=(?P<is_spec_dec>\d+)"
+    r"(?: "
+    r"decompress=(?P<decompress_ms>-?[0-9.]+)ms "
+    r"deserialize_unwrap=(?P<deserialize_unwrap_ms>-?[0-9.]+)ms "
+    r"deserialize_core=(?P<deserialize_core_ms>-?[0-9.]+)ms "
+    r"compress=(?P<compress_ms>-?[0-9.]+)ms "
+    r"serialize_wrap=(?P<serialize_wrap_ms>-?[0-9.]+)ms "
+    r"serialize_core=(?P<serialize_core_ms>-?[0-9.]+)ms"
+    r")?"
 )
 STEP_TIMING_BREAKDOWN_MB_RE = re.compile(
     r"\[STEP_TIMING_BREAKDOWN_MB\] step_id=(?P<step_id>\S+) mode=micro_batch "
@@ -47,6 +57,12 @@ STEP_TIMING_BREAKDOWN_MB_RE = re.compile(
     r"deserialize_sum=(?P<deserialize_sum_ms>-?[0-9.]+)ms "
     r"compute_sum=(?P<compute_sum_ms>-?[0-9.]+)ms "
     r"serialize=(?P<serialize_ms>-?[0-9.]+)ms "
+    r"(?:decompress_sum=(?P<decompress_sum_ms>-?[0-9.]+)ms "
+    r"deserialize_unwrap_sum=(?P<deserialize_unwrap_sum_ms>-?[0-9.]+)ms "
+    r"deserialize_core_sum=(?P<deserialize_core_sum_ms>-?[0-9.]+)ms "
+    r"compress=(?P<compress_ms>-?[0-9.]+)ms "
+    r"serialize_wrap=(?P<serialize_wrap_ms>-?[0-9.]+)ms "
+    r"serialize_core=(?P<serialize_core_ms>-?[0-9.]+)ms )?"
     r"residual=(?P<residual_ms>-?[0-9.]+)ms "
     r"total=(?P<total_ms>-?[0-9.]+)ms "
     r"queue_sources=(?P<queue_sources>\S+)"
@@ -62,6 +78,154 @@ HANDLER_STEP_TIMING_RE = re.compile(
     r"handler_total=(?P<handler_total_ms>-?[0-9.]+)ms "
     r"can_push=(?P<can_push>[01])"
 )
+COMP_RATIO_RE = re.compile(
+    r"\[COMP_RATIO\]\s+"
+    r"source=(?P<source>\S+)\s+"
+    r"channel=(?P<channel>\S+)\s+"
+    r"blocks=(?P<blocks>\S+)\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"tensor=(?P<tensor>\S+)\s+"
+    r"raw_bytes=(?P<raw_bytes>\d+)\s+"
+    r"wire_bytes=(?P<wire_bytes>\d+)\s+"
+    r"ratio=(?P<ratio>-?[0-9.]+)\s+"
+    r"savings=(?P<savings>-?[0-9.]+)\s+"
+    r"nnz=(?P<nnz>-?[0-9.]+)"
+)
+COMP_TIMING_RE = re.compile(
+    r"\[COMP_TIMING\]\s+"
+    r"source=(?P<source>\S+)\s+"
+    r"channel=(?P<channel>\S+)\s+"
+    r"blocks=(?P<blocks>\S+)\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"serialize_core_ms=(?P<serialize_core_ms>-?[0-9.]+)\s+"
+    r"serialize_wrap_ms=(?P<serialize_wrap_ms>-?[0-9.]+)\s+"
+    r"compress_ms=(?P<compress_ms>-?[0-9.]+)\s+"
+    r"deserialize_unwrap_ms=(?P<deserialize_unwrap_ms>-?[0-9.]+)\s+"
+    r"decompress_ms=(?P<decompress_ms>-?[0-9.]+)\s+"
+    r"deserialize_core_ms=(?P<deserialize_core_ms>-?[0-9.]+)\s+"
+    r"serialize_raw_bytes=(?P<serialize_raw_bytes>\d+)\s+"
+    r"serialize_wire_bytes=(?P<serialize_wire_bytes>\d+)\s+"
+    r"deserialize_wire_bytes=(?P<deserialize_wire_bytes>\d+)\s+"
+    r"deserialize_raw_bytes=(?P<deserialize_raw_bytes>\d+)\s+"
+    r"serialize_ratio=(?P<serialize_ratio>-?[0-9.]+)\s+"
+    r"serialize_savings=(?P<serialize_savings>-?[0-9.]+)\s+"
+    r"compress_calls=(?P<compress_calls>\d+)\s+"
+    r"decompress_calls=(?P<decompress_calls>\d+)"
+)
+S2S_WIRE_MB_RE = re.compile(
+    r"\[S2S_WIRE\]\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"mb_idx=(?P<mb_idx>-?\d+)\s+"
+    r"sender_blocks=(?P<sender_blocks>\S+)\s+"
+    r"receiver_blocks=(?P<receiver_blocks>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"payload_kb=(?P<payload_kb>-?[0-9.]+)\s+"
+    r"metadata_b=(?P<metadata_b>\d+)\s+"
+    r"raw_transfer_ms=(?P<raw_transfer_ms>-?[0-9.]+)\s+"
+    r"sender_serialize_ms=(?P<sender_serialize_ms>-?[0-9.]+)\s+"
+    r"sender_sem_wait_ms=(?P<sender_sem_wait_ms>-?[0-9.]+)\s+"
+    r"sender_queue_ms=(?P<sender_queue_ms>-?[0-9.]+)\s+"
+    r"sender_prep_ms=(?P<sender_prep_ms>-?[0-9.]+)\s+"
+    r"wire_ms=(?P<wire_ms>-?[0-9.]+)\s+"
+    r"e2e_from_serialize_end_ms=(?P<e2e_from_serialize_end_ms>-?[0-9.]+)\s+"
+    r"clock_sync=(?P<clock_sync>[01])\s+"
+    r"clock_offset_ms=(?P<clock_offset_ms>-?[0-9.]+)\s+"
+    r"clock_rtt_ms=(?P<clock_rtt_ms>-?[0-9.]+)"
+)
+S2S_WIRE_FULL_RE = re.compile(
+    r"\[S2S_WIRE\]\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"channel=(?P<channel>\S+)\s+"
+    r"sender_blocks=(?P<sender_blocks>\S+)\s+"
+    r"receiver_blocks=(?P<receiver_blocks>\S+)\s+"
+    r"payload_kb=(?P<payload_kb>-?[0-9.]+)\s+"
+    r"metadata_b=(?P<metadata_b>\d+)\s+"
+    r"raw_transfer_ms=(?P<raw_transfer_ms>-?[0-9.]+)\s+"
+    r"wire_ms=(?P<wire_ms>-?[0-9.]+)\s+"
+    r"clock_sync=(?P<clock_sync>[01])"
+)
+S2S_NET_RE = re.compile(
+    r"\[S2S_NET\]\s+"
+    r"link=(?P<link>\S+)\s+"
+    r"samples=(?P<samples>\d+)\s+"
+    r"latency_ms=(?P<latency_ms>-?[0-9.]+)\s+"
+    r"bandwidth_mbps=(?P<bandwidth_mbps>-?[0-9.]+)\s+"
+    r"jitter_ms=(?P<jitter_ms>-?[0-9.]+)\s+"
+    r"payload_kb=(?P<payload_kb>-?[0-9.]+)\s+"
+    r"metadata_b=(?P<metadata_b>\d+)\s+"
+    r"clock_sync=(?P<clock_sync>[01])"
+)
+S2S_NET_SUMMARY_RE = re.compile(
+    r"\[S2S_NET_SUMMARY\]\s+"
+    r"link=(?P<link>\S+)\s+"
+    r"window=(?P<window>\d+)\s+"
+    r"samples=(?P<samples>\d+)\s+"
+    r"stability=(?P<stability>\S+)\s+"
+    r"lat_mean=(?P<lat_mean_ms>-?[0-9.]+)ms\s+"
+    r"lat_std=(?P<lat_std_ms>-?[0-9.]+)ms\s+"
+    r"lat_p50=(?P<lat_p50_ms>-?[0-9.]+)ms\s+"
+    r"lat_p95=(?P<lat_p95_ms>-?[0-9.]+)ms\s+"
+    r"jit_mean=(?P<jit_mean_ms>-?[0-9.]+)ms\s+"
+    r"jit_std=(?P<jit_std_ms>-?[0-9.]+)ms\s+"
+    r"jit_p50=(?P<jit_p50_ms>-?[0-9.]+)ms\s+"
+    r"jit_p95=(?P<jit_p95_ms>-?[0-9.]+)ms\s+"
+    r"bw_mean=(?P<bw_mean_mbps>-?[0-9.]+)Mbps\s+"
+    r"bw_std=(?P<bw_std_mbps>-?[0-9.]+)Mbps\s+"
+    r"bw_p50=(?P<bw_p50_mbps>-?[0-9.]+)Mbps\s+"
+    r"bw_p95=(?P<bw_p95_mbps>-?[0-9.]+)Mbps\s+"
+    r"bytes_total_mb=(?P<bytes_total_mb>-?[0-9.]+)\s+"
+    r"clock_sync_coverage=(?P<clock_sync_coverage_pct>-?[0-9.]+)%"
+)
+KVCACHE_IO_RE = re.compile(
+    r"\[KVCACHE_IO\]\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"mb_idx=(?P<mb_idx>\d+)\s+"
+    r"blocks=(?P<blocks>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"compute_ms=(?P<compute_ms>-?[0-9.]+)\s+"
+    r"pcie_submit_ms=(?P<pcie_submit_ms>-?[0-9.]+)\s+"
+    r"pcie_block_ms=(?P<pcie_block_ms>-?[0-9.]+)\s+"
+    r"pcie_total_obs_ms=(?P<pcie_total_obs_ms>-?[0-9.]+)\s+"
+    r"offload_calls=(?P<offload_calls>\d+)\s+"
+    r"prefetch_calls=(?P<prefetch_calls>\d+)\s+"
+    r"offload_bytes=(?P<offload_bytes>\d+)\s+"
+    r"prefetch_bytes=(?P<prefetch_bytes>\d+)\s+"
+    r"pcie_bytes=(?P<pcie_bytes>\d+)\s+"
+    r"pcie_bw_mbps=(?P<pcie_bw_mbps>-?[0-9.]+)\s+"
+    r"activation_raw_bytes=(?P<activation_raw_bytes>\d+)\s+"
+    r"activation_to_kv_ratio=(?P<activation_to_kv_ratio>-?[0-9.]+)\s+"
+    r"overlap_headroom_ms=(?P<overlap_headroom_ms>-?[0-9.]+)\s+"
+    r"overlap_cover_pct=(?P<overlap_cover_pct>-?[0-9.]+)\s+"
+    r"gpu_alloc_mb=(?P<gpu_alloc_mb>-?[0-9.]+)\s+"
+    r"gpu_reserved_mb=(?P<gpu_reserved_mb>-?[0-9.]+)\s+"
+    r"gpu_max_alloc_mb=(?P<gpu_max_alloc_mb>-?[0-9.]+)\s+"
+    r"staging_live_mb=(?P<staging_live_mb>-?[0-9.]+)\s+"
+    r"staging_peak_mb=(?P<staging_peak_mb>-?[0-9.]+)\s+"
+    r"staged_entries=(?P<staged_entries>\d+)\s+"
+    r"async=(?P<async_kv>[01])"
+)
+ACTIVATION_XFER_CHECK_RE = re.compile(
+    r"\[ACTIVATION_XFER_CHECK\]\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"mb_idx=(?P<mb_idx>\d+)\s+"
+    r"blocks=(?P<blocks>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"activation_raw_bytes=(?P<activation_raw_bytes>\d+)\s+"
+    r"activation_wire_bytes=(?P<activation_wire_bytes>\d+)\s+"
+    r"activation_ratio=(?P<activation_ratio>-?[0-9.]+)\s+"
+    r"kv_offload_bytes=(?P<kv_offload_bytes>\d+)\s+"
+    r"kv_prefetch_bytes=(?P<kv_prefetch_bytes>\d+)\s+"
+    r"kv_pcie_bytes=(?P<kv_pcie_bytes>\d+)\s+"
+    r"kv_submit_ms=(?P<kv_submit_ms>-?[0-9.]+)\s+"
+    r"kv_block_ms=(?P<kv_block_ms>-?[0-9.]+)\s+"
+    r"kv_pcie_bw_mbps=(?P<kv_pcie_bw_mbps>-?[0-9.]+)\s+"
+    r"kv_gpu_alloc_mb=(?P<kv_gpu_alloc_mb>-?[0-9.]+)\s+"
+    r"kv_staging_peak_mb=(?P<kv_staging_peak_mb>-?[0-9.]+)\s+"
+    r"kv_to_activation_ratio=(?P<kv_to_activation_ratio>-?[0-9.]+)\s+"
+    r"invariant=(?P<invariant>[01])"
+)
 
 
 def _safe_mean(xs):
@@ -74,6 +238,60 @@ def _safe_median(xs):
 
 def _fmt(v):
     return f"{v:.2f}"
+
+
+def _weighted_ratio(rows):
+    raw_total = sum(float(x.get("raw_bytes", 0.0)) for x in rows)
+    wire_total = sum(float(x.get("wire_bytes", 0.0)) for x in rows)
+    if raw_total <= 0:
+        return 1.0
+    return wire_total / raw_total
+
+
+def _parse_block_key(s: str):
+    """
+    Parse block-span strings like "0:20" or "0:20->20:40" for ordering.
+    """
+    m = re.match(r"(?P<a>\d+):(?P<b>\d+)(?:->(?P<c>\d+):(?P<d>\d+))?", s)
+    if not m:
+        return (10**9, 10**9, s)
+    a = int(m.group("a"))
+    b = int(m.group("b"))
+    return (a, b, s)
+
+
+def _split_s2s_link(link: str):
+    """
+    Split link labels like "micro_batch:0:20->20:40" into
+    (channel, sender_blocks, receiver_blocks).
+    """
+    if ":" not in link or "->" not in link:
+        return ("unknown", link, "unknown")
+    channel, remainder = link.split(":", 1)
+    if "->" not in remainder:
+        return (channel, remainder, "unknown")
+    sender_blocks, receiver_blocks = remainder.split("->", 1)
+    return (channel, sender_blocks, receiver_blocks)
+
+
+def _pearson(xs, ys):
+    if len(xs) < 2 or len(xs) != len(ys):
+        return 0.0
+    mx = _safe_mean(xs)
+    my = _safe_mean(ys)
+    num = 0.0
+    den_x = 0.0
+    den_y = 0.0
+    for x, y in zip(xs, ys):
+        dx = x - mx
+        dy = y - my
+        num += dx * dy
+        den_x += dx * dx
+        den_y += dy * dy
+    den = math.sqrt(max(den_x * den_y, 0.0))
+    if den <= 0:
+        return 0.0
+    return num / den
 
 
 def parse_client_log(path: Path):
@@ -150,6 +368,12 @@ def parse_detailed_server_logs(logs):
     step_rows = []
     mb_rows = []
     handler_rows = []
+    comp_timing_rows = []
+    s2s_wire_rows = []
+    s2s_net_rows = []
+    s2s_net_summary_rows = []
+    kv_io_rows = []
+    activation_xfer_rows = []
 
     for source_name, path in logs:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
@@ -166,6 +390,20 @@ def parse_detailed_server_logs(logs):
                             "deserialize_ms": float(m.group("deserialize_ms")),
                             "compute_ms": float(m.group("compute_ms")),
                             "serialize_ms": float(m.group("serialize_ms")),
+                            "decompress_ms": float(m.group("decompress_ms")) if m.group("decompress_ms") is not None else 0.0,
+                            "deserialize_unwrap_ms": float(m.group("deserialize_unwrap_ms"))
+                            if m.group("deserialize_unwrap_ms") is not None
+                            else 0.0,
+                            "deserialize_core_ms": float(m.group("deserialize_core_ms"))
+                            if m.group("deserialize_core_ms") is not None
+                            else 0.0,
+                            "compress_ms": float(m.group("compress_ms")) if m.group("compress_ms") is not None else 0.0,
+                            "serialize_wrap_ms": float(m.group("serialize_wrap_ms"))
+                            if m.group("serialize_wrap_ms") is not None
+                            else 0.0,
+                            "serialize_core_ms": float(m.group("serialize_core_ms"))
+                            if m.group("serialize_core_ms") is not None
+                            else 0.0,
                             "residual_ms": float(m.group("residual_ms")),
                             "step_total_ms": float(m.group("step_total_ms")),
                             "total_with_queue_ms": float(m.group("total_with_queue_ms")),
@@ -189,6 +427,22 @@ def parse_detailed_server_logs(logs):
                             "deserialize_sum_ms": float(m.group("deserialize_sum_ms")),
                             "compute_sum_ms": float(m.group("compute_sum_ms")),
                             "serialize_ms": float(m.group("serialize_ms")),
+                            "decompress_sum_ms": float(m.group("decompress_sum_ms"))
+                            if m.group("decompress_sum_ms") is not None
+                            else 0.0,
+                            "deserialize_unwrap_sum_ms": float(m.group("deserialize_unwrap_sum_ms"))
+                            if m.group("deserialize_unwrap_sum_ms") is not None
+                            else 0.0,
+                            "deserialize_core_sum_ms": float(m.group("deserialize_core_sum_ms"))
+                            if m.group("deserialize_core_sum_ms") is not None
+                            else 0.0,
+                            "compress_ms": float(m.group("compress_ms")) if m.group("compress_ms") is not None else 0.0,
+                            "serialize_wrap_ms": float(m.group("serialize_wrap_ms"))
+                            if m.group("serialize_wrap_ms") is not None
+                            else 0.0,
+                            "serialize_core_ms": float(m.group("serialize_core_ms"))
+                            if m.group("serialize_core_ms") is not None
+                            else 0.0,
                             "residual_ms": float(m.group("residual_ms")),
                             "total_ms": float(m.group("total_ms")),
                             "queue_sources": m.group("queue_sources"),
@@ -217,15 +471,258 @@ def parse_detailed_server_logs(logs):
                     )
                     continue
 
-    return step_rows, mb_rows, handler_rows
+                m = COMP_TIMING_RE.search(line)
+                if m:
+                    comp_timing_rows.append(
+                        {
+                            "source": source_name,
+                            "record_source": m.group("source"),
+                            "channel": m.group("channel"),
+                            "blocks": m.group("blocks"),
+                            "step_id": m.group("step_id"),
+                            "batch": int(m.group("batch")),
+                            "serialize_core_ms": float(m.group("serialize_core_ms")),
+                            "serialize_wrap_ms": float(m.group("serialize_wrap_ms")),
+                            "compress_ms": float(m.group("compress_ms")),
+                            "deserialize_unwrap_ms": float(m.group("deserialize_unwrap_ms")),
+                            "decompress_ms": float(m.group("decompress_ms")),
+                            "deserialize_core_ms": float(m.group("deserialize_core_ms")),
+                            "serialize_raw_bytes": int(m.group("serialize_raw_bytes")),
+                            "serialize_wire_bytes": int(m.group("serialize_wire_bytes")),
+                            "deserialize_wire_bytes": int(m.group("deserialize_wire_bytes")),
+                            "deserialize_raw_bytes": int(m.group("deserialize_raw_bytes")),
+                            "serialize_ratio": float(m.group("serialize_ratio")),
+                            "serialize_savings": float(m.group("serialize_savings")),
+                            "compress_calls": int(m.group("compress_calls")),
+                            "decompress_calls": int(m.group("decompress_calls")),
+                        }
+                    )
+                    continue
+
+                m = S2S_WIRE_MB_RE.search(line)
+                if m:
+                    s2s_wire_rows.append(
+                        {
+                            "source": source_name,
+                            "channel": "micro_batch",
+                            "step_id": m.group("step_id"),
+                            "mb_idx": int(m.group("mb_idx")),
+                            "sender_blocks": m.group("sender_blocks"),
+                            "receiver_blocks": m.group("receiver_blocks"),
+                            "batch": int(m.group("batch")),
+                            "payload_kb": float(m.group("payload_kb")),
+                            "metadata_b": int(m.group("metadata_b")),
+                            "raw_transfer_ms": float(m.group("raw_transfer_ms")),
+                            "sender_serialize_ms": float(m.group("sender_serialize_ms")),
+                            "sender_sem_wait_ms": float(m.group("sender_sem_wait_ms")),
+                            "sender_queue_ms": float(m.group("sender_queue_ms")),
+                            "sender_prep_ms": float(m.group("sender_prep_ms")),
+                            "wire_ms": float(m.group("wire_ms")),
+                            "e2e_from_serialize_end_ms": float(m.group("e2e_from_serialize_end_ms")),
+                            "clock_sync": int(m.group("clock_sync")),
+                            "clock_offset_ms": float(m.group("clock_offset_ms")),
+                            "clock_rtt_ms": float(m.group("clock_rtt_ms")),
+                        }
+                    )
+                    continue
+
+                m = S2S_WIRE_FULL_RE.search(line)
+                if m:
+                    s2s_wire_rows.append(
+                        {
+                            "source": source_name,
+                            "channel": m.group("channel"),
+                            "step_id": m.group("step_id"),
+                            "mb_idx": None,
+                            "sender_blocks": m.group("sender_blocks"),
+                            "receiver_blocks": m.group("receiver_blocks"),
+                            "batch": None,
+                            "payload_kb": float(m.group("payload_kb")),
+                            "metadata_b": int(m.group("metadata_b")),
+                            "raw_transfer_ms": float(m.group("raw_transfer_ms")),
+                            "sender_serialize_ms": None,
+                            "sender_sem_wait_ms": None,
+                            "sender_queue_ms": None,
+                            "sender_prep_ms": None,
+                            "wire_ms": float(m.group("wire_ms")),
+                            "e2e_from_serialize_end_ms": None,
+                            "clock_sync": int(m.group("clock_sync")),
+                            "clock_offset_ms": None,
+                            "clock_rtt_ms": None,
+                        }
+                    )
+                    continue
+
+                m = S2S_NET_RE.search(line)
+                if m:
+                    channel, sender_blocks, receiver_blocks = _split_s2s_link(m.group("link"))
+                    s2s_net_rows.append(
+                        {
+                            "source": source_name,
+                            "link": m.group("link"),
+                            "channel": channel,
+                            "sender_blocks": sender_blocks,
+                            "receiver_blocks": receiver_blocks,
+                            "samples": int(m.group("samples")),
+                            "latency_ms": float(m.group("latency_ms")),
+                            "bandwidth_mbps": float(m.group("bandwidth_mbps")),
+                            "jitter_ms": float(m.group("jitter_ms")),
+                            "payload_kb": float(m.group("payload_kb")),
+                            "metadata_b": int(m.group("metadata_b")),
+                            "clock_sync": int(m.group("clock_sync")),
+                        }
+                    )
+                    continue
+
+                m = S2S_NET_SUMMARY_RE.search(line)
+                if m:
+                    channel, sender_blocks, receiver_blocks = _split_s2s_link(m.group("link"))
+                    s2s_net_summary_rows.append(
+                        {
+                            "source": source_name,
+                            "link": m.group("link"),
+                            "channel": channel,
+                            "sender_blocks": sender_blocks,
+                            "receiver_blocks": receiver_blocks,
+                            "window": int(m.group("window")),
+                            "samples": int(m.group("samples")),
+                            "stability": m.group("stability"),
+                            "lat_mean_ms": float(m.group("lat_mean_ms")),
+                            "lat_std_ms": float(m.group("lat_std_ms")),
+                            "lat_p50_ms": float(m.group("lat_p50_ms")),
+                            "lat_p95_ms": float(m.group("lat_p95_ms")),
+                            "jit_mean_ms": float(m.group("jit_mean_ms")),
+                            "jit_std_ms": float(m.group("jit_std_ms")),
+                            "jit_p50_ms": float(m.group("jit_p50_ms")),
+                            "jit_p95_ms": float(m.group("jit_p95_ms")),
+                            "bw_mean_mbps": float(m.group("bw_mean_mbps")),
+                            "bw_std_mbps": float(m.group("bw_std_mbps")),
+                            "bw_p50_mbps": float(m.group("bw_p50_mbps")),
+                            "bw_p95_mbps": float(m.group("bw_p95_mbps")),
+                            "bytes_total_mb": float(m.group("bytes_total_mb")),
+                            "clock_sync_coverage_pct": float(m.group("clock_sync_coverage_pct")),
+                        }
+                    )
+                    continue
+
+                m = KVCACHE_IO_RE.search(line)
+                if m:
+                    kv_io_rows.append(
+                        {
+                            "source": source_name,
+                            "step_id": m.group("step_id"),
+                            "mb_idx": int(m.group("mb_idx")),
+                            "blocks": m.group("blocks"),
+                            "batch": int(m.group("batch")),
+                            "compute_ms": float(m.group("compute_ms")),
+                            "pcie_submit_ms": float(m.group("pcie_submit_ms")),
+                            "pcie_block_ms": float(m.group("pcie_block_ms")),
+                            "pcie_total_obs_ms": float(m.group("pcie_total_obs_ms")),
+                            "offload_calls": int(m.group("offload_calls")),
+                            "prefetch_calls": int(m.group("prefetch_calls")),
+                            "offload_bytes": int(m.group("offload_bytes")),
+                            "prefetch_bytes": int(m.group("prefetch_bytes")),
+                            "pcie_bytes": int(m.group("pcie_bytes")),
+                            "pcie_bw_mbps": float(m.group("pcie_bw_mbps")),
+                            "activation_raw_bytes": int(m.group("activation_raw_bytes")),
+                            "activation_to_kv_ratio": float(m.group("activation_to_kv_ratio")),
+                            "overlap_headroom_ms": float(m.group("overlap_headroom_ms")),
+                            "overlap_cover_pct": float(m.group("overlap_cover_pct")),
+                            "gpu_alloc_mb": float(m.group("gpu_alloc_mb")),
+                            "gpu_reserved_mb": float(m.group("gpu_reserved_mb")),
+                            "gpu_max_alloc_mb": float(m.group("gpu_max_alloc_mb")),
+                            "staging_live_mb": float(m.group("staging_live_mb")),
+                            "staging_peak_mb": float(m.group("staging_peak_mb")),
+                            "staged_entries": int(m.group("staged_entries")),
+                            "async_kv": int(m.group("async_kv")),
+                        }
+                    )
+                    continue
+
+                m = ACTIVATION_XFER_CHECK_RE.search(line)
+                if m:
+                    activation_xfer_rows.append(
+                        {
+                            "source": source_name,
+                            "step_id": m.group("step_id"),
+                            "mb_idx": int(m.group("mb_idx")),
+                            "blocks": m.group("blocks"),
+                            "batch": int(m.group("batch")),
+                            "activation_raw_bytes": int(m.group("activation_raw_bytes")),
+                            "activation_wire_bytes": int(m.group("activation_wire_bytes")),
+                            "activation_ratio": float(m.group("activation_ratio")),
+                            "kv_offload_bytes": int(m.group("kv_offload_bytes")),
+                            "kv_prefetch_bytes": int(m.group("kv_prefetch_bytes")),
+                            "kv_pcie_bytes": int(m.group("kv_pcie_bytes")),
+                            "kv_submit_ms": float(m.group("kv_submit_ms")),
+                            "kv_block_ms": float(m.group("kv_block_ms")),
+                            "kv_pcie_bw_mbps": float(m.group("kv_pcie_bw_mbps")),
+                            "kv_gpu_alloc_mb": float(m.group("kv_gpu_alloc_mb")),
+                            "kv_staging_peak_mb": float(m.group("kv_staging_peak_mb")),
+                            "kv_to_activation_ratio": float(m.group("kv_to_activation_ratio")),
+                            "invariant": int(m.group("invariant")),
+                        }
+                    )
+                    continue
+
+    return (
+        step_rows,
+        mb_rows,
+        handler_rows,
+        comp_timing_rows,
+        s2s_wire_rows,
+        s2s_net_rows,
+        s2s_net_summary_rows,
+        kv_io_rows,
+        activation_xfer_rows,
+    )
+
+
+def parse_comp_ratio_logs(logs):
+    rows = []
+    for source_name, path in logs:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = COMP_RATIO_RE.search(line)
+                if not m:
+                    continue
+                rows.append(
+                    {
+                        "source": source_name,
+                        "channel": m.group("channel"),
+                        "blocks": m.group("blocks"),
+                        "step_id": m.group("step_id"),
+                        "batch": int(m.group("batch")),
+                        "tensor": m.group("tensor"),
+                        "raw_bytes": int(m.group("raw_bytes")),
+                        "wire_bytes": int(m.group("wire_bytes")),
+                        "ratio": float(m.group("ratio")),
+                        "savings": float(m.group("savings")),
+                        "nnz": float(m.group("nnz")),
+                    }
+                )
+    return rows
 
 
 def summarize(client_log: Path, server1_log: Path, server2_log: Path):
     step_network, server_duration, step_latency = parse_client_log(client_log)
     s1_vals = parse_server1_log(server1_log)
     s2_vals = parse_server2_log(server2_log)
-    step_breakdown_rows, mb_breakdown_rows, handler_step_rows = parse_detailed_server_logs(
-        [("server1", server1_log), ("server2", server2_log)]
+    (
+        step_breakdown_rows,
+        mb_breakdown_rows,
+        handler_step_rows,
+        comp_timing_rows,
+        s2s_wire_rows,
+        s2s_net_rows,
+        s2s_net_summary_rows,
+        kv_io_rows,
+        activation_xfer_rows,
+    ) = parse_detailed_server_logs(
+        [("client", client_log), ("server1", server1_log), ("server2", server2_log)]
+    )
+    comp_rows = parse_comp_ratio_logs(
+        [("client", client_log), ("server1", server1_log), ("server2", server2_log)]
     )
 
     step_records = []
@@ -330,6 +827,287 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
     print("-" * 92)
 
     print()
+    print("Server-to-server transport timing (from [S2S_WIRE]):")
+    print("-" * 92)
+    if s2s_wire_rows:
+        source_counts = Counter(x["source"] for x in s2s_wire_rows)
+        channel_counts = Counter(x["channel"] for x in s2s_wire_rows)
+        pair_counts = Counter((x["sender_blocks"], x["receiver_blocks"]) for x in s2s_wire_rows)
+        valid_wire = [x for x in s2s_wire_rows if x["clock_sync"] == 1 and x["wire_ms"] >= 0.0]
+        valid_e2e = [
+            x for x in s2s_wire_rows if x["clock_sync"] == 1 and x["e2e_from_serialize_end_ms"] is not None and x["e2e_from_serialize_end_ms"] >= 0.0
+        ]
+        print(
+            "sources="
+            + ",".join(f"{k}:{v}" for k, v in sorted(source_counts.items()))
+            + " | channels="
+            + ",".join(f"{k}:{v}" for k, v in sorted(channel_counts.items()))
+            + f" | samples={len(s2s_wire_rows)} | wire_valid={len(valid_wire)}"
+        )
+        print(
+            f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}"
+        )
+        # raw_transfer_ms is same-clock uncorrected; use it as a fallback indicator only.
+        for key, label, rows in [
+            ("raw_transfer_ms", "raw_transfer_ms(uncorrected)", [x for x in s2s_wire_rows if x["raw_transfer_ms"] >= 0.0]),
+            ("wire_ms", "wire_ms(clock_corrected)", valid_wire),
+            ("e2e_from_serialize_end_ms", "e2e_from_serialize_end_ms", valid_e2e),
+            (
+                "sender_serialize_ms",
+                "sender_serialize_ms",
+                [x for x in s2s_wire_rows if x["sender_serialize_ms"] is not None and x["sender_serialize_ms"] >= 0.0],
+            ),
+            (
+                "sender_sem_wait_ms",
+                "sender_sem_wait_ms",
+                [x for x in s2s_wire_rows if x["sender_sem_wait_ms"] is not None and x["sender_sem_wait_ms"] >= 0.0],
+            ),
+            (
+                "sender_queue_ms",
+                "sender_queue_ms",
+                [x for x in s2s_wire_rows if x["sender_queue_ms"] is not None and x["sender_queue_ms"] >= 0.0],
+            ),
+            (
+                "sender_prep_ms",
+                "sender_prep_ms",
+                [x for x in s2s_wire_rows if x["sender_prep_ms"] is not None and x["sender_prep_ms"] >= 0.0],
+            ),
+            ("payload_kb", "payload_kb", s2s_wire_rows),
+        ]:
+            vals = [r[key] for r in rows]
+            print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
+
+        print()
+        print(
+            f"{'sender->receiver':28} {'wire_ms':>12} {'e2e_ser_end_ms':>14} {'count':>8}"
+        )
+        for pair, count in sorted(pair_counts.items()):
+            pair_rows = [x for x in s2s_wire_rows if (x["sender_blocks"], x["receiver_blocks"]) == pair]
+            pair_wire = [x["wire_ms"] for x in pair_rows if x["clock_sync"] == 1 and x["wire_ms"] >= 0.0]
+            pair_e2e = [
+                x["e2e_from_serialize_end_ms"]
+                for x in pair_rows
+                if x["clock_sync"] == 1 and x["e2e_from_serialize_end_ms"] >= 0.0
+            ]
+            pair_name = f"{pair[0]}->{pair[1]}"
+            print(
+                f"{pair_name:28} {_fmt(_safe_mean(pair_wire)):>12} {_fmt(_safe_mean(pair_e2e)):>14} {count:>8}"
+            )
+    else:
+        print("No [S2S_WIRE] entries found.")
+        print("Hint: rerun with updated server code on both stages.")
+    print("-" * 92)
+
+    print()
+    print("Server-to-server network telemetry (from [S2S_NET] / [S2S_NET_SUMMARY]):")
+    print("-" * 92)
+    if s2s_net_rows or s2s_net_summary_rows:
+        if s2s_net_rows:
+            source_counts = Counter(x["source"] for x in s2s_net_rows)
+            channel_counts = Counter(x["channel"] for x in s2s_net_rows)
+            print(
+                "instant_samples="
+                + str(len(s2s_net_rows))
+                + " | sources="
+                + ",".join(f"{k}:{v}" for k, v in sorted(source_counts.items()))
+                + " | channels="
+                + ",".join(f"{k}:{v}" for k, v in sorted(channel_counts.items()))
+            )
+            print(f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}")
+            for key, label in [
+                ("latency_ms", "latency_ms"),
+                ("bandwidth_mbps", "bandwidth_mbps"),
+                ("jitter_ms", "jitter_ms"),
+                ("payload_kb", "payload_kb"),
+            ]:
+                vals = [r[key] for r in s2s_net_rows]
+                print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
+
+            print()
+            print(f"{'link':28} {'lat_ms':>10} {'jit_ms':>10} {'bw_mbps':>12} {'count':>8}")
+            by_link = defaultdict(list)
+            for r in s2s_net_rows:
+                by_link[r["link"]].append(r)
+            for link in sorted(by_link):
+                rows = by_link[link]
+                print(
+                    f"{link:28} "
+                    f"{_fmt(_safe_mean([x['latency_ms'] for x in rows])):>10} "
+                    f"{_fmt(_safe_mean([x['jitter_ms'] for x in rows])):>10} "
+                    f"{_fmt(_safe_mean([x['bandwidth_mbps'] for x in rows])):>12} "
+                    f"{len(rows):>8}"
+                )
+
+        if s2s_net_summary_rows:
+            latest_by_link = {}
+            for row in s2s_net_summary_rows:
+                prev = latest_by_link.get(row["link"])
+                if prev is None or row["samples"] >= prev["samples"]:
+                    latest_by_link[row["link"]] = row
+
+            latest_rows = [latest_by_link[k] for k in sorted(latest_by_link)]
+            stability_counts = Counter(x["stability"] for x in latest_rows)
+            print()
+            print(
+                "latest_windows="
+                + str(len(latest_rows))
+                + " | stability="
+                + ",".join(f"{k}:{v}" for k, v in sorted(stability_counts.items()))
+            )
+            print(
+                f"{'link':28} {'stability':>10} {'lat_mean':>10} {'lat_p95':>10} "
+                f"{'jit_p95':>10} {'bw_mean':>10} {'clk_cov%':>10}"
+            )
+            for row in latest_rows:
+                print(
+                    f"{row['link']:28} "
+                    f"{row['stability']:>10} "
+                    f"{_fmt(row['lat_mean_ms']):>10} "
+                    f"{_fmt(row['lat_p95_ms']):>10} "
+                    f"{_fmt(row['jit_p95_ms']):>10} "
+                    f"{_fmt(row['bw_mean_mbps']):>10} "
+                    f"{_fmt(row['clock_sync_coverage_pct']):>10}"
+                )
+
+            volatile_rows = [x for x in latest_rows if x["stability"] == "volatile"]
+            stable_rows = [x for x in latest_rows if x["stability"] == "stable"]
+            print()
+            print(
+                "Credibility check: "
+                f"stable_links={len(stable_rows)}, volatile_links={len(volatile_rows)}, "
+                f"mean_lat_std_ms={_fmt(_safe_mean([x['lat_std_ms'] for x in latest_rows]))}, "
+                f"mean_jit_p95_ms={_fmt(_safe_mean([x['jit_p95_ms'] for x in latest_rows]))}"
+            )
+            if volatile_rows:
+                print("Warning: volatile links detected; throughput changes may be influenced by network variability.")
+            else:
+                print("Network stability looks acceptable; throughput changes are less likely to be explained by link jitter alone.")
+    else:
+        print("No [S2S_NET] or [S2S_NET_SUMMARY] entries found.")
+        print("Hint: rerun with the updated server code that emits S2S telemetry logs.")
+    print("-" * 92)
+
+    print()
+    print("KV offload / PCIe critical path (from [KVCACHE_IO]):")
+    print("-" * 92)
+    if kv_io_rows:
+        source_counts = Counter(x["source"] for x in kv_io_rows)
+        print("sources=" + ",".join(f"{k}:{v}" for k, v in sorted(source_counts.items())))
+        print(f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}")
+        for key, label in [
+            ("compute_ms", "compute_ms"),
+            ("pcie_submit_ms", "pcie_submit_ms"),
+            ("pcie_block_ms", "pcie_block_ms"),
+            ("pcie_total_obs_ms", "pcie_total_obs_ms"),
+            ("pcie_bw_mbps", "pcie_bw_mbps"),
+            ("overlap_headroom_ms", "overlap_headroom_ms"),
+            ("overlap_cover_pct", "overlap_cover_pct"),
+            ("gpu_alloc_mb", "gpu_alloc_mb"),
+            ("gpu_reserved_mb", "gpu_reserved_mb"),
+            ("gpu_max_alloc_mb", "gpu_max_alloc_mb"),
+            ("staging_live_mb", "staging_live_mb"),
+            ("staging_peak_mb", "staging_peak_mb"),
+        ]:
+            vals = [r[key] for r in kv_io_rows]
+            print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
+
+        print()
+        total_pcie_mb = sum(r["pcie_bytes"] for r in kv_io_rows) / (1024.0 * 1024.0)
+        total_offload_mb = sum(r["offload_bytes"] for r in kv_io_rows) / (1024.0 * 1024.0)
+        total_prefetch_mb = sum(r["prefetch_bytes"] for r in kv_io_rows) / (1024.0 * 1024.0)
+        mean_compute = _safe_mean([r["compute_ms"] for r in kv_io_rows])
+        mean_pcie_block = _safe_mean([r["pcie_block_ms"] for r in kv_io_rows])
+        mean_pcie_submit = _safe_mean([r["pcie_submit_ms"] for r in kv_io_rows])
+        micro_wire_rows = [r for r in s2s_wire_rows if r["channel"] == "micro_batch"]
+        mean_wire = _safe_mean([r["wire_ms"] for r in micro_wire_rows])
+        cpath_uncovered = mean_pcie_block + mean_wire
+        overlap_headroom = max(0.0, mean_compute - cpath_uncovered)
+        print(
+            f"traffic: total_pcie_mb={total_pcie_mb:.2f}, offload_mb={total_offload_mb:.2f}, "
+            f"prefetch_mb={total_prefetch_mb:.2f}, async_ratio={_safe_mean([r['async_kv'] for r in kv_io_rows]):.2f}"
+        )
+        print(
+            f"C-path estimate: compute_ms={mean_compute:.2f}, pcie_submit_ms={mean_pcie_submit:.2f}, "
+            f"pcie_block_ms={mean_pcie_block:.2f}, s2s_wire_ms={mean_wire:.2f}, "
+            f"uncovered_io_plus_wire_ms={cpath_uncovered:.2f}, overlap_headroom_ms={overlap_headroom:.2f}"
+        )
+        if mean_compute >= cpath_uncovered and cpath_uncovered > 0:
+            print("Micro-batch compute window is large enough to hide most observed PCIe tail + network wire time.")
+        elif cpath_uncovered > 0:
+            print("Observed PCIe tail + network wire time still exceeds the average compute window; throughput remains latency-sensitive.")
+        else:
+            print("Insufficient micro-batch wire data to estimate overlap against network transport.")
+
+        print()
+        print(f"{'blocks':24} {'pcie_mb':>10} {'pcie_bw':>10} {'cover_pct':>10} {'count':>8}")
+        by_blocks = defaultdict(list)
+        for r in kv_io_rows:
+            by_blocks[r["blocks"]].append(r)
+        for blocks, rows in sorted(by_blocks.items(), key=lambda kv: _parse_block_key(kv[0])):
+            print(
+                f"{blocks:24} "
+                f"{sum(x['pcie_bytes'] for x in rows) / (1024.0 * 1024.0):>10.2f} "
+                f"{_safe_mean([x['pcie_bw_mbps'] for x in rows]):>10.2f} "
+                f"{_safe_mean([x['overlap_cover_pct'] for x in rows]):>10.2f} "
+                f"{len(rows):>8}"
+            )
+    else:
+        print("No [KVCACHE_IO] entries found.")
+        print("Hint: rerun with the updated server code that emits KV/PCIe critical-path telemetry.")
+    print("-" * 92)
+
+    print()
+    print("Activation vs KV transport check (from [ACTIVATION_XFER_CHECK]):")
+    print("-" * 92)
+    if activation_xfer_rows:
+        source_counts = Counter(x["source"] for x in activation_xfer_rows)
+        invariant_ok = sum(x["invariant"] for x in activation_xfer_rows)
+        print("sources=" + ",".join(f"{k}:{v}" for k, v in sorted(source_counts.items())))
+        print(f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}")
+        for key, label in [
+            ("activation_ratio", "activation_ratio"),
+            ("kv_submit_ms", "kv_submit_ms"),
+            ("kv_block_ms", "kv_block_ms"),
+            ("kv_pcie_bw_mbps", "kv_pcie_bw_mbps"),
+            ("kv_gpu_alloc_mb", "kv_gpu_alloc_mb"),
+            ("kv_staging_peak_mb", "kv_staging_peak_mb"),
+            ("kv_to_activation_ratio", "kv_to_activation_ratio"),
+        ]:
+            vals = [r[key] for r in activation_xfer_rows]
+            print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
+
+        act_raw_total = sum(r["activation_raw_bytes"] for r in activation_xfer_rows)
+        act_wire_total = sum(r["activation_wire_bytes"] for r in activation_xfer_rows)
+        kv_pcie_total = sum(r["kv_pcie_bytes"] for r in activation_xfer_rows)
+        weighted_act_ratio = (act_wire_total / act_raw_total) if act_raw_total > 0 else 1.0
+        print()
+        print(
+            f"totals: activation_raw_mb={act_raw_total / (1024.0 * 1024.0):.2f}, "
+            f"activation_wire_mb={act_wire_total / (1024.0 * 1024.0):.2f}, "
+            f"kv_pcie_mb={kv_pcie_total / (1024.0 * 1024.0):.2f}, "
+            f"weighted_activation_ratio={weighted_act_ratio:.4f}"
+        )
+        print(
+            f"invariant_ok={invariant_ok}/{len(activation_xfer_rows)} | "
+            "activation bytes are logged from serialized hidden_states, while KV offload bytes are tracked separately."
+        )
+
+        print()
+        print(f"{'blocks':24} {'act_wire_kb':>12} {'kv_pcie_kb':>12} {'kv/act':>10} {'count':>8}")
+        by_blocks = defaultdict(list)
+        for r in activation_xfer_rows:
+            by_blocks[r["blocks"]].append(r)
+        for blocks, rows in sorted(by_blocks.items(), key=lambda kv: _parse_block_key(kv[0])):
+            act_wire = sum(x["activation_wire_bytes"] for x in rows) / 1024.0
+            kv_pcie = sum(x["kv_pcie_bytes"] for x in rows) / 1024.0
+            ratio = (kv_pcie / act_wire) if act_wire > 0 else 0.0
+            print(f"{blocks:24} {act_wire:>12.2f} {kv_pcie:>12.2f} {ratio:>10.4f} {len(rows):>8}")
+    else:
+        print("No [ACTIVATION_XFER_CHECK] entries found.")
+        print("Hint: rerun with the updated micro-batch push path that emits activation-vs-KV telemetry.")
+    print("-" * 92)
+
+    print()
     print("Server detailed step breakdown (from [STEP_TIMING_BREAKDOWN]):")
     print("-" * 92)
     if step_breakdown_rows:
@@ -352,6 +1130,12 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             ("deserialize_ms", "deserialize_ms"),
             ("compute_ms", "compute_ms"),
             ("serialize_ms", "serialize_ms"),
+            ("decompress_ms", "decompress_ms"),
+            ("deserialize_unwrap_ms", "deserialize_unwrap_ms"),
+            ("deserialize_core_ms", "deserialize_core_ms"),
+            ("compress_ms", "compress_ms"),
+            ("serialize_wrap_ms", "serialize_wrap_ms"),
+            ("serialize_core_ms", "serialize_core_ms"),
             ("residual_ms", "residual_ms"),
             ("step_total_ms", "step_total_ms"),
             ("total_with_queue_ms", "total_with_queue_ms"),
@@ -377,6 +1161,12 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             ("deserialize_sum_ms", "deserialize_sum_ms"),
             ("compute_sum_ms", "compute_sum_ms"),
             ("serialize_ms", "serialize_ms"),
+            ("decompress_sum_ms", "decompress_sum_ms"),
+            ("deserialize_unwrap_sum_ms", "deserialize_unwrap_sum_ms"),
+            ("deserialize_core_sum_ms", "deserialize_core_sum_ms"),
+            ("compress_ms", "compress_ms"),
+            ("serialize_wrap_ms", "serialize_wrap_ms"),
+            ("serialize_core_ms", "serialize_core_ms"),
             ("residual_ms", "residual_ms"),
             ("total_ms", "total_ms"),
         ]:
@@ -421,6 +1211,147 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
     else:
         print("No [HANDLER_STEP_TIMING] entries found.")
+    print("-" * 92)
+
+    print()
+    print("Transport compression/decompression timing (from [COMP_TIMING]):")
+    print("-" * 92)
+    if comp_timing_rows:
+        source_counts = Counter(x["source"] for x in comp_timing_rows)
+        channel_counts = Counter(x["channel"] for x in comp_timing_rows)
+        print(
+            "sources="
+            + ",".join(f"{k}:{v}" for k, v in sorted(source_counts.items()))
+            + " | channels="
+            + ",".join(f"{k}:{v}" for k, v in sorted(channel_counts.items()))
+        )
+        print(f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}")
+        for key, label in [
+            ("serialize_core_ms", "serialize_core_ms"),
+            ("serialize_wrap_ms", "serialize_wrap_ms"),
+            ("compress_ms", "compress_ms"),
+            ("deserialize_unwrap_ms", "deserialize_unwrap_ms"),
+            ("decompress_ms", "decompress_ms"),
+            ("deserialize_core_ms", "deserialize_core_ms"),
+            ("serialize_ratio", "serialize_ratio"),
+            ("serialize_savings", "serialize_savings"),
+        ]:
+            vals = [r[key] for r in comp_timing_rows]
+            print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
+
+        print()
+        print(
+            f"{'source':10} {'channel':22} {'w_ratio':>10} {'mean_savings':>14} {'count':>8} "
+            f"{'raw_kb':>10} {'wire_kb':>10}"
+        )
+        by_src_channel = defaultdict(list)
+        for r in comp_timing_rows:
+            by_src_channel[(r["source"], r["channel"])].append(r)
+        for (src, channel), rows in sorted(by_src_channel.items()):
+            raw_total = sum(x["serialize_raw_bytes"] for x in rows)
+            wire_total = sum(x["serialize_wire_bytes"] for x in rows)
+            ratio = (wire_total / raw_total) if raw_total > 0 else 1.0
+            print(
+                f"{src:10} {channel:22} {ratio:>10.4f} {_safe_mean([x['serialize_savings'] for x in rows]):>14.4f} "
+                f"{len(rows):>8} {raw_total / 1024.0:>10.1f} {wire_total / 1024.0:>10.1f}"
+            )
+    else:
+        print("No [COMP_TIMING] entries found.")
+        print("Hint: ensure BLOOMBEE_COMP_TIMING_PROFILE=1 and rerun inference.")
+    print("-" * 92)
+
+    print()
+    print("Compression ratio factor analysis (from [COMP_RATIO]):")
+    print("-" * 92)
+    print("Method / formulas:")
+    print("1) ratio = wire_bytes / raw_bytes  (lower is better, savings = 1 - ratio)")
+    print("2) layer/span weighted ratio = sum(wire_bytes) / sum(raw_bytes) within each blocks group")
+    print("3) batch weighted ratio = sum(wire_bytes) / sum(raw_bytes) within each batch group")
+    print("4) nnz relation uses Pearson r between per-record ratio and nnz")
+    print("   r = cov(ratio, nnz) / (std(ratio) * std(nnz))")
+    print("-" * 92)
+    if comp_rows:
+        print(
+            f"overall: samples={len(comp_rows)}, "
+            f"weighted_ratio={_fmt(_weighted_ratio(comp_rows))}, "
+            f"mean_ratio={_fmt(_safe_mean([r['ratio'] for r in comp_rows]))}, "
+            f"mean_nnz={_fmt(_safe_mean([r['nnz'] for r in comp_rows]))}"
+        )
+
+        print()
+        print("By source/channel:")
+        print(f"{'source':12} {'channel':20} {'w_ratio':>10} {'mean_ratio':>12} {'count':>8}")
+        by_src_channel = defaultdict(list)
+        for r in comp_rows:
+            by_src_channel[(r["source"], r["channel"])].append(r)
+        for (src, channel), rows in sorted(by_src_channel.items()):
+            print(
+                f"{src:12} {channel:20} "
+                f"{_fmt(_weighted_ratio(rows)):>10} "
+                f"{_fmt(_safe_mean([x['ratio'] for x in rows])):>12} "
+                f"{len(rows):>8}"
+            )
+
+        print()
+        print("By layer/span (blocks):")
+        print(f"{'blocks':24} {'w_ratio':>10} {'mean_ratio':>12} {'mean_nnz':>10} {'count':>8}")
+        by_blocks = defaultdict(list)
+        for r in comp_rows:
+            by_blocks[r["blocks"]].append(r)
+        ordered_blocks = sorted(by_blocks.items(), key=lambda kv: _parse_block_key(kv[0]))
+        for blocks, rows in ordered_blocks:
+            print(
+                f"{blocks:24} "
+                f"{_fmt(_weighted_ratio(rows)):>10} "
+                f"{_fmt(_safe_mean([x['ratio'] for x in rows])):>12} "
+                f"{_fmt(_safe_mean([x['nnz'] for x in rows])):>10} "
+                f"{len(rows):>8}"
+            )
+        if len(ordered_blocks) >= 2:
+            front_blocks, front_rows = ordered_blocks[0]
+            back_blocks, back_rows = ordered_blocks[-1]
+            front_w = _weighted_ratio(front_rows)
+            back_w = _weighted_ratio(back_rows)
+            print(
+                f"front_vs_back: front={front_blocks}({front_w:.4f}) "
+                f"back={back_blocks}({back_w:.4f}) delta(back-front)={(back_w-front_w):.4f}"
+            )
+
+        print()
+        print("By batch size:")
+        print(f"{'batch':>8} {'w_ratio':>10} {'mean_ratio':>12} {'mean_nnz':>10} {'count':>8}")
+        by_batch = defaultdict(list)
+        for r in comp_rows:
+            by_batch[int(r["batch"])].append(r)
+        for batch in sorted(by_batch):
+            rows = by_batch[batch]
+            print(
+                f"{batch:>8} "
+                f"{_fmt(_weighted_ratio(rows)):>10} "
+                f"{_fmt(_safe_mean([x['ratio'] for x in rows])):>12} "
+                f"{_fmt(_safe_mean([x['nnz'] for x in rows])):>10} "
+                f"{len(rows):>8}"
+            )
+
+        ratios = [r["ratio"] for r in comp_rows]
+        nnzs = [r["nnz"] for r in comp_rows]
+        pearson_r = _pearson(nnzs, ratios)
+        median_nnz = _safe_median(nnzs)
+        low_rows = [r for r in comp_rows if r["nnz"] <= median_nnz]
+        high_rows = [r for r in comp_rows if r["nnz"] > median_nnz]
+        print()
+        print("nnz vs ratio:")
+        print(
+            f"pearson_r={pearson_r:.4f} (negative means denser activations tend to compress better)"
+        )
+        print(
+            f"median_split: median_nnz={median_nnz:.4f}, "
+            f"low_nnz_w_ratio={_weighted_ratio(low_rows):.4f}, "
+            f"high_nnz_w_ratio={_weighted_ratio(high_rows):.4f}"
+        )
+    else:
+        print("No [COMP_RATIO] entries found.")
+        print("Hint: ensure BLOOMBEE_COMP_RATIO_PROFILE=1 and rerun inference.")
     print("-" * 92)
 
     if step_records and step_latency and s1_vals and s2_vals:

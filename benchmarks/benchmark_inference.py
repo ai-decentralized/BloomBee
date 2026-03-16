@@ -34,6 +34,12 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
     parser.add_argument("--batch_size", type=int, default=1, help="Client batch size (number of sequences to generate in parallel)")
     parser.add_argument(
+        "--early_terminate_steps",
+        type=int,
+        default=256,
+        help="Early terminate after this many generated tokens; set <=0 to disable",
+    )
+    parser.add_argument(
         "--prompt_start_index",
         type=int,
         default=1,
@@ -156,8 +162,22 @@ def benchmark_inference(process_idx, args, result_pipe):
         temp_result_tokens = input_ids
         logger.info(f"{process_idx=} adjusted prompt_length to {prompt_length} tokens")
 
-    total_max_length = prompt_length + args.seq_len
-    logger.info(f"{process_idx=} prompt_length={prompt_length}, generating {args.seq_len} tokens, total_max_length={total_max_length}")
+    requested_seq_len = int(args.seq_len)
+    early_terminate_steps = int(getattr(args, "early_terminate_steps", 0))
+    if early_terminate_steps > 0:
+        decode_target_steps = min(requested_seq_len, early_terminate_steps)
+    else:
+        decode_target_steps = requested_seq_len
+    if decode_target_steps <= 0:
+        raise ValueError("decode_target_steps must be > 0")
+
+    # Reserve cache for the full requested sequence length, but optionally stop
+    # the benchmark loop early for shorter experimental runs.
+    total_max_length = prompt_length + requested_seq_len
+    logger.info(
+        f"{process_idx=} prompt_length={prompt_length}, requested_seq_len={requested_seq_len}, "
+        f"decode_target_steps={decode_target_steps}, reserved_max_length={total_max_length}"
+    )
     
     step_times = []
     step_latencies = []  # Track individual step latencies for cross-GPU analysis
@@ -168,9 +188,12 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     with model.transformer.h.inference_session(max_length=total_max_length) as sess:
         logger.info(f"{process_idx=} Created inference session with max_length={total_max_length}")
-        logger.info(f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | SeqLen={args.seq_len}")
+        logger.info(
+            f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | "
+            f"RequestedSeqLen={requested_seq_len} | DecodeTargetSteps={decode_target_steps}"
+        )
         
-        for step in range(args.seq_len):
+        for step in range(decode_target_steps):
             step_start_time = perf_counter()
             
             # For the first step, pass input_ids; for subsequent steps, generate() will use session state
@@ -185,52 +208,56 @@ def benchmark_inference(process_idx, args, result_pipe):
             step_latency_ms = (step_end_time - step_start_time) * 1000
             step_latencies.append(step_latency_ms)
             
+            # Enhanced logging for cross-GPU analysis
+            logger.info(f"[STEP_LATENCY] Process={process_idx} | Step={step} | "
+                       f"Latency={step_latency_ms:.2f}ms | BatchSize={batch_size}")
             logger.debug(f"{process_idx=} {step=} After generate, outputs.shape={outputs.shape}")
             
+            # Log generated tokens for all sequences in the batch
             log_step_tokens = (
                 args.log_all_tokens
                 or step < 2
-                or step == args.seq_len - 1
+                or step == decode_target_steps - 1
                 or (args.token_log_every > 0 and step % args.token_log_every == 0)
             )
-            token_line = ""
             if log_step_tokens:
-                token_ids = [outputs[b][-1].item() for b in range(outputs.shape[0])]
-                token_texts = [tokenizer.decode([tid]) for tid in token_ids]
-                parts = []
-                i = 0
-                while i < len(token_texts):
-                    txt = token_texts[i]
-                    count = 1
-                    while i + count < len(token_texts) and token_texts[i + count] == txt:
-                        count += 1
-                    display = repr(txt)
-                    parts.append(f"{display}x{count}" if count > 1 else display)
-                    i += count
-                token_line = " | tokens=[" + " ".join(parts) + "]"
+                for batch_idx in range(outputs.shape[0]):
+                    new_token_id = outputs[batch_idx][-1].item()
+                    new_token_text = tokenizer.decode([new_token_id])
+                    logger.info(
+                        f"[TOKEN] process={process_idx} step={step} batch[{batch_idx}] "
+                        f"token='{new_token_text}' id={new_token_id}"
+                    )
             
             temp_result_tokens = torch.cat([temp_result_tokens, outputs[:, -1:]], dim=1)
 
             if step >= args.warmup_steps:
                 step_times.append(perf_counter() - step_start_time)
                 speed = 1 / np.mean(step_times)
+                # Report speed per sequence (total tokens / time) 
                 effective_speed = speed * batch_size
-                logger.info(
-                    f"[STEP] P{process_idx} step={step} | {step_latency_ms:.1f}ms | "
-                    f"{speed:.2f} tok/s/seq ({effective_speed:.1f} tok/s){token_line}"
-                )
+                logger.info(f"{process_idx=} {step=} {speed=:.2f} tokens/sec/sequence, effective={effective_speed:.2f} tokens/sec")
+                
+                # Collect latencies for analysis
                 cross_gpu_latencies.append(step_latency_ms)
                 server_processing_latencies.append(step_latency_ms)
-            else:
-                logger.info(
-                    f"[STEP] P{process_idx} step={step} | {step_latency_ms:.1f}ms | "
-                    f"(warmup){token_line}"
-                )
+
+            if (step + 1) >= decode_target_steps:
+                speed_now = (1 / np.mean(step_times)) if step_times else 0.0
+                effective_speed_now = speed_now * batch_size
+                if decode_target_steps < requested_seq_len:
+                    logger.info(
+                        f"[EARLY_TERMINATE] Process={process_idx} | ReachedSteps={step + 1} | "
+                        f"TargetSteps={decode_target_steps} | RequestedSeqLen={requested_seq_len} | "
+                        f"throughput={speed_now:.2f} tokens/sec/sequence | "
+                        f"effective_throughput={effective_speed_now:.2f} tokens/sec"
+                    )
+                break
         
         # Calculate and log statistics
         warmup_latencies = step_latencies[args.warmup_steps:]
-        warmup_cross_gpu_latencies = cross_gpu_latencies[args.warmup_steps:]
-        warmup_server_processing_latencies = server_processing_latencies[args.warmup_steps:]
+        warmup_cross_gpu_latencies = cross_gpu_latencies
+        warmup_server_processing_latencies = server_processing_latencies
         
         if warmup_latencies:
             mean_latency = np.mean(warmup_latencies)

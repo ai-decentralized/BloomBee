@@ -4,9 +4,10 @@ import asyncio
 import contextlib
 import multiprocessing as mp
 import sys
+from collections import deque
 from enum import Enum
 from itertools import chain
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from time import perf_counter
 import time
@@ -30,7 +31,17 @@ from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritiz
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.hivemind_compat import DHT, MSGPackSerializer, P2PContext, PeerID, nested_flatten, nested_pack
 from bloombee.utils.convert_block import QuantType
-from bloombee.utils.lossless_transport import deserialize_tensor_stream, deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.debug_config import is_log_channel_enabled
+from bloombee.utils.lossless_transport import (
+    deserialize_tensor_stream,
+    deserialize_torch_tensor,
+    serialize_torch_tensor,
+    log_comp_ratio_event,
+    log_transport_profile_event,
+    transport_profile_scope,
+    tensor_nnz_ratio,
+    tensor_raw_nbytes,
+)
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -108,6 +119,58 @@ class StreamingDecodeState:
     cache_handles: Optional[List] = None    # KV cache handles
     first_mb_metadata: Optional[Dict] = None  # Metadata from first MB for context
     start_time: float = 0.0                 # Start time for timing
+
+
+@dataclass
+class S2SLinkTelemetry:
+    """
+    Rolling transport telemetry for one server-to-server link.
+
+    This is used to distinguish real throughput changes from network variance:
+    we log latency, bandwidth and jitter over a sliding window so experiments
+    can show whether the network stayed stable while throughput changed.
+    """
+
+    label: str
+    window_size: int
+    samples: int = 0
+    total_bytes: int = 0
+    clock_sync_samples: int = 0
+    last_latency_ms: Optional[float] = None
+    latency_ms_window: Deque[float] = field(init=False)
+    bandwidth_mbps_window: Deque[float] = field(init=False)
+    jitter_ms_window: Deque[float] = field(init=False)
+    raw_latency_ms_window: Deque[float] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.latency_ms_window = deque(maxlen=self.window_size)
+        self.bandwidth_mbps_window = deque(maxlen=self.window_size)
+        self.jitter_ms_window = deque(maxlen=self.window_size)
+        self.raw_latency_ms_window = deque(maxlen=self.window_size)
+
+    def record(
+        self,
+        *,
+        latency_ms: float,
+        raw_latency_ms: float,
+        bandwidth_mbps: float,
+        total_bytes: int,
+        clock_sync_ok: bool,
+    ) -> float:
+        jitter_ms = 0.0
+        if self.last_latency_ms is not None:
+            jitter_ms = abs(float(latency_ms) - float(self.last_latency_ms))
+        self.last_latency_ms = float(latency_ms)
+
+        self.samples += 1
+        self.total_bytes += max(0, int(total_bytes))
+        if clock_sync_ok:
+            self.clock_sync_samples += 1
+        self.latency_ms_window.append(float(latency_ms))
+        self.bandwidth_mbps_window.append(float(bandwidth_mbps))
+        self.jitter_ms_window.append(float(jitter_ms))
+        self.raw_latency_ms_window.append(float(raw_latency_ms))
+        return jitter_ms
 
 # Directory for storing micro-batch accumulator data
 _MB_ACCUMULATOR_DIR = os.path.join(tempfile.gettempdir(), "bloombee_mb_accumulator")
@@ -196,6 +259,124 @@ def _cleanup_microbatch_files(acc_key: str, expected_num: int) -> None:
         logger.debug(f"{MBPIPE_LOG_PREFIX} Failed to cleanup files: {e}")
 
 
+class AdaptivePushConcurrency:
+    """
+    Self-tuning limiter for cross-stage micro-batch pushes.
+
+    The limiter adjusts in-flight push concurrency from runtime signals:
+    - acquire wait (queue pressure inside sender)
+    - RPC send duration (network pressure)
+    - send failures (stability signal)
+
+    No external tuning knobs are required; limits are bounded to keep behavior stable.
+    """
+
+    def __init__(
+        self,
+        *,
+        logger_: logging.Logger,
+        name: str,
+        initial_limit: int = 4,
+        min_limit: int = 2,
+        max_limit: int = 12,
+        ewma_alpha: float = 0.2,
+        decision_interval: int = 8,
+    ):
+        self._logger = logger_
+        self._name = name
+        self._limit = max(min_limit, min(max_limit, int(initial_limit)))
+        self._min_limit = int(min_limit)
+        self._max_limit = int(max_limit)
+        self._ewma_alpha = float(ewma_alpha)
+        self._decision_interval = max(1, int(decision_interval))
+
+        self._in_flight = 0
+        self._cond = asyncio.Condition()
+
+        self._ewma_wait_ms = 0.0
+        self._ewma_send_ms = 0.0
+        self._release_events = 0
+        self._recent_failures = 0
+        self._consecutive_failures = 0
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    def _update_ewma(self, prev: float, sample: float) -> float:
+        if prev <= 0.0:
+            return sample
+        a = self._ewma_alpha
+        return prev * (1.0 - a) + sample * a
+
+    async def acquire(self) -> float:
+        wait_start = perf_counter()
+        async with self._cond:
+            while self._in_flight >= self._limit:
+                await self._cond.wait()
+            self._in_flight += 1
+        wait_ms = (perf_counter() - wait_start) * 1000.0
+        self._ewma_wait_ms = self._update_ewma(self._ewma_wait_ms, wait_ms)
+        return wait_ms
+
+    async def release(self, *, send_time_ms: float, success: bool) -> None:
+        change_log = None
+        async with self._cond:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._ewma_send_ms = self._update_ewma(self._ewma_send_ms, max(0.0, float(send_time_ms)))
+
+            if success:
+                self._consecutive_failures = 0
+                self._recent_failures = max(0, self._recent_failures - 1)
+            else:
+                self._consecutive_failures += 1
+                self._recent_failures = min(16, self._recent_failures + 1)
+
+            self._release_events += 1
+            if self._release_events % self._decision_interval == 0:
+                old_limit = self._limit
+                reason = None
+
+                # Stability first: back off quickly on repeated failures.
+                if self._consecutive_failures >= 2 or self._recent_failures >= 3:
+                    self._limit = max(self._min_limit, self._limit - 1)
+                    self._consecutive_failures = 0
+                    reason = "send_failures"
+                # If local wait is non-trivial while network send remains moderate,
+                # increase concurrency to reduce sender-side queue pressure.
+                elif self._ewma_wait_ms > 8.0 and self._ewma_send_ms < 220.0 and self._in_flight >= max(1, self._limit - 1):
+                    self._limit = min(self._max_limit, self._limit + 1)
+                    reason = "queue_pressure"
+                # If network send slows down a lot, decrease concurrency to avoid congestion collapse.
+                elif self._ewma_send_ms > 320.0 and self._ewma_wait_ms < 2.0:
+                    self._limit = max(self._min_limit, self._limit - 1)
+                    reason = "network_backpressure"
+
+                if self._limit != old_limit:
+                    change_log = (
+                        old_limit,
+                        self._limit,
+                        reason or "unspecified",
+                        self._ewma_wait_ms,
+                        self._ewma_send_ms,
+                        self._in_flight,
+                    )
+
+            self._cond.notify_all()
+
+        if change_log is not None:
+            old_limit, new_limit, reason, ewma_wait_ms, ewma_send_ms, in_flight = change_log
+            self._logger.info(
+                f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] adaptive_limit[{self._name}] "
+                f"{old_limit}->{new_limit} reason={reason} "
+                f"ewma_wait={ewma_wait_ms:.1f}ms ewma_send={ewma_send_ms:.1f}ms in_flight={in_flight}"
+            )
+
+
 class TransformerConnectionHandler(ConnectionHandler):
     """Handles three request types: forward, backward and forward-incremental (inference)"""
 
@@ -229,11 +410,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._listener_task: Optional[asyncio.Task] = None
         self._session_queues: Dict[str, asyncio.Queue] = {}
         self._session_handlers: Dict[str, int] = {}
-        
         self._session_timing: Dict[str, list] = {}
         self._session_comm_timing: Dict[str, Dict[str, Dict[str, float]]] = {}
         self._session_background_push_tasks: Dict[str, set] = {}
-
         # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
         # Key: (session_id, step_id) -> Queue holding individual micro-batches
         self._mb_queues: Dict[tuple, asyncio.Queue] = {}
@@ -276,6 +455,27 @@ class TransformerConnectionHandler(ConnectionHandler):
         logger.info(
             f"{MBPIPE_LOG_PREFIX} Clock sync enabled: alpha={self._clock_sync_alpha:.2f}, "
             f"max_rtt={self._clock_sync_max_rtt_us/1000:.1f}ms, log_every={self._clock_sync_log_every}"
+        )
+
+        # [S2S_TELEMETRY] Rolling link telemetry for server-to-server transport.
+        # This makes it easier to verify that throughput changes are not caused by
+        # transient network jitter or bandwidth fluctuations.
+        self._s2s_stats_window = max(4, int(os.environ.get("BLOOMBEE_S2S_STATS_WINDOW", "32")))
+        self._s2s_stats_log_every = max(1, int(os.environ.get("BLOOMBEE_S2S_STATS_LOG_EVERY", "8")))
+        self._s2s_link_stats: Dict[str, S2SLinkTelemetry] = {}
+        logger.info(
+            f"{MBPIPE_LOG_PREFIX} S2S telemetry enabled: "
+            f"window={self._s2s_stats_window}, log_every={self._s2s_stats_log_every}"
+        )
+
+        # [FLOW_CONTROL] Internal adaptive limiter for cross-stage async pushes.
+        # Keeps pipeline stable while seeking higher throughput from runtime feedback.
+        self._push_limiter = AdaptivePushConcurrency(
+            logger_=logger,
+            name=self.dht_prefix,
+            initial_limit=4,
+            min_limit=2,
+            max_limit=12,
         )
 
 
@@ -393,6 +593,12 @@ class TransformerConnectionHandler(ConnectionHandler):
         }
         return runtime_pb2.ExpertResponse(metadata=MSGPackSerializer.dumps(ack_metadata))
 
+    @staticmethod
+    def _calc_mbps(total_bytes: int, latency_ms: float) -> float:
+        if total_bytes <= 0 or latency_ms <= 0:
+            return 0.0
+        return (float(total_bytes) * 8.0) / (float(latency_ms) * 1000.0)
+
     def _record_session_comm_timing(
         self,
         session_id: Optional[str],
@@ -444,43 +650,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             return
         await asyncio.gather(*pending, return_exceptions=True)
 
-    def _extract_rpc_push_timing(
-        self,
-        response: Optional[runtime_pb2.ExpertResponse],
-        *,
-        sender_send_us: int,
-        sender_ack_us: int,
-        fallback_rtt_ms: float,
-    ) -> Dict[str, float]:
-        result = {
-            "end_to_end_rtt_ms": max(0.0, float(sender_ack_us - sender_send_us) / 1000.0),
-            "network_rtt_ms": max(0.0, float(fallback_rtt_ms)),
-            "receiver_processing_ms": 0.0,
-        }
-        if response is None or not response.metadata:
-            return result
-
-        try:
-            response_meta = MSGPackSerializer.loads(response.metadata)
-        except Exception:
-            return result
-        if not isinstance(response_meta, dict):
-            return result
-
-        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
-        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
-        if receiver_recv_us <= 0 or receiver_ack_us < receiver_recv_us or sender_ack_us < sender_send_us:
-            return result
-
-        receiver_processing_ms = max(0.0, float(receiver_ack_us - receiver_recv_us) / 1000.0)
-        end_to_end_rtt_ms = max(0.0, float(sender_ack_us - sender_send_us) / 1000.0)
-        network_rtt_ms = max(0.0, end_to_end_rtt_ms - receiver_processing_ms)
-        return {
-            "end_to_end_rtt_ms": end_to_end_rtt_ms,
-            "network_rtt_ms": network_rtt_ms,
-            "receiver_processing_ms": receiver_processing_ms,
-        }
-
     @staticmethod
     def _normalize_serialized_tensors(
         tensors: Union[runtime_pb2.Tensor, Sequence[runtime_pb2.Tensor]]
@@ -490,6 +659,115 @@ class TransformerConnectionHandler(ConnectionHandler):
             bad_types = [type(tensor).__name__ for tensor in normalized]
             raise TypeError(f"Expected serialized runtime_pb2.Tensor objects, got {bad_types}")
         return normalized
+
+    @staticmethod
+    def _window_stats(values: Sequence[float]) -> Tuple[float, float, float, float]:
+        if not values:
+            return 0.0, 0.0, 0.0, 0.0
+        arr = np.asarray(values, dtype=np.float64)
+        mean = float(np.mean(arr))
+        std = float(np.std(arr))
+        p50 = float(np.percentile(arr, 50))
+        p95 = float(np.percentile(arr, 95))
+        return mean, std, p50, p95
+
+    @staticmethod
+    def _classify_link_stability(latency_mean_ms: float, latency_std_ms: float, jitter_p95_ms: float) -> str:
+        if latency_mean_ms <= 0:
+            return "unknown"
+        cv = latency_std_ms / latency_mean_ms
+        if cv <= 0.05 and jitter_p95_ms <= max(2.0, latency_mean_ms * 0.10):
+            return "stable"
+        if cv <= 0.15 and jitter_p95_ms <= max(5.0, latency_mean_ms * 0.25):
+            return "moderate"
+        return "volatile"
+
+    @staticmethod
+    def _uids_to_block_span_label(uids: Union[str, Sequence[str]]) -> str:
+        if isinstance(uids, str):
+            uid_items = [item for item in uids.split(CHAIN_DELIMITER) if item]
+        else:
+            uid_items = [str(item) for item in uids if item]
+        indices: List[int] = []
+        for uid in uid_items:
+            try:
+                indices.append(int(uid.split(UID_DELIMITER)[-1]))
+            except Exception:
+                continue
+        if not indices:
+            return "unknown"
+        return f"{min(indices)}:{max(indices) + 1}"
+
+    def _record_s2s_network_sample(
+        self,
+        *,
+        channel: str,
+        sender_blocks: str,
+        receiver_blocks: str,
+        payload_bytes: int,
+        metadata_bytes: int,
+        raw_transfer_ms: float,
+        wire_ms: float,
+        clock_sync_ok: bool,
+    ) -> None:
+        effective_latency_ms = wire_ms if wire_ms > 0 else raw_transfer_ms
+        if effective_latency_ms <= 0:
+            return
+
+        total_bytes = max(0, int(payload_bytes)) + max(0, int(metadata_bytes))
+        bandwidth_mbps = self._calc_mbps(total_bytes, effective_latency_ms)
+        link_key = f"{channel}:{sender_blocks}->{receiver_blocks}"
+        telemetry = self._s2s_link_stats.get(link_key)
+        if telemetry is None:
+            telemetry = S2SLinkTelemetry(label=link_key, window_size=self._s2s_stats_window)
+            self._s2s_link_stats[link_key] = telemetry
+
+        jitter_ms = telemetry.record(
+            latency_ms=effective_latency_ms,
+            raw_latency_ms=raw_transfer_ms if raw_transfer_ms > 0 else effective_latency_ms,
+            bandwidth_mbps=bandwidth_mbps,
+            total_bytes=total_bytes,
+            clock_sync_ok=clock_sync_ok,
+        )
+
+        logger.info(
+            f"[S2S_NET] link={link_key} samples={telemetry.samples} "
+            f"latency_ms={effective_latency_ms:.3f} "
+            f"bandwidth_mbps={bandwidth_mbps:.3f} "
+            f"jitter_ms={jitter_ms:.3f} "
+            f"payload_kb={payload_bytes / 1024.0:.2f} "
+            f"metadata_b={metadata_bytes} "
+            f"clock_sync={int(clock_sync_ok)}"
+        )
+
+        if telemetry.samples <= 3 or telemetry.samples % self._s2s_stats_log_every == 0:
+            latency_mean_ms, latency_std_ms, latency_p50_ms, latency_p95_ms = self._window_stats(
+                list(telemetry.latency_ms_window)
+            )
+            bw_mean_mbps, bw_std_mbps, bw_p50_mbps, bw_p95_mbps = self._window_stats(
+                list(telemetry.bandwidth_mbps_window)
+            )
+            jitter_mean_ms, jitter_std_ms, jitter_p50_ms, jitter_p95_ms = self._window_stats(
+                list(telemetry.jitter_ms_window)
+            )
+            stability = self._classify_link_stability(latency_mean_ms, latency_std_ms, jitter_p95_ms)
+            clock_sync_coverage = (
+                100.0 * float(telemetry.clock_sync_samples) / float(telemetry.samples)
+                if telemetry.samples > 0
+                else 0.0
+            )
+            logger.info(
+                f"[S2S_NET_SUMMARY] link={link_key} window={len(telemetry.latency_ms_window)} "
+                f"samples={telemetry.samples} stability={stability} "
+                f"lat_mean={latency_mean_ms:.3f}ms lat_std={latency_std_ms:.3f}ms "
+                f"lat_p50={latency_p50_ms:.3f}ms lat_p95={latency_p95_ms:.3f}ms "
+                f"jit_mean={jitter_mean_ms:.3f}ms jit_std={jitter_std_ms:.3f}ms "
+                f"jit_p50={jitter_p50_ms:.3f}ms jit_p95={jitter_p95_ms:.3f}ms "
+                f"bw_mean={bw_mean_mbps:.3f}Mbps bw_std={bw_std_mbps:.3f}Mbps "
+                f"bw_p50={bw_p50_mbps:.3f}Mbps bw_p95={bw_p95_mbps:.3f}Mbps "
+                f"bytes_total_mb={telemetry.total_bytes / (1024.0 * 1024.0):.3f} "
+                f"clock_sync_coverage={clock_sync_coverage:.1f}%"
+            )
 
 
     async def add_p2p_handlers(self, *args, **kwargs) -> None:
@@ -554,7 +832,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             total_request_size = sum(request_tensor_sizes) + request_metadata_size
             recv_time_ms = (recv_end - recv_start) * 1000
             
-            logger.debug(f"[NETWORK_RX] SERVER_RECV | "
+            logger.info(f"[NETWORK_RX] SERVER_RECV | "
                        f"tensor_size={sum(request_tensor_sizes)/1024:.2f}KB | "
                        f"metadata_size={request_metadata_size}B | "
                        f"total={total_request_size/1024:.2f}KB | "
@@ -658,11 +936,15 @@ class TransformerConnectionHandler(ConnectionHandler):
                             f"for KV allocation (actual incoming mb={batch_size})"
                         )
                         batch_size = streaming_full_batch_size
-                    # [MBPIPE_FIX] If using micro-batch pipeline, DO NOT override batch_size with full_batch_size
-                    # We want to allocate cache ONLY for the micro-batch size to enable GPU multiplexing
+                    # [MBPIPE_FIX] Keep the incoming request batch at micro-batch size for streaming.
+                    # The logical full batch is still passed separately to _allocate_cache(),
+                    # which decides how many GPU working slots to reserve.
                     elif is_microbatch_enabled() and streaming_full_batch_size > batch_size:
-                        logger.debug(f"[MBPIPE_FIX] Micro-batch enabled: Keeping batch_size={batch_size} (micro-batch size) "
-                                    f"instead of full_batch_size={streaming_full_batch_size} to enable GPU multiplexing")
+                        logger.info(
+                            f"[MBPIPE_FIX] Micro-batch enabled: keeping request_batch={batch_size} "
+                            f"(incoming micro-batch), while logical_full_batch={streaming_full_batch_size} "
+                            f"will drive working-slot allocation in _allocate_cache"
+                        )
                     elif streaming_full_batch_size > batch_size:
                         logger.info(f"{MBPIPE_LOG_PREFIX} [STREAMING_DECODE] Detected streaming micro-batch (LEGACY), "
                                     f"using full_batch_size={streaming_full_batch_size} for KV cache (actual MB size={batch_size})")
@@ -678,11 +960,25 @@ class TransformerConnectionHandler(ConnectionHandler):
                     # Non-streaming RPC path keeps logical full batch size here.
                     # Physical KV cache allocation is decided in _allocate_cache():
                     # when micro-batching is enabled and batch_size > micro_batch_size,
-                    # we allocate only micro_batch_size slots and multiplex on GPU.
+                    # we either keep full-batch KV (overlap-only) or allocate up to
+                    # (micro_batch_size * working_slots) in explicit multiplexing mode.
                     if is_microbatch_enabled():
+                        first_backend = requested_backends[0]
+                        offloading_policy = first_backend.cache_manager.offloading_policy
                         micro_batch_size = get_micro_batch_size()
-                        logger.debug(f"[MBPIPE_FIX] Non-streaming: logical batch_size={batch_size}, "
-                                    f"physical alloc will use micro_batch_size={micro_batch_size} in _allocate_cache")
+                        working_slots = max(1, int(getattr(offloading_policy, "num_gpu_batches", 1)))
+                        if get_current_path() == "multiplexing":
+                            logger.info(
+                                f"[MBPIPE_FIX] Non-streaming: logical batch_size={batch_size}, "
+                                f"physical alloc will use up to {micro_batch_size * working_slots} "
+                                f"(slot_batch={micro_batch_size}, working_slots={working_slots}) in _allocate_cache"
+                            )
+                        else:
+                            logger.info(
+                                f"[MBPIPE_FIX] Non-streaming overlap-only mode: logical batch_size={batch_size}, "
+                                f"KV allocation stays full-batch in _allocate_cache; "
+                                f"micro_batch_size={micro_batch_size}, working_slots={working_slots}"
+                            )
                     else:
                         logger.debug(f"[MB_DEBUG] NOT streaming decode, using original batch_size={batch_size}")
                 
@@ -720,6 +1016,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 async with self._allocate_cache(
                     requested_backends,
                     batch_size=batch_size,
+                    logical_full_batch_size=metadata_full_batch_size,
                     max_length=max_length,
                     timeout=alloc_timeout,
                     force_full_batch_alloc=is_spec_request,
@@ -733,7 +1030,39 @@ class TransformerConnectionHandler(ConnectionHandler):
                     if cache_handles:
                         for i, handles in enumerate(cache_handles):
                             logger.debug(f"[KVCACHE_DEBUG] cache_handles[{i}]: {len(handles) if handles else 0} handles")
-                    
+
+                    background_tasks = set()
+                    background_task_errors: List[Exception] = []
+
+                    def _track_background_task(task: asyncio.Task) -> None:
+                        """Track task lifecycle and capture async push failures."""
+                        background_tasks.add(task)
+
+                        def _on_done(done_task: asyncio.Task) -> None:
+                            background_tasks.discard(done_task)
+                            if done_task.cancelled():
+                                return
+                            exc = done_task.exception()
+                            if exc is not None:
+                                background_task_errors.append(exc)
+                                logger.warning(
+                                    f"{MBPIPE_LOG_PREFIX} Async push task failed: {exc}",
+                                    exc_info=True,
+                                )
+
+                        task.add_done_callback(_on_done)
+
+                    async def _drain_background_tasks() -> None:
+                        """Wait for pending background pushes and surface failures."""
+                        if not background_tasks:
+                            return
+                        pending = list(background_tasks)
+                        results = await asyncio.gather(*pending, return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, Exception):
+                                background_task_errors.append(result)
+                        if background_task_errors:
+                            raise RuntimeError("Background push tasks failed") from background_task_errors[0]
                     step_=0
                     warmup_completed = False  # Track if warmup/prefill phase is completed
                     
@@ -759,11 +1088,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                             # Must be async because _push_outputs is async
                             async def buffered_push_fn(item):
                                 req, tensors, meta = item
-                                await self._push_outputs(req, tensors, meta)
+                                await self._push_outputs(req, tensors, meta, raise_on_error=True)
                             
                             await output_buffer.start_sender(buffered_push_fn)
                             logger.info(
                                 f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer started for cross-stage overlap"
+                            )
+                        elif use_buffer and buffer_pos == "consumer":
+                            logger.info(
+                                f"{MBPIPE_LOG_PREFIX} Buffer decision=consumer; "
+                                f"consumer-side buffering is not implemented, using direct push path"
                             )
                     
                     # [MBPIPE] Cross-stage streaming push callback (for micro-batch level streaming)
@@ -779,7 +1113,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             )
                         
                         cross_stage_push_microbatch = _cross_stage_push_wrapper
-                        logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
+                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
                     
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
@@ -827,7 +1161,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             # [MBPIPE] Skip _push_outputs if data was already sent via cross-stage micro-batch push
                             cross_stage_pushed = step_metadata.get("cross_stage_pushed", False) if step_metadata else False
                             if cross_stage_pushed:
-                                logger.debug(f"{MBPIPE_LOG_PREFIX} Skipping _push_outputs: data sent via cross-stage micro-batch push")
+                                logger.info(f"{MBPIPE_LOG_PREFIX} Skipping _push_outputs: data sent via cross-stage micro-batch push")
                             elif output_buffer is not None and output_buffer.is_running:
                                 # Non-blocking put into buffer - actual send happens in background
                                 try:
@@ -837,14 +1171,26 @@ class TransformerConnectionHandler(ConnectionHandler):
                                     )
                                 except Exception as e:
                                     logger.warning(f"{MBPIPE_LOG_PREFIX} Buffer put failed, falling back to direct send: {e}")
-                                    task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
-                                    background_tasks.add(task)
-                                    task.add_done_callback(background_tasks.discard)
+                                    task = asyncio.create_task(
+                                        self._push_outputs(
+                                            request,
+                                            output_tensors,
+                                            step_metadata,
+                                            raise_on_error=True,
+                                        )
+                                    )
+                                    _track_background_task(task)
                             else:
                                 # Original direct task creation
-                                task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
-                                background_tasks.add(task)  # Keep reference until it is done to save it from GC
-                                task.add_done_callback(background_tasks.discard)
+                                task = asyncio.create_task(
+                                    self._push_outputs(
+                                        request,
+                                        output_tensors,
+                                        step_metadata,
+                                        raise_on_error=True,
+                                    )
+                                )
+                                _track_background_task(task)
                         start_ExpertResponse_time=perf_counter() ###
                         push_schedule_ms = (start_ExpertResponse_time - can_push_case_time) * 1000.0
                         push_time.append(push_schedule_ms) ###
@@ -864,14 +1210,15 @@ class TransformerConnectionHandler(ConnectionHandler):
                             if isinstance(step_metadata, dict)
                             else "unknown"
                         )
-                        logger.debug(
-                            f"[HANDLER_STEP_TIMING] step_id={step_id_for_log} "
-                            f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
-                            f"push_schedule={push_schedule_ms:.2f}ms "
-                            f"response_emit={response_emit_ms:.2f}ms "
-                            f"handler_total={handler_step_total_ms:.2f}ms "
-                            f"can_push={int(bool(can_push))}"
-                        )
+                        if is_log_channel_enabled("handler_step_timing_logs"):
+                            logger.info(
+                                f"[HANDLER_STEP_TIMING] step_id={step_id_for_log} "
+                                f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
+                                f"push_schedule={push_schedule_ms:.2f}ms "
+                                f"response_emit={response_emit_ms:.2f}ms "
+                                f"handler_total={handler_step_total_ms:.2f}ms "
+                                f"can_push={int(bool(can_push))}"
+                            )
                         if isinstance(step_metadata, dict) and session_id:
                             rec = {
                                 "step_id": step_id_for_log,
@@ -897,10 +1244,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                     # [MBPIPE] Cleanup async buffer if used
                     if output_buffer is not None:
                         try:
-                            await output_buffer.flush()  # Wait for pending sends
-                            await output_buffer.stop()   # Stop background sender
+                            await output_buffer.stop(raise_on_error=True)
                         except Exception as e:
                             logger.warning(f"{MBPIPE_LOG_PREFIX} Buffer cleanup failed: {e}")
+                            raise
+
+                    # Ensure async push tasks complete before request finalization
+                    await _drain_background_tasks()
             
             finally:
                 # [MBPIPE_FIX] Clear offload state (CPU staging buffers) ONLY after the entire
@@ -910,7 +1260,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         cache_manager = requested_backends[0].cache_manager
                         if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
                             cache_manager.clear_offload_state()
-                            logger.debug(f"[MBPIPE_FIX] Cleared offload state after request completion")
+                            logger.info(f"[MBPIPE_FIX] Cleared offload state after request completion")
                 except Exception as e:
                     logger.warning(f"[MBPIPE_FIX] Failed to clear offload state: {e}")
 
@@ -919,8 +1269,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                 await self._await_session_push_tasks(session_id)
 
                 self._log_request("rpc_inference.close", requested_uids, context)
-                end_time_rpc_infer = perf_counter()
-                self._emit_timing_summary(session_id, requested_uids)
+                if session_id:
+                    self._emit_timing_summary(session_id, requested_uids)
+                # print_time_now('')
+                # print('end of  rpc_inference ..........')  ###
+                end_time_rpc_infer = perf_counter() ###
+                # print('rpc_inference total time(sec) ', end_time_rpc_infer - start_time) ###
             
 
     @contextlib.contextmanager
@@ -940,42 +1294,38 @@ class TransformerConnectionHandler(ConnectionHandler):
                 if other_index != self._handler_index:
                     other_queue.put_nowait((Event.END_SESSION, session_id, self._handler_index))
 
-    def _emit_timing_summary(self, session_id: str, requested_uids):
+    def _emit_timing_summary(self, session_id: str, requested_uids) -> None:
         records = self._session_timing.pop(session_id, [])
         comm_records = self._session_comm_timing.pop(session_id, {})
         if not records:
             return
+
         warmup = 1
         decode_records = records[warmup:] if len(records) > warmup else records
         if not decode_records:
             return
 
-        blocks_desc = "unknown"
-        if requested_uids:
-            first = str(requested_uids[0]).split(".")[-1] if "." in str(requested_uids[0]) else "0"
-            last = str(requested_uids[-1]).split(".")[-1] if "." in str(requested_uids[-1]) else "?"
-            blocks_desc = f"{first}:{int(last)+1}"
+        blocks_desc = self._uids_to_block_span_label(requested_uids)
+        compute_arr = np.array([r["compute_ms"] for r in decode_records], dtype=np.float64)
+        gpu2cpu_arr = np.array([r["t_gpu2cpu_ms"] for r in decode_records], dtype=np.float64)
+        step_arr = np.array([r["step_total_ms"] for r in decode_records], dtype=np.float64)
+        queue_arr = np.array([r["queue_wait_ms"] for r in decode_records], dtype=np.float64)
+        data_arr = np.array([r["data_bytes"] for r in decode_records], dtype=np.float64)
+        nic2cpu_arr = np.array([r["t_nic2cpu_ms"] for r in decode_records], dtype=np.float64)
+        cpu2gpu_arr = np.array([r["t_cpu2gpu_ms"] for r in decode_records], dtype=np.float64)
+        batch_arr = np.array([r.get("batch_size", 1) for r in decode_records], dtype=np.float64)
+        token_arr = np.array([r.get("token_increment", 1) for r in decode_records], dtype=np.float64)
 
-        nic2cpu_arr = np.array([r["t_nic2cpu_ms"] for r in decode_records], dtype=float)
-        cpu2gpu_arr = np.array([r["t_cpu2gpu_ms"] for r in decode_records], dtype=float)
-        compute_arr = np.array([r["compute_ms"] for r in decode_records])
-        gpu2cpu_arr = np.array([r["t_gpu2cpu_ms"] for r in decode_records])
-        step_arr = np.array([r["step_total_ms"] for r in decode_records])
-        queue_arr = np.array([r["queue_wait_ms"] for r in decode_records])
-        data_arr = np.array([r["data_bytes"] for r in decode_records])
-        batch_arr = np.array([r.get("batch_size", 1) for r in decode_records], dtype=float)
-        token_arr = np.array([r.get("token_increment", 1) for r in decode_records], dtype=float)
-
-        total_compute = compute_arr.sum()
-        total_step = step_arr.sum()
-        total_nic2cpu = nic2cpu_arr.sum()
-        total_cpu2gpu = cpu2gpu_arr.sum()
-        total_gpu2cpu = gpu2cpu_arr.sum()
+        total_compute = float(compute_arr.sum())
+        total_step = float(step_arr.sum())
+        total_nic2cpu = float(nic2cpu_arr.sum())
+        total_cpu2gpu = float(cpu2gpu_arr.sum())
+        total_gpu2cpu = float(gpu2cpu_arr.sum())
         total_host_io = total_nic2cpu + total_cpu2gpu + total_gpu2cpu
-        compute_ratio = (total_compute / total_step * 100) if total_step > 0 else 0
-        host_io_ratio = (total_host_io / total_step * 100) if total_step > 0 else 0
-        gpu2cpu_ratio = (total_gpu2cpu / total_step * 100) if total_step > 0 else 0
-        avg_bw = (data_arr.mean() / (gpu2cpu_arr.mean() / 1000) / 1e9) if gpu2cpu_arr.mean() > 0 else 0
+        compute_ratio = (total_compute / total_step * 100.0) if total_step > 0 else 0.0
+        host_io_ratio = (total_host_io / total_step * 100.0) if total_step > 0 else 0.0
+        gpu2cpu_ratio = (total_gpu2cpu / total_step * 100.0) if total_step > 0 else 0.0
+        avg_bw = (data_arr.mean() / (gpu2cpu_arr.mean() / 1000.0) / 1e9) if gpu2cpu_arr.mean() > 0 else 0.0
         total_tokens = float(np.sum(batch_arr * token_arr))
         throughput_tok_s = (total_tokens / (total_step / 1000.0)) if total_step > 0 else 0.0
         inference_latency_ms = float(step_arr.mean()) if len(step_arr) > 0 else 0.0
@@ -990,22 +1340,22 @@ class TransformerConnectionHandler(ConnectionHandler):
         total_nic2nic = 0.0
         matched_comm_records = [comm_records[r["step_id"]] for r in decode_records if r.get("step_id") in comm_records]
         if matched_comm_records:
-            cpu2nic_arr = np.array([r["t_cpu2nic_ms"] for r in matched_comm_records])
-            nic2nic_arr = np.array([r["t_nic2nic_ms"] for r in matched_comm_records])
-            push_e2e_arr = np.array([r["push_e2e_ms"] for r in matched_comm_records])
-            receiver_proc_arr = np.array([r["receiver_processing_ms"] for r in matched_comm_records])
-            wire_arr = np.array([r["wire_bytes"] for r in matched_comm_records])
+            cpu2nic_arr = np.array([r["t_cpu2nic_ms"] for r in matched_comm_records], dtype=np.float64)
+            nic2nic_arr = np.array([r["t_nic2nic_ms"] for r in matched_comm_records], dtype=np.float64)
+            push_e2e_arr = np.array([r["push_e2e_ms"] for r in matched_comm_records], dtype=np.float64)
+            receiver_proc_arr = np.array([r["receiver_processing_ms"] for r in matched_comm_records], dtype=np.float64)
+            wire_arr = np.array([r["wire_bytes"] for r in matched_comm_records], dtype=np.float64)
 
             total_cpu2nic = float(cpu2nic_arr.sum())
             total_nic2nic = float(nic2nic_arr.sum())
             total_comm = total_gpu2cpu + total_cpu2nic + total_nic2nic
-            gpu2cpu_comm_ratio = (total_gpu2cpu / total_comm * 100) if total_comm > 0 else 0
-            cpu2nic_ratio = (total_cpu2nic / total_comm * 100) if total_comm > 0 else 0
-            nic2nic_ratio = (total_nic2nic / total_comm * 100) if total_comm > 0 else 0
+            gpu2cpu_comm_ratio = (total_gpu2cpu / total_comm * 100.0) if total_comm > 0 else 0.0
+            cpu2nic_ratio = (total_cpu2nic / total_comm * 100.0) if total_comm > 0 else 0.0
+            nic2nic_ratio = (total_nic2nic / total_comm * 100.0) if total_comm > 0 else 0.0
             cpu2nic_mean = float(cpu2nic_arr.mean())
             nic2nic_mean = float(nic2nic_arr.mean())
             push_e2e_mean = float(push_e2e_arr.mean())
-            avg_nic_bw = (wire_arr.mean() / (nic2nic_arr.mean() / 1000) / 1e6) if nic2nic_arr.mean() > 0 else 0
+            avg_nic_bw = (wire_arr.mean() / (nic2nic_arr.mean() / 1000.0) / 1e6) if nic2nic_arr.mean() > 0 else 0.0
             comm_volume_kb = wire_arr.mean() / 1024.0 if len(wire_arr) > 0 else comm_volume_kb
 
             comm_summary = (
@@ -1018,7 +1368,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"\n  recv_proc: mean={receiver_proc_arr.mean():.2f}ms  median={np.median(receiver_proc_arr):.2f}ms  "
                 f"p95={np.percentile(receiver_proc_arr,95):.2f}ms  max={receiver_proc_arr.max():.2f}ms"
                 f"\n  s2s_ratio: gpu2cpu={gpu2cpu_comm_ratio:.1f}%  cpu2nic={cpu2nic_ratio:.1f}%  "
-                f"nic2nic={nic2nic_ratio:.1f}%  avg_bw(nic)={avg_nic_bw:.1f}MB/s  wire_per_push={wire_arr.mean()/1024:.1f}KB"
+                f"nic2nic={nic2nic_ratio:.1f}%  avg_bw(nic)={avg_nic_bw:.1f}MB/s  wire_per_push={wire_arr.mean()/1024.0:.1f}KB"
             )
 
         n = len(decode_records)
@@ -1060,6 +1410,43 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         logger.info(timing_table_line)
         self._emit_unconditional_summary(timing_table_line)
+
+    def _extract_rpc_push_timing(
+        self,
+        response: Optional[runtime_pb2.ExpertResponse],
+        *,
+        sender_send_us: int,
+        sender_ack_us: int,
+        fallback_rtt_ms: float,
+    ) -> Dict[str, float]:
+        result = {
+            "end_to_end_rtt_ms": max(0.0, float(sender_ack_us - sender_send_us) / 1000.0),
+            "network_rtt_ms": max(0.0, float(fallback_rtt_ms)),
+            "receiver_processing_ms": 0.0,
+        }
+        if response is None or not response.metadata:
+            return result
+
+        try:
+            response_meta = MSGPackSerializer.loads(response.metadata)
+        except Exception:
+            return result
+        if not isinstance(response_meta, dict):
+            return result
+
+        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
+        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
+        if receiver_recv_us <= 0 or receiver_ack_us < receiver_recv_us or sender_ack_us < sender_send_us:
+            return result
+
+        receiver_processing_ms = max(0.0, float(receiver_ack_us - receiver_recv_us) / 1000.0)
+        end_to_end_rtt_ms = max(0.0, float(sender_ack_us - sender_send_us) / 1000.0)
+        network_rtt_ms = max(0.0, end_to_end_rtt_ms - receiver_processing_ms)
+        return {
+            "end_to_end_rtt_ms": end_to_end_rtt_ms,
+            "network_rtt_ms": network_rtt_ms,
+            "receiver_processing_ms": receiver_processing_ms,
+        }
 
     def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest):
         handler_index = self._session_handlers.get(session_id)
@@ -1168,6 +1555,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         request = first_request
         anext_task = get_push_task = None
         queue_wait_ms = 0.0
+        queue_wait_start_us = 0
+        queue_wait_end_us = 0
         queue_source = "initial"
         try:
             start_iterate_inference_steps_time = perf_counter()
@@ -1227,6 +1616,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                             mb_metadata["pushed"] = True
                             mb_metadata["_queue_wait_ms"] = float(queue_wait_ms)
                             mb_metadata["_queue_source"] = queue_source
+                            mb_metadata["_queue_wait_start_us"] = int(queue_wait_start_us)
+                            mb_metadata["_queue_wait_end_us"] = int(queue_wait_end_us)
                             
                             logger.debug(
                                 f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
@@ -1270,6 +1661,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                         if (not skip_direct_request) and (step_id is None or step_id not in processed_step_ids):
                             metadata["_queue_wait_ms"] = float(queue_wait_ms)
                             metadata["_queue_source"] = queue_source
+                            metadata["_queue_wait_start_us"] = int(queue_wait_start_us)
+                            metadata["_queue_wait_end_us"] = int(queue_wait_end_us)
                             yield request, metadata
                             if step_id is not None:
                                 processed_step_ids.add(step_id)
@@ -1289,9 +1682,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                     
                     # Wait for next request, coming either from stream or push queue.
                     wait_start_time = perf_counter()
+                    queue_wait_start_us = self._now_us()
                     done, _ = await asyncio.wait(
                         [anext_task, get_push_task], timeout=self.step_timeout, return_when=asyncio.FIRST_COMPLETED
                     )
+                    queue_wait_end_us = self._now_us()
                     queue_wait_ms = (perf_counter() - wait_start_time) * 1000.0
                     
                     # Prefer push_queue when both are ready to keep micro-batch pipeline flowing.
@@ -1333,6 +1728,41 @@ class TransformerConnectionHandler(ConnectionHandler):
             return self._build_rpc_push_ack_response(receive_us)
         
         # Original flow: put into session queue for normal processing
+        if metadata.get("pushed"):
+            sender_blocks = str(metadata.get("sender_blocks", "unknown"))
+            receiver_blocks = str(metadata.get("receiver_blocks", "unknown"))
+            sender_send_us = self._to_int(metadata.get("clock_sync_sender_send_us"), 0)
+            sender_to_receiver_clock_offset_us = self._to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
+            sender_to_receiver_clock_samples = self._to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
+            clock_sync_ok = sender_to_receiver_clock_samples > 0
+            raw_transfer_ms = (
+                max(0.0, (receive_us - sender_send_us) / 1000.0)
+                if sender_send_us > 0 and receive_us >= sender_send_us
+                else -1.0
+            )
+            wire_ms = -1.0
+            if clock_sync_ok and sender_send_us > 0:
+                sender_send_local_us = sender_send_us + sender_to_receiver_clock_offset_us
+                wire_ms = max(0.0, (receive_us - sender_send_local_us) / 1000.0)
+            payload_bytes = sum(len(t.buffer) for t in request.tensors)
+            metadata_bytes = len(request.metadata) if request.metadata else 0
+            logger.info(
+                f"[S2S_WIRE] step_id={metadata.get('step_id')} channel=full_batch "
+                f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
+                f"payload_kb={payload_bytes / 1024.0:.2f} metadata_b={metadata_bytes} "
+                f"raw_transfer_ms={raw_transfer_ms:.3f} wire_ms={wire_ms:.3f} "
+                f"clock_sync={int(clock_sync_ok)}"
+            )
+            self._record_s2s_network_sample(
+                channel="full_batch",
+                sender_blocks=sender_blocks,
+                receiver_blocks=receiver_blocks,
+                payload_bytes=payload_bytes,
+                metadata_bytes=metadata_bytes,
+                raw_transfer_ms=raw_transfer_ms,
+                wire_ms=wire_ms,
+                clock_sync_ok=clock_sync_ok,
+            )
         self._log_request("rpc_push", requested_uids, context, debug=f"session_id={session_id}")
         self._put_into_session_queue(session_id, request)
         return self._build_rpc_push_ack_response(receive_us)
@@ -1361,6 +1791,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         mb_size = metadata.get("micro_batch_size", 1)
         full_batch_size = metadata.get("full_batch_size", mb_size)
         start_from_position = metadata.get("start_from_position", None)
+        receive_us = self._now_us()
         
         # Use total_micro_batches from metadata if available, otherwise calculate
         expected_num_mb = metadata.get("total_micro_batches")
@@ -1385,6 +1816,101 @@ class TransformerConnectionHandler(ConnectionHandler):
             return runtime_pb2.ExpertResponse()
         
         self._mb_processed[mb_key].add(mb_idx)
+        metadata["s2s_receiver_receive_us"] = int(receive_us)
+
+        # [S2S_WIRE] Sender->receiver micro-batch transport timing breakdown.
+        # Uses sender->receiver clock offset when available to isolate pure wire time.
+        sender_blocks = str(metadata.get("sender_blocks", "unknown"))
+        receiver_blocks = str(metadata.get("receiver_blocks", "unknown"))
+        sender_send_us = self._to_int(metadata.get("clock_sync_sender_send_us"), 0)
+        sender_ser_start_us = self._to_int(metadata.get("s2s_sender_serialize_start_us"), 0)
+        sender_ser_end_us = self._to_int(metadata.get("s2s_sender_serialize_end_us"), 0)
+        sender_enqueue_us = self._to_int(metadata.get("s2s_sender_enqueue_us"), 0)
+        push_timestamp_us = self._to_int(metadata.get("stage_push_timestamp_us"), 0)
+        sender_compute_to_serialize_start_ms = 0.0
+        try:
+            sender_compute_to_serialize_start_ms = float(
+                metadata.get("s2s_sender_compute_to_serialize_start_ms", 0.0)
+            )
+        except Exception:
+            sender_compute_to_serialize_start_ms = 0.0
+        sender_sem_wait_ms = 0.0
+        try:
+            sender_sem_wait_ms = float(metadata.get("s2s_sender_sem_wait_ms", 0.0))
+        except Exception:
+            sender_sem_wait_ms = 0.0
+
+        sender_to_receiver_clock_offset_us = self._to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
+        sender_to_receiver_clock_rtt_us = max(0, self._to_int(metadata.get("sender_to_receiver_clock_rtt_us"), 0))
+        sender_to_receiver_clock_samples = self._to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
+        clock_sync_ok = sender_to_receiver_clock_samples > 0
+
+        sender_serialize_ms = (
+            max(0.0, (sender_ser_end_us - sender_ser_start_us) / 1000.0)
+            if sender_ser_start_us > 0 and sender_ser_end_us >= sender_ser_start_us
+            else -1.0
+        )
+        sender_queue_ms = (
+            max(0.0, (sender_send_us - sender_enqueue_us) / 1000.0)
+            if sender_enqueue_us > 0 and sender_send_us >= sender_enqueue_us
+            else -1.0
+        )
+        sender_prep_ms = (
+            max(0.0, (sender_send_us - sender_ser_end_us) / 1000.0)
+            if sender_ser_end_us > 0 and sender_send_us >= sender_ser_end_us
+            else -1.0
+        )
+        sender_pre_send_wait_ms = sender_prep_ms
+        sender_pre_send_post_enqueue_ms = sender_queue_ms
+        sender_pre_send_misc_ms = (
+            max(0.0, sender_pre_send_wait_ms - sender_sem_wait_ms - max(0.0, sender_pre_send_post_enqueue_ms))
+            if sender_pre_send_wait_ms >= 0.0
+            else -1.0
+        )
+        raw_transfer_ms = (
+            max(0.0, (receive_us - push_timestamp_us) / 1000.0)
+            if push_timestamp_us > 0 and receive_us >= push_timestamp_us
+            else -1.0
+        )
+
+        wire_ms = -1.0
+        e2e_from_serialize_end_ms = -1.0
+        if clock_sync_ok and sender_send_us > 0:
+            sender_send_local_us = sender_send_us + sender_to_receiver_clock_offset_us
+            wire_ms = max(0.0, (receive_us - sender_send_local_us) / 1000.0)
+            if sender_ser_end_us > 0:
+                sender_ser_end_local_us = sender_ser_end_us + sender_to_receiver_clock_offset_us
+                e2e_from_serialize_end_ms = max(0.0, (receive_us - sender_ser_end_local_us) / 1000.0)
+
+        payload_bytes = sum(len(t.buffer) for t in request.tensors)
+        metadata_bytes = len(request.metadata) if request.metadata else 0
+        logger.info(
+            f"[S2S_WIRE] step_id={step_id} mb_idx={int(mb_idx)} "
+            f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
+            f"batch={int(mb_size)} payload_kb={payload_bytes/1024.0:.2f} metadata_b={metadata_bytes} "
+            f"raw_transfer_ms={raw_transfer_ms:.3f} "
+            f"sender_compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
+            f"sender_serialize_ms={sender_serialize_ms:.3f} "
+            f"sender_sem_wait_ms={sender_sem_wait_ms:.3f} "
+            f"sender_queue_ms={sender_queue_ms:.3f} sender_prep_ms={sender_prep_ms:.3f} "
+            f"sender_pre_send_wait_ms={sender_pre_send_wait_ms:.3f} "
+            f"sender_pre_send_post_enqueue_ms={sender_pre_send_post_enqueue_ms:.3f} "
+            f"sender_pre_send_misc_ms={sender_pre_send_misc_ms:.3f} "
+            f"wire_ms={wire_ms:.3f} e2e_from_serialize_end_ms={e2e_from_serialize_end_ms:.3f} "
+            f"clock_sync={int(clock_sync_ok)} "
+            f"clock_offset_ms={sender_to_receiver_clock_offset_us/1000.0:.3f} "
+            f"clock_rtt_ms={sender_to_receiver_clock_rtt_us/1000.0:.3f}"
+        )
+        self._record_s2s_network_sample(
+            channel="micro_batch",
+            sender_blocks=sender_blocks,
+            receiver_blocks=receiver_blocks,
+            payload_bytes=payload_bytes,
+            metadata_bytes=metadata_bytes,
+            raw_transfer_ms=raw_transfer_ms,
+            wire_ms=wire_ms,
+            clock_sync_ok=clock_sync_ok,
+        )
         
         # Initialize tracking for this (session, step) if not exists
         if mb_key not in self._mb_queues:
@@ -1417,6 +1943,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         if self._enable_immediate_mb_queue:
             # ========== IMMEDIATE QUEUING PATH (Step A) ==========
             # Put each micro-batch directly into session queue as a queue item
+            metadata["s2s_receiver_queue_put_us"] = int(self._now_us())
             
             mb_queue_item = create_microbatch_queue_item(
                 request_id=session_id,
@@ -1568,10 +2095,16 @@ class TransformerConnectionHandler(ConnectionHandler):
     async def _push_outputs(
         self,
         request: runtime_pb2.ExpertRequest,
-        serialized_outputs: Sequence[runtime_pb2.Tensor],
+        serialized_outputs: Union[runtime_pb2.Tensor, Sequence[runtime_pb2.Tensor]],
         metadata: dict,
+        raise_on_error: bool = False,
     ) -> None:
+        # print('_push_outputs metadata ', metadata)
         push_start_time = perf_counter()
+        next_peer_id = None
+        next_session_id = None
+        next_start = None
+        next_end = None
         try:
             next_servers = metadata.get("next_servers")
             if not next_servers:
@@ -1582,15 +2115,30 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_peer_id_str = str(next_peer_id)
             next_peer_id = PeerID.from_base58(next_peer_id)
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
+            sender_blocks = self._uids_to_block_span_label(request.uid)
 
-            logger.debug(f"[CROSS_GPU_TRANSFER_START] FromBlocks={self.dht_prefix} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}")
+            # Log cross-GPU transfer start
+            if is_log_channel_enabled("cross_gpu_transfer_logs"):
+                logger.info(
+                    f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}"
+                )
 
-
+            # `serialized_outputs` already contains the next-stage hidden states and
+            # accompanying routing tensors. Skip the original request tensor at index 2
+            # (`need_pruning`) so the downstream tensor layout stays aligned.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
             next_tensors = normalized_outputs + list(request.tensors[3:])
-            
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
+            next_metadata["sender_blocks"] = sender_blocks
+            next_metadata["receiver_blocks"] = f"{next_start}:{next_end}"
+            next_metadata["s2s_channel"] = "full_batch"
+            next_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
+            clock_sync_estimate = self._get_clock_sync_estimate(next_peer_id_str)
+            if clock_sync_estimate is not None:
+                next_metadata["sender_to_receiver_clock_offset_us"] = clock_sync_estimate["offset_us"]
+                next_metadata["sender_to_receiver_clock_rtt_us"] = clock_sync_estimate["rtt_us"]
+                next_metadata["sender_to_receiver_clock_samples"] = clock_sync_estimate["samples"]
             sender_send_us = self._now_us()
             next_metadata["clock_sync_sender_send_us"] = sender_send_us
 
@@ -1598,45 +2146,36 @@ class TransformerConnectionHandler(ConnectionHandler):
             push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
             serialized_next_metadata = MSGPackSerializer.dumps(next_metadata)
             push_metadata_bytes = len(serialized_next_metadata)
-
-            # T(CPU→NIC): time from push_start to rpc_push call (metadata prep, stub creation, protobuf assembly)
-            rpc_request = runtime_pb2.ExpertRequest(
-                uid=next_uid,
-                tensors=next_tensors,
-                metadata=serialized_next_metadata,
-            )
+            rpc_request = runtime_pb2.ExpertRequest(uid=next_uid, tensors=next_tensors, metadata=serialized_next_metadata)
             cpu2nic_prep_end = perf_counter()
-            t_cpu2nic_ms = (cpu2nic_prep_end - push_start_time) * 1000
+            t_cpu2nic_ms = max(0.0, (cpu2nic_prep_end - push_start_time) * 1000.0)
 
-            # T(NIC→NIC): actual network round-trip (rpc_push)
             nic2nic_start = perf_counter()
             response = await stub.rpc_push(rpc_request, timeout=self.request_timeout)
             nic2nic_end = perf_counter()
-
             sender_ack_us = self._now_us()
             rpc_timing = self._extract_rpc_push_timing(
                 response,
                 sender_send_us=sender_send_us,
                 sender_ack_us=sender_ack_us,
-                fallback_rtt_ms=(nic2nic_end - nic2nic_start) * 1000,
+                fallback_rtt_ms=(nic2nic_end - nic2nic_start) * 1000.0,
             )
-            t_nic2nic_ms = float(rpc_timing["network_rtt_ms"])
-            push_e2e_ms = float(rpc_timing["end_to_end_rtt_ms"])
-            receiver_processing_ms = float(rpc_timing["receiver_processing_ms"])
             self._update_clock_sync_from_rpc_response(
                 peer_id=next_peer_id_str,
                 sender_send_us=sender_send_us,
                 sender_ack_us=sender_ack_us,
                 response=response,
             )
-            
-            transfer_time_ms = (nic2nic_end - push_start_time) * 1000
+            transfer_time_ms = (nic2nic_end - push_start_time) * 1000.0
+            transfer_bw_mbps = self._calc_mbps(push_tensor_bytes + push_metadata_bytes, transfer_time_ms)
+            t_nic2nic_ms = float(rpc_timing["network_rtt_ms"])
+            push_e2e_ms = float(rpc_timing["end_to_end_rtt_ms"])
+            receiver_processing_ms = float(rpc_timing["receiver_processing_ms"])
 
-            # T(GPU→CPU) from the runtime output transfer tracked during the compute step.
-            t_gpu2cpu_ms = float(metadata.get("_serialize_ms", 0.0))
+            # T(GPU→CPU) comes from the compute step's serialization timing.
+            t_gpu2cpu_ms = float(metadata.get("_t_gpu2cpu_ms", metadata.get("_serialize_ms", 0.0)))
             compute_ms = float(metadata.get("_compute_ms", 0.0))
             data_bytes = int(metadata.get("_data_bytes", 0))
-            step_total_ms = float(metadata.get("_step_total_ms", 0.0))
 
             total_comm_ms = t_gpu2cpu_ms + t_cpu2nic_ms + t_nic2nic_ms
             gpu2cpu_pct = (t_gpu2cpu_ms / total_comm_ms * 100) if total_comm_ms > 0 else 0.0
@@ -1676,17 +2215,20 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"wire_bytes={push_tensor_bytes}"
             )
 
-            logger.debug(f"[NETWORK_S2S] PUSH_COMPLETE | "
-                       f"from_blocks={self.dht_prefix} | to_blocks={next_start}:{next_end} | "
+            logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "
+                       f"from_blocks={sender_blocks} | to_blocks={next_start}:{next_end} | "
                        f"tensor_size={push_tensor_bytes/1024:.2f}KB | "
                        f"metadata_size={push_metadata_bytes}B | "
-                       f"transfer_time={transfer_time_ms:.2f}ms")
+                       f"transfer_time={transfer_time_ms:.2f}ms | "
+                       f"approx_bw={transfer_bw_mbps:.2f}Mbps")
             
         except Exception:
-            logger.debug(
+            logger.warning(
                 f"Failed to push outputs to peer_id={next_peer_id}, session_id={next_session_id}, blocks={next_start}:{next_end}:",
                 exc_info=True,
             )
+            if raise_on_error:
+                raise
 
     async def _push_microbatch(
         self,
@@ -1752,30 +2294,121 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_peer_id = PeerID.from_base58(next_peer_id)
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
             
-            # Serialize the micro-batch hidden states
+            # Serialize the micro-batch tensors
             outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
-            serialize_start = perf_counter()
-            serialized_hidden = serialize_torch_tensor(
-                mb_hidden.to(outputs_schema[0].dtype),
-                outputs_schema[0].compression,
-                allow_inplace=True
+            sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
+            serialize_start_us = self._now_us()
+            transport_phase = "prefill" if mb_hidden.ndim >= 2 and int(mb_hidden.shape[1]) > 1 else "decode"
+            sender_blocks_str = str(metadata.get("sender_blocks", "unknown"))
+            sender_blocks = sender_blocks_str
+            push_blocks = f"{sender_blocks_str}->{next_start}:{next_end}"
+            with transport_profile_scope() as push_transport_profile:
+                serialized_hidden = serialize_torch_tensor(
+                    mb_hidden.to(outputs_schema[0].dtype),
+                    outputs_schema[0].compression,
+                    allow_inplace=True,
+                    debug_context={
+                        "phase": transport_phase,
+                        "tensor_name": "hidden_states",
+                        "source": "server",
+                        "channel": "rpc_push_microbatch",
+                        "blocks": push_blocks,
+                        "batch": int(mb_size),
+                    },
+                )
+                if mb_keep_indices is not None:
+                    serialized_keep = serialize_torch_tensor(
+                        mb_keep_indices.to(torch.int64),
+                        outputs_schema[1].compression if len(outputs_schema) > 1 else runtime_pb2.CompressionType.NONE,
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": transport_phase,
+                            "tensor_name": "keep_indices",
+                            "source": "server",
+                            "channel": "rpc_push_microbatch",
+                            "blocks": push_blocks,
+                            "batch": int(mb_size),
+                        },
+                    )
+                else:
+                    serialized_keep = serialize_torch_tensor(
+                        torch.arange(mb_hidden.shape[1], dtype=torch.int64),
+                        runtime_pb2.CompressionType.NONE,
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": transport_phase,
+                            "tensor_name": "keep_indices",
+                            "source": "server",
+                            "channel": "rpc_push_microbatch",
+                            "blocks": push_blocks,
+                            "batch": int(mb_size),
+                        },
+                    )
+            serialize_end_perf = perf_counter()
+            serialize_end_us = self._now_us()
+            sender_serialize_ms = max(0.0, (serialize_end_us - serialize_start_us) / 1000.0)
+            t_gpu2cpu_ms = sender_serialize_ms
+            sender_compute_to_serialize_start_ms = (
+                max(0.0, (serialize_start_us - sender_compute_end_us) / 1000.0)
+                if sender_compute_end_us > 0 and serialize_start_us >= sender_compute_end_us
+                else -1.0
             )
-            
-            # Serialize keep_indices if present
-            if mb_keep_indices is not None:
-                serialized_keep = serialize_torch_tensor(
-                    mb_keep_indices.to(torch.int64),
-                    outputs_schema[1].compression if len(outputs_schema) > 1 else runtime_pb2.CompressionType.NONE,
-                    allow_inplace=True
-                )
-            else:
-                serialized_keep = serialize_torch_tensor(
-                    torch.arange(mb_hidden.shape[1], dtype=torch.int64),
-                    runtime_pb2.CompressionType.NONE,
-                    allow_inplace=True
-                )
-            serialize_end = perf_counter()
-            t_gpu2cpu_ms = (serialize_end - serialize_start) * 1000.0
+            log_comp_ratio_event(
+                logger,
+                source="server",
+                channel="rpc_push_microbatch",
+                blocks=push_blocks,
+                step_id=str(metadata.get("step_id", "unknown")),
+                batch_size=int(mb_size),
+                tensor_name="hidden_states",
+                raw_bytes=tensor_raw_nbytes(mb_hidden),
+                wire_bytes=len(serialized_hidden.buffer),
+                nnz_ratio=tensor_nnz_ratio(mb_hidden),
+                extra={
+                    "mb_idx": int(mb_idx),
+                    "phase": transport_phase,
+                    "seq_tokens": int(mb_hidden.shape[1]) if mb_hidden.ndim >= 2 else 1,
+                },
+            )
+            log_transport_profile_event(
+                logger,
+                source="server",
+                channel="rpc_push_microbatch",
+                blocks=push_blocks,
+                step_id=str(metadata.get("step_id", "unknown")),
+                batch_size=int(mb_size),
+                stats=push_transport_profile,
+                extra={
+                    "mb_idx": int(mb_idx),
+                    "phase": transport_phase,
+                    "seq_tokens": int(mb_hidden.shape[1]) if mb_hidden.ndim >= 2 else 1,
+                },
+            )
+            activation_raw_bytes = int(metadata.get("activation_raw_bytes", tensor_raw_nbytes(mb_hidden)))
+            activation_wire_bytes = len(serialized_hidden.buffer)
+            activation_ratio = (
+                (activation_wire_bytes / activation_raw_bytes) if activation_raw_bytes > 0 else 1.0
+            )
+            kv_offload_bytes = int(metadata.get("kv_offload_bytes", 0))
+            kv_prefetch_bytes = int(metadata.get("kv_prefetch_bytes", 0))
+            kv_pcie_bytes = int(metadata.get("kv_pcie_bytes", 0))
+            kv_to_activation_ratio = (
+                (kv_pcie_bytes / activation_wire_bytes) if activation_wire_bytes > 0 else 0.0
+            )
+            logger.info(
+                f"[ACTIVATION_XFER_CHECK] step_id={metadata.get('step_id', 'unknown')} "
+                f"mb_idx={int(mb_idx)} blocks={sender_blocks}->{next_start}:{next_end} "
+                f"batch={int(mb_size)} activation_raw_bytes={activation_raw_bytes} "
+                f"activation_wire_bytes={activation_wire_bytes} activation_ratio={activation_ratio:.6f} "
+                f"kv_offload_bytes={kv_offload_bytes} kv_prefetch_bytes={kv_prefetch_bytes} "
+                f"kv_pcie_bytes={kv_pcie_bytes} kv_submit_ms={float(metadata.get('kv_pcie_submit_ms', 0.0)):.3f} "
+                f"kv_block_ms={float(metadata.get('kv_pcie_block_ms', 0.0)):.3f} "
+                f"kv_pcie_bw_mbps={float(metadata.get('kv_pcie_bw_mbps', 0.0)):.3f} "
+                f"kv_gpu_alloc_mb={float(metadata.get('kv_gpu_alloc_mb', 0.0)):.3f} "
+                f"kv_staging_peak_mb={float(metadata.get('kv_staging_peak_mb', 0.0)):.3f} "
+                f"kv_to_activation_ratio={kv_to_activation_ratio:.6f} "
+                f"invariant=1"
+            )
             
             # Build metadata for micro-batch push
             push_metadata = {
@@ -1788,6 +2421,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "micro_batch_offset": mb_offset,
                 "micro_batch_size": mb_size,
                 "full_batch_size": full_batch_size,
+                "s2s_channel": "micro_batch",
+                # Stable S1->S2 transport timing markers (sender clock domain)
+                "sender_blocks": sender_blocks,
+                "receiver_blocks": f"{next_start}:{next_end}",
+                "s2s_sender_serialize_start_us": int(serialize_start_us),
+                "s2s_sender_serialize_end_us": int(serialize_end_us),
+                "s2s_sender_compute_to_serialize_start_ms": float(sender_compute_to_serialize_start_ms),
             }
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
@@ -1820,40 +2460,39 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             stub = self.get_stub(self._p2p, next_peer_id)
             
+            # Prioritize MB0 delivery to reduce per-step startup bubble on downstream stage.
+            mb0_bypass_enabled = os.environ.get("BLOOMBEE_MB0_SEMAPHORE_BYPASS", "1") == "1"
+            bypass_limiter = mb0_bypass_enabled and int(mb_idx) == 0
+            acquired_slot = False
+            sem_wait_time = 0.0
+            if not bypass_limiter:
+                sem_wait_time = await self._push_limiter.acquire()
+                acquired_slot = True
+                if sem_wait_time > 1.0:  # Only log if we had to wait
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB{mb_idx} waited {sem_wait_time:.1f}ms "
+                        f"for push slot (limit={self._push_limiter.limit}, in_flight={self._push_limiter.in_flight})"
+                    )
+            else:
+                logger.debug(
+                    f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB0 bypassed limiter "
+                    f"(set BLOOMBEE_MB0_SEMAPHORE_BYPASS=0 to disable)"
+                )
+
             # [ASYNC_PUSH] Fire-and-forget: don't await RPC response
-            # This allows Stage 1 compute to continue immediately while data is sent in background
-            push_metadata["clock_sync_sender_send_us"] = self._now_us()
+            # This allows Stage 1 compute to continue immediately while data is sent in background.
+            # These timestamps are used on the receiver to isolate pure wire latency.
+            push_metadata["s2s_sender_sem_wait_ms"] = float(sem_wait_time)
+            push_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
+            push_metadata["clock_sync_sender_send_us"] = int(push_metadata["s2s_sender_enqueue_us"])
             serialized_push_metadata = MSGPackSerializer.dumps(push_metadata)
             rpc_request = runtime_pb2.ExpertRequest(
                 uid=next_uid,
                 tensors=[serialized_hidden, serialized_keep],
                 metadata=serialized_push_metadata,
             )
-            t_cpu2nic_ms = (perf_counter() - serialize_end) * 1000.0
+            t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
             push_tensor_bytes = len(serialized_hidden.buffer) + len(serialized_keep.buffer)
-            
-            # [PHASE2] Flow control: limit concurrent pending pushes to prevent queue buildup
-            # Initialize semaphore lazily (max 4 concurrent pushes)
-            if not hasattr(self, '_push_semaphore'):
-                self._push_semaphore = asyncio.Semaphore(4)
-            
-            # Prioritize MB0 delivery to reduce per-step startup bubble on downstream stage.
-            mb0_bypass_enabled = os.environ.get("BLOOMBEE_MB0_SEMAPHORE_BYPASS", "1") == "1"
-            bypass_semaphore = mb0_bypass_enabled and int(mb_idx) == 0
-            acquired_semaphore = False
-            if not bypass_semaphore:
-                # Acquire semaphore before queueing (non-blocking check for logging)
-                sem_wait_start = perf_counter()
-                await self._push_semaphore.acquire()
-                acquired_semaphore = True
-                sem_wait_time = (perf_counter() - sem_wait_start) * 1000
-                if sem_wait_time > 1.0:  # Only log if we had to wait
-                    logger.info(f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB{mb_idx} waited {sem_wait_time:.1f}ms for push slot")
-            else:
-                logger.debug(
-                    f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB0 bypassed semaphore "
-                    f"(set BLOOMBEE_MB0_SEMAPHORE_BYPASS=0 to disable)"
-                )
             
             # Create task for background sending - don't await
             send_task = asyncio.create_task(
@@ -1869,8 +2508,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                     t_gpu2cpu_ms=t_gpu2cpu_ms,
                     t_cpu2nic_ms=t_cpu2nic_ms,
                     wire_bytes=push_tensor_bytes,
-                    release_semaphore=acquired_semaphore,
+                    release_slot=acquired_slot,
                 )
+            )
+            logger.info(
+                f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
+                f"mb_idx={int(mb_idx)} sender_blocks={sender_blocks} receiver_blocks={next_start}:{next_end} "
+                f"compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
+                f"serialize_ms={sender_serialize_ms:.3f} "
+                f"pre_send_wait_pending=1 "
+                f"sem_wait_ms={float(sem_wait_time):.3f}"
             )
             
             # Track task to prevent garbage collection
@@ -1903,7 +2550,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         t_cpu2nic_ms: float,
         wire_bytes: int,
         *,
-        release_semaphore: bool = True,
+        release_slot: bool = True,
     ) -> None:
         """
         [ASYNC_PUSH] Actually perform the RPC push in background.
@@ -1912,7 +2559,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         to continue without waiting for the network round-trip.
         """
         send_start = perf_counter()
+        send_time = 0.0
+        success = False
         try:
+            payload_bytes = sum(len(t.buffer) for t in request.tensors)
+            metadata_bytes = len(request.metadata) if request.metadata else 0
             sender_send_us = self._now_us()
             if request.metadata:
                 try:
@@ -1929,7 +2580,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 response,
                 sender_send_us=sender_send_us,
                 sender_ack_us=sender_ack_us,
-                fallback_rtt_ms=(perf_counter() - send_start) * 1000,
+                fallback_rtt_ms=(perf_counter() - send_start) * 1000.0,
             )
             self._update_clock_sync_from_rpc_response(
                 peer_id=peer_id,
@@ -1939,6 +2590,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
             total_time = (perf_counter() - queue_start_time) * 1000
             send_time = (perf_counter() - send_start) * 1000
+            approx_bw_mbps = self._calc_mbps(payload_bytes + metadata_bytes, send_time)
             t_nic2nic_ms = float(rpc_timing["network_rtt_ms"])
             push_e2e_ms = float(rpc_timing["end_to_end_rtt_ms"])
             receiver_processing_ms = float(rpc_timing["receiver_processing_ms"])
@@ -1955,7 +2607,8 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
             logger.debug(
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} sent: "
-                f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms"
+                f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms, "
+                f"payload_kb={payload_bytes / 1024.0:.2f}, approx_bw={approx_bw_mbps:.2f}Mbps"
             )
             logger.info(
                 f"[COMM_BREAKDOWN_MB] step_id={step_id or 'unknown'} mb_idx={mb_idx} "
@@ -1969,14 +2622,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"BW(NIC)={bw_nic_mbps:.1f}MB/s "
                 f"wire_bytes={wire_bytes}"
             )
+            success = True
         except Exception as e:
             logger.warning(
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send failed: {e}"
             )
         finally:
-            # [PHASE2] Release semaphore to allow next push
-            if release_semaphore and hasattr(self, '_push_semaphore'):
-                self._push_semaphore.release()
+            # Release slot and feed metrics to adaptive limiter.
+            if release_slot and hasattr(self, "_push_limiter"):
+                measured_send_ms = send_time if send_time > 0 else (perf_counter() - send_start) * 1000.0
+                await self._push_limiter.release(send_time_ms=measured_send_ms, success=success)
 
     async def rpc_forward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
         async with timeout(self.request_timeout):
@@ -2186,6 +2841,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         backends: Sequence[TransformerBackend],
         *,
         batch_size: int,
+        logical_full_batch_size: Optional[int] = None,
         max_length: int,
         timeout: Optional[float],
         force_full_batch_alloc: bool = False,
@@ -2203,54 +2859,74 @@ class TransformerConnectionHandler(ConnectionHandler):
         # Use KVCacheManager's offloading strategy
         cache_manager = backends[0].cache_manager
 
-        # [TRUE MICRO-BATCH MULTIPLEXING] 
-        # When micro-batching is enabled:
-        # - GPU cache is sized for micro_batch_size only
-        # - Client can request larger batch_size (handled via offload/prefetch)
-        # - Each micro-batch reuses the same GPU cache slots
+        # Micro-batching supports two modes:
+        # - overlap-only (default): split execution but keep full logical KV cache
+        # - GPU multiplexing (opt-in): shrink active GPU KV capacity and reuse slots
         from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
         from bloombee.utils.memory_usage import log_mbpipe_memory, log_kv_cache_allocation, MemoryTracker
         
         mb_config = get_micro_batch_config()
         policy = cache_manager.offloading_policy
-        max_supported_batch = policy.gpu_batch_size
+        max_supported_batch = policy.gpu_batch_size * max(1, int(getattr(policy, "num_gpu_batches", 1)))
         micro_batch_size = mb_config['micro_batch_size']
+        working_slots = max(1, int(getattr(policy, "num_gpu_batches", 1)))
+        logical_batch_size = (
+            int(logical_full_batch_size)
+            if logical_full_batch_size is not None and int(logical_full_batch_size) > 0
+            else int(batch_size)
+        )
+        gpu_multiplexing_enabled = bool(mb_config.get('gpu_multiplexing', False))
         
         # [MBPIPE_DEBUG] Log the critical allocation decision
         logger.debug(f"[MBPIPE_ALLOC_DEBUG] ========================================")
         logger.debug(f"[MBPIPE_ALLOC_DEBUG] KV CACHE ALLOCATION DECISION POINT")
         logger.debug(f"[MBPIPE_ALLOC_DEBUG] ========================================")
-        logger.debug(f"[MBPIPE_ALLOC_DEBUG] Input: batch_size={batch_size}, max_length={max_length}")
-        logger.debug(f"[MBPIPE_ALLOC_DEBUG] Config: mb_enabled={mb_config['enabled']}, micro_batch_size={micro_batch_size}")
-        logger.debug(f"[MBPIPE_ALLOC_DEBUG] Policy: gpu_batch_size={max_supported_batch}")
+        logger.debug(
+            f"[MBPIPE_ALLOC_DEBUG] Input: request_batch={batch_size}, "
+            f"logical_full_batch={logical_batch_size}, max_length={max_length}"
+        )
+        logger.debug(
+            f"[MBPIPE_ALLOC_DEBUG] Config: mb_enabled={mb_config['enabled']}, "
+            f"micro_batch_size={micro_batch_size}, mode={mb_config.get('mode', 'legacy')}"
+        )
+        logger.debug(f"[MBPIPE_ALLOC_DEBUG] Policy working capacity: {max_supported_batch}")
         
         if force_full_batch_alloc:
             # Speculative decoding currently requires full-batch KV residency for
             # correctness in verify path (tree mask/rotary/kv_valid alignment).
             # Do not multiplex KV cache for this session.
-            alloc_batch_size = batch_size
+            alloc_batch_size = logical_batch_size
             logger.info(
                 f"{MBPIPE_LOG_PREFIX} KV alloc mode: SPEC_FULL "
-                f"(alloc_batch={alloc_batch_size}, client_batch={batch_size}, micro_batch={micro_batch_size})"
+                f"(alloc_batch={alloc_batch_size}, request_batch={batch_size}, micro_batch={micro_batch_size})"
             )
 
-        elif mb_config['enabled'] and micro_batch_size < batch_size:
+        elif mb_config['enabled'] and micro_batch_size < logical_batch_size and gpu_multiplexing_enabled:
             # True GPU multiplexing:
             # - Keep logical full batch for scheduling
-            # - Allocate KV cache only for one micro-batch on GPU
-            # - Offload/prefetch swaps per-micro-batch cache data between CPU and GPU
-            alloc_batch_size = micro_batch_size
+            # - Allocate a small number of GPU working slots
+            # - Offload/prefetch swaps inactive per-micro-batch snapshots between CPU and GPU
+            alloc_batch_size = min(logical_batch_size, micro_batch_size * working_slots)
             
             logger.debug(f"[MBPIPE_ALLOC_DEBUG] !!! MICRO-BATCHING ENABLED (GPU MULTIPLEXING) !!!")
-            logger.debug(f"[MBPIPE_ALLOC_DEBUG] alloc_batch_size = {alloc_batch_size} (MICRO BATCH)")
-            logger.debug(f"[MBPIPE_ALLOC_DEBUG] Full batch ({batch_size}) will be processed in {(batch_size + micro_batch_size - 1) // micro_batch_size} micro-batches")
-            logger.debug(f"[MBPIPE_ALLOC_DEBUG] Micro-batches reuse the same GPU cache slots (offset=0)")
+            logger.debug(
+                f"[MBPIPE_ALLOC_DEBUG] alloc_batch_size = {alloc_batch_size} "
+                f"(working_slots={working_slots}, slot_batch_size={micro_batch_size})"
+            )
+            logger.debug(
+                f"[MBPIPE_ALLOC_DEBUG] Full batch ({logical_batch_size}) will be processed in "
+                f"{(logical_batch_size + micro_batch_size - 1) // micro_batch_size} micro-batches"
+            )
+            logger.debug(
+                f"[MBPIPE_ALLOC_DEBUG] Micro-batches reuse {working_slots} GPU working slots; "
+                f"inactive KV state is preserved via CPU snapshots"
+            )
             
             # [MBPIPE_DEBUG] Calculate and log expected memory usage
             try:
                 block_config = cache_manager.block_config
                 log_kv_cache_allocation(
-                    batch_size=batch_size,
+                    batch_size=logical_batch_size,
                     micro_batch_size=micro_batch_size,
                     max_length=max_length,
                     num_blocks=len(backends),
@@ -2262,12 +2938,23 @@ class TransformerConnectionHandler(ConnectionHandler):
                 logger.debug(f"[MBPIPE_ALLOC_DEBUG] log_kv_cache_allocation failed: {e}")
             
         else:
-            # Micro-batching disabled: enforce strict batch limit
-            alloc_batch_size = batch_size
-            logger.debug(f"[MBPIPE_ALLOC_DEBUG] Micro-batching disabled, alloc_batch_size={alloc_batch_size}")
-            if batch_size > max_supported_batch:
+            # Legacy or overlap-only mode: keep a full logical KV cache allocation.
+            alloc_batch_size = logical_batch_size
+            if mb_config['enabled'] and micro_batch_size < logical_batch_size:
+                logger.info(
+                    f"{MBPIPE_LOG_PREFIX} KV alloc mode: OVERLAP_ONLY "
+                    f"(alloc_batch={alloc_batch_size}, request_batch={batch_size}, "
+                    f"micro_batch={micro_batch_size}, flexgen_offload=preserved)"
+                )
+                logger.debug(
+                    "[MBPIPE_ALLOC_DEBUG] Micro-batching is enabled for overlap only; "
+                    "keeping full-batch KV allocation to preserve FlexGen cache slicing"
+                )
+            else:
+                logger.debug(f"[MBPIPE_ALLOC_DEBUG] Micro-batching disabled, alloc_batch_size={alloc_batch_size}")
+            if logical_batch_size > max_supported_batch:
                 raise AllocationFailed(
-                    f"Requested batch size {batch_size} exceeds server capacity "
+                    f"Requested batch size {logical_batch_size} exceeds server capacity "
                     f"{max_supported_batch}. Reduce client batch size or restart the "
                     f"server with a larger --batch_size value."
                 )
@@ -2277,16 +2964,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         # [MBPIPE_DEBUG] Call the memory savings diagnosis to explain current behavior
         try:
             from bloombee.utils.microbatch_config import log_memory_savings_diagnosis
-            log_memory_savings_diagnosis(logger, batch_size)
+            log_memory_savings_diagnosis(logger, logical_batch_size)
         except Exception as e:
             logger.debug(f"[MBPIPE_ALLOC_DEBUG] log_memory_savings_diagnosis failed: {e}")
 
-        # Allocate cache descriptors for alloc_batch_size (= micro_batch_size when MB enabled)
+        # Allocate cache descriptors for alloc_batch_size (= working slot capacity in micro-batch mode)
         descriptors = [backend.get_inference_cache_descriptors(alloc_batch_size, max_length) for backend in backends]
 
         logger.info(
             f"OFFLOAD: requesting KV allocation for {len(backends)} blocks, "
-            f"alloc_batch={alloc_batch_size}, client_batch={batch_size}, max_length={max_length}"
+            f"alloc_batch={alloc_batch_size}, request_batch={batch_size}, "
+            f"logical_batch={logical_batch_size}, max_length={max_length}"
         )
         
         async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as raw_handles:
@@ -2306,20 +2994,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             # This helps release shared memory used by temporary Python objects
             gc.collect()
             
-            # Never trigger CUDA lazy init from a forked worker just to clean up warmup buffers.
-            # In Hivemind workers this can raise "Cannot re-initialize CUDA in forked subprocess".
-            if not torch.cuda.is_available():
-                logger.debug("Cleaned up temporary shared memory after warmup phase")
-                return
-
-            in_bad_fork = bool(getattr(torch.cuda, "_is_in_bad_fork", lambda: False)())
-            if in_bad_fork:
-                logger.debug("Skipping CUDA warmup cleanup in forked subprocess")
-                return
-
-            # Only touch CUDA if this process already has an initialized context.
-            if torch.cuda.is_initialized():
+            # Clear CUDA cache if available (this may free some shared memory)
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                # Synchronize to ensure cleanup is complete
+                torch.cuda.synchronize()
             
             logger.debug("Cleaned up temporary shared memory after warmup phase")
         except Exception as e:

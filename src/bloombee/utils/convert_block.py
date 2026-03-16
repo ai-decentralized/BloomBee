@@ -222,9 +222,15 @@ def convert_block(
 
         def named_parameters(self, *args, **kwargs):
             return self._module.named_parameters(*args, **kwargs)
+
+        def parameters(self, *args, **kwargs):
+            return self._module.parameters(*args, **kwargs)
             
         def named_buffers(self, *args, **kwargs):
             return self._module.named_buffers(*args, **kwargs)
+
+        def buffers(self, *args, **kwargs):
+            return self._module.buffers(*args, **kwargs)
         
         def rms_norm(self, *args, **kwargs):
             if hasattr(self._module, 'rms_norm'):

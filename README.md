@@ -32,7 +32,7 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 - `2025/11/21` : Remove O(prompt_len) prompt copies (PR [#35](../../pull/35) by @JiuChen0).
 - `2025/11/12` : Optimize shared memory usage, clean up legacy quantization, and remove unused modules (PR [#34](../../pull/34) by @JiuChen0).
 - `2025/11/01` : Add multi-batch inference support, fix hivemind dependency, and improve installation process (PR [#27](../../pull/27) by @JiuChen0).
- 
+
 
 
 
@@ -335,7 +335,7 @@ Jupyter notebook examples are in the `examples/` directory:
 ---
 ## Contribution
 Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/) and College of William&Mary. We welcome and appreciate any contribution to this open-source project.
- 
+
 
 ## Acknowledgements
 

@@ -1,11 +1,11 @@
 import time
 
-import hivemind
 import pytest
 import torch
 
 from bloombee import AutoDistributedConfig, RemoteSequential
 from bloombee.server.handler import CACHE_TOKENS_AVAILABLE
+from bloombee.utils.hivemind_compat import DHT
 from test_utils import *
 
 
@@ -14,7 +14,7 @@ def test_server_info(block_from: int = 2, block_to: int = 5, max_length: int = 1
     config = AutoDistributedConfig.from_pretrained(MODEL_NAME)
     config.allowed_servers = ["QmNV5G3hq2UmAck2htEgsqrmPFBff5goFZAdmKDcZLBZLX"]  # PeerID from server2.id
 
-    dht = hivemind.DHT(initial_peers=INITIAL_PEERS, client_mode=True, start=True)
+    dht = DHT(initial_peers=INITIAL_PEERS, client_mode=True, start=True)
     blocks1 = RemoteSequential(config, dht=dht, start_block=block_from, end_block=block_to)
     blocks2 = RemoteSequential(config, dht=dht, start_block=block_to - 1, end_block=block_to)
 

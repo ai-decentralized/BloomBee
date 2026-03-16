@@ -29,6 +29,8 @@ global_cpu_device = None
 global_disk_device = None
 
 logger = get_logger(__name__)
+_MHA_GEN_DECODE_PROBE_EMITTED = False
+_MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = False
 
 
 def fix_recursive_import():
@@ -713,6 +715,7 @@ class TorchDevice:
                 w_out, n_head, k_cache, v_cache, donate,
                 attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids):
         """Multi-head attention (decoding phase)."""
+        global _MHA_GEN_DECODE_PROBE_EMITTED, _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -769,6 +772,34 @@ class TorchDevice:
         if not isinstance(k_cache, TorchTensor):
             k_cache = TorchTensor.create_from_torch(k_cache, attention_mask.device)
             v_cache = TorchTensor.create_from_torch(v_cache, attention_mask.device)
+
+        if not _MHA_GEN_DECODE_PROBE_EMITTED:
+            cache_type = type(k_cache).__name__
+            is_torch_tensor = isinstance(k_cache, TorchTensor)
+            cache_device_type = None
+            cache_data_type = None
+            cache_data_is_cuda = None
+            if is_torch_tensor:
+                cache_device_type = getattr(getattr(k_cache, "device", None), "device_type", None)
+                cache_data = getattr(k_cache, "data", None)
+                cache_data_type = type(cache_data).__name__
+                if torch.is_tensor(cache_data):
+                    cache_data_is_cuda = bool(cache_data.is_cuda)
+                elif isinstance(cache_data, tuple):
+                    cache_data_is_cuda = False
+            logger.info(
+                f"[CACHE_PATH_PROBE] backend_device_type={getattr(self, 'device_type', None)} "
+                f"compress_cache={compress_cache} attn_sparsity={attn_sparsity} "
+                f"k_cache_type={cache_type} is_torch_tensor={is_torch_tensor} "
+                f"cache_device_type={cache_device_type} cache_data_type={cache_data_type} "
+                f"cache_data_is_cuda={cache_data_is_cuda}"
+            )
+            if is_torch_tensor and cache_device_type == DeviceType.MIXED:
+                logger.warning(
+                    "[CACHE_PATH_PROBE] k_cache is MIXED, but decode will still enter the TorchTensor branch "
+                    "before _mixed_device_attention(). If you expected mixed-device attention, verify this path."
+                )
+            _MHA_GEN_DECODE_PROBE_EMITTED = True
         
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
@@ -787,9 +818,15 @@ class TorchDevice:
                 # shape: (b * n_head, s, head_dim)
                 v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
                 if k.is_cuda:
+                    if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
+                        logger.info("[CACHE_PATH_BRANCH] decode_branch=dense_cuda")
+                        _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = True
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim)
                 else:
+                    if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
+                        logger.info("[CACHE_PATH_BRANCH] decode_branch=dense_cpu")
+                        _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = True
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
                     value = self._attention_value(q, k, v, attention_mask.data,
@@ -813,6 +850,9 @@ class TorchDevice:
                         attn_sparsity).cuda().half()
         else:  # Mixed device attention
             assert attn_sparsity >= 1.0
+            if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
+                logger.info("[CACHE_PATH_BRANCH] decode_branch=mixed_device")
+                _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = True
             value = self._mixed_device_attention(q, k_cache, v_cache,
                 k_new, v_new, attention_mask.data, b, src_s, tgt_s,
                 n_head, head_dim)

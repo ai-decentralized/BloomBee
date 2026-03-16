@@ -17,10 +17,20 @@ from bloombee.server.backend import TransformerBackend
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
-from bloombee.utils.lossless_transport import deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.lossless_transport import (
+    deserialize_torch_tensor,
+    serialize_torch_tensor,
+    log_comp_ratio_event,
+    log_transport_profile_event,
+    summarize_transport_profile,
+    tensor_nnz_ratio,
+    tensor_raw_nbytes,
+    transport_profile_scope,
+)
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -40,21 +50,20 @@ from bloombee.utils.microbatch_schema import (
     create_microbatch_result_metadata,
     MBPIPE_SCHEMA_PREFIX,
 )
-from bloombee.utils.debug import dprint
 
 # [MBPIPE] Cross-stage streaming push support
 _cross_stage_push_callback = None  # Will be set by handler for cross-stage streaming
 
 
 from time import perf_counter
-from datetime import datetime, timezone  
+from datetime import datetime, timezone
 def print_time_now(s):
-    # Get the current time in UTC  
-    current_utc_datetime = datetime.now(timezone.utc)  
-    # Format the datetime to the desired string format  
-    formatted_utc_time = current_utc_datetime.strftime('%Y-%m-%d %H:%M:%S.%f %Z')  
-    dprint('\t\t\t'+s+" UTC Time: "+ str(formatted_utc_time) )  
-    
+    # Get the current time in UTC
+    current_utc_datetime = datetime.now(timezone.utc)
+    # Format the datetime to the desired string format
+    formatted_utc_time = current_utc_datetime.strftime('%Y-%m-%d %H:%M:%S.%f %Z')
+    print('\t\t\t'+s+" UTC Time: "+ str(formatted_utc_time) )
+
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
@@ -72,7 +81,11 @@ offload_logger.setLevel(logging.INFO)
 
 def _mbpipe_verbose_enabled() -> bool:
     """Enable full per-micro-batch logs via BLOOMBEE_MBPIPE_VERBOSE=1."""
-    return os.environ.get("BLOOMBEE_MBPIPE_VERBOSE", "0") == "1"
+    return get_env_bool_with_debug_fallback(
+        "BLOOMBEE_MBPIPE_VERBOSE",
+        default=False,
+        groups=("microbatch",),
+    )
 
 
 def _should_log_mb_detail(step_metadata: Optional[Dict[str, Any]]) -> bool:
@@ -107,6 +120,38 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _bytes_to_mb(value: Any) -> float:
+    return _to_float(value) / (1024.0 * 1024.0)
+
+
+def _estimate_bandwidth_mbps(total_bytes: Any, elapsed_ms: Any) -> float:
+    bytes_f = max(0.0, _to_float(total_bytes))
+    ms_f = max(0.0, _to_float(elapsed_ms))
+    if bytes_f <= 0.0 or ms_f <= 0.0:
+        return 0.0
+    return (bytes_f * 8.0) / (ms_f / 1000.0) / 1_000_000.0
+
+
+def _interval_overlap_ms_from_us(
+    range_start_us: int,
+    range_end_us: int,
+    window_start_us: int,
+    window_end_us: int,
+) -> float:
+    if (
+        range_start_us <= 0
+        or range_end_us <= range_start_us
+        or window_start_us <= 0
+        or window_end_us <= window_start_us
+    ):
+        return 0.0
+    overlap_start_us = max(range_start_us, window_start_us)
+    overlap_end_us = min(range_end_us, window_end_us)
+    if overlap_end_us <= overlap_start_us:
+        return 0.0
+    return (overlap_end_us - overlap_start_us) / 1000.0
 
 
 def _as_python_bool(value: Any) -> bool:
@@ -195,6 +240,24 @@ def _accumulate_runtime_timing(
             continue
 
 
+def _block_span_from_uids(requested_uids: Sequence[Union[ExpertUID, str]]) -> str:
+    """
+    Convert requested UIDs to a stable layer-span label, e.g. "0:20".
+    """
+    indices = []
+    for uid in requested_uids:
+        try:
+            token = str(uid).split(".")[-1]
+            indices.append(int(token))
+        except Exception:
+            continue
+    if not indices:
+        return "unknown"
+    start = min(indices)
+    end = max(indices) + 1
+    return f"{start}:{end}"
+
+
 async def run_rpc_forward(
     *flat_tensors: torch.Tensor,
     requested_backends: Sequence[TransformerBackend],
@@ -273,12 +336,13 @@ async def run_rpc_forward(
         if i > 0:  # Only measure transfer between different backends
             estimated_transfer_time = backend_total_time - task_processing_time
             s1_to_s2_transfer_times.append(estimated_transfer_time)
-            logger.debug(f"[S1_TO_S2_TRANSFER] Backend {i} | "
+            logger.info(f"[S1_TO_S2_TRANSFER] Backend {i} | "
                        f"Estimated Transfer Time: {estimated_transfer_time:.2f}ms | "
                        f"Total Backend Time: {backend_total_time:.2f}ms | "
                        f"Pure Processing: {task_processing_time:.2f}ms")
         
-        logger.debug(f"[PROCESSING_LATENCY] Backend {i} | "
+        # Log processing latency for each backend
+        logger.info(f"[PROCESSING_LATENCY] Backend {i} | "
                    f"Task Processing: {task_processing_time:.2f}ms | "
                    f"Total Backend Time: {backend_total_time:.2f}ms | "
                    f"Hidden States Shape: {hidden_states.shape}")
@@ -288,18 +352,20 @@ async def run_rpc_forward(
             hidden_states.ndim == 3
         ), f"inputs to {type(backend)} must be a list with a single 3d tensor of hidden states"
 
+    # Calculate total Cross-GPU Transfer Latency
     cross_gpu_end_time = perf_counter()
     cross_gpu_latency = (cross_gpu_end_time - cross_gpu_start_time) * 1000
     
+    # Calculate S1->S2 transfer statistics
     if s1_to_s2_transfer_times:
         s1_to_s2_mean = sum(s1_to_s2_transfer_times) / len(s1_to_s2_transfer_times)
         s1_to_s2_total = sum(s1_to_s2_transfer_times)
-        logger.debug(f"[S1_TO_S2_TRANSFER_SUMMARY] "
+        logger.info(f"[S1_TO_S2_TRANSFER_SUMMARY] "
                    f"Average Transfer: {s1_to_s2_mean:.2f}ms | "
                    f"Total Transfer: {s1_to_s2_total:.2f}ms | "
                    f"Transfer Count: {len(s1_to_s2_transfer_times)}")
     
-    logger.debug(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
+    logger.info(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
                f"Backends: {len(requested_backends)} | "
                f"Output Shape: {hidden_states.shape}")
 
@@ -514,6 +580,13 @@ async def iterate_rpc_inference(
             sender_to_receiver_clock_samples = _to_int(
                 step_metadata.get("sender_to_receiver_clock_samples"), 0
             )
+            queue_wait_start_us = _to_int(step_metadata.get("_queue_wait_start_us"), 0)
+            queue_wait_end_us = _to_int(step_metadata.get("_queue_wait_end_us"), 0)
+            receiver_receive_us = _to_int(step_metadata.get("s2s_receiver_receive_us"), 0)
+            receiver_queue_put_us = _to_int(step_metadata.get("s2s_receiver_queue_put_us"), 0)
+            sender_send_us = _to_int(step_metadata.get("clock_sync_sender_send_us"), 0)
+            sender_serialize_start_us = _to_int(step_metadata.get("s2s_sender_serialize_start_us"), 0)
+            sender_serialize_end_us = _to_int(step_metadata.get("s2s_sender_serialize_end_us"), 0)
             transfer_latency_us = receive_timestamp_us - push_timestamp_us if push_timestamp_us > 0 else 0
             
             # [CROSS_STAGE] Pipeline overlap: If previous stage started MB1 compute before we receive MB0,
@@ -542,6 +615,14 @@ async def iterate_rpc_inference(
                 'prev_stage_clock_samples': sender_to_receiver_clock_samples,
                 'this_stage_receive_us': receive_timestamp_us,
                 'transfer_latency_us': transfer_latency_us,
+                'this_stage_queue_wait_ms': queue_wait_ms,
+                'this_stage_queue_wait_start_us': queue_wait_start_us,
+                'this_stage_queue_wait_end_us': queue_wait_end_us,
+                'receiver_receive_us': receiver_receive_us,
+                'receiver_queue_put_us': receiver_queue_put_us,
+                'sender_send_us': sender_send_us,
+                'sender_serialize_start_us': sender_serialize_start_us,
+                'sender_serialize_end_us': sender_serialize_end_us,
             }
             
             if compute_start_timestamp_us > 0:
@@ -566,8 +647,10 @@ async def iterate_rpc_inference(
             
             # Deserialize only the 2 tensors from micro-batch push
             mb_deserialize_start = perf_counter()
-            flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+            with transport_profile_scope() as mb_transport_profile:
+                flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
             mb_deserialize_ms = (perf_counter() - mb_deserialize_start) * 1000.0
+            mb_transport_summary = summarize_transport_profile(mb_transport_profile)
             
             # [MB_DEBUG] Log deserialized tensors
             logger.debug(f"[MB_DEBUG] Deserialized {len(flat_tensors)} tensors from request")
@@ -869,6 +952,7 @@ async def iterate_rpc_inference(
                 push_metadata["micro_batch_offset"] = mb_offset
                 push_metadata["micro_batch_size"] = mb_size
                 push_metadata["full_batch_size"] = full_batch_size
+                push_metadata["sender_blocks"] = _block_span_from_uids(requested_uids)
                 push_metadata["total_micro_batches"] = expected_num_mb
                 push_metadata["stage_push_timestamp_us"] = push_timestamp_us
                 compute_start_abs_us = compute_done_timestamp_us - int(process_time_ms * 1000)
@@ -914,6 +998,9 @@ async def iterate_rpc_inference(
                     'cpu2gpu_ms_sum': 0.0,
                     'gpu2cpu_ms_sum': 0.0,
                     'compute_ms_sum': 0.0,
+                    'decompress_ms_sum': 0.0,
+                    'deserialize_unwrap_ms_sum': 0.0,
+                    'deserialize_core_ms_sum': 0.0,
                     'queue_source_counts': {},
                     'token_increment': int(token_increment),
                 }
@@ -936,13 +1023,20 @@ async def iterate_rpc_inference(
             accum['cpu2gpu_ms_sum'] += mb_t_cpu2gpu_ms
             accum['gpu2cpu_ms_sum'] += mb_t_gpu2cpu_ms
             accum['compute_ms_sum'] += process_time_ms
+            accum['decompress_ms_sum'] += float(mb_transport_summary.get('decompress_ms', 0.0))
+            accum['deserialize_unwrap_ms_sum'] += float(mb_transport_summary.get('deserialize_unwrap_ms', 0.0))
+            accum['deserialize_core_ms_sum'] += float(mb_transport_summary.get('deserialize_core_ms', 0.0))
             accum['queue_source_counts'][queue_source] = accum['queue_source_counts'].get(queue_source, 0) + 1
             if log_mb_detail:
                 logger.info(
                     f"[STEP_TIMING_MB] step_id={step_id} mb_idx={mb_idx} "
                     f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
+                    f"deserialize={mb_deserialize_ms:.2f}ms "
                     f"nic2cpu={mb_t_nic2cpu_ms:.2f}ms cpu2gpu={mb_t_cpu2gpu_ms:.2f}ms "
-                    f"compute={process_time_ms:.2f}ms gpu2cpu={mb_t_gpu2cpu_ms:.2f}ms"
+                    f"compute={process_time_ms:.2f}ms gpu2cpu={mb_t_gpu2cpu_ms:.2f}ms "
+                    f"decompress={mb_transport_summary.get('decompress_ms', 0.0):.2f}ms "
+                    f"unwrap={mb_transport_summary.get('deserialize_unwrap_ms', 0.0):.2f}ms "
+                    f"deserialize_core={mb_transport_summary.get('deserialize_core_ms', 0.0):.2f}ms"
                 )
             
             if log_mb_detail:
@@ -1021,6 +1115,11 @@ async def iterate_rpc_inference(
                    overlap_tracking_key in iterate_rpc_inference._cross_stage_overlap_data:
                     
                     overlap_summary = iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]
+                    overlap_accum = (
+                        getattr(iterate_rpc_inference, '_mb_accumulators', {}).get(mb_accum_key, {})
+                        if hasattr(iterate_rpc_inference, '_mb_accumulators')
+                        else {}
+                    )
                     total_overlap_ms = 0.0
                     total_stage2_compute_ms = 0.0
                     total_comparable_stage2_compute_ms = 0.0
@@ -1030,6 +1129,8 @@ async def iterate_rpc_inference(
                     clock_uncorrected_pair_count = 0
                     clock_offset_abs_sum_ms = 0.0
                     clock_rtt_max_ms = 0.0
+                    total_next_sender_serialize_ms = 0.0
+                    hidden_next_sender_serialize_ms = 0.0
                     
                     # For each pair (MB_n on this stage, MB_{n+1} on previous stage),
                     # compute strict overlap as interval intersection:
@@ -1051,6 +1152,12 @@ async def iterate_rpc_inference(
                             
                             stage1_next_start_us = _to_int(next_mb_data.get('prev_stage_compute_start_us'), 0)
                             stage1_next_end_us = _to_int(next_mb_data.get('prev_stage_compute_end_us'), 0)
+                            stage1_next_sender_serialize_start_us = _to_int(
+                                next_mb_data.get('sender_serialize_start_us'), 0
+                            )
+                            stage1_next_sender_serialize_end_us = _to_int(
+                                next_mb_data.get('sender_serialize_end_us'), 0
+                            )
                             stage1_next_clock_offset_us = _to_int(next_mb_data.get('prev_stage_clock_offset_us'), 0)
                             stage1_next_clock_rtt_us = max(0, _to_int(next_mb_data.get('prev_stage_clock_rtt_us'), 0))
                             stage1_next_clock_samples = _to_int(next_mb_data.get('prev_stage_clock_samples'), 0)
@@ -1074,6 +1181,10 @@ async def iterate_rpc_inference(
                             if stage1_next_clock_samples > 0:
                                 stage1_next_start_us += stage1_next_clock_offset_us
                                 stage1_next_end_us += stage1_next_clock_offset_us
+                                if stage1_next_sender_serialize_start_us > 0:
+                                    stage1_next_sender_serialize_start_us += stage1_next_clock_offset_us
+                                if stage1_next_sender_serialize_end_us > 0:
+                                    stage1_next_sender_serialize_end_us += stage1_next_clock_offset_us
                                 clock_corrected_pair_count += 1
                                 clock_offset_abs_sum_ms += abs(stage1_next_clock_offset_us) / 1000.0
                                 clock_rtt_max_ms = max(clock_rtt_max_ms, stage1_next_clock_rtt_us / 1000.0)
@@ -1090,6 +1201,22 @@ async def iterate_rpc_inference(
                                 continue
 
                             total_comparable_stage2_compute_ms += this_compute_ms
+                            next_sender_serialize_total_ms = (
+                                max(0.0, (stage1_next_sender_serialize_end_us - stage1_next_sender_serialize_start_us) / 1000.0)
+                                if (
+                                    stage1_next_sender_serialize_start_us > 0
+                                    and stage1_next_sender_serialize_end_us > stage1_next_sender_serialize_start_us
+                                )
+                                else 0.0
+                            )
+                            next_sender_serialize_hidden_ms = _interval_overlap_ms_from_us(
+                                this_compute_start_us,
+                                this_compute_end_us,
+                                stage1_next_sender_serialize_start_us,
+                                stage1_next_sender_serialize_end_us,
+                            )
+                            total_next_sender_serialize_ms += next_sender_serialize_total_ms
+                            hidden_next_sender_serialize_ms += next_sender_serialize_hidden_ms
 
                             overlap_start_us = max(this_compute_start_us, stage1_next_start_us)
                             overlap_end_us = min(this_compute_end_us, stage1_next_end_us)
@@ -1121,6 +1248,221 @@ async def iterate_rpc_inference(
                     
                     # Calculate overlap efficiency
                     if total_stage2_compute_ms > 0:
+                        stage2_queue_wait_sum_ms = float(overlap_accum.get('queue_wait_ms_sum', 0.0))
+                        stage2_queue_wait_pre_ms = float(overlap_accum.get('queue_wait_pre_ms', 0.0))
+                        stage2_queue_wait_inter_ms = float(overlap_accum.get('queue_wait_inter_ms', 0.0))
+                        stage2_deserialize_sum_ms = float(overlap_accum.get('deserialize_ms_sum', 0.0))
+                        stage2_decompress_sum_ms = float(overlap_accum.get('decompress_ms_sum', 0.0))
+                        stage2_elapsed_to_summary_ms = (
+                            (perf_counter() - overlap_accum.get('step_start_time', step_receive_time)) * 1000.0
+                        )
+                        stage2_critical_path_ms = (
+                            stage2_queue_wait_sum_ms + stage2_deserialize_sum_ms + total_stage2_compute_ms
+                        )
+                        stage2_full_path_ms = stage2_elapsed_to_summary_ms + stage2_queue_wait_pre_ms
+                        stage2_residual_path_ms = stage2_full_path_ms - stage2_critical_path_ms
+                        stage2_queue_wait_pre_upstream_compute_ms = 0.0
+                        stage2_queue_wait_pre_transfer_receive_ms = 0.0
+                        stage2_queue_wait_pre_precompute_gap_ms = 0.0
+                        stage2_queue_wait_pre_sender_post_compute_ms = 0.0
+                        stage2_queue_wait_pre_sender_compute_to_serialize_ms = 0.0
+                        stage2_queue_wait_pre_sender_serialize_ms = 0.0
+                        stage2_queue_wait_pre_sender_pre_send_wait_ms = 0.0
+                        stage2_queue_wait_pre_wire_receive_ms = 0.0
+                        stage2_queue_wait_pre_receiver_dispatch_ms = 0.0
+                        stage2_queue_wait_pre_breakdown_ready = 0
+                        next_sender_serialize_exposed_ms = max(
+                            0.0, total_next_sender_serialize_ms - hidden_next_sender_serialize_ms
+                        )
+                        next_sender_serialize_hidden_pct = (
+                            (hidden_next_sender_serialize_ms / total_next_sender_serialize_ms) * 100.0
+                            if total_next_sender_serialize_ms > 0.0
+                            else 0.0
+                        )
+
+                        mb0_data = overlap_summary.get(0, {})
+                        mb0_wait_start_us = _to_int(mb0_data.get('this_stage_queue_wait_start_us'), 0)
+                        mb0_wait_end_us = _to_int(mb0_data.get('this_stage_queue_wait_end_us'), 0)
+                        mb0_prev_start_us = _to_int(mb0_data.get('prev_stage_compute_start_us'), 0)
+                        mb0_prev_end_us = _to_int(mb0_data.get('prev_stage_compute_end_us'), 0)
+                        mb0_clock_offset_us = _to_int(mb0_data.get('prev_stage_clock_offset_us'), 0)
+                        mb0_clock_samples = _to_int(mb0_data.get('prev_stage_clock_samples'), 0)
+                        mb0_sender_send_us = _to_int(mb0_data.get('sender_send_us'), 0)
+                        mb0_sender_ser_start_us = _to_int(mb0_data.get('sender_serialize_start_us'), 0)
+                        mb0_sender_ser_end_us = _to_int(mb0_data.get('sender_serialize_end_us'), 0)
+                        mb0_receiver_receive_us = _to_int(mb0_data.get('receiver_receive_us'), 0)
+                        mb0_receiver_queue_put_us = _to_int(mb0_data.get('receiver_queue_put_us'), 0)
+
+                        if (
+                            stage2_queue_wait_pre_ms > 0.0
+                            and mb0_wait_end_us <= 0
+                            and mb0_wait_start_us > 0
+                        ):
+                            mb0_wait_end_us = mb0_wait_start_us + int(round(stage2_queue_wait_pre_ms * 1000.0))
+                        if (
+                            stage2_queue_wait_pre_ms > 0.0
+                            and mb0_wait_start_us <= 0
+                            and mb0_wait_end_us > 0
+                        ):
+                            mb0_wait_start_us = mb0_wait_end_us - int(round(stage2_queue_wait_pre_ms * 1000.0))
+
+                        def _interval_overlap_ms(
+                            range_start_us: int,
+                            range_end_us: int,
+                            window_start_us: int,
+                            window_end_us: int,
+                        ) -> float:
+                            if (
+                                range_start_us <= 0
+                                or range_end_us <= range_start_us
+                                or window_start_us <= 0
+                                or window_end_us <= window_start_us
+                            ):
+                                return 0.0
+                            overlap_start_us = max(range_start_us, window_start_us)
+                            overlap_end_us = min(range_end_us, window_end_us)
+                            if overlap_end_us <= overlap_start_us:
+                                return 0.0
+                            return (overlap_end_us - overlap_start_us) / 1000.0
+
+                        if (
+                            mb0_wait_start_us > 0
+                            and mb0_wait_end_us > mb0_wait_start_us
+                            and mb0_prev_start_us > 0
+                            and mb0_prev_end_us >= mb0_prev_start_us
+                            and mb0_clock_samples > 0
+                        ):
+                            mb0_prev_start_local_us = mb0_prev_start_us + mb0_clock_offset_us
+                            mb0_prev_end_local_us = mb0_prev_end_us + mb0_clock_offset_us
+                            mb0_sender_ser_start_local_us = (
+                                mb0_sender_ser_start_us + mb0_clock_offset_us if mb0_sender_ser_start_us > 0 else 0
+                            )
+                            mb0_sender_ser_end_local_us = (
+                                mb0_sender_ser_end_us + mb0_clock_offset_us if mb0_sender_ser_end_us > 0 else 0
+                            )
+                            mb0_sender_send_local_us = (
+                                mb0_sender_send_us + mb0_clock_offset_us if mb0_sender_send_us > 0 else 0
+                            )
+
+                            stage2_queue_wait_pre_upstream_compute_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_prev_start_local_us,
+                                mb0_prev_end_local_us,
+                            )
+                            stage2_queue_wait_pre_sender_compute_to_serialize_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_prev_end_local_us,
+                                mb0_sender_ser_start_local_us,
+                            )
+                            stage2_queue_wait_pre_sender_serialize_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_sender_ser_start_local_us,
+                                mb0_sender_ser_end_local_us,
+                            )
+                            stage2_queue_wait_pre_sender_pre_send_wait_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_sender_ser_end_local_us,
+                                mb0_sender_send_local_us,
+                            )
+                            stage2_queue_wait_pre_sender_post_compute_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_prev_end_local_us,
+                                mb0_sender_send_local_us,
+                            )
+                            sender_post_compute_segment_sum_ms = (
+                                stage2_queue_wait_pre_sender_compute_to_serialize_ms
+                                + stage2_queue_wait_pre_sender_serialize_ms
+                                + stage2_queue_wait_pre_sender_pre_send_wait_ms
+                            )
+                            if sender_post_compute_segment_sum_ms > 0.0:
+                                stage2_queue_wait_pre_sender_post_compute_ms = sender_post_compute_segment_sum_ms
+                            stage2_queue_wait_pre_wire_receive_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_sender_send_local_us,
+                                mb0_receiver_receive_us,
+                            )
+                            stage2_queue_wait_pre_receiver_dispatch_ms = _interval_overlap_ms(
+                                mb0_wait_start_us,
+                                mb0_wait_end_us,
+                                mb0_receiver_receive_us,
+                                mb0_wait_end_us,
+                            )
+                            stage2_queue_wait_pre_transfer_receive_ms = (
+                                stage2_queue_wait_pre_sender_post_compute_ms
+                                + stage2_queue_wait_pre_wire_receive_ms
+                                + stage2_queue_wait_pre_receiver_dispatch_ms
+                            )
+                            accounted_pre_wait_ms = (
+                                stage2_queue_wait_pre_upstream_compute_ms
+                                + stage2_queue_wait_pre_transfer_receive_ms
+                            )
+                            stage2_queue_wait_pre_precompute_gap_ms = max(
+                                0.0, stage2_queue_wait_pre_ms - accounted_pre_wait_ms
+                            )
+                            stage2_queue_wait_pre_breakdown_ready = 1
+
+                            if (
+                                mb0_receiver_queue_put_us > 0
+                                and mb0_receiver_queue_put_us < mb0_receiver_receive_us
+                            ):
+                                mb0_receiver_queue_put_us = mb0_receiver_receive_us
+
+                            if (
+                                mb0_receiver_queue_put_us > 0
+                                and mb0_receiver_receive_us > 0
+                                and mb0_receiver_queue_put_us < mb0_wait_end_us
+                            ):
+                                receiver_handle_ms = _interval_overlap_ms(
+                                    mb0_wait_start_us,
+                                    mb0_wait_end_us,
+                                    mb0_receiver_receive_us,
+                                    mb0_receiver_queue_put_us,
+                                )
+                                receiver_ready_ms = _interval_overlap_ms(
+                                    mb0_wait_start_us,
+                                    mb0_wait_end_us,
+                                    mb0_receiver_queue_put_us,
+                                    mb0_wait_end_us,
+                                )
+                                stage2_queue_wait_pre_receiver_dispatch_ms = receiver_handle_ms + receiver_ready_ms
+                                stage2_queue_wait_pre_transfer_receive_ms = (
+                                    stage2_queue_wait_pre_sender_post_compute_ms
+                                    + stage2_queue_wait_pre_wire_receive_ms
+                                    + stage2_queue_wait_pre_receiver_dispatch_ms
+                                )
+                                accounted_pre_wait_ms = (
+                                    stage2_queue_wait_pre_upstream_compute_ms
+                                    + stage2_queue_wait_pre_transfer_receive_ms
+                                )
+                                stage2_queue_wait_pre_precompute_gap_ms = max(
+                                    0.0, stage2_queue_wait_pre_ms - accounted_pre_wait_ms
+                                )
+                        overlap_accum['queue_wait_pre_upstream_compute_ms'] = stage2_queue_wait_pre_upstream_compute_ms
+                        overlap_accum['queue_wait_pre_transfer_receive_ms'] = stage2_queue_wait_pre_transfer_receive_ms
+                        overlap_accum['queue_wait_pre_precompute_gap_ms'] = stage2_queue_wait_pre_precompute_gap_ms
+                        overlap_accum['queue_wait_pre_sender_post_compute_ms'] = stage2_queue_wait_pre_sender_post_compute_ms
+                        overlap_accum['queue_wait_pre_sender_compute_to_serialize_ms'] = (
+                            stage2_queue_wait_pre_sender_compute_to_serialize_ms
+                        )
+                        overlap_accum['queue_wait_pre_sender_serialize_ms'] = (
+                            stage2_queue_wait_pre_sender_serialize_ms
+                        )
+                        overlap_accum['queue_wait_pre_sender_pre_send_wait_ms'] = (
+                            stage2_queue_wait_pre_sender_pre_send_wait_ms
+                        )
+                        overlap_accum['queue_wait_pre_wire_receive_ms'] = stage2_queue_wait_pre_wire_receive_ms
+                        overlap_accum['queue_wait_pre_receiver_dispatch_ms'] = stage2_queue_wait_pre_receiver_dispatch_ms
+                        overlap_accum['queue_wait_pre_breakdown_ready'] = stage2_queue_wait_pre_breakdown_ready
+                        overlap_accum['next_sender_serialize_total_ms'] = total_next_sender_serialize_ms
+                        overlap_accum['next_sender_serialize_hidden_ms'] = hidden_next_sender_serialize_ms
+                        overlap_accum['next_sender_serialize_exposed_ms'] = next_sender_serialize_exposed_ms
+                        overlap_accum['next_sender_serialize_hidden_pct'] = next_sender_serialize_hidden_pct
                         overlap_efficiency = (total_overlap_ms / total_stage2_compute_ms) * 100
                         strict_efficiency = (
                             (total_overlap_ms / total_comparable_stage2_compute_ms) * 100
@@ -1141,6 +1483,29 @@ async def iterate_rpc_inference(
                         logger.info(
                             f"[CROSS_STAGE_OVERLAP_SUMMARY] step={overlap_tracking_key[1]} overlap={total_overlap_ms:.1f}ms, "
                             f"Stage2_compute={total_stage2_compute_ms:.1f}ms, "
+                            f"Stage2_queue_wait={stage2_queue_wait_sum_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre={stage2_queue_wait_pre_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_upstream_compute={stage2_queue_wait_pre_upstream_compute_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_transfer_receive={stage2_queue_wait_pre_transfer_receive_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_precompute_gap={stage2_queue_wait_pre_precompute_gap_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_sender_post_compute={stage2_queue_wait_pre_sender_post_compute_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_sender_compute_to_serialize={stage2_queue_wait_pre_sender_compute_to_serialize_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_sender_serialize={stage2_queue_wait_pre_sender_serialize_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_sender_pre_send_wait={stage2_queue_wait_pre_sender_pre_send_wait_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_wire_receive={stage2_queue_wait_pre_wire_receive_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_receiver_dispatch={stage2_queue_wait_pre_receiver_dispatch_ms:.1f}ms, "
+                            f"Stage2_queue_wait_pre_breakdown_ready={stage2_queue_wait_pre_breakdown_ready}, "
+                            f"Stage2_queue_wait_inter={stage2_queue_wait_inter_ms:.1f}ms, "
+                            f"Stage2_deserialize={stage2_deserialize_sum_ms:.1f}ms, "
+                            f"Stage2_decompress_on_critical_path={stage2_decompress_sum_ms:.1f}ms, "
+                            f"Stage2_decompress_hidden=0.0ms, "
+                            f"Stage1_next_sender_serialize_total={total_next_sender_serialize_ms:.1f}ms, "
+                            f"Stage1_next_sender_serialize_hidden={hidden_next_sender_serialize_ms:.1f}ms, "
+                            f"Stage1_next_sender_serialize_exposed={next_sender_serialize_exposed_ms:.1f}ms, "
+                            f"Stage1_next_sender_serialize_hidden_pct={next_sender_serialize_hidden_pct:.1f}%, "
+                            f"Stage2_critical_path={stage2_critical_path_ms:.1f}ms, "
+                            f"Stage2_full_path={stage2_full_path_ms:.1f}ms, "
+                            f"Stage2_residual={stage2_residual_path_ms:.1f}ms, "
                             f"efficiency={overlap_efficiency:.1f}%, "
                             f"strict_efficiency={strict_efficiency:.1f}%, "
                             f"comparable_compute={total_comparable_stage2_compute_ms:.1f}ms, "
@@ -1170,13 +1535,47 @@ async def iterate_rpc_inference(
                 
                 need_pruning_next = torch.tensor(0)
                 merge_serialize_start = perf_counter()
-                output_tensors = [
-                    serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-                    for result, proto in zip(
-                        (merged_hidden_states, merged_keep_indices, need_pruning_next), 
-                        nested_flatten(requested_backends[-1].outputs_schema)
-                    )
-                ]
+                transport_phase = (
+                    "prefill" if merged_hidden_states.ndim >= 2 and int(merged_hidden_states.shape[1]) > 1 else "decode"
+                )
+                output_debug_names = ("hidden_states", "keep_indices", "need_pruning_next")
+                with transport_profile_scope() as merge_transport_profile:
+                    output_tensors = [
+                        serialize_torch_tensor(
+                            result.to(proto.dtype),
+                            proto.compression,
+                            allow_inplace=True,
+                            debug_context={
+                                "phase": transport_phase,
+                                "tensor_name": output_debug_names[idx] if idx < len(output_debug_names) else f"output_{idx}",
+                                "source": "server",
+                                "channel": "rpc_inference_mb_merge",
+                                "blocks": _block_span_from_uids(requested_uids),
+                                "batch": int(merged_hidden_states.shape[0]) if merged_hidden_states.ndim >= 1 else 1,
+                            },
+                        )
+                        for idx, (result, proto) in enumerate(zip(
+                            (merged_hidden_states, merged_keep_indices, need_pruning_next),
+                            nested_flatten(requested_backends[-1].outputs_schema)
+                        ))
+                    ]
+                merge_transport_summary = summarize_transport_profile(merge_transport_profile)
+                log_comp_ratio_event(
+                    logger,
+                    source="server",
+                    channel="rpc_inference_mb_merge",
+                    blocks=_block_span_from_uids(requested_uids),
+                    step_id=str(step_id),
+                    batch_size=int(merged_hidden_states.shape[0]) if merged_hidden_states.ndim >= 1 else 1,
+                    tensor_name="hidden_states",
+                    raw_bytes=tensor_raw_nbytes(merged_hidden_states),
+                    wire_bytes=len(output_tensors[0].buffer) if output_tensors else 0,
+                    nnz_ratio=tensor_nnz_ratio(merged_hidden_states),
+                    extra={
+                        "phase": transport_phase,
+                        "seq_tokens": int(merged_hidden_states.shape[1]) if merged_hidden_states.ndim >= 2 else 1,
+                    },
+                )
                 merge_serialize_ms = (perf_counter() - merge_serialize_start) * 1000.0
                 merge_total_ms = (perf_counter() - accum.get('step_start_time', step_receive_time)) * 1000.0
                 queue_wait_sum_ms = float(accum.get('queue_wait_ms_sum', 0.0))
@@ -1187,10 +1586,36 @@ async def iterate_rpc_inference(
                 cpu2gpu_sum_ms = float(accum.get('cpu2gpu_ms_sum', 0.0))
                 gpu2cpu_sum_ms = float(accum.get('gpu2cpu_ms_sum', 0.0))
                 compute_sum_ms = float(accum.get('compute_ms_sum', 0.0))
+                decompress_sum_ms = float(accum.get('decompress_ms_sum', 0.0))
+                deserialize_unwrap_sum_ms = float(accum.get('deserialize_unwrap_ms_sum', 0.0))
+                deserialize_core_sum_ms = float(accum.get('deserialize_core_ms_sum', 0.0))
+                queue_wait_pre_upstream_compute_ms = float(accum.get('queue_wait_pre_upstream_compute_ms', 0.0))
+                queue_wait_pre_transfer_receive_ms = float(accum.get('queue_wait_pre_transfer_receive_ms', 0.0))
+                queue_wait_pre_precompute_gap_ms = float(accum.get('queue_wait_pre_precompute_gap_ms', 0.0))
+                queue_wait_pre_sender_post_compute_ms = float(accum.get('queue_wait_pre_sender_post_compute_ms', 0.0))
+                queue_wait_pre_sender_compute_to_serialize_ms = float(
+                    accum.get('queue_wait_pre_sender_compute_to_serialize_ms', 0.0)
+                )
+                queue_wait_pre_sender_serialize_ms = float(
+                    accum.get('queue_wait_pre_sender_serialize_ms', 0.0)
+                )
+                queue_wait_pre_sender_pre_send_wait_ms = float(
+                    accum.get('queue_wait_pre_sender_pre_send_wait_ms', 0.0)
+                )
+                queue_wait_pre_wire_receive_ms = float(accum.get('queue_wait_pre_wire_receive_ms', 0.0))
+                queue_wait_pre_receiver_dispatch_ms = float(accum.get('queue_wait_pre_receiver_dispatch_ms', 0.0))
+                queue_wait_pre_breakdown_ready = int(accum.get('queue_wait_pre_breakdown_ready', 0) or 0)
+                next_sender_serialize_total_ms = float(accum.get('next_sender_serialize_total_ms', 0.0))
+                next_sender_serialize_hidden_ms = float(accum.get('next_sender_serialize_hidden_ms', 0.0))
+                next_sender_serialize_exposed_ms = float(accum.get('next_sender_serialize_exposed_ms', 0.0))
+                next_sender_serialize_hidden_pct = float(accum.get('next_sender_serialize_hidden_pct', 0.0))
                 merge_residual_ms = merge_total_ms - (
                     nic2cpu_sum_ms + cpu2gpu_sum_ms + compute_sum_ms + gpu2cpu_sum_ms + merge_serialize_ms
                 )
                 total_with_pre_wait_ms = merge_total_ms + queue_wait_pre_ms
+                critical_path_ms = queue_wait_sum_ms + deserialize_sum_ms + compute_sum_ms
+                full_path_ms = total_with_pre_wait_ms
+                residual_to_full_ms = full_path_ms - critical_path_ms
                 queue_source_counts = accum.get("queue_source_counts", {})
                 queue_source_stats = ",".join(
                     f"{k}:{v}" for k, v in sorted(queue_source_counts.items())
@@ -1216,12 +1641,55 @@ async def iterate_rpc_inference(
                     f"compute_sum={compute_sum_ms:.2f}ms "
                     f"gpu2cpu_sum={gpu2cpu_sum_ms:.2f}ms "
                     f"serialize_cpu={merge_serialize_ms:.2f}ms "
+                    f"decompress_sum={decompress_sum_ms:.2f}ms "
+                    f"deserialize_unwrap_sum={deserialize_unwrap_sum_ms:.2f}ms "
+                    f"deserialize_core_sum={deserialize_core_sum_ms:.2f}ms "
+                    f"compress={merge_transport_summary.get('compress_ms', 0.0):.2f}ms "
+                    f"serialize_wrap={merge_transport_summary.get('serialize_wrapper_ms', 0.0):.2f}ms "
+                    f"serialize_core={merge_transport_summary.get('serialize_core_ms', 0.0):.2f}ms "
                     f"residual={merge_residual_ms:.2f}ms "
+                    f"critical_path={critical_path_ms:.2f}ms "
                     f"total={merge_total_ms:.2f}ms "
                     f"queue_sources={queue_source_stats} "
                     f"queue_wait_pre={queue_wait_pre_ms:.2f}ms "
+                    f"queue_wait_pre_upstream_compute={queue_wait_pre_upstream_compute_ms:.2f}ms "
+                    f"queue_wait_pre_transfer_receive={queue_wait_pre_transfer_receive_ms:.2f}ms "
+                    f"queue_wait_pre_precompute_gap={queue_wait_pre_precompute_gap_ms:.2f}ms "
+                    f"queue_wait_pre_sender_post_compute={queue_wait_pre_sender_post_compute_ms:.2f}ms "
+                    f"queue_wait_pre_sender_compute_to_serialize={queue_wait_pre_sender_compute_to_serialize_ms:.2f}ms "
+                    f"queue_wait_pre_sender_serialize={queue_wait_pre_sender_serialize_ms:.2f}ms "
+                    f"queue_wait_pre_sender_pre_send_wait={queue_wait_pre_sender_pre_send_wait_ms:.2f}ms "
+                    f"queue_wait_pre_wire_receive={queue_wait_pre_wire_receive_ms:.2f}ms "
+                    f"queue_wait_pre_receiver_dispatch={queue_wait_pre_receiver_dispatch_ms:.2f}ms "
+                    f"queue_wait_pre_breakdown_ready={queue_wait_pre_breakdown_ready} "
+                    f"next_sender_serialize_total={next_sender_serialize_total_ms:.2f}ms "
+                    f"next_sender_serialize_hidden={next_sender_serialize_hidden_ms:.2f}ms "
+                    f"next_sender_serialize_exposed={next_sender_serialize_exposed_ms:.2f}ms "
+                    f"next_sender_serialize_hidden_pct={next_sender_serialize_hidden_pct:.2f}% "
+                    f"decompress_on_critical_path={decompress_sum_ms:.2f}ms "
+                    f"decompress_hidden=0.00ms "
                     f"queue_wait_inter={queue_wait_inter_ms:.2f}ms "
+                    f"full_path={full_path_ms:.2f}ms "
+                    f"residual_to_full={residual_to_full_ms:.2f}ms "
                     f"total_with_pre_wait={total_with_pre_wait_ms:.2f}ms"
+                )
+                log_transport_profile_event(
+                    logger,
+                    source="server",
+                    channel="rpc_inference_mb_merge",
+                    blocks=_block_span_from_uids(requested_uids),
+                    step_id=str(step_id),
+                    batch_size=int(merged_hidden_states.shape[0]) if merged_hidden_states.ndim >= 1 else 1,
+                    stats=merge_transport_profile,
+                    extra={
+                        "expected_mb": int(accum.get('expected', 0)),
+                        "recv_mb": int(len(accum.get('results', {}))),
+                        "decompress_sum_ms": f"{decompress_sum_ms:.3f}",
+                        "deserialize_unwrap_sum_ms": f"{deserialize_unwrap_sum_ms:.3f}",
+                        "deserialize_core_sum_ms": f"{deserialize_core_sum_ms:.3f}",
+                        "phase": transport_phase,
+                        "seq_tokens": int(merged_hidden_states.shape[1]) if merged_hidden_states.ndim >= 2 else 1,
+                    },
                 )
                 # Cleanup accumulator
                 del iterate_rpc_inference._mb_accumulators[mb_accum_key]
@@ -1235,8 +1703,10 @@ async def iterate_rpc_inference(
 
         # [MERGED] Use upstream's standard tensor unpacking for full-batch path
         deserialize_start = perf_counter()
-        flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+        with transport_profile_scope() as full_deserialize_profile:
+            flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
         deserialize_time = (perf_counter() - deserialize_start) * 1000.0
+        full_deserialize_summary = summarize_transport_profile(full_deserialize_profile)
         if args_structure is not None:
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
@@ -1286,8 +1756,16 @@ async def iterate_rpc_inference(
         
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
-        assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
-        
+        if hypo_ids.dtype != torch.int64:
+            if hypo_ids.numel() == 0:
+                logger.warning(
+                    "Coercing empty hypo_ids placeholder from "
+                    f"{hypo_ids.dtype} to torch.int64 in full-batch path"
+                )
+                hypo_ids = hypo_ids.to(dtype=torch.int64)
+            else:
+                raise AssertionError(f"hypo ids must be int64, got {hypo_ids.dtype}")
+
         # Add Cross-GPU Transfer Latency measurement
         cross_gpu_start_time = perf_counter()
         start_compute_time = perf_counter()  # Initialize compute time tracking
@@ -1385,7 +1863,7 @@ async def iterate_rpc_inference(
                             f"(preserve full spec context)"
                         )
                     if enable_cross_stage and log_mb_detail:
-                        logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled: {len(next_servers)} downstream stages")
+                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled: {len(next_servers)} downstream stages")
                     
                     async def process_microbatch_merged(mb_idx: int, mb_start: int, mb_end: int, total_mb: int):
                         """Process a single micro-batch through merged pool with GPU memory reuse."""
@@ -1492,6 +1970,17 @@ async def iterate_rpc_inference(
                         offload_wait_calls = int(kv_timing.get("offload_wait_calls", 0))
                         prefetch_launch_calls = int(kv_timing.get("prefetch_launch_calls", 0))
                         offload_launch_calls = int(kv_timing.get("offload_launch_calls", 0))
+                        offload_bytes = float(kv_timing.get("offload_bytes", 0.0))
+                        prefetch_bytes = float(kv_timing.get("prefetch_bytes", 0.0))
+                        offload_calls = int(kv_timing.get("offload_calls", 0))
+                        prefetch_calls = int(kv_timing.get("prefetch_calls", 0))
+                        staging_live_bytes = float(kv_timing.get("staging_live_bytes", 0.0))
+                        staging_peak_bytes = float(kv_timing.get("staging_peak_bytes", 0.0))
+                        active_staged_entries = int(kv_timing.get("active_staged_entries", 0))
+                        gpu_alloc_mb = float(kv_timing.get("gpu_alloc_mb", 0.0))
+                        gpu_reserved_mb = float(kv_timing.get("gpu_reserved_mb", 0.0))
+                        gpu_max_alloc_mb = float(kv_timing.get("gpu_max_alloc_mb", 0.0))
+                        async_kv_transfer = int(kv_timing.get("async_kv_transfer", 0))
                         
                         # [MBPIPE_MEM_DEBUG] End-of-micro-batch memory summary in verbose mode only.
                         if verbose_mb:
@@ -1509,6 +1998,19 @@ async def iterate_rpc_inference(
                         total_mb_time_ms = (mb_end_time - mb_start_time) * 1000
                         transfer_wait_time_ms = prefetch_wait_time_ms + offload_wait_time_ms
                         transfer_launch_time_ms = prefetch_launch_time_ms + offload_launch_time_ms
+                        pcie_total_bytes = offload_bytes + prefetch_bytes
+                        pcie_observed_ms = transfer_launch_time_ms + transfer_wait_time_ms
+                        pcie_bandwidth_mbps = _estimate_bandwidth_mbps(pcie_total_bytes, pcie_observed_ms)
+                        activation_raw_bytes = tensor_raw_nbytes(mb_out_hidden)
+                        activation_to_kv_ratio = (
+                            (activation_raw_bytes / pcie_total_bytes) if pcie_total_bytes > 0 else 0.0
+                        )
+                        pcie_hidden_tail_ms = max(0.0, compute_time_ms - transfer_wait_time_ms)
+                        pcie_overlap_cover_pct = (
+                            min(100.0, (pcie_hidden_tail_ms / compute_time_ms) * 100.0)
+                            if compute_time_ms > 0
+                            else 0.0
+                        )
                         if log_mb_detail:
                             logger.info(
                                 f"[KVCACHE_TIMING] MB{mb_idx}: compute={compute_time_ms:.2f}ms, "
@@ -1519,6 +2021,26 @@ async def iterate_rpc_inference(
                                 f"wait_total={transfer_wait_time_ms:.2f}ms, launch_total={transfer_launch_time_ms:.2f}ms, "
                                 f"total={total_mb_time_ms:.2f}ms"
                             )
+                        logger.info(
+                            f"[KVCACHE_IO] step_id={step_metadata.get('step_id', 'unknown') if isinstance(step_metadata, dict) else 'unknown'} "
+                            f"mb_idx={mb_idx} blocks={_block_span_from_uids(requested_uids)} "
+                            f"batch={mb_size} compute_ms={compute_time_ms:.2f} "
+                            f"pcie_submit_ms={transfer_launch_time_ms:.2f} "
+                            f"pcie_block_ms={transfer_wait_time_ms:.2f} "
+                            f"pcie_total_obs_ms={pcie_observed_ms:.2f} "
+                            f"offload_calls={offload_calls} prefetch_calls={prefetch_calls} "
+                            f"offload_bytes={int(offload_bytes)} prefetch_bytes={int(prefetch_bytes)} "
+                            f"pcie_bytes={int(pcie_total_bytes)} pcie_bw_mbps={pcie_bandwidth_mbps:.2f} "
+                            f"activation_raw_bytes={int(activation_raw_bytes)} "
+                            f"activation_to_kv_ratio={activation_to_kv_ratio:.4f} "
+                            f"overlap_headroom_ms={pcie_hidden_tail_ms:.2f} "
+                            f"overlap_cover_pct={pcie_overlap_cover_pct:.2f} "
+                            f"gpu_alloc_mb={gpu_alloc_mb:.2f} gpu_reserved_mb={gpu_reserved_mb:.2f} "
+                            f"gpu_max_alloc_mb={gpu_max_alloc_mb:.2f} "
+                            f"staging_live_mb={_bytes_to_mb(staging_live_bytes):.2f} "
+                            f"staging_peak_mb={_bytes_to_mb(staging_peak_bytes):.2f} "
+                            f"staged_entries={active_staged_entries} async={async_kv_transfer}"
+                        )
                         
                         # Store timing in list for later analysis
                         kv_timing_stats.append({
@@ -1531,6 +2053,20 @@ async def iterate_rpc_inference(
                             'offload_launch_ms': offload_launch_time_ms,
                             'prefetch_launch_calls': prefetch_launch_calls,
                             'offload_launch_calls': offload_launch_calls,
+                            'offload_calls': offload_calls,
+                            'prefetch_calls': prefetch_calls,
+                            'offload_bytes': offload_bytes,
+                            'prefetch_bytes': prefetch_bytes,
+                            'pcie_total_bytes': pcie_total_bytes,
+                            'pcie_observed_ms': pcie_observed_ms,
+                            'pcie_bandwidth_mbps': pcie_bandwidth_mbps,
+                            'activation_raw_bytes': activation_raw_bytes,
+                            'gpu_alloc_mb': gpu_alloc_mb,
+                            'gpu_reserved_mb': gpu_reserved_mb,
+                            'gpu_max_alloc_mb': gpu_max_alloc_mb,
+                            'staging_live_mb': _bytes_to_mb(staging_live_bytes),
+                            'staging_peak_mb': _bytes_to_mb(staging_peak_bytes),
+                            'active_staged_entries': active_staged_entries,
                             # Backward-compat aliases for existing diagnostics logic.
                             'prefetch_sync_ms': prefetch_wait_time_ms,
                             'offload_ms': offload_launch_time_ms,
@@ -1549,10 +2085,25 @@ async def iterate_rpc_inference(
                             push_metadata["micro_batch_offset"] = mb_start
                             push_metadata["micro_batch_size"] = mb_size
                             push_metadata["full_batch_size"] = batch_size
+                            push_metadata["sender_blocks"] = _block_span_from_uids(requested_uids)
                             push_metadata["total_micro_batches"] = len(micro_ranges)
                             push_metadata["stage_push_timestamp_us"] = push_timestamp_us  # For overlap analysis
                             push_metadata["stage_compute_start_timestamp_us"] = compute_start_timestamp_us  # When this MB started computing
                             push_metadata["stage_compute_end_timestamp_us"] = compute_end_timestamp_us
+                            push_metadata["kv_offload_bytes"] = int(offload_bytes)
+                            push_metadata["kv_prefetch_bytes"] = int(prefetch_bytes)
+                            push_metadata["kv_pcie_bytes"] = int(pcie_total_bytes)
+                            push_metadata["kv_pcie_submit_ms"] = round(transfer_launch_time_ms, 3)
+                            push_metadata["kv_pcie_block_ms"] = round(transfer_wait_time_ms, 3)
+                            push_metadata["kv_pcie_total_obs_ms"] = round(pcie_observed_ms, 3)
+                            push_metadata["kv_pcie_bw_mbps"] = round(pcie_bandwidth_mbps, 3)
+                            push_metadata["kv_gpu_alloc_mb"] = round(gpu_alloc_mb, 3)
+                            push_metadata["kv_gpu_reserved_mb"] = round(gpu_reserved_mb, 3)
+                            push_metadata["kv_gpu_max_alloc_mb"] = round(gpu_max_alloc_mb, 3)
+                            push_metadata["kv_staging_live_mb"] = round(_bytes_to_mb(staging_live_bytes), 3)
+                            push_metadata["kv_staging_peak_mb"] = round(_bytes_to_mb(staging_peak_bytes), 3)
+                            push_metadata["kv_staged_entries"] = int(active_staged_entries)
+                            push_metadata["activation_raw_bytes"] = int(activation_raw_bytes)
 
                             # [MBPIPE_FIX] Clone tensors before async push to avoid buffer reuse races.
                             push_hidden = mb_out_hidden.detach().clone()
@@ -1636,7 +2187,7 @@ async def iterate_rpc_inference(
                         launch_overhead_ratio = (total_launch_overhead / total_elapsed * 100) if total_elapsed > 0 else 0
                         
                         start_pos_for_log = step_metadata.get("start_from_position") if isinstance(step_metadata, dict) else "unknown"
-                        logger.debug(
+                        logger.info(
                             f"[MBPIPE_SUMMARY] step={start_pos_for_log} mb={len(kv_timing_stats)} "
                             f"compute={total_compute:.1f}ms elapsed={total_elapsed:.1f}ms "
                             f"wait={total_wait_overhead:.1f}ms({wait_overhead_ratio:.1f}%) "
@@ -1644,15 +2195,15 @@ async def iterate_rpc_inference(
                             f"efficiency={compute_efficiency:.1f}%"
                         )
                         if log_mb_detail:
-                            logger.debug(f"[MBPIPE_SUMMARY] Total prefetch wait: {total_prefetch_wait:.1f}ms ({total_prefetch_wait_calls} calls)")
-                            logger.debug(f"[MBPIPE_SUMMARY] Total offload wait: {total_offload_wait:.1f}ms ({total_offload_wait_calls} calls)")
-                            logger.debug(f"[MBPIPE_SUMMARY] Total prefetch launch: {total_prefetch_launch:.1f}ms ({total_prefetch_launch_calls} calls)")
-                            logger.debug(f"[MBPIPE_SUMMARY] Total offload launch: {total_offload_launch:.1f}ms ({total_offload_launch_calls} calls)")
+                            logger.info(f"[MBPIPE_SUMMARY] Total prefetch wait: {total_prefetch_wait:.1f}ms ({total_prefetch_wait_calls} calls)")
+                            logger.info(f"[MBPIPE_SUMMARY] Total offload wait: {total_offload_wait:.1f}ms ({total_offload_wait_calls} calls)")
+                            logger.info(f"[MBPIPE_SUMMARY] Total prefetch launch: {total_prefetch_launch:.1f}ms ({total_prefetch_launch_calls} calls)")
+                            logger.info(f"[MBPIPE_SUMMARY] Total offload launch: {total_offload_launch:.1f}ms ({total_offload_launch_calls} calls)")
                         if verbose_mb:
-                            logger.debug(f"[MBPIPE_SUMMARY] ----- Per Micro-Batch Breakdown -----")
+                            logger.info(f"[MBPIPE_SUMMARY] ----- Per Micro-Batch Breakdown -----")
                             for stat in kv_timing_stats:
                                 mb_eff = (stat['compute_ms'] / stat['total_ms'] * 100) if stat['total_ms'] > 0 else 0
-                                logger.debug(f"[MBPIPE_SUMMARY] MB{stat['mb_idx']}: "
+                                logger.info(f"[MBPIPE_SUMMARY] MB{stat['mb_idx']}: "
                                            f"compute={stat['compute_ms']:.1f}ms, "
                                            f"prefetch_wait={stat['prefetch_wait_ms']:.1f}ms({stat['prefetch_wait_calls']}), "
                                            f"offload_wait={stat['offload_wait_ms']:.1f}ms({stat['offload_wait_calls']}), "
@@ -1706,7 +2257,7 @@ async def iterate_rpc_inference(
                             f"(preserve full spec context)"
                         )
                     if enable_cross_stage:
-                        logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled (separate_pools): {len(next_servers)} downstream stages")
+                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage streaming enabled (separate_pools): {len(next_servers)} downstream stages")
                     
                     async def process_microbatch(mb_idx: int, mb_start: int, mb_end: int):
                         """Process a single micro-batch through all backends."""
@@ -1761,6 +2312,7 @@ async def iterate_rpc_inference(
                             push_metadata["micro_batch_offset"] = mb_start
                             push_metadata["micro_batch_size"] = mb_size
                             push_metadata["full_batch_size"] = batch_size
+                            push_metadata["sender_blocks"] = _block_span_from_uids(requested_uids)
                             push_metadata["total_micro_batches"] = len(micro_ranges)
                             push_metadata["stage_compute_start_timestamp_us"] = compute_start_timestamp_us
                             push_metadata["stage_compute_end_timestamp_us"] = compute_end_timestamp_us
@@ -1772,7 +2324,7 @@ async def iterate_rpc_inference(
                                 cross_stage_push_fn(push_hidden, push_keep, push_metadata)
                             )
                             cross_stage_push_tasks.append(push_task)
-                            logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
+                            logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
                         
                         return mb_hidden, mb_keep_idx
                     
@@ -1848,12 +2400,12 @@ async def iterate_rpc_inference(
                         if i > 0:
                             estimated_transfer_time = backend_total_time - task_processing_time
                             s1_to_s2_transfer_times.append(estimated_transfer_time)
-                            logger.debug(f"[S1_TO_S2_TRANSFER] Backend {i} | "
+                            logger.info(f"[S1_TO_S2_TRANSFER] Backend {i} | "
                                        f"Estimated Transfer Time: {estimated_transfer_time:.2f}ms | "
                                        f"Total Backend Time: {backend_total_time:.2f}ms | "
                                        f"Pure Processing: {task_processing_time:.2f}ms")
                         
-                        logger.debug(f"[PROCESSING_LATENCY] Backend {i} | "
+                        logger.info(f"[PROCESSING_LATENCY] Backend {i} | "
                                    f"Task Processing: {task_processing_time:.2f}ms | "
                                    f"Total Backend Time: {backend_total_time:.2f}ms | "
                                    f"Hidden States Shape: {hidden_states.shape}")
@@ -1861,7 +2413,7 @@ async def iterate_rpc_inference(
                     if s1_to_s2_transfer_times:
                         s1_to_s2_mean = sum(s1_to_s2_transfer_times) / len(s1_to_s2_transfer_times)
                         s1_to_s2_total = sum(s1_to_s2_transfer_times)
-                        logger.debug(f"[S1_TO_S2_TRANSFER_SUMMARY] "
+                        logger.info(f"[S1_TO_S2_TRANSFER_SUMMARY] "
                                    f"Average Transfer: {s1_to_s2_mean:.2f}ms | "
                                    f"Total Transfer: {s1_to_s2_total:.2f}ms | "
                                    f"Transfer Count: {len(s1_to_s2_transfer_times)}")
@@ -1869,7 +2421,7 @@ async def iterate_rpc_inference(
                     cross_gpu_end_time = perf_counter()
                     cross_gpu_latency = (cross_gpu_end_time - cross_gpu_start_time) * 1000
                     
-                    logger.debug(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
+                    logger.info(f"[CROSS_GPU_TRANSFER_LATENCY] Total: {cross_gpu_latency:.2f}ms | "
                                f"Backends: {len(requested_backends)} | "
                                f"Output Shape: {hidden_states.shape}")
             
@@ -1893,10 +2445,44 @@ async def iterate_rpc_inference(
         
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)
-        output_tensors = [
-            serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-            for result, proto in zip((hidden_states, keep_indices, need_pruning_next), nested_flatten(requested_backends[-1].outputs_schema))
-        ]
+        transport_phase = "prefill" if hidden_states.ndim >= 2 and int(hidden_states.shape[1]) > 1 else "decode"
+        output_debug_names = ("hidden_states", "keep_indices", "need_pruning_next")
+        with transport_profile_scope() as full_serialize_profile:
+            output_tensors = [
+                serialize_torch_tensor(
+                    result.to(proto.dtype),
+                    proto.compression,
+                    allow_inplace=True,
+                    debug_context={
+                        "phase": transport_phase,
+                        "tensor_name": output_debug_names[idx] if idx < len(output_debug_names) else f"output_{idx}",
+                        "source": "server",
+                        "channel": "rpc_inference_final",
+                        "blocks": _block_span_from_uids(requested_uids),
+                        "batch": int(hidden_states.shape[0]) if hidden_states.ndim >= 1 else 1,
+                    },
+                )
+                for idx, (result, proto) in enumerate(
+                    zip((hidden_states, keep_indices, need_pruning_next), nested_flatten(requested_backends[-1].outputs_schema))
+                )
+            ]
+        full_serialize_summary = summarize_transport_profile(full_serialize_profile)
+        log_comp_ratio_event(
+            logger,
+            source="server",
+            channel="rpc_inference_final",
+            blocks=_block_span_from_uids(requested_uids),
+            step_id=str(step_id_for_log),
+            batch_size=int(hidden_states.shape[0]) if hidden_states.ndim >= 1 else 1,
+            tensor_name="hidden_states",
+            raw_bytes=tensor_raw_nbytes(hidden_states),
+            wire_bytes=len(output_tensors[0].buffer) if output_tensors else 0,
+            nnz_ratio=tensor_nnz_ratio(hidden_states),
+            extra={
+                "phase": transport_phase,
+                "seq_tokens": int(hidden_states.shape[1]) if hidden_states.ndim >= 2 else 1,
+            },
+        )
         serialize_end = perf_counter()
         serialize_time = (serialize_end - serialize_start) * 1000  # ms
         # print('after serialize and send last layer outputs ', )
@@ -1942,6 +2528,13 @@ async def iterate_rpc_inference(
             f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
             f"compute_pct={compute_pct:.1f}% mem_copy_pct={comm_overhead_pct:.1f}% "
             f"data_bytes={data_bytes} bw_gpu2cpu={bw_gpu2cpu_gbps:.2f}GB/s "
+            f"cross_gpu_window={cross_gpu_receive_time:.2f}ms "
+            f"decompress={full_deserialize_summary.get('decompress_ms', 0.0):.2f}ms "
+            f"deserialize_unwrap={full_deserialize_summary.get('deserialize_unwrap_ms', 0.0):.2f}ms "
+            f"deserialize_core={full_deserialize_summary.get('deserialize_core_ms', 0.0):.2f}ms "
+            f"compress={full_serialize_summary.get('compress_ms', 0.0):.2f}ms "
+            f"serialize_wrap={full_serialize_summary.get('serialize_wrapper_ms', 0.0):.2f}ms "
+            f"serialize_core={full_serialize_summary.get('serialize_core_ms', 0.0):.2f}ms "
             f"batch={batch_size} seq_inc={token_increment} raw_seq={length_increment} is_spec_dec={int(bool(is_spec_dec))}"
         )
 
@@ -1957,23 +2550,72 @@ async def iterate_rpc_inference(
             step_metadata["_step_total_ms"] = step_total_time
             step_metadata["_batch_size"] = int(batch_size)
             step_metadata["_token_increment"] = int(token_increment)
+        log_transport_profile_event(
+            logger,
+            source="server",
+            channel="rpc_inference_final",
+            blocks=_block_span_from_uids(requested_uids),
+            step_id=str(step_id_for_log),
+            batch_size=int(batch_size),
+            stats={
+                "serialize_calls": full_serialize_summary.get("serialize_calls", 0.0),
+                "deserialize_calls": full_deserialize_summary.get("deserialize_calls", 0.0),
+                "serialize_core_ms": full_serialize_summary.get("serialize_core_ms", 0.0),
+                "deserialize_core_ms": full_deserialize_summary.get("deserialize_core_ms", 0.0),
+                "serialize_wrapper_ms": full_serialize_summary.get("serialize_wrapper_ms", 0.0),
+                "deserialize_unwrap_ms": full_deserialize_summary.get("deserialize_unwrap_ms", 0.0),
+                "compress_ms": full_serialize_summary.get("compress_ms", 0.0),
+                "decompress_ms": full_deserialize_summary.get("decompress_ms", 0.0),
+                "compress_calls": full_serialize_summary.get("compress_calls", 0.0),
+                "decompress_calls": full_deserialize_summary.get("decompress_calls", 0.0),
+                "serialize_wrapper_applied_calls": full_serialize_summary.get("serialize_wrapper_applied_calls", 0.0),
+                "deserialize_wrapper_applied_calls": full_deserialize_summary.get("deserialize_wrapper_applied_calls", 0.0),
+                "serialize_raw_bytes": full_serialize_summary.get("serialize_raw_bytes", 0.0),
+                "serialize_wire_bytes": full_serialize_summary.get("serialize_wire_bytes", 0.0),
+                "deserialize_wire_bytes": full_deserialize_summary.get("deserialize_wire_bytes", 0.0),
+                "deserialize_raw_bytes": full_deserialize_summary.get("deserialize_raw_bytes", 0.0),
+                "compress_input_bytes": full_serialize_summary.get("compress_input_bytes", 0.0),
+                "compress_output_bytes": full_serialize_summary.get("compress_output_bytes", 0.0),
+                "decompress_input_bytes": full_deserialize_summary.get("decompress_input_bytes", 0.0),
+                "decompress_output_bytes": full_deserialize_summary.get("decompress_output_bytes", 0.0),
+            },
+            extra={
+                "mode": execution_mode,
+                "phase": transport_phase,
+                "seq_tokens": int(hidden_states.shape[1]) if hidden_states.ndim >= 2 else 1,
+            },
+        )
         
         # [MBPIPE] Record stage timing for cross-stage overlap decisions
         try:
+            # Extract stage ID safely from UIDs (format: "prefix.block_idx")
             first_uid = str(requested_uids[0]) if requested_uids else "unknown"
             last_uid = str(requested_uids[-1]) if requested_uids else "unknown"
+            # Try to extract block indices
             first_idx = first_uid.split('.')[-1] if '.' in first_uid else "0"
             last_idx = last_uid.split('.')[-1] if '.' in last_uid else "0"
             stage_id = f"blocks_{first_idx}_{last_idx}"
+            # Use explicit phase metrics for stable buffer decisions.
+            stage_compute_ms = max(0.0, compute_time)
+            stage_comm_ms = max(0.0, step_total_time - stage_compute_ms)
             
             log_stage_timing(
                 logger, stage_id,
-                compute_time_ms=compute_time,
-                comm_time_ms=comm_overhead_ms,
+                compute_time_ms=stage_compute_ms,
+                comm_time_ms=stage_comm_ms,
                 component="iterate_rpc_inference"
             )
         except Exception as e:
+            # Don't let timing logging break the main flow
             logger.debug(f"{MBPIPE_LOG_PREFIX} Failed to log stage timing: {e}")
+
+        if isinstance(step_metadata, dict):
+            step_metadata["_compute_ms"] = float(compute_time)
+            step_metadata["_serialize_ms"] = float(serialize_time)
+            step_metadata["_step_total_ms"] = float(step_total_time)
+            step_metadata["_data_bytes"] = int(
+                sum(len(t.buffer) for t in output_tensors) if output_tensors is not None else 0
+            )
         
         yield output_tensors, can_push, step_metadata
         # print('output_tensors ',output_tensors)
