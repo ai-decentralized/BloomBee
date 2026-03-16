@@ -73,7 +73,6 @@ def main():
     results = [pipe_recv.recv() for _ in range(args.n_processes)]
     speeds = [r[0] for r in results]
     effective_speeds = [r[1] for r in results]
-    
     avg_speed = np.mean(speeds)
     avg_effective_throughput = np.mean(effective_speeds)
     logger.info(f"Final result: throughput={avg_speed:.2f} tokens/sec/sequence, effective_throughput={avg_effective_throughput:.2f} tokens/sec")

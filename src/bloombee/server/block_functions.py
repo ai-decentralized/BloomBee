@@ -172,14 +172,27 @@ def _unpack_inference_submit_result(result: Any) -> Tuple[torch.Tensor, Any, Opt
     """
     Backward-compatible unpack for inference_pool.submit_task():
     - legacy shape: (hidden_states, keep_indices)
-    - extended shape: (hidden_states, keep_indices, runtime_kv_timing_dict)
+    - extended shape: (hidden_states, keep_indices, runtime_timing_dict)
     """
     if not isinstance(result, (tuple, list)) or len(result) < 2:
         raise RuntimeError(f"Unexpected inference_pool result: type={type(result)}, value={result!r}")
     hidden_states = result[0]
     keep_indices = result[1]
-    runtime_kv_timing = result[2] if len(result) >= 3 and isinstance(result[2], dict) else None
-    return hidden_states, keep_indices, runtime_kv_timing
+    runtime_timing = result[2] if len(result) >= 3 and isinstance(result[2], dict) else None
+    return hidden_states, keep_indices, runtime_timing
+
+
+def _accumulate_runtime_timing(
+    total: Dict[str, float],
+    sample: Optional[Dict[str, float]],
+) -> None:
+    if not isinstance(sample, dict):
+        return
+    for key in ("t_cpu2gpu_ms", "t_gpu2cpu_ms", "input_bytes", "output_bytes"):
+        try:
+            total[key] = float(total.get(key, 0.0)) + float(sample.get(key, 0.0))
+        except Exception:
+            continue
 
 
 async def run_rpc_forward(
@@ -701,6 +714,7 @@ async def iterate_rpc_inference(
                 f"can_merge_pools={can_merge_pools}, "
                 f"prompts unpacked would be {len(prompts)} items"
             )
+            runtime_timing_total = {"t_cpu2gpu_ms": 0.0, "t_gpu2cpu_ms": 0.0, "input_bytes": 0.0, "output_bytes": 0.0}
             
             if hidden_states.numel() > 0:
                 if can_merge_pools:
@@ -743,7 +757,8 @@ async def iterate_rpc_inference(
                     submit_result = await requested_backends[0].inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                     )
-                    hidden_states, keep_indices, _ = _unpack_inference_submit_result(submit_result)
+                    hidden_states, keep_indices, runtime_timing = _unpack_inference_submit_result(submit_result)
+                    _accumulate_runtime_timing(runtime_timing_total, runtime_timing)
                     submit_time_ms = (perf_counter() - submit_start) * 1000
                     
                     # [MB_DEBUG] Log after submit_task
@@ -772,9 +787,13 @@ async def iterate_rpc_inference(
                         submit_result = await backend.inference_pool.submit_task(
                             hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                         )
-                        hidden_states, keep_indices, _ = _unpack_inference_submit_result(submit_result)
+                        hidden_states, keep_indices, runtime_timing = _unpack_inference_submit_result(submit_result)
+                        _accumulate_runtime_timing(runtime_timing_total, runtime_timing)
             
             process_time_ms = (perf_counter() - process_start_time) * 1000
+            mb_t_nic2cpu_ms = mb_deserialize_ms
+            mb_t_cpu2gpu_ms = float(runtime_timing_total.get("t_cpu2gpu_ms", 0.0))
+            mb_t_gpu2cpu_ms = float(runtime_timing_total.get("t_gpu2cpu_ms", 0.0))
             compute_done_timestamp_us = int(_time.time() * 1_000_000)
             compute_start_timestamp_us_this = int((perf_counter() - (process_time_ms / 1000)) * 1_000_000)  # Approximate
             
@@ -891,6 +910,9 @@ async def iterate_rpc_inference(
                     'queue_wait_pre_ms': 0.0,
                     'queue_wait_inter_ms': 0.0,
                     'deserialize_ms_sum': 0.0,
+                    'nic2cpu_ms_sum': 0.0,
+                    'cpu2gpu_ms_sum': 0.0,
+                    'gpu2cpu_ms_sum': 0.0,
                     'compute_ms_sum': 0.0,
                     'queue_source_counts': {},
                     'token_increment': int(token_increment),
@@ -910,13 +932,17 @@ async def iterate_rpc_inference(
             else:
                 accum['queue_wait_inter_ms'] += queue_wait_ms
             accum['deserialize_ms_sum'] += mb_deserialize_ms
+            accum['nic2cpu_ms_sum'] += mb_t_nic2cpu_ms
+            accum['cpu2gpu_ms_sum'] += mb_t_cpu2gpu_ms
+            accum['gpu2cpu_ms_sum'] += mb_t_gpu2cpu_ms
             accum['compute_ms_sum'] += process_time_ms
             accum['queue_source_counts'][queue_source] = accum['queue_source_counts'].get(queue_source, 0) + 1
             if log_mb_detail:
                 logger.info(
                     f"[STEP_TIMING_MB] step_id={step_id} mb_idx={mb_idx} "
                     f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
-                    f"deserialize={mb_deserialize_ms:.2f}ms compute={process_time_ms:.2f}ms"
+                    f"nic2cpu={mb_t_nic2cpu_ms:.2f}ms cpu2gpu={mb_t_cpu2gpu_ms:.2f}ms "
+                    f"compute={process_time_ms:.2f}ms gpu2cpu={mb_t_gpu2cpu_ms:.2f}ms"
                 )
             
             if log_mb_detail:
@@ -1157,22 +1183,39 @@ async def iterate_rpc_inference(
                 queue_wait_pre_ms = float(accum.get('queue_wait_pre_ms', 0.0))
                 queue_wait_inter_ms = float(accum.get('queue_wait_inter_ms', 0.0))
                 deserialize_sum_ms = float(accum.get('deserialize_ms_sum', 0.0))
+                nic2cpu_sum_ms = float(accum.get('nic2cpu_ms_sum', 0.0))
+                cpu2gpu_sum_ms = float(accum.get('cpu2gpu_ms_sum', 0.0))
+                gpu2cpu_sum_ms = float(accum.get('gpu2cpu_ms_sum', 0.0))
                 compute_sum_ms = float(accum.get('compute_ms_sum', 0.0))
                 merge_residual_ms = merge_total_ms - (
-                    deserialize_sum_ms + compute_sum_ms + merge_serialize_ms
+                    nic2cpu_sum_ms + cpu2gpu_sum_ms + compute_sum_ms + gpu2cpu_sum_ms + merge_serialize_ms
                 )
                 total_with_pre_wait_ms = merge_total_ms + queue_wait_pre_ms
                 queue_source_counts = accum.get("queue_source_counts", {})
                 queue_source_stats = ",".join(
                     f"{k}:{v}" for k, v in sorted(queue_source_counts.items())
                 ) or "unknown:0"
+                data_bytes = merged_hidden_states.nelement() * merged_hidden_states.element_size()
+                accum["step_metadata"]["_t_nic2cpu_ms"] = nic2cpu_sum_ms
+                accum["step_metadata"]["_t_cpu2gpu_ms"] = cpu2gpu_sum_ms
+                accum["step_metadata"]["_t_gpu2cpu_ms"] = gpu2cpu_sum_ms
+                accum["step_metadata"]["_serialize_ms"] = gpu2cpu_sum_ms
+                accum["step_metadata"]["_cpu_serialize_ms"] = merge_serialize_ms
+                accum["step_metadata"]["_compute_ms"] = compute_sum_ms
+                accum["step_metadata"]["_data_bytes"] = data_bytes
+                accum["step_metadata"]["_step_total_ms"] = merge_total_ms
+                accum["step_metadata"]["_batch_size"] = int(accum.get("full_batch_size", merged_hidden_states.shape[0]))
+                accum["step_metadata"]["_token_increment"] = int(accum.get("token_increment", 0))
                 logger.info(
                     f"[STEP_TIMING_BREAKDOWN_MB] step_id={step_id} mode=micro_batch "
                     f"expected_mb={accum.get('expected', 0)} recv_mb={len(accum.get('results', {}))} "
                     f"queue_wait_sum={queue_wait_sum_ms:.2f}ms "
                     f"deserialize_sum={deserialize_sum_ms:.2f}ms "
+                    f"nic2cpu_sum={nic2cpu_sum_ms:.2f}ms "
+                    f"cpu2gpu_sum={cpu2gpu_sum_ms:.2f}ms "
                     f"compute_sum={compute_sum_ms:.2f}ms "
-                    f"serialize={merge_serialize_ms:.2f}ms "
+                    f"gpu2cpu_sum={gpu2cpu_sum_ms:.2f}ms "
+                    f"serialize_cpu={merge_serialize_ms:.2f}ms "
                     f"residual={merge_residual_ms:.2f}ms "
                     f"total={merge_total_ms:.2f}ms "
                     f"queue_sources={queue_source_stats} "
@@ -1250,6 +1293,7 @@ async def iterate_rpc_inference(
         start_compute_time = perf_counter()  # Initialize compute time tracking
         compute_time = 0.0
         execution_mode = "unknown"
+        runtime_timing_total = {"t_cpu2gpu_ms": 0.0, "t_gpu2cpu_ms": 0.0, "input_bytes": 0.0, "output_bytes": 0.0}
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
@@ -1423,6 +1467,7 @@ async def iterate_rpc_inference(
                             mb_hidden, mb_hypo, mb_inference_infos, *prompts, priority=priority
                         )
                         mb_out_hidden, mb_out_keep, runtime_kv_timing = _unpack_inference_submit_result(submit_result)
+                        _accumulate_runtime_timing(runtime_timing_total, runtime_kv_timing)
                         compute_time_ms = (_perf_counter() - compute_start) * 1000
                         
                         mb_end_time = _perf_counter()
@@ -1627,7 +1672,8 @@ async def iterate_rpc_inference(
                     submit_result = await requested_backends[0].inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
                     )
-                    hidden_states, keep_indices, _ = _unpack_inference_submit_result(submit_result)
+                    hidden_states, keep_indices, runtime_timing = _unpack_inference_submit_result(submit_result)
+                    _accumulate_runtime_timing(runtime_timing_total, runtime_timing)
                 
             else:
                 # Separate pools path: process backends one by one
@@ -1700,7 +1746,8 @@ async def iterate_rpc_inference(
                             submit_result = await backend.inference_pool.submit_task(
                                 mb_hidden, mb_hypo, inference_info, prompt, priority=priority
                             )
-                            mb_hidden, mb_keep_idx, _ = _unpack_inference_submit_result(submit_result)
+                            mb_hidden, mb_keep_idx, runtime_timing = _unpack_inference_submit_result(submit_result)
+                            _accumulate_runtime_timing(runtime_timing_total, runtime_timing)
                         
                         mb_end_time = _perf_counter()
                         mb_timings.append((mb_idx, mb_start_time, mb_end_time))
@@ -1788,7 +1835,8 @@ async def iterate_rpc_inference(
                         submit_result = await backend.inference_pool.submit_task(
                             hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                         )
-                        hidden_states, keep_indices, _ = _unpack_inference_submit_result(submit_result)
+                        hidden_states, keep_indices, runtime_timing = _unpack_inference_submit_result(submit_result)
+                        _accumulate_runtime_timing(runtime_timing_total, runtime_timing)
                         task_end_time = perf_counter()
                         task_processing_time = (task_end_time - task_start_time) * 1000
                         
@@ -1869,23 +1917,28 @@ async def iterate_rpc_inference(
         # Calculate total step time
         step_end_time = perf_counter()
         step_total_time = (step_end_time - step_receive_time) * 1000  # ms
-        step_residual_ms = step_total_time - (deserialize_time + compute_time + serialize_time)
+        t_nic2cpu_ms = deserialize_time
+        t_cpu2gpu_ms = float(runtime_timing_total.get("t_cpu2gpu_ms", 0.0))
+        t_gpu2cpu_ms = float(runtime_timing_total.get("t_gpu2cpu_ms", 0.0))
+        cpu_serialize_ms = serialize_time
+        step_residual_ms = step_total_time - (
+            t_nic2cpu_ms + t_cpu2gpu_ms + compute_time + t_gpu2cpu_ms + cpu_serialize_ms
+        )
         step_total_with_queue_ms = step_total_time + queue_wait_ms
 
         # Critical path analysis: compute vs communication ratio
-        t_gpu2cpu_ms = serialize_time
-        t_cpu2gpu_ms = deserialize_time
         data_bytes = hidden_states.nelement() * hidden_states.element_size()
         compute_pct = (compute_time / step_total_time * 100) if step_total_time > 0 else 0.0
-        comm_overhead_ms = t_gpu2cpu_ms + t_cpu2gpu_ms
+        comm_overhead_ms = t_nic2cpu_ms + t_cpu2gpu_ms + t_gpu2cpu_ms
         comm_overhead_pct = (comm_overhead_ms / step_total_time * 100) if step_total_time > 0 else 0.0
         bw_gpu2cpu_gbps = (data_bytes / (t_gpu2cpu_ms / 1000) / 1e9) if t_gpu2cpu_ms > 0 else 0.0
 
         logger.info(
             f"[STEP_TIMING_BREAKDOWN] step_id={step_id_for_log} mode={execution_mode} "
             f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
-            f"t_cpu2gpu={t_cpu2gpu_ms:.2f}ms compute={compute_time:.2f}ms "
-            f"t_gpu2cpu={t_gpu2cpu_ms:.2f}ms residual={step_residual_ms:.2f}ms "
+            f"t_nic2cpu={t_nic2cpu_ms:.2f}ms t_cpu2gpu={t_cpu2gpu_ms:.2f}ms "
+            f"compute={compute_time:.2f}ms t_gpu2cpu={t_gpu2cpu_ms:.2f}ms "
+            f"serialize_cpu={cpu_serialize_ms:.2f}ms residual={step_residual_ms:.2f}ms "
             f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
             f"compute_pct={compute_pct:.1f}% mem_copy_pct={comm_overhead_pct:.1f}% "
             f"data_bytes={data_bytes} bw_gpu2cpu={bw_gpu2cpu_gbps:.2f}GB/s "
@@ -1894,10 +1947,16 @@ async def iterate_rpc_inference(
 
         # Pass timing data to handler for [COMM_BREAKDOWN] log
         if isinstance(step_metadata, dict):
+            step_metadata["_t_nic2cpu_ms"] = t_nic2cpu_ms
+            step_metadata["_t_cpu2gpu_ms"] = t_cpu2gpu_ms
+            step_metadata["_t_gpu2cpu_ms"] = t_gpu2cpu_ms
             step_metadata["_serialize_ms"] = t_gpu2cpu_ms
+            step_metadata["_cpu_serialize_ms"] = cpu_serialize_ms
             step_metadata["_compute_ms"] = compute_time
             step_metadata["_data_bytes"] = data_bytes
             step_metadata["_step_total_ms"] = step_total_time
+            step_metadata["_batch_size"] = int(batch_size)
+            step_metadata["_token_increment"] = int(token_increment)
         
         # [MBPIPE] Record stage timing for cross-stage overlap decisions
         try:
