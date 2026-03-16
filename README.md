@@ -115,46 +115,9 @@ pip install bloombee
 
 #### From Source
 ```bash
-git clone https://github.com/JiuChen0/BloomBee.git
+git clone https://github.com/ai-decentralized/BloomBee.git
 cd BloomBee
 pip install .
-```
-
-#### With Docker
-Build the image once, push it to Docker Hub, and reuse it for every cloud pod:
-
-```bash
-docker build -t <dockerhub-user>/bloombee:latest .
-docker push <dockerhub-user>/bloombee:latest
-```
-
-This repository also includes a GitHub Actions workflow at `.github/workflows/docker-image.yml` that can publish `linux/amd64` images to Docker Hub automatically after each push to `main` once `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` are configured as repository secrets. If you want to publish to an organization or a different repository name, set the optional `DOCKERHUB_REPOSITORY` repository variable (for example, `jiuchen0/bloombee`).
-
-This Docker image is tailored for Yotta Pods. It extends Yotta's official PyTorch image so SSH and Jupyter are already wired up when the pod starts, creates a conda environment named `bb` with Python 3.10, keeps the `.git` history inside the container for normal git workflows, and preinstalls BloomBee in editable mode at `/home/user/BloomBee` so you can SSH in and develop immediately. A startup wrapper also fixes ownership for `/home/user` and common editor directories on every boot, which helps Cursor, VS Code Remote SSH, user-local pip installs, and other dev tools work without manual `chown`.
-
-When launching a pod from Docker Hub:
-- Use `Public Image` if your Docker Hub repository is public. `Private Image` requires Docker Hub credentials in the platform UI.
-- Set the image to `<dockerhub-user>/bloombee:latest`.
-- Do not override the container start command on Yotta Pods; let the base image start SSH and Jupyter for you.
-- Set `JUPYTER_PASSWORD` in the platform UI to your own password. The image includes a default for first boot, but overriding it is strongly recommended.
-- Expose ports `22` and `8888` for SSH and Jupyter, and add `31340/tcp` if the pod will run a DHT/bootstrap node or worker.
-- After SSH login, your working tree is already available at `/home/user/BloomBee`, and the `bb` conda environment is activated automatically.
-
-Example init command for a bootstrap node:
-
-```bash
-python -m bloombee.cli.run_dht \
-  --host_maddrs /ip4/0.0.0.0/tcp/31340 \
-  --identity_path /cache/bootstrap.id
-```
-
-Example init command for a worker:
-
-```bash
-python -m bloombee.cli.run_server meta-llama/Llama-2-7b-hf \
-  --initial_peers /ip4/YOUR_IP/tcp/31340/p2p/YOUR_PEER_ID \
-  --num_blocks 16 \
-  --identity_path /cache/worker.id
 ```
 
 ---
