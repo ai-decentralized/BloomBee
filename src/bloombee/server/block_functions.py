@@ -1761,9 +1761,9 @@ async def iterate_rpc_inference(
             step_metadata["is_spec_dec"] = False
             step_metadata["need_pruning"] = False
             
-        logger.info(f"hidden_states: {hidden_states.shape}")
-        logger.info(f"keep_indices: {keep_indices.shape}")
-        logger.info(f"draft_tokens: {draft_tokens.shape}")
+        # logger.info(f"hidden_states: {hidden_states.shape}")
+        # logger.info(f"keep_indices: {keep_indices.shape}")
+        # logger.info(f"draft_tokens: {draft_tokens.shape}")
             
         if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])

@@ -42,7 +42,7 @@ def _patch_hivemind_cleanup() -> None:
     hivemind_p2p_daemon.cancel_task_if_running = _safe_cancel_task_if_running
 
 
-_patch_hivemind_cleanup()
+# _patch_hivemind_cleanup()
 
 __all__ = [
     "BatchTensorDescriptor",
