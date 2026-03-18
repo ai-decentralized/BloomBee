@@ -15,6 +15,7 @@ from transformers import PretrainedConfig
 from pynvml import *
 from bloombee.utils.debug import dprint
 from bloombee.utils.memory_usage import see_memory_usage, log_mem
+from bloombee.server.flexgen_tensor_parallel import FlexgenLlamaTensorParallel
 from bloombee.server.tensor_parallel import LlamaTensorParallelAdapter
 
 logger = get_logger(__name__)
@@ -293,6 +294,32 @@ def make_tensor_parallel(
     policy=None,
 ) -> nn.Module:
     if model_config.model_type == "llama":
+        num_kv_heads = getattr(model_config, "num_key_value_heads", model_config.num_attention_heads)
+        can_use_flexgen_native = (
+            hasattr(block, "env")
+            and hasattr(block, "path")
+            and num_kv_heads == model_config.num_attention_heads
+            and model_config.num_attention_heads % len(devices) == 0
+            and model_config.intermediate_size % len(devices) == 0
+        )
+        if can_use_flexgen_native:
+            return FlexgenLlamaTensorParallel(
+                block,
+                model_config,
+                devices,
+                output_device,
+                policy=policy,
+            )
+
+        if len(devices) > 1:
+            logger.warning(
+                "Falling back to HF-based LLaMA TP because FlexGen-native TP is unavailable for this config "
+                "(num_attention_heads=%s, num_key_value_heads=%s, intermediate_size=%s, tp_world_size=%s)",
+                model_config.num_attention_heads,
+                num_kv_heads,
+                model_config.intermediate_size,
+                len(devices),
+            )
         tp_block = tp.TensorParallel(block, devices, config=None, output_device=output_device, delay_init=True)
         return LlamaTensorParallelAdapter(
             tp_block,

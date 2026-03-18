@@ -138,7 +138,16 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
 
 
 class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
-    def __init__(self, config: LlamaConfig, layer_id: int, env: ExecutionEnv, policy: Policy, weight_home: array_1d, path: str):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_id: int,
+        env: ExecutionEnv,
+        policy: Policy,
+        weight_home: array_1d,
+        path: str,
+        skip_init_weights: bool = False,
+    ):
         nn.Module.__init__(self)
         self.layer_id = layer_id
         self.config = config
@@ -225,9 +234,11 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         self._cached_output_ids_shape = None
         self._output_ids_prompt_initialized = False
 
-        # log_mem(f"[LlamaDecoderLayer:{self.layer_id}] before init_all_weights")
-        self.init_all_weights()
-        # log_mem(f"[LlamaDecoderLayer:{self.layer_id}] after init_all_weights")
+        self.weight_home = array_1d(self.num_layers, ValueHolder)
+        if not skip_init_weights:
+            # log_mem(f"[LlamaDecoderLayer:{self.layer_id}] before init_all_weights")
+            self.init_all_weights()
+            # log_mem(f"[LlamaDecoderLayer:{self.layer_id}] after init_all_weights")
 
         self.temp_hidden = ValueHolder()
         

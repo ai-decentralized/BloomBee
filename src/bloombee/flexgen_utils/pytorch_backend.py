@@ -656,8 +656,12 @@ class TorchDevice:
             w_v = w_v.device.decompress(w_v)
             w_out = w_out.device.decompress(w_out)
             
-        bsz, q_len, h = hidden_states.shape
-        head_dim = h // num_attention_heads
+        bsz, q_len, hidden_size = hidden_states.shape
+        qkv_hidden_size = w_q.shape[0]
+        assert qkv_hidden_size % num_attention_heads == 0, (
+            f"q_proj rows={qkv_hidden_size} must be divisible by num_attention_heads={num_attention_heads}"
+        )
+        head_dim = qkv_hidden_size // num_attention_heads
         
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
@@ -692,7 +696,7 @@ class TorchDevice:
         
         attn_weights = attn_weights.view(bsz * num_attention_heads, q_len, q_len)
         value = torch.bmm(attn_weights, v).view(bsz, num_attention_heads, q_len, head_dim)
-        value = value.transpose(1, 2).reshape(bsz, q_len, h)
+        value = value.transpose(1, 2).reshape(bsz, q_len, qkv_hidden_size)
 
         value = F.linear(value, w_out.data)
         value.add_(hidden_states.data)
@@ -723,9 +727,13 @@ class TorchDevice:
             w_v = w_v.device.decompress(w_v)
             w_out = w_out.device.decompress(w_out)
             
-        b, tgt_s, h = inputs.shape
+        b, tgt_s, hidden_size = inputs.shape
         src_s = attention_mask.shape[-1]
-        head_dim = h // n_head
+        qkv_hidden_size = w_q.shape[0]
+        assert qkv_hidden_size % n_head == 0, (
+            f"q_proj rows={qkv_hidden_size} must be divisible by n_head={n_head}"
+        )
+        head_dim = qkv_hidden_size // n_head
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
 
@@ -858,7 +866,7 @@ class TorchDevice:
                 n_head, head_dim)
 
         # shape: (b, 1, h)
-        value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, h)
+        value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, qkv_hidden_size)
         
         value = F.linear(value, w_out.data)
 

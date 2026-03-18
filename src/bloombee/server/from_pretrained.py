@@ -9,7 +9,7 @@ If necessary, one can rewrite this to implement a different behavior, such as:
 import json
 import time
 from contextlib import suppress
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Sequence, Union
 
 import safetensors
 import torch
@@ -66,6 +66,7 @@ def load_pretrained_block(
     token: Optional[Union[str, bool]] = None,
     cache_dir: Optional[str] = None,
     max_disk_space: Optional[int] = None,
+    tensor_parallel_devices: Optional[Sequence[torch.device]] = None,
     force_hf_llama: bool = False,
 ) -> nn.Module:
     if config is None:
@@ -76,10 +77,33 @@ def load_pretrained_block(
     assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
     torch_dtype = resolve_block_dtype(config, torch_dtype)
 
+    use_native_flexgen_llama_tp = (
+        getattr(config, "model_type", None) == "llama"
+        and tensor_parallel_devices is not None
+        and len(tensor_parallel_devices) > 1
+        and not force_hf_llama
+    )
+
     # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral)
     _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock) or force_hf_llama
 
-    if _is_hf_model:
+    if use_native_flexgen_llama_tp:
+        with init_empty_weights():
+            logger.info(
+                "Preparing FlexGen-native LLaMA TP block template for layer %s across %s devices",
+                block_index,
+                len(tensor_parallel_devices),
+            )
+            block = config.block_class(
+                config,
+                block_index,
+                env,
+                policy,
+                weight_home,
+                path,
+                skip_init_weights=True,
+            )
+    elif _is_hf_model:
         # For HF-based models: create block normally (weights on CPU) then load state dict
         if force_hf_llama and getattr(config, "model_type", None) == "llama":
             block = LlamaDecoderLayer(config, layer_idx=block_index)
