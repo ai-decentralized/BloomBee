@@ -27,6 +27,7 @@ from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, Mod
 from bloombee.server.backend import TransformerBackend
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
+from bloombee.server.microbatch import resolve_expected_num_microbatches
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.utils.hivemind_compat import DHT, MSGPackSerializer, P2PContext, PeerID, nested_flatten, nested_pack
 from bloombee.utils.convert_block import QuantType
@@ -897,11 +898,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                         is_spec_request = False
                 if is_spec_request and not self._speculative_pruner_enabled:
                     logger.info(
-                        f"{MBPIPE_LOG_PREFIX} Speculative decoding requested but disabled on this server; "
-                        f"falling back to normal decode for session_id={session_id}"
+                        f"{MBPIPE_LOG_PREFIX} Speculative decoding requested without an active pruner; "
+                        f"continuing without branch pruning for session_id={session_id}"
                     )
-                    is_spec_request = False
-                    metadata["is_spec_dec"] = False
                     metadata["need_pruning"] = False
                 if not requested_uids:
                     raise ValueError("User must specify at least one block for inference, but got none")
@@ -1805,14 +1804,10 @@ class TransformerConnectionHandler(ConnectionHandler):
         receive_us = self._now_us()
         
         # Use total_micro_batches from metadata if available, otherwise calculate
-        expected_num_mb = metadata.get("total_micro_batches")
-        if expected_num_mb is None:
-            micro_batch_size_config = get_micro_batch_size()
-            if micro_batch_size_config > 0:
-                expected_num_mb = (full_batch_size + micro_batch_size_config - 1) // micro_batch_size_config
-            else:
-                # Safety fallback: if micro-batching is disabled/misconfigured, treat as a single chunk.
-                expected_num_mb = 1
+        expected_num_mb = resolve_expected_num_microbatches(
+            full_batch_size,
+            total_micro_batches=metadata.get("total_micro_batches"),
+        )
         
         mb_key = (session_id, step_id)
         

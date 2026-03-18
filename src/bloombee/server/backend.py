@@ -307,10 +307,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # mode can get stuck after the first request served by this backend.
                 self._need_pruning = _flag_to_bool(inference_info.need_pruning)
                 requested_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
-                self._is_spec_decoding = requested_spec_decoding and self.pruner_manager is not None
-                if requested_spec_decoding and not self._is_spec_decoding:
+                self._is_spec_decoding = requested_spec_decoding
+                if self._need_pruning and self.pruner_manager is None:
                     logger.debug(
-                        "%s speculative decoding requested but pruner is disabled; using normal decode path",
+                        "%s speculative decoding requested without an active pruner; pruning is disabled",
                         self.name,
                     )
                     self._need_pruning = False

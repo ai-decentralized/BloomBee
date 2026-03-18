@@ -21,7 +21,7 @@ Usage:
     3. After inference:
        Copy the activation files from server and run compression benchmark:
        
-       python benchmarks/benchmark_compression.py --input_dir /tmp/real_activations
+       python benchmarks/compression/benchmark_compression.py --input_dir /tmp/real_activations
 """
 
 import os

@@ -35,7 +35,6 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_CLOCK_SYNC_LOG_EVERY` | `64` | Clock sync logging interval. |
 | `BLOOMBEE_S2S_STATS_WINDOW` | `32` | Rolling window size for server-to-server telemetry. |
 | `BLOOMBEE_S2S_STATS_LOG_EVERY` | `8` | How often S2S telemetry summaries are logged. |
-| `BLOOMBEE_ENABLE_SPECULATIVE_PRUNER` | `0` | Enables the speculative pruner manager. Default is off in the current main branch. |
 
 ## KV Cache and Offload
 

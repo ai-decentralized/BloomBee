@@ -12,8 +12,14 @@ from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 from hivemind.utils.nested import nested_flatten
 
-from bloombee.data_structures import Handle, InferenceMetadata
+from bloombee.data_structures import Handle
 from bloombee.server.backend import TransformerBackend
+from bloombee.server.microbatch import (
+    build_cross_stage_push_metadata,
+    build_inference_metadata,
+    build_inference_metadata_batch,
+    slice_microbatch_inputs,
+)
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
@@ -192,27 +198,6 @@ def _effective_token_increment(
     if kv_cache_position_ids.numel() == 0:
         return 0
     return int(kv_cache_position_ids[0].numel())
-
-
-def _slice_batch_aligned(
-    value: Any,
-    mb_start: int,
-    mb_end: int,
-    full_batch_size: int,
-) -> Any:
-    """
-    Slice tensor-like request fields only if they are batch-aligned.
-    Non-tensor / scalar / already-global fields are returned as-is.
-    """
-    if value is None or not torch.is_tensor(value):
-        return value
-    if is_dummy(value):
-        return value
-    if value.ndim == 0:
-        return value
-    if value.shape[0] == full_batch_size:
-        return value[mb_start:mb_end].contiguous()
-    return value
 
 
 def _unpack_inference_submit_result(result: Any) -> Tuple[torch.Tensor, Any, Optional[Dict[str, float]]]:
@@ -711,9 +696,6 @@ async def iterate_rpc_inference(
             # Seed a per-step context explicitly so schema fallback does not emit warnings.
             if not request_context.is_initialized:
                 spec_from_metadata = _as_python_bool(step_metadata.get("is_spec_dec", 0))
-                if spec_from_metadata and not spec_pruner_enabled:
-                    spec_from_metadata = False
-                    step_metadata["is_spec_dec"] = False
                 pruning_from_metadata = _as_python_bool(step_metadata.get("need_pruning", 0))
                 if pruning_from_metadata and not spec_pruner_enabled:
                     pruning_from_metadata = False
@@ -811,21 +793,21 @@ async def iterate_rpc_inference(
             if hidden_states.numel() > 0:
                 if can_merge_pools:
                     # Use merged pool for this micro-batch
-                    inference_infos = tuple(
-                        InferenceMetadata(
-                            uid, prefix_length, tuple(handles), active_adapter,
-                            tree_attention_mask=tree_attention_mask,
-                            kv_cache_position_ids=kv_cache_position_ids,
-                            draft_tokens=draft_tokens,
-                            prefill_length=prefill_length,
-                            keep_indices=keep_indices,
-                            need_pruning=need_pruning,
-                            is_spec_dec=is_spec_dec,
-                            batch_offset=mb_offset,
-                            full_batch_size=full_batch_size,
-                            micro_batch_size=mb_size
-                        )
-                        for uid, handles in zip(requested_uids, cache_handles)
+                    inference_infos = build_inference_metadata_batch(
+                        requested_uids,
+                        cache_handles,
+                        prefix_length,
+                        active_adapter,
+                        tree_attention_mask=tree_attention_mask,
+                        kv_cache_position_ids=kv_cache_position_ids,
+                        draft_tokens=draft_tokens,
+                        prefill_length=prefill_length,
+                        keep_indices=keep_indices,
+                        need_pruning=need_pruning,
+                        is_spec_dec=is_spec_dec,
+                        batch_offset=mb_offset,
+                        full_batch_size=full_batch_size,
+                        micro_batch_size=mb_size,
                     )
                     # [MB_DEBUG] Log InferenceMetadata details
                     logger.debug(f"[MB_DEBUG] === INFERENCE METADATA ===")
@@ -863,8 +845,11 @@ async def iterate_rpc_inference(
                     for backend, uid, handles, prompt in zip(
                         requested_backends, requested_uids, cache_handles, prompts
                     ):
-                        inference_infos = (InferenceMetadata(
-                            uid, prefix_length, tuple(handles), active_adapter,
+                        inference_infos = (build_inference_metadata(
+                            uid,
+                            handles,
+                            prefix_length,
+                            active_adapter,
                             tree_attention_mask=tree_attention_mask,
                             kv_cache_position_ids=kv_cache_position_ids,
                             draft_tokens=draft_tokens,
@@ -874,7 +859,7 @@ async def iterate_rpc_inference(
                             is_spec_dec=is_spec_dec,
                             batch_offset=mb_offset,
                             full_batch_size=full_batch_size,
-                            micro_batch_size=mb_size
+                            micro_batch_size=mb_size,
                         ),)
                         submit_result = await backend.inference_pool.submit_task(
                             hidden_states, hypo_ids, inference_infos, prompt, priority=priority
@@ -955,19 +940,20 @@ async def iterate_rpc_inference(
             if cross_stage_push_fn is not None and next_servers is not None:
                 import asyncio
                 push_timestamp_us = int(_time.time() * 1_000_000)
-                
-                push_metadata = step_metadata.copy()
-                push_metadata["micro_batch_idx"] = mb_idx
-                push_metadata["micro_batch_offset"] = mb_offset
-                push_metadata["micro_batch_size"] = mb_size
-                push_metadata["full_batch_size"] = full_batch_size
-                push_metadata["sender_blocks"] = _block_span_from_uids(requested_uids)
-                push_metadata["total_micro_batches"] = expected_num_mb
-                push_metadata["stage_push_timestamp_us"] = push_timestamp_us
                 compute_start_abs_us = compute_done_timestamp_us - int(process_time_ms * 1000)
-                push_metadata["stage_compute_start_timestamp_us"] = compute_start_abs_us
-                push_metadata["stage_compute_end_timestamp_us"] = compute_done_timestamp_us
-                push_metadata["is_streaming_decode"] = True  # Mark as streaming decode
+                push_metadata = build_cross_stage_push_metadata(
+                    step_metadata,
+                    mb_idx=mb_idx,
+                    mb_offset=mb_offset,
+                    mb_size=mb_size,
+                    full_batch_size=full_batch_size,
+                    sender_blocks=_block_span_from_uids(requested_uids),
+                    total_micro_batches=expected_num_mb,
+                    compute_start_timestamp_us=compute_start_abs_us,
+                    compute_end_timestamp_us=compute_done_timestamp_us,
+                    push_timestamp_us=push_timestamp_us,
+                    extra_fields={"is_streaming_decode": True},
+                )
                 
                 # [MBPIPE_FIX] Clone tensors before fire-and-forget async push.
                 # Without cloning, underlying buffers may be mutated/reused before serialization finishes.
@@ -1751,14 +1737,12 @@ async def iterate_rpc_inference(
             )
         if not need_pruning and _as_python_bool(step_metadata.get("need_pruning", 0)):
             need_pruning = True
-        if is_spec_dec and not spec_pruner_enabled:
+        if need_pruning and not spec_pruner_enabled:
             logger.info(
-                f"{MBPIPE_LOG_PREFIX} Speculative decoding disabled; "
-                f"using normal decode path for step_id={step_metadata.get('step_id')}"
+                f"{MBPIPE_LOG_PREFIX} Speculative decoding requested without an active pruner; "
+                f"skipping branch pruning for step_id={step_metadata.get('step_id')}"
             )
-            is_spec_dec = False
             need_pruning = False
-            step_metadata["is_spec_dec"] = False
             step_metadata["need_pruning"] = False
             
         # logger.info(f"hidden_states: {hidden_states.shape}")
@@ -1887,7 +1871,19 @@ async def iterate_rpc_inference(
                         """Process a single micro-batch through merged pool with GPU memory reuse."""
                         mb_start_time = _perf_counter()
                         
-                        mb_size = mb_end - mb_start
+                        mb_inputs = slice_microbatch_inputs(
+                            hidden_states,
+                            hypo_ids,
+                            tree_attention_mask,
+                            kv_cache_position_ids,
+                            draft_tokens,
+                            prefill_length,
+                            keep_indices,
+                            mb_start=mb_start,
+                            mb_end=mb_end,
+                            full_batch_size=batch_size,
+                        )
+                        mb_size = mb_inputs.micro_batch_size
                         
                         # [MBPIPE_MEM_DEBUG] Log memory only in verbose mode to reduce noise.
                         if verbose_mb:
@@ -1908,14 +1904,6 @@ async def iterate_rpc_inference(
                         if log_mb_detail:
                             logger.info(f"[CROSS_STAGE] Stage starts MB{mb_idx} compute at t={compute_start_timestamp_us}")
                         
-                        mb_hidden = hidden_states[mb_start:mb_end].clone()
-                        mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
-                        mb_tree_mask = _slice_batch_aligned(tree_attention_mask, mb_start, mb_end, batch_size)
-                        mb_kv_position_ids = kv_cache_position_ids
-                        mb_draft_tokens = _slice_batch_aligned(draft_tokens, mb_start, mb_end, batch_size)
-                        mb_prefill_length = _slice_batch_aligned(prefill_length, mb_start, mb_end, batch_size)
-                        mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
-                        
                         # [MBPIPE_MULTIPLEX] GPU Memory Multiplexing Mode:
                         # When micro-batching is enabled, GPU cache is sized for micro_batch_size only.
                         # All micro-batches REUSE the same GPU cache slots (offset=0).
@@ -1926,7 +1914,7 @@ async def iterate_rpc_inference(
                         # - Each micro-batch writes to offset=0 (not mb_start)
                         # - offload() saves data to CPU after compute
                         # - prefetch() loads data from CPU before compute
-                        from bloombee.utils.microbatch_config import is_microbatch_enabled, get_micro_batch_size
+                        from bloombee.utils.microbatch_config import is_microbatch_enabled
                         
                         # [MBPIPE_FIX] Always pass logical offsets to cache manager
                         # The cache manager will detect if we are in Multiplexing Mode (cache_size == mb_size)
@@ -1934,7 +1922,7 @@ async def iterate_rpc_inference(
                         #
                         # Previously, we forced offset=0 here, which broke Legacy Mode where the cache 
                         # is large enough for the full batch.
-                        cache_batch_offset = mb_start
+                        cache_batch_offset = mb_inputs.batch_offset
                         cache_full_batch_size = batch_size
                         
                         if is_microbatch_enabled() and total_mb > 1:
@@ -1942,25 +1930,31 @@ async def iterate_rpc_inference(
                         else:
                             logger.debug(f"[MBPIPE_DEBUG] MB{mb_idx}: Legacy/Single mode, cache_batch_offset={cache_batch_offset}")
                         
-                        mb_inference_infos = tuple(
-                            InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter,
-                                tree_attention_mask=mb_tree_mask,
-                                kv_cache_position_ids=mb_kv_position_ids,
-                                draft_tokens=mb_draft_tokens,
-                                prefill_length=mb_prefill_length,
-                                keep_indices=mb_keep_idx,
-                                need_pruning=need_pruning,
-                                is_spec_dec=is_spec_dec,
-                                batch_offset=cache_batch_offset,
-                                full_batch_size=cache_full_batch_size,
-                                micro_batch_size=mb_size)
-                            for uid, handles in zip(requested_uids, cache_handles)
+                        mb_inference_infos = build_inference_metadata_batch(
+                            requested_uids,
+                            cache_handles,
+                            prefix_length,
+                            active_adapter,
+                            tree_attention_mask=mb_inputs.tree_attention_mask,
+                            kv_cache_position_ids=mb_inputs.kv_cache_position_ids,
+                            draft_tokens=mb_inputs.draft_tokens,
+                            prefill_length=mb_inputs.prefill_length,
+                            keep_indices=mb_inputs.keep_indices,
+                            need_pruning=need_pruning,
+                            is_spec_dec=is_spec_dec,
+                            batch_offset=cache_batch_offset,
+                            full_batch_size=cache_full_batch_size,
+                            micro_batch_size=mb_size,
                         )
                         
                         # [KVCACHE_OFFLOAD] STEP 2: Compute - forward pass through model
                         compute_start = _perf_counter()
                         submit_result = await requested_backends[0].inference_pool.submit_task(
-                            mb_hidden, mb_hypo, mb_inference_infos, *prompts, priority=priority
+                            mb_inputs.hidden_states,
+                            mb_inputs.hypo_ids,
+                            mb_inference_infos,
+                            *prompts,
+                            priority=priority,
                         )
                         mb_out_hidden, mb_out_keep, runtime_kv_timing = _unpack_inference_submit_result(submit_result)
                         _accumulate_runtime_timing(runtime_timing_total, runtime_kv_timing)
@@ -2098,30 +2092,34 @@ async def iterate_rpc_inference(
                         if enable_cross_stage:
                             compute_end_timestamp_us = int(_time.time() * 1_000_000)
                             push_timestamp_us = int(_time.time() * 1_000_000)  # Absolute timestamp for cross-server correlation
-                            push_metadata = step_metadata.copy()
-                            push_metadata["micro_batch_idx"] = mb_idx
-                            push_metadata["micro_batch_offset"] = mb_start
-                            push_metadata["micro_batch_size"] = mb_size
-                            push_metadata["full_batch_size"] = batch_size
-                            push_metadata["sender_blocks"] = _block_span_from_uids(requested_uids)
-                            push_metadata["total_micro_batches"] = len(micro_ranges)
-                            push_metadata["stage_push_timestamp_us"] = push_timestamp_us  # For overlap analysis
-                            push_metadata["stage_compute_start_timestamp_us"] = compute_start_timestamp_us  # When this MB started computing
-                            push_metadata["stage_compute_end_timestamp_us"] = compute_end_timestamp_us
-                            push_metadata["kv_offload_bytes"] = int(offload_bytes)
-                            push_metadata["kv_prefetch_bytes"] = int(prefetch_bytes)
-                            push_metadata["kv_pcie_bytes"] = int(pcie_total_bytes)
-                            push_metadata["kv_pcie_submit_ms"] = round(transfer_launch_time_ms, 3)
-                            push_metadata["kv_pcie_block_ms"] = round(transfer_wait_time_ms, 3)
-                            push_metadata["kv_pcie_total_obs_ms"] = round(pcie_observed_ms, 3)
-                            push_metadata["kv_pcie_bw_mbps"] = round(pcie_bandwidth_mbps, 3)
-                            push_metadata["kv_gpu_alloc_mb"] = round(gpu_alloc_mb, 3)
-                            push_metadata["kv_gpu_reserved_mb"] = round(gpu_reserved_mb, 3)
-                            push_metadata["kv_gpu_max_alloc_mb"] = round(gpu_max_alloc_mb, 3)
-                            push_metadata["kv_staging_live_mb"] = round(_bytes_to_mb(staging_live_bytes), 3)
-                            push_metadata["kv_staging_peak_mb"] = round(_bytes_to_mb(staging_peak_bytes), 3)
-                            push_metadata["kv_staged_entries"] = int(active_staged_entries)
-                            push_metadata["activation_raw_bytes"] = int(activation_raw_bytes)
+                            push_metadata = build_cross_stage_push_metadata(
+                                step_metadata,
+                                mb_idx=mb_idx,
+                                mb_offset=mb_start,
+                                mb_size=mb_size,
+                                full_batch_size=batch_size,
+                                sender_blocks=_block_span_from_uids(requested_uids),
+                                total_micro_batches=len(micro_ranges),
+                                compute_start_timestamp_us=compute_start_timestamp_us,
+                                compute_end_timestamp_us=compute_end_timestamp_us,
+                                push_timestamp_us=push_timestamp_us,
+                                extra_fields={
+                                    "kv_offload_bytes": int(offload_bytes),
+                                    "kv_prefetch_bytes": int(prefetch_bytes),
+                                    "kv_pcie_bytes": int(pcie_total_bytes),
+                                    "kv_pcie_submit_ms": round(transfer_launch_time_ms, 3),
+                                    "kv_pcie_block_ms": round(transfer_wait_time_ms, 3),
+                                    "kv_pcie_total_obs_ms": round(pcie_observed_ms, 3),
+                                    "kv_pcie_bw_mbps": round(pcie_bandwidth_mbps, 3),
+                                    "kv_gpu_alloc_mb": round(gpu_alloc_mb, 3),
+                                    "kv_gpu_reserved_mb": round(gpu_reserved_mb, 3),
+                                    "kv_gpu_max_alloc_mb": round(gpu_max_alloc_mb, 3),
+                                    "kv_staging_live_mb": round(_bytes_to_mb(staging_live_bytes), 3),
+                                    "kv_staging_peak_mb": round(_bytes_to_mb(staging_peak_bytes), 3),
+                                    "kv_staged_entries": int(active_staged_entries),
+                                    "activation_raw_bytes": int(activation_raw_bytes),
+                                },
+                            )
 
                             # [MBPIPE_FIX] Clone tensors before async push to avoid buffer reuse races.
                             push_hidden = mb_out_hidden.detach().clone()
@@ -2234,9 +2232,18 @@ async def iterate_rpc_inference(
                 else:
                     execution_mode = "merged_fullbatch"
                     # Legacy path: process entire batch at once
-                    inference_infos = tuple(
-                        InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec)
-                        for i, (uid, handles) in enumerate(zip(requested_uids, cache_handles))
+                    inference_infos = build_inference_metadata_batch(
+                        requested_uids,
+                        cache_handles,
+                        prefix_length,
+                        active_adapter,
+                        tree_attention_mask=tree_attention_mask,
+                        kv_cache_position_ids=kv_cache_position_ids,
+                        draft_tokens=draft_tokens,
+                        prefill_length=prefill_length,
+                        keep_indices=keep_indices,
+                        need_pruning=need_pruning,
+                        is_spec_dec=is_spec_dec,
                     )
                     submit_result = await requested_backends[0].inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
@@ -2285,30 +2292,39 @@ async def iterate_rpc_inference(
                             compute_start_timestamp_us = int(_time.time() * 1_000_000)
                         else:
                             compute_start_timestamp_us = 0
-                        
-                        mb_hidden = hidden_states[mb_start:mb_end].clone()
-                        mb_hypo = hypo_ids[mb_start:mb_end] if hypo_ids is not None and not is_dummy(hypo_ids) else hypo_ids
-                        mb_tree_mask = _slice_batch_aligned(tree_attention_mask, mb_start, mb_end, batch_size)
-                        mb_kv_position_ids = kv_cache_position_ids
-                        mb_draft_tokens = _slice_batch_aligned(draft_tokens, mb_start, mb_end, batch_size)
-                        mb_prefill_length = _slice_batch_aligned(prefill_length, mb_start, mb_end, batch_size)
-                        mb_keep_idx = keep_indices[mb_start:mb_end] if keep_indices is not None and not is_dummy(keep_indices) and keep_indices.dim() > 0 and keep_indices.shape[0] == batch_size else keep_indices
-                        
-                        mb_size = mb_end - mb_start
+                        mb_inputs = slice_microbatch_inputs(
+                            hidden_states,
+                            hypo_ids,
+                            tree_attention_mask,
+                            kv_cache_position_ids,
+                            draft_tokens,
+                            prefill_length,
+                            keep_indices,
+                            mb_start=mb_start,
+                            mb_end=mb_end,
+                            full_batch_size=batch_size,
+                        )
+                        mb_hidden = mb_inputs.hidden_states
+                        mb_hypo = mb_inputs.hypo_ids
+                        mb_keep_idx = mb_inputs.keep_indices
+                        mb_size = mb_inputs.micro_batch_size
                         
                         for i, (backend, uid, handles, prompt) in enumerate(zip(requested_backends, requested_uids, cache_handles, prompts)):
                             # [MBPIPE] Pass batch_offset, full_batch_size and micro_batch_size for KV cache slicing
-                            inference_info = (InferenceMetadata(
-                                uid, prefix_length, tuple(handles), active_adapter,
-                                tree_attention_mask=mb_tree_mask,
-                                kv_cache_position_ids=mb_kv_position_ids,
-                                draft_tokens=mb_draft_tokens,
-                                prefill_length=mb_prefill_length,
+                            inference_info = (build_inference_metadata(
+                                uid,
+                                handles,
+                                prefix_length,
+                                active_adapter,
+                                tree_attention_mask=mb_inputs.tree_attention_mask,
+                                kv_cache_position_ids=mb_inputs.kv_cache_position_ids,
+                                draft_tokens=mb_inputs.draft_tokens,
+                                prefill_length=mb_inputs.prefill_length,
                                 keep_indices=mb_keep_idx,
                                 need_pruning=need_pruning,
                                 is_spec_dec=is_spec_dec,
-                                batch_offset=mb_start,
-                                full_batch_size=batch_size,
+                                batch_offset=mb_inputs.batch_offset,
+                                full_batch_size=mb_inputs.full_batch_size,
                                 micro_batch_size=mb_size,
                             ),)
                             
@@ -2325,16 +2341,18 @@ async def iterate_rpc_inference(
                         if enable_cross_stage:
                             compute_end_timestamp_us = int(_time.time() * 1_000_000)
                             push_timestamp_us = int(_time.time() * 1_000_000)
-                            push_metadata = step_metadata.copy()
-                            push_metadata["micro_batch_idx"] = mb_idx
-                            push_metadata["micro_batch_offset"] = mb_start
-                            push_metadata["micro_batch_size"] = mb_size
-                            push_metadata["full_batch_size"] = batch_size
-                            push_metadata["sender_blocks"] = _block_span_from_uids(requested_uids)
-                            push_metadata["total_micro_batches"] = len(micro_ranges)
-                            push_metadata["stage_compute_start_timestamp_us"] = compute_start_timestamp_us
-                            push_metadata["stage_compute_end_timestamp_us"] = compute_end_timestamp_us
-                            push_metadata["stage_push_timestamp_us"] = push_timestamp_us
+                            push_metadata = build_cross_stage_push_metadata(
+                                step_metadata,
+                                mb_idx=mb_idx,
+                                mb_offset=mb_start,
+                                mb_size=mb_size,
+                                full_batch_size=batch_size,
+                                sender_blocks=_block_span_from_uids(requested_uids),
+                                total_micro_batches=len(micro_ranges),
+                                compute_start_timestamp_us=compute_start_timestamp_us,
+                                compute_end_timestamp_us=compute_end_timestamp_us,
+                                push_timestamp_us=push_timestamp_us,
+                            )
                             # [MBPIPE_FIX] Clone tensors before async push to avoid buffer reuse races.
                             push_hidden = mb_hidden.detach().clone()
                             push_keep = mb_keep_idx.detach().clone() if torch.is_tensor(mb_keep_idx) else mb_keep_idx
@@ -2398,7 +2416,19 @@ async def iterate_rpc_inference(
                     for i, (backend, uid, handles, prompt) in enumerate(zip(requested_backends, requested_uids, cache_handles, prompts)):
                         backend_start_time = perf_counter()
                         
-                        inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec),)
+                        inference_infos = (build_inference_metadata(
+                            uid,
+                            handles,
+                            prefix_length,
+                            active_adapter,
+                            tree_attention_mask=tree_attention_mask,
+                            kv_cache_position_ids=kv_cache_position_ids,
+                            draft_tokens=draft_tokens,
+                            prefill_length=prefill_length,
+                            keep_indices=keep_indices,
+                            need_pruning=need_pruning,
+                            is_spec_dec=is_spec_dec,
+                        ),)
                         
                         # Submit task and measure processing time
                         task_start_time = perf_counter()

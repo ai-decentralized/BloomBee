@@ -96,10 +96,6 @@ if TYPE_CHECKING:
     from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 
 
-def _is_speculative_pruner_enabled() -> bool:
-    return os.environ.get("BLOOMBEE_ENABLE_SPECULATIVE_PRUNER", "0") == "1"
-
-
 class Server:
     """
     Runs ModuleContainer, periodically checks that the network is balanced,
@@ -339,29 +335,10 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
         
+        # Speculative decoding runs without the pruning stack by default.
+        # The pruning/training path is intentionally left inactive because it
+        # pulls in extra assets and is not needed for the main serving path.
         self.pruner_manager = None
-        if _is_speculative_pruner_enabled():
-            from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
-            from bloombee.server.speculative_pruner.utils import PruningConfig, PruningMethod
-
-            hidden_size = 4096
-            vocab_size = 32000
-            config = PruningConfig(
-                method=PruningMethod.ADAPTIVE_NEURAL,
-                neural_threshold=0.5,
-                simple_threshold=0.1
-            )
-            self.pruner_manager = SpeculativePrunerManager(
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-                config=config
-            )
-            logger.info("Speculative pruner enabled")
-        else:
-            logger.info(
-                f"{MBPIPE_LOG_PREFIX} Speculative pruner disabled; "
-                f"set BLOOMBEE_ENABLE_SPECULATIVE_PRUNER=1 to enable it"
-            )
         
         ##############################################################
         

@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
 
 from bloombee.server.speculative_pruner.mid_layer_LM_head import MidLMHead
 from bloombee.utils.debug import dprint
@@ -16,18 +17,27 @@ class LM_head_trainer:
         self.vocab_size = vocab_size
         self.device = device
         self.config = config
+
+        weights_path = hf_hub_download(
+            repo_id="xxiong59/lm-head-for-speculative-pruning",
+            filename="lm_head_weights_15.pt",
+            cache_dir="./cache",
+        )
+        checkpoint = torch.load(weights_path, map_location=device)
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
         
         # LM head for getting probabilities
         self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
-        # need to modify this path to real LM head path
-        self.lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
+        self.lm_head.load_state_dict(state_dict)
         self.lm_head.requires_grad_(False)
         self.lm_head.to(dtype=torch.bfloat16)
 
         
         self.original_lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
-        # need to modify this path to real LM head path
-        self.original_lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
+        self.original_lm_head.load_state_dict(state_dict)
         self.original_lm_head.requires_grad_(False)
         self.original_lm_head.to(dtype=torch.bfloat16)
         
