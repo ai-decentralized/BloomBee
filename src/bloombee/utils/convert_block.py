@@ -15,6 +15,7 @@ from transformers import PretrainedConfig
 from pynvml import *
 from bloombee.utils.debug import dprint
 from bloombee.utils.memory_usage import see_memory_usage, log_mem
+from bloombee.server.tensor_parallel import LlamaTensorParallelAdapter
 
 logger = get_logger(__name__)
 
@@ -115,6 +116,9 @@ def convert_block(
     """
     if freeze:
         block.requires_grad_(False)
+    if len(tensor_parallel_devices) > 1 and config.model_type == "llama":
+        return make_tensor_parallel(block, config, tensor_parallel_devices, output_device, policy=policy)
+
     # Skip tensor parallelism for FlexGen blocks - they manage their own weights and devices
     log_prefix = f"[convert_block:{block_index}]"
     # log_mem(f"{log_prefix} skipping tensor parallelism - FlexGen manages weights directly")
@@ -282,8 +286,21 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
 
 
 def make_tensor_parallel(
-    block: nn.Module, model_config: PretrainedConfig, devices: Sequence[torch.device], output_device: torch.device
+    block: nn.Module,
+    model_config: PretrainedConfig,
+    devices: Sequence[torch.device],
+    output_device: torch.device,
+    policy=None,
 ) -> nn.Module:
+    if model_config.model_type == "llama":
+        tp_block = tp.TensorParallel(block, devices, config=None, output_device=output_device, delay_init=True)
+        return LlamaTensorParallelAdapter(
+            tp_block,
+            model_config,
+            layer_idx=getattr(block, "layer_idx", 0),
+            policy=policy,
+        )
+
     if model_config.model_type == "bloom":
         tp_config = get_bloom_config(model_config, devices)
         del tp_config.state_rules[re.compile(".*word_embeddings.weight$")]
@@ -301,7 +318,8 @@ def make_tensor_parallel(
             # print("submodule ", submodule)
             if isinstance(submodule, model_config.attn_class):
                 total_heads += submodule.num_heads
-    assert total_heads == model_config.num_attention_heads
+    if model_config.model_type == "bloom":
+        assert total_heads == model_config.num_attention_heads
     return tp_block
 
 

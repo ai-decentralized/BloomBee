@@ -667,6 +667,7 @@ class ModuleContainer(threading.Thread):
                     token=token,
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
+                    force_hf_llama=(len(tensor_parallel_devices) > 1 and block_config.model_type == "llama"),
                 )
                 # see_memory_usage("-----------------------------------------after petals load pretrained block ")
                 # print('block nn.module() before convert_block() ', block )

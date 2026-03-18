@@ -127,11 +127,15 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
-        self.shard_num_heads = []
-        for shard in self.module.module_shards:
-            for submodule in shard.modules():
-                if isinstance(submodule, config.attn_class):
-                    self.shard_num_heads.append(submodule.num_heads)
+        provided_shard_num_heads = getattr(self.module, "shard_num_heads", None)
+        if provided_shard_num_heads is not None:
+            self.shard_num_heads = list(provided_shard_num_heads)
+        else:
+            self.shard_num_heads = []
+            for shard in self.module.module_shards:
+                for submodule in shard.modules():
+                    if isinstance(submodule, config.attn_class):
+                        self.shard_num_heads.append(submodule.num_heads)
         assert len(self.shard_num_heads) == len(self.module.devices)
         assert sum(self.shard_num_heads) == config.num_attention_heads
 

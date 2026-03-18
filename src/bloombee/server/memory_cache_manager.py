@@ -611,8 +611,6 @@ class KVCacheManager:
             # When cache is MixedDevice and we're reading a BH slice, we need to manually
             # read from each segment and concatenate, because general_copy's cut_indices
             # doesn't work correctly for micro-batch BH offsets
-            from bloombee.flexgen_utils.pytorch_backend import DeviceType
-            
             if hasattr(k_cache, 'device') and getattr(k_cache.device, 'device_type', None) == DeviceType.MIXED:
                 # TorchMixedDevice: manually read from each segment and concatenate
                 tensors, seg_points = k_cache.data  # ([gpu_tensor, cpu_tensor, ...], [0, seg1, seg2, ...])
@@ -1278,7 +1276,6 @@ class KVCacheManager:
 
         # If possibly FlexGen wrapper/compression, convert to torch.Tensor
         try:
-            from bloombee.flexgen_utils.pytorch_backend import DeviceType
             def _to_torch(x):
                 if hasattr(x, 'device') and (
                     getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
@@ -1388,8 +1385,6 @@ class KVCacheManager:
         # [KVCACHE_OFFLOAD] Handle TorchMixedDevice (GPU+CPU split) properly for micro-batch slicing
         # The issue: general_copy's cut_indices uses segment boundaries on BOTH src and dst,
         # but for micro-batch, src size != dst slice size (e.g., src=128 but dst_idx spans [128:256])
-        from bloombee.flexgen_utils.pytorch_backend import DeviceType
-        
         def _write_to_cache(cache, src_tt, dst_idx, cache_name):
             """Write source tensor to cache, handling TorchMixedDevice segment splitting."""
             if hasattr(cache, 'device') and getattr(cache.device, 'device_type', None) == DeviceType.MIXED:

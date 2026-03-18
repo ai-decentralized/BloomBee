@@ -89,9 +89,8 @@ def is_microbatch_gpu_multiplexing_enabled() -> bool:
     is overlap-only: split execution for pipeline overlap while keeping a full
     logical KV cache allocation, which preserves FlexGen static cache offload.
     """
-    # Temporarily force-disable GPU multiplexing while validating the
-    # overlap-only path with FlexGen static cache offload.
-    return False
+    env_value = os.environ.get(ENV_ENABLE_GPU_MULTIPLEXING, "0")
+    return env_value == "1"
 
 
 def get_micro_batch_config() -> dict:
