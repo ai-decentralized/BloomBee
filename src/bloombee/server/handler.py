@@ -1234,15 +1234,31 @@ class TransformerConnectionHandler(ConnectionHandler):
                                 "step_id": step_id_for_log,
                                 "t_nic2cpu_ms": float(step_metadata.get("_t_nic2cpu_ms", 0)),
                                 "t_cpu2gpu_ms": float(step_metadata.get("_t_cpu2gpu_ms", 0)),
+                                "t_gpu2gpu_ms": float(step_metadata.get("_t_gpu2gpu_ms", 0)),
                                 "compute_ms": float(step_metadata.get("_compute_ms", 0)),
                                 "t_gpu2cpu_ms": float(
                                     step_metadata.get("_t_gpu2cpu_ms", step_metadata.get("_serialize_ms", 0))
                                 ),
+                                "cpu_serialize_ms": float(step_metadata.get("_cpu_serialize_ms", 0)),
                                 "step_total_ms": float(step_metadata.get("_step_total_ms", 0)),
                                 "data_bytes": int(step_metadata.get("_data_bytes", 0)),
+                                "gpu2gpu_bytes": float(step_metadata.get("_gpu2gpu_bytes", 0)),
                                 "queue_wait_ms": queue_wait_ms,
                                 "batch_size": int(step_metadata.get("_batch_size", 1)),
                                 "token_increment": int(step_metadata.get("_token_increment", 1)),
+                                "critical_path_exposed_ms": float(step_metadata.get("_critical_path_exposed_ms", 0)),
+                                "sender_post_compute_exposed_ms": float(step_metadata.get("_sender_post_compute_exposed_ms", 0)),
+                                "sender_gpu2cpu_exposed_ms": float(step_metadata.get("_sender_gpu2cpu_exposed_ms", 0)),
+                                "sender_cpu2nic_exposed_ms": float(step_metadata.get("_sender_cpu2nic_exposed_ms", 0)),
+                                "nic2nic_exposed_ms": float(step_metadata.get("_nic2nic_exposed_ms", 0)),
+                                "receiver_dispatch_exposed_ms": float(step_metadata.get("_receiver_dispatch_exposed_ms", 0)),
+                                "receiver_nic2cpu_exposed_ms": float(step_metadata.get("_receiver_nic2cpu_exposed_ms", 0)),
+                                "receiver_cpu2gpu_exposed_ms": float(step_metadata.get("_receiver_cpu2gpu_exposed_ms", 0)),
+                                "pipeline_overlap_breakdown_ready": int(step_metadata.get("_pipeline_overlap_breakdown_ready", 0)),
+                                "upstream_sender_gpu2cpu_ms": float(step_metadata.get("_s2s_sender_gpu2cpu_ms", 0)),
+                                "upstream_sender_cpu2nic_ms": float(step_metadata.get("_s2s_sender_cpu2nic_ms", 0)),
+                                "upstream_wire_ms": float(step_metadata.get("_s2s_wire_ms", 0)),
+                                "upstream_payload_bytes": int(step_metadata.get("_s2s_payload_bytes", 0)),
                             }
                             self._session_timing.setdefault(session_id, []).append(rec)
                         
@@ -1323,6 +1339,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         data_arr = np.array([r["data_bytes"] for r in decode_records], dtype=np.float64)
         nic2cpu_arr = np.array([r["t_nic2cpu_ms"] for r in decode_records], dtype=np.float64)
         cpu2gpu_arr = np.array([r["t_cpu2gpu_ms"] for r in decode_records], dtype=np.float64)
+        gpu2gpu_arr = np.array([r.get("t_gpu2gpu_ms", 0.0) for r in decode_records], dtype=np.float64)
+        gpu2gpu_bytes_arr = np.array([r.get("gpu2gpu_bytes", 0.0) for r in decode_records], dtype=np.float64)
+        cpu_serialize_arr = np.array([r.get("cpu_serialize_ms", 0.0) for r in decode_records], dtype=np.float64)
         batch_arr = np.array([r.get("batch_size", 1) for r in decode_records], dtype=np.float64)
         token_arr = np.array([r.get("token_increment", 1) for r in decode_records], dtype=np.float64)
 
@@ -1345,9 +1364,12 @@ class TransformerConnectionHandler(ConnectionHandler):
         nic2nic_mean = 0.0
         push_e2e_mean = 0.0
         avg_nic_bw = 0.0
+        avg_nic_bw_gbps = 0.0
         comm_volume_kb = data_arr.mean() / 1024.0 if len(data_arr) > 0 else 0.0
+        comm_volume_bytes = data_arr.mean() if len(data_arr) > 0 else 0.0
         total_cpu2nic = 0.0
         total_nic2nic = 0.0
+        wire_arr = np.array([], dtype=np.float64)
         matched_comm_records = [comm_records[r["step_id"]] for r in decode_records if r.get("step_id") in comm_records]
         if matched_comm_records:
             cpu2nic_arr = np.array([r["t_cpu2nic_ms"] for r in matched_comm_records], dtype=np.float64)
@@ -1366,7 +1388,9 @@ class TransformerConnectionHandler(ConnectionHandler):
             nic2nic_mean = float(nic2nic_arr.mean())
             push_e2e_mean = float(push_e2e_arr.mean())
             avg_nic_bw = (wire_arr.mean() / (nic2nic_arr.mean() / 1000.0) / 1e6) if nic2nic_arr.mean() > 0 else 0.0
+            avg_nic_bw_gbps = (wire_arr.mean() * 8.0 / (nic2nic_arr.mean() / 1000.0) / 1e9) if nic2nic_arr.mean() > 0 else 0.0
             comm_volume_kb = wire_arr.mean() / 1024.0 if len(wire_arr) > 0 else comm_volume_kb
+            comm_volume_bytes = wire_arr.mean() if len(wire_arr) > 0 else comm_volume_bytes
 
             comm_summary = (
                 f"\n  cpu2nic : mean={cpu2nic_arr.mean():.2f}ms  median={np.median(cpu2nic_arr):.2f}ms  "
@@ -1380,6 +1404,131 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"\n  s2s_ratio: gpu2cpu={gpu2cpu_comm_ratio:.1f}%  cpu2nic={cpu2nic_ratio:.1f}%  "
                 f"nic2nic={nic2nic_ratio:.1f}%  avg_bw(nic)={avg_nic_bw:.1f}MB/s  wire_per_push={wire_arr.mean()/1024.0:.1f}KB"
             )
+
+        pipeline_gpu2gpu_samples = []
+        pipeline_gpu2gpu_bytes = []
+        for rec in decode_records:
+            sender_gpu2cpu_ms = float(rec.get("upstream_sender_gpu2cpu_ms", 0.0))
+            sender_cpu2nic_ms = float(rec.get("upstream_sender_cpu2nic_ms", 0.0))
+            upstream_wire_ms = float(rec.get("upstream_wire_ms", 0.0))
+            if sender_gpu2cpu_ms <= 0.0 and sender_cpu2nic_ms <= 0.0 and upstream_wire_ms <= 0.0:
+                continue
+            pipeline_gpu2gpu_samples.append(
+                sender_gpu2cpu_ms
+                + sender_cpu2nic_ms
+                + upstream_wire_ms
+                + float(rec["t_nic2cpu_ms"])
+                + float(rec["t_cpu2gpu_ms"])
+            )
+            pipeline_gpu2gpu_bytes.append(float(rec.get("upstream_payload_bytes", 0)))
+
+        pipeline_gpu2gpu_arr = np.array(pipeline_gpu2gpu_samples, dtype=np.float64)
+        pipeline_gpu2gpu_bytes_arr = np.array(pipeline_gpu2gpu_bytes, dtype=np.float64)
+        pipeline_gpu2gpu_mean = float(pipeline_gpu2gpu_arr.mean()) if len(pipeline_gpu2gpu_arr) > 0 else 0.0
+        pure_gpu2gpu_mean = float(gpu2gpu_arr.mean()) if len(gpu2gpu_arr) > 0 else 0.0
+        pure_gpu2gpu_bw_mbps = (
+            gpu2gpu_bytes_arr.mean() * 8.0 / (pure_gpu2gpu_mean / 1000.0) / 1e6
+            if pure_gpu2gpu_mean > 0 and len(gpu2gpu_bytes_arr) > 0 and gpu2gpu_bytes_arr.mean() > 0
+            else 0.0
+        )
+        local_gpu_staging_mean = float((gpu2cpu_arr + cpu2gpu_arr).mean()) if len(gpu2cpu_arr) > 0 else 0.0
+        pure_gpu_compute_mean = float(compute_arr.mean()) if len(compute_arr) > 0 else 0.0
+        pipeline_bw_mbps = (
+            pipeline_gpu2gpu_bytes_arr.mean() * 8.0 / (pipeline_gpu2gpu_mean / 1000.0) / 1e6
+            if pipeline_gpu2gpu_mean > 0 and len(pipeline_gpu2gpu_bytes_arr) > 0 and pipeline_gpu2gpu_bytes_arr.mean() > 0
+            else 0.0
+        )
+        comm_volume_kb_runtime = float(comm_volume_bytes) / 1024.0 if comm_volume_bytes > 0 else 0.0
+        upstream_sender_gpu2cpu_arr = np.array(
+            [r.get("upstream_sender_gpu2cpu_ms", 0.0) for r in decode_records if r.get("upstream_sender_gpu2cpu_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        upstream_sender_cpu2nic_arr = np.array(
+            [r.get("upstream_sender_cpu2nic_ms", 0.0) for r in decode_records if r.get("upstream_sender_cpu2nic_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        upstream_wire_arr = np.array(
+            [r.get("upstream_wire_ms", 0.0) for r in decode_records if r.get("upstream_wire_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        upstream_payload_bytes_arr = np.array(
+            [r.get("upstream_payload_bytes", 0.0) for r in decode_records if r.get("upstream_payload_bytes", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        paper_gpu2cpu_mean = (
+            float(upstream_sender_gpu2cpu_arr.mean()) if len(upstream_sender_gpu2cpu_arr) > 0 else float(gpu2cpu_arr.mean())
+        )
+        paper_cpu2nic_mean = (
+            float(upstream_sender_cpu2nic_arr.mean()) if len(upstream_sender_cpu2nic_arr) > 0 else cpu2nic_mean
+        )
+        paper_nic2nic_mean = float(upstream_wire_arr.mean()) if len(upstream_wire_arr) > 0 else nic2nic_mean
+        paper_comm_volume_bytes = (
+            float(upstream_payload_bytes_arr.mean()) if len(upstream_payload_bytes_arr) > 0 else float(comm_volume_bytes)
+        )
+        paper_comm_volume_kb = paper_comm_volume_bytes / 1024.0 if paper_comm_volume_bytes > 0 else 0.0
+        paper_net_latency_ms = push_e2e_mean if push_e2e_mean > 0 else paper_nic2nic_mean
+        paper_net_bw_mbps = (
+            paper_comm_volume_bytes * 8.0 / (paper_nic2nic_mean / 1000.0) / 1e6
+            if paper_nic2nic_mean > 0 and paper_comm_volume_bytes > 0
+            else 0.0
+        )
+        exposed_ready_count = sum(int(r.get("pipeline_overlap_breakdown_ready", 0)) for r in decode_records)
+        critical_path_exposed_arr = np.array(
+            [r.get("critical_path_exposed_ms", 0.0) for r in decode_records if r.get("critical_path_exposed_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        sender_gpu2cpu_exposed_arr = np.array(
+            [r.get("sender_gpu2cpu_exposed_ms", 0.0) for r in decode_records if r.get("sender_gpu2cpu_exposed_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        sender_cpu2nic_exposed_arr = np.array(
+            [r.get("sender_cpu2nic_exposed_ms", 0.0) for r in decode_records if r.get("sender_cpu2nic_exposed_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        nic2nic_exposed_arr = np.array(
+            [r.get("nic2nic_exposed_ms", 0.0) for r in decode_records if r.get("nic2nic_exposed_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        receiver_nic2cpu_exposed_arr = np.array(
+            [r.get("receiver_nic2cpu_exposed_ms", 0.0) for r in decode_records if r.get("receiver_nic2cpu_exposed_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        receiver_cpu2gpu_exposed_arr = np.array(
+            [r.get("receiver_cpu2gpu_exposed_ms", 0.0) for r in decode_records if r.get("receiver_cpu2gpu_exposed_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        sender_post_compute_exposed_arr = np.array(
+            [r.get("sender_post_compute_exposed_ms", 0.0) for r in decode_records if r.get("sender_post_compute_exposed_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        receiver_dispatch_exposed_arr = np.array(
+            [r.get("receiver_dispatch_exposed_ms", 0.0) for r in decode_records if r.get("receiver_dispatch_exposed_ms", 0.0) > 0.0],
+            dtype=np.float64,
+        )
+        critical_path_exposed_mean = (
+            float(critical_path_exposed_arr.mean()) if len(critical_path_exposed_arr) > 0 else float(inference_latency_ms)
+        )
+        sender_gpu2cpu_exposed_mean = (
+            float(sender_gpu2cpu_exposed_arr.mean()) if len(sender_gpu2cpu_exposed_arr) > 0 else paper_gpu2cpu_mean
+        )
+        sender_cpu2nic_exposed_mean = (
+            float(sender_cpu2nic_exposed_arr.mean()) if len(sender_cpu2nic_exposed_arr) > 0 else paper_cpu2nic_mean
+        )
+        nic2nic_exposed_mean = (
+            float(nic2nic_exposed_arr.mean()) if len(nic2nic_exposed_arr) > 0 else paper_nic2nic_mean
+        )
+        receiver_nic2cpu_exposed_mean = (
+            float(receiver_nic2cpu_exposed_arr.mean()) if len(receiver_nic2cpu_exposed_arr) > 0 else float(nic2cpu_arr.mean())
+        )
+        receiver_cpu2gpu_exposed_mean = (
+            float(receiver_cpu2gpu_exposed_arr.mean()) if len(receiver_cpu2gpu_exposed_arr) > 0 else float(cpu2gpu_arr.mean())
+        )
+        sender_post_compute_exposed_mean = (
+            float(sender_post_compute_exposed_arr.mean()) if len(sender_post_compute_exposed_arr) > 0 else 0.0
+        )
+        receiver_dispatch_exposed_mean = (
+            float(receiver_dispatch_exposed_arr.mean()) if len(receiver_dispatch_exposed_arr) > 0 else 0.0
+        )
 
         n = len(decode_records)
         summary_message = (
@@ -1420,6 +1569,87 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         logger.info(timing_table_line)
         self._emit_unconditional_summary(timing_table_line)
+
+        paper_timing_table_line = (
+            f"[PAPER_TIMING_TABLE] blocks={blocks_desc} steps={n} "
+            f"T_GPU->CPU={paper_gpu2cpu_mean:.2f}ms "
+            f"T_CPU->NIC={paper_cpu2nic_mean:.2f}ms "
+            f"T_NIC->NIC={paper_nic2nic_mean:.2f}ms "
+            f"T_NIC->CPU={nic2cpu_arr.mean():.2f}ms "
+            f"T_CPU->GPU={cpu2gpu_arr.mean():.2f}ms "
+            f"InferenceLatency={inference_latency_ms:.2f}ms "
+            f"Throughput={throughput_tok_s:.2f}tok/s "
+            f"CommunicationVolume={paper_comm_volume_kb:.1f}KB "
+            f"T_GPU_Compute={compute_arr.mean():.2f}ms "
+            f"NetworkLatency={paper_net_latency_ms:.2f}ms "
+            f"NetworkBandwidth={paper_net_bw_mbps:.2f}Mbps"
+        )
+        logger.info(paper_timing_table_line)
+        self._emit_unconditional_summary(paper_timing_table_line)
+
+        component_scope_line = (
+            f"[PIPELINE_COMPONENT_VIEW] blocks={blocks_desc} steps={n} "
+            f"sender_T_GPU->CPU_RAW={paper_gpu2cpu_mean:.2f}ms "
+            f"sender_T_CPU->NIC_RAW={paper_cpu2nic_mean:.2f}ms "
+            f"link_T_NIC->NIC_RAW={paper_nic2nic_mean:.2f}ms "
+            f"receiver_T_NIC->CPU_RAW={nic2cpu_arr.mean():.2f}ms "
+            f"receiver_T_CPU->GPU_RAW={cpu2gpu_arr.mean():.2f}ms "
+            f"pipeline_overlap_affects_component_visibility=1"
+        )
+        logger.info(component_scope_line)
+        self._emit_unconditional_summary(component_scope_line)
+
+        exposed_component_line = (
+            f"[PIPELINE_EXPOSED_VIEW] blocks={blocks_desc} steps={n} "
+            f"EndToEndCriticalPathExposed={critical_path_exposed_mean:.2f}ms "
+            f"sender_T_GPU->CPU_EXPOSED={sender_gpu2cpu_exposed_mean:.2f}ms "
+            f"sender_T_CPU->NIC_EXPOSED={sender_cpu2nic_exposed_mean:.2f}ms "
+            f"link_T_NIC->NIC_EXPOSED={nic2nic_exposed_mean:.2f}ms "
+            f"receiver_T_NIC->CPU_EXPOSED={receiver_nic2cpu_exposed_mean:.2f}ms "
+            f"receiver_T_CPU->GPU_EXPOSED={receiver_cpu2gpu_exposed_mean:.2f}ms "
+            f"sender_post_compute_gap_EXPOSED={sender_post_compute_exposed_mean:.2f}ms "
+            f"receiver_dispatch_EXPOSED={receiver_dispatch_exposed_mean:.2f}ms "
+            f"overlap_breakdown_coverage={exposed_ready_count}/{n}"
+        )
+        logger.info(exposed_component_line)
+        self._emit_unconditional_summary(exposed_component_line)
+
+        pipeline_gpu_line = (
+            f"[PIPELINE_GPU2GPU] blocks={blocks_desc} steps={n} "
+            f"T_GPU->GPU_PIPE={pipeline_gpu2gpu_mean:.2f}ms "
+            f"BW_GPU->GPU_PIPE={pipeline_bw_mbps:.2f}Mbps "
+            f"T_GPU->GPU_PURE={pure_gpu2gpu_mean:.2f}ms "
+            f"BW_GPU->GPU_PURE={pure_gpu2gpu_bw_mbps:.2f}Mbps "
+            f"T_GPU_LOCAL_STAGING={local_gpu_staging_mean:.2f}ms "
+            f"T_GPU_PURE_COMPUTE={pure_gpu_compute_mean:.2f}ms "
+            f"T_CPU_SERIALIZE={cpu_serialize_arr.mean():.2f}ms "
+            f"samples={len(pipeline_gpu2gpu_arr)}"
+        )
+        logger.info(pipeline_gpu_line)
+        self._emit_unconditional_summary(pipeline_gpu_line)
+
+        timing_note_line = (
+            f"[TIMING_NOTE] blocks={blocks_desc} "
+            f"T_GPU->GPU_PIPE=sender(T_GPU->CPU+T_CPU->NIC+wire)+receiver(T_NIC->CPU+T_CPU->GPU); "
+            f"PAPER_TIMING_TABLE prefers upstream sender+wire fields on downstream stages when available; "
+            f"T_GPU->GPU_PURE is same-host cuda->cuda transfer time collected inside task_pool .to(device); "
+            f"T_GPU->CPU happens on sender after compute; T_CPU->NIC happens on sender before rpc_push; "
+            f"T_NIC->NIC is one-hop wire time; T_NIC->CPU happens on receiver during deserialize/unpack; "
+            f"T_CPU->GPU happens on receiver when runtime moves tensors to cuda; "
+            f"component fields are raw local segment durations and may be overlapped by pipeline; "
+            f"they are not additive to end-to-end latency; "
+            f"PIPELINE_EXPOSED_VIEW reports the downstream critical-path-visible portion of each segment; "
+            f"with full-batch PP (no micro-batching), EXPOSED is reported from observed per-step segments and coverage should be n/n; "
+            f"with micro-batch PP, EXPOSED uses overlap attribution when available and otherwise falls back to RAW means; "
+            f"T_NIC->CPU includes deserialize/unpack; "
+            f"T_CPU->NIC includes request packing and pre-send prep; "
+            f"InferenceLatency/Throughput are stage-local means; "
+            f"CommunicationVolume is mean payload per decode step in KB; "
+            f"NetworkLatency=push_e2e(send->ack), while T_NIC->NIC subtracts receiver processing; "
+            f"NetworkBandwidth=payload_bits/T_NIC->NIC in Mbps."
+        )
+        logger.info(timing_note_line)
+        self._emit_unconditional_summary(timing_note_line)
 
     def _extract_rpc_push_timing(
         self,
@@ -1773,6 +2003,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                 wire_ms=wire_ms,
                 clock_sync_ok=clock_sync_ok,
             )
+            metadata["_s2s_sender_gpu2cpu_ms"] = float(
+                metadata.get("s2s_sender_gpu2cpu_ms", metadata.get("_t_gpu2cpu_ms", metadata.get("_serialize_ms", 0.0)))
+            )
+            metadata["_s2s_sender_cpu2nic_ms"] = float(metadata.get("s2s_sender_cpu2nic_ms", 0.0))
+            metadata["_s2s_wire_ms"] = float(wire_ms if wire_ms >= 0.0 else raw_transfer_ms if raw_transfer_ms >= 0.0 else 0.0)
+            metadata["_s2s_payload_bytes"] = int(payload_bytes)
+            request.metadata = MSGPackSerializer.dumps(metadata)
         self._log_request("rpc_push", requested_uids, context, debug=f"session_id={session_id}")
         self._put_into_session_queue(session_id, request)
         return self._build_rpc_push_ack_response(receive_us)
@@ -1917,6 +2154,12 @@ class TransformerConnectionHandler(ConnectionHandler):
             wire_ms=wire_ms,
             clock_sync_ok=clock_sync_ok,
         )
+        metadata["_s2s_sender_gpu2cpu_ms"] = float(
+            metadata.get("s2s_sender_gpu2cpu_ms", sender_serialize_ms if sender_serialize_ms >= 0.0 else 0.0)
+        )
+        metadata["_s2s_sender_cpu2nic_ms"] = float(metadata.get("s2s_sender_cpu2nic_ms", sender_prep_ms if sender_prep_ms >= 0.0 else 0.0))
+        metadata["_s2s_wire_ms"] = float(wire_ms if wire_ms >= 0.0 else raw_transfer_ms if raw_transfer_ms >= 0.0 else 0.0)
+        metadata["_s2s_payload_bytes"] = int(payload_bytes)
         
         # Initialize tracking for this (session, step) if not exists
         if mb_key not in self._mb_queues:
@@ -2149,14 +2392,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                 next_metadata["sender_to_receiver_clock_samples"] = clock_sync_estimate["samples"]
             sender_send_us = self._now_us()
             next_metadata["clock_sync_sender_send_us"] = sender_send_us
+            t_gpu2cpu_ms = float(metadata.get("_t_gpu2cpu_ms", metadata.get("_serialize_ms", 0.0)))
+            next_metadata["s2s_sender_gpu2cpu_ms"] = float(t_gpu2cpu_ms)
 
             stub = self.get_stub(self._p2p, next_peer_id)
             push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
+            cpu2nic_prep_end = perf_counter()
+            t_cpu2nic_ms = max(0.0, (cpu2nic_prep_end - push_start_time) * 1000.0)
+            next_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
             serialized_next_metadata = MSGPackSerializer.dumps(next_metadata)
             push_metadata_bytes = len(serialized_next_metadata)
             rpc_request = runtime_pb2.ExpertRequest(uid=next_uid, tensors=next_tensors, metadata=serialized_next_metadata)
-            cpu2nic_prep_end = perf_counter()
-            t_cpu2nic_ms = max(0.0, (cpu2nic_prep_end - push_start_time) * 1000.0)
 
             nic2nic_start = perf_counter()
             response = await stub.rpc_push(rpc_request, timeout=self.request_timeout)
@@ -2181,7 +2427,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             receiver_processing_ms = float(rpc_timing["receiver_processing_ms"])
 
             # T(GPU→CPU) comes from the compute step's serialization timing.
-            t_gpu2cpu_ms = float(metadata.get("_t_gpu2cpu_ms", metadata.get("_serialize_ms", 0.0)))
             compute_ms = float(metadata.get("_compute_ms", 0.0))
             data_bytes = int(metadata.get("_data_bytes", 0))
 
@@ -2436,6 +2681,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "s2s_sender_serialize_start_us": int(serialize_start_us),
                 "s2s_sender_serialize_end_us": int(serialize_end_us),
                 "s2s_sender_compute_to_serialize_start_ms": float(sender_compute_to_serialize_start_ms),
+                "s2s_sender_gpu2cpu_ms": float(t_gpu2cpu_ms),
+                "s2s_sender_cpu2nic_ms": float(t_cpu2nic_ms),
             }
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction

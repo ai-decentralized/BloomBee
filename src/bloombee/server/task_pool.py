@@ -128,16 +128,36 @@ class PrioritizedTaskPool(threading.Thread):
         self, timeout: Optional[float] = None, device: Optional[torch.device] = None
     ) -> Tuple[Any, List[torch.Tensor]]:
         """receive next batch of arrays"""
-        device = device if device is not None else self.device  # If device not specified, use default device 
+        device = torch.device(device if device is not None else self.device)  # If device not specified, use default device
         # print('-=-==-=-=-=-=- task pool: load_batch_to_runtime(): device ', device)
         task = self._ordered_tasks.get(block=True, timeout=timeout)  # Get next task from ordered task queue, may block until timeout 
-        transfer_start = time.perf_counter()
-        batch_inputs = [_move_to_device_if_tensor(arg, device, share_memory=False) for arg in task.args]  # Move task arguments to specified device
+        batch_inputs = []
+        runtime_timing = {
+            "t_cpu2gpu_ms": 0.0,
+            "t_gpu2gpu_ms": 0.0,
+            "input_bytes": 0.0,
+            "gpu2gpu_bytes": 0.0,
+        }
+        for arg in task.args:
+            if isinstance(arg, torch.Tensor):
+                src_device = arg.device
+                tensor_bytes = float(arg.numel() * arg.element_size())
+                transfer_start = time.perf_counter()
+                moved_arg = _move_to_device_if_tensor(arg, device, share_memory=False)
+                transfer_ms = (time.perf_counter() - transfer_start) * 1000.0
+                dst_device = moved_arg.device
+                if src_device != dst_device:
+                    if src_device.type == "cpu" and dst_device.type == "cuda":
+                        runtime_timing["t_cpu2gpu_ms"] += transfer_ms
+                        runtime_timing["input_bytes"] += tensor_bytes
+                    elif src_device.type == "cuda" and dst_device.type == "cuda":
+                        runtime_timing["t_gpu2gpu_ms"] += transfer_ms
+                        runtime_timing["gpu2gpu_bytes"] += tensor_bytes
+                batch_inputs.append(moved_arg)
+            else:
+                batch_inputs.append(arg)
         if self.track_transfer_timing:
-            self._runtime_transfer_timings[task.uid] = {
-                "t_cpu2gpu_ms": (time.perf_counter() - transfer_start) * 1000.0,
-                "input_bytes": float(_estimate_tensor_bytes(task.args)),
-            }
+            self._runtime_transfer_timings[task.uid] = runtime_timing
         self._dispatched_tasks[task.uid] = task  # Mark task as dispatched 
         self.batch_receiver.recv()  # reduce the number of active batches
         if not self._ordered_tasks.empty():  # If there are remaining tasks  

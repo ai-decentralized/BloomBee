@@ -219,7 +219,7 @@ def _accumulate_runtime_timing(
 ) -> None:
     if not isinstance(sample, dict):
         return
-    for key in ("t_cpu2gpu_ms", "t_gpu2cpu_ms", "input_bytes", "output_bytes"):
+    for key in ("t_cpu2gpu_ms", "t_gpu2cpu_ms", "t_gpu2gpu_ms", "input_bytes", "output_bytes", "gpu2gpu_bytes"):
         try:
             total[key] = float(total.get(key, 0.0)) + float(sample.get(key, 0.0))
         except Exception:
@@ -808,7 +808,14 @@ async def iterate_rpc_inference(
                 f"can_merge_pools={can_merge_pools}, "
                 f"prompts unpacked would be {len(prompts)} items"
             )
-            runtime_timing_total = {"t_cpu2gpu_ms": 0.0, "t_gpu2cpu_ms": 0.0, "input_bytes": 0.0, "output_bytes": 0.0}
+            runtime_timing_total = {
+                "t_cpu2gpu_ms": 0.0,
+                "t_gpu2cpu_ms": 0.0,
+                "t_gpu2gpu_ms": 0.0,
+                "input_bytes": 0.0,
+                "output_bytes": 0.0,
+                "gpu2gpu_bytes": 0.0,
+            }
             
             if hidden_states.numel() > 0:
                 if can_merge_pools:
@@ -890,6 +897,7 @@ async def iterate_rpc_inference(
             process_time_ms = (perf_counter() - process_start_time) * 1000
             mb_t_nic2cpu_ms = mb_deserialize_ms
             mb_t_cpu2gpu_ms = float(runtime_timing_total.get("t_cpu2gpu_ms", 0.0))
+            mb_t_gpu2gpu_ms = float(runtime_timing_total.get("t_gpu2gpu_ms", 0.0))
             mb_t_gpu2cpu_ms = float(runtime_timing_total.get("t_gpu2cpu_ms", 0.0))
             compute_done_timestamp_us = int(_time.time() * 1_000_000)
             compute_start_timestamp_us_this = int((perf_counter() - (process_time_ms / 1000)) * 1_000_000)  # Approximate
@@ -1011,7 +1019,9 @@ async def iterate_rpc_inference(
                     'deserialize_ms_sum': 0.0,
                     'nic2cpu_ms_sum': 0.0,
                     'cpu2gpu_ms_sum': 0.0,
+                    'gpu2gpu_ms_sum': 0.0,
                     'gpu2cpu_ms_sum': 0.0,
+                    'gpu2gpu_bytes_sum': 0.0,
                     'compute_ms_sum': 0.0,
                     'decompress_ms_sum': 0.0,
                     'deserialize_unwrap_ms_sum': 0.0,
@@ -1036,7 +1046,9 @@ async def iterate_rpc_inference(
             accum['deserialize_ms_sum'] += mb_deserialize_ms
             accum['nic2cpu_ms_sum'] += mb_t_nic2cpu_ms
             accum['cpu2gpu_ms_sum'] += mb_t_cpu2gpu_ms
+            accum['gpu2gpu_ms_sum'] += mb_t_gpu2gpu_ms
             accum['gpu2cpu_ms_sum'] += mb_t_gpu2cpu_ms
+            accum['gpu2gpu_bytes_sum'] += float(runtime_timing_total.get("gpu2gpu_bytes", 0.0))
             accum['compute_ms_sum'] += process_time_ms
             accum['decompress_ms_sum'] += float(mb_transport_summary.get('decompress_ms', 0.0))
             accum['deserialize_unwrap_ms_sum'] += float(mb_transport_summary.get('deserialize_unwrap_ms', 0.0))
@@ -1048,7 +1060,7 @@ async def iterate_rpc_inference(
                     f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
                     f"deserialize={mb_deserialize_ms:.2f}ms "
                     f"nic2cpu={mb_t_nic2cpu_ms:.2f}ms cpu2gpu={mb_t_cpu2gpu_ms:.2f}ms "
-                    f"compute={process_time_ms:.2f}ms gpu2cpu={mb_t_gpu2cpu_ms:.2f}ms "
+                    f"gpu2gpu={mb_t_gpu2gpu_ms:.2f}ms compute={process_time_ms:.2f}ms gpu2cpu={mb_t_gpu2cpu_ms:.2f}ms "
                     f"decompress={mb_transport_summary.get('decompress_ms', 0.0):.2f}ms "
                     f"unwrap={mb_transport_summary.get('deserialize_unwrap_ms', 0.0):.2f}ms "
                     f"deserialize_core={mb_transport_summary.get('deserialize_core_ms', 0.0):.2f}ms"
@@ -1599,7 +1611,9 @@ async def iterate_rpc_inference(
                 deserialize_sum_ms = float(accum.get('deserialize_ms_sum', 0.0))
                 nic2cpu_sum_ms = float(accum.get('nic2cpu_ms_sum', 0.0))
                 cpu2gpu_sum_ms = float(accum.get('cpu2gpu_ms_sum', 0.0))
+                gpu2gpu_sum_ms = float(accum.get('gpu2gpu_ms_sum', 0.0))
                 gpu2cpu_sum_ms = float(accum.get('gpu2cpu_ms_sum', 0.0))
+                gpu2gpu_bytes_sum = float(accum.get('gpu2gpu_bytes_sum', 0.0))
                 compute_sum_ms = float(accum.get('compute_ms_sum', 0.0))
                 decompress_sum_ms = float(accum.get('decompress_ms_sum', 0.0))
                 deserialize_unwrap_sum_ms = float(accum.get('deserialize_unwrap_ms_sum', 0.0))
@@ -1638,14 +1652,25 @@ async def iterate_rpc_inference(
                 data_bytes = merged_hidden_states.nelement() * merged_hidden_states.element_size()
                 accum["step_metadata"]["_t_nic2cpu_ms"] = nic2cpu_sum_ms
                 accum["step_metadata"]["_t_cpu2gpu_ms"] = cpu2gpu_sum_ms
+                accum["step_metadata"]["_t_gpu2gpu_ms"] = gpu2gpu_sum_ms
                 accum["step_metadata"]["_t_gpu2cpu_ms"] = gpu2cpu_sum_ms
                 accum["step_metadata"]["_serialize_ms"] = gpu2cpu_sum_ms
                 accum["step_metadata"]["_cpu_serialize_ms"] = merge_serialize_ms
                 accum["step_metadata"]["_compute_ms"] = compute_sum_ms
                 accum["step_metadata"]["_data_bytes"] = data_bytes
+                accum["step_metadata"]["_gpu2gpu_bytes"] = gpu2gpu_bytes_sum
                 accum["step_metadata"]["_step_total_ms"] = merge_total_ms
                 accum["step_metadata"]["_batch_size"] = int(accum.get("full_batch_size", merged_hidden_states.shape[0]))
                 accum["step_metadata"]["_token_increment"] = int(accum.get("token_increment", 0))
+                accum["step_metadata"]["_critical_path_exposed_ms"] = critical_path_ms
+                accum["step_metadata"]["_sender_post_compute_exposed_ms"] = queue_wait_pre_sender_post_compute_ms
+                accum["step_metadata"]["_sender_gpu2cpu_exposed_ms"] = queue_wait_pre_sender_serialize_ms
+                accum["step_metadata"]["_sender_cpu2nic_exposed_ms"] = queue_wait_pre_sender_pre_send_wait_ms
+                accum["step_metadata"]["_nic2nic_exposed_ms"] = queue_wait_pre_wire_receive_ms
+                accum["step_metadata"]["_receiver_dispatch_exposed_ms"] = queue_wait_pre_receiver_dispatch_ms
+                accum["step_metadata"]["_receiver_nic2cpu_exposed_ms"] = nic2cpu_sum_ms
+                accum["step_metadata"]["_receiver_cpu2gpu_exposed_ms"] = cpu2gpu_sum_ms
+                accum["step_metadata"]["_pipeline_overlap_breakdown_ready"] = int(queue_wait_pre_breakdown_ready)
                 logger.info(
                     f"[STEP_TIMING_BREAKDOWN_MB] step_id={step_id} mode=micro_batch "
                     f"expected_mb={accum.get('expected', 0)} recv_mb={len(accum.get('results', {}))} "
@@ -1653,6 +1678,7 @@ async def iterate_rpc_inference(
                     f"deserialize_sum={deserialize_sum_ms:.2f}ms "
                     f"nic2cpu_sum={nic2cpu_sum_ms:.2f}ms "
                     f"cpu2gpu_sum={cpu2gpu_sum_ms:.2f}ms "
+                    f"gpu2gpu_sum={gpu2gpu_sum_ms:.2f}ms "
                     f"compute_sum={compute_sum_ms:.2f}ms "
                     f"gpu2cpu_sum={gpu2cpu_sum_ms:.2f}ms "
                     f"serialize_cpu={merge_serialize_ms:.2f}ms "
@@ -1793,7 +1819,14 @@ async def iterate_rpc_inference(
         start_compute_time = perf_counter()  # Initialize compute time tracking
         compute_time = 0.0
         execution_mode = "unknown"
-        runtime_timing_total = {"t_cpu2gpu_ms": 0.0, "t_gpu2cpu_ms": 0.0, "input_bytes": 0.0, "output_bytes": 0.0}
+        runtime_timing_total = {
+            "t_cpu2gpu_ms": 0.0,
+            "t_gpu2cpu_ms": 0.0,
+            "t_gpu2gpu_ms": 0.0,
+            "input_bytes": 0.0,
+            "output_bytes": 0.0,
+            "gpu2gpu_bytes": 0.0,
+        }
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
@@ -2583,29 +2616,32 @@ async def iterate_rpc_inference(
         step_total_time = (step_end_time - step_receive_time) * 1000  # ms
         t_nic2cpu_ms = deserialize_time
         t_cpu2gpu_ms = float(runtime_timing_total.get("t_cpu2gpu_ms", 0.0))
+        t_gpu2gpu_ms = float(runtime_timing_total.get("t_gpu2gpu_ms", 0.0))
         t_gpu2cpu_ms = float(runtime_timing_total.get("t_gpu2cpu_ms", 0.0))
         cpu_serialize_ms = serialize_time
+        gpu2gpu_bytes = float(runtime_timing_total.get("gpu2gpu_bytes", 0.0))
         step_residual_ms = step_total_time - (
-            t_nic2cpu_ms + t_cpu2gpu_ms + compute_time + t_gpu2cpu_ms + cpu_serialize_ms
+            t_nic2cpu_ms + t_cpu2gpu_ms + t_gpu2gpu_ms + compute_time + t_gpu2cpu_ms + cpu_serialize_ms
         )
         step_total_with_queue_ms = step_total_time + queue_wait_ms
 
         # Critical path analysis: compute vs communication ratio
         data_bytes = hidden_states.nelement() * hidden_states.element_size()
         compute_pct = (compute_time / step_total_time * 100) if step_total_time > 0 else 0.0
-        comm_overhead_ms = t_nic2cpu_ms + t_cpu2gpu_ms + t_gpu2cpu_ms
+        comm_overhead_ms = t_nic2cpu_ms + t_cpu2gpu_ms + t_gpu2gpu_ms + t_gpu2cpu_ms
         comm_overhead_pct = (comm_overhead_ms / step_total_time * 100) if step_total_time > 0 else 0.0
         bw_gpu2cpu_gbps = (data_bytes / (t_gpu2cpu_ms / 1000) / 1e9) if t_gpu2cpu_ms > 0 else 0.0
+        bw_gpu2gpu_gbps = (gpu2gpu_bytes / (t_gpu2gpu_ms / 1000) / 1e9) if t_gpu2gpu_ms > 0 and gpu2gpu_bytes > 0 else 0.0
 
         logger.info(
             f"[STEP_TIMING_BREAKDOWN] step_id={step_id_for_log} mode={execution_mode} "
             f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
             f"t_nic2cpu={t_nic2cpu_ms:.2f}ms t_cpu2gpu={t_cpu2gpu_ms:.2f}ms "
-            f"compute={compute_time:.2f}ms t_gpu2cpu={t_gpu2cpu_ms:.2f}ms "
+            f"t_gpu2gpu={t_gpu2gpu_ms:.2f}ms compute={compute_time:.2f}ms t_gpu2cpu={t_gpu2cpu_ms:.2f}ms "
             f"serialize_cpu={cpu_serialize_ms:.2f}ms residual={step_residual_ms:.2f}ms "
             f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
             f"compute_pct={compute_pct:.1f}% mem_copy_pct={comm_overhead_pct:.1f}% "
-            f"data_bytes={data_bytes} bw_gpu2cpu={bw_gpu2cpu_gbps:.2f}GB/s "
+            f"data_bytes={data_bytes} bw_gpu2cpu={bw_gpu2cpu_gbps:.2f}GB/s bw_gpu2gpu={bw_gpu2gpu_gbps:.2f}GB/s "
             f"cross_gpu_window={cross_gpu_receive_time:.2f}ms "
             f"decompress={full_deserialize_summary.get('decompress_ms', 0.0):.2f}ms "
             f"deserialize_unwrap={full_deserialize_summary.get('deserialize_unwrap_ms', 0.0):.2f}ms "
@@ -2618,16 +2654,39 @@ async def iterate_rpc_inference(
 
         # Pass timing data to handler for [COMM_BREAKDOWN] log
         if isinstance(step_metadata, dict):
+            sender_gpu2cpu_exposed_ms = float(
+                step_metadata.get("_s2s_sender_gpu2cpu_ms", step_metadata.get("s2s_sender_gpu2cpu_ms", t_gpu2cpu_ms))
+            )
+            sender_cpu2nic_exposed_ms = float(
+                step_metadata.get("_s2s_sender_cpu2nic_ms", step_metadata.get("s2s_sender_cpu2nic_ms", 0.0))
+            )
+            nic2nic_exposed_ms = float(
+                step_metadata.get("_s2s_wire_ms", step_metadata.get("s2s_wire_ms", 0.0))
+            )
             step_metadata["_t_nic2cpu_ms"] = t_nic2cpu_ms
             step_metadata["_t_cpu2gpu_ms"] = t_cpu2gpu_ms
+            step_metadata["_t_gpu2gpu_ms"] = t_gpu2gpu_ms
             step_metadata["_t_gpu2cpu_ms"] = t_gpu2cpu_ms
             step_metadata["_serialize_ms"] = t_gpu2cpu_ms
             step_metadata["_cpu_serialize_ms"] = cpu_serialize_ms
             step_metadata["_compute_ms"] = compute_time
             step_metadata["_data_bytes"] = data_bytes
+            step_metadata["_gpu2gpu_bytes"] = gpu2gpu_bytes
             step_metadata["_step_total_ms"] = step_total_time
             step_metadata["_batch_size"] = int(batch_size)
             step_metadata["_token_increment"] = int(token_increment)
+            # Full-batch PP does not produce micro-batch overlap attribution. In this path,
+            # expose the observed per-step segments directly so PIPELINE_EXPOSED_VIEW still
+            # has explicit values instead of falling back via missing coverage.
+            step_metadata["_critical_path_exposed_ms"] = float(step_total_time)
+            step_metadata["_sender_post_compute_exposed_ms"] = 0.0
+            step_metadata["_sender_gpu2cpu_exposed_ms"] = sender_gpu2cpu_exposed_ms
+            step_metadata["_sender_cpu2nic_exposed_ms"] = sender_cpu2nic_exposed_ms
+            step_metadata["_nic2nic_exposed_ms"] = nic2nic_exposed_ms
+            step_metadata["_receiver_dispatch_exposed_ms"] = 0.0
+            step_metadata["_receiver_nic2cpu_exposed_ms"] = t_nic2cpu_ms
+            step_metadata["_receiver_cpu2gpu_exposed_ms"] = t_cpu2gpu_ms
+            step_metadata["_pipeline_overlap_breakdown_ready"] = 1
         log_transport_profile_event(
             logger,
             source="server",

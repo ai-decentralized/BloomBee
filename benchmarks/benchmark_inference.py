@@ -180,9 +180,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     )
     
     step_times = []
-    step_latencies = []  # Track individual step latencies for cross-GPU analysis
-    cross_gpu_latencies = []  # Track cross-GPU transfer latencies
-    server_processing_latencies = []  # Track server processing latencies
+    step_latencies = []  # Client-observed end-to-end per-step latencies
     
     start_time = perf_counter()
     
@@ -238,10 +236,6 @@ def benchmark_inference(process_idx, args, result_pipe):
                 effective_speed = speed * batch_size
                 logger.info(f"{process_idx=} {step=} {speed=:.2f} tokens/sec/sequence, effective={effective_speed:.2f} tokens/sec")
                 
-                # Collect latencies for analysis
-                cross_gpu_latencies.append(step_latency_ms)
-                server_processing_latencies.append(step_latency_ms)
-
             if (step + 1) >= decode_target_steps:
                 speed_now = (1 / np.mean(step_times)) if step_times else 0.0
                 effective_speed_now = speed_now * batch_size
@@ -256,8 +250,6 @@ def benchmark_inference(process_idx, args, result_pipe):
         
         # Calculate and log statistics
         warmup_latencies = step_latencies[args.warmup_steps:]
-        warmup_cross_gpu_latencies = cross_gpu_latencies
-        warmup_server_processing_latencies = server_processing_latencies
         
         if warmup_latencies:
             mean_latency = np.mean(warmup_latencies)
@@ -266,20 +258,6 @@ def benchmark_inference(process_idx, args, result_pipe):
             p99_latency = np.percentile(warmup_latencies, 99)
             min_latency = np.min(warmup_latencies)
             max_latency = np.max(warmup_latencies)
-            
-            # Cross-GPU Transfer Latency statistics
-            if warmup_cross_gpu_latencies:
-                cross_gpu_mean = np.mean(warmup_cross_gpu_latencies)
-                cross_gpu_median = np.median(warmup_cross_gpu_latencies)
-                cross_gpu_p95 = np.percentile(warmup_cross_gpu_latencies, 95)
-                cross_gpu_p99 = np.percentile(warmup_cross_gpu_latencies, 99)
-            
-            # Server Processing Latency statistics
-            if warmup_server_processing_latencies:
-                server_mean = np.mean(warmup_server_processing_latencies)
-                server_median = np.median(warmup_server_processing_latencies)
-                server_p95 = np.percentile(warmup_server_processing_latencies, 95)
-                server_p99 = np.percentile(warmup_server_processing_latencies, 99)
             
             logger.info(f"\n{'='*80}")
             logger.info(f"[PERFORMANCE_SUMMARY] Process={process_idx}")
@@ -293,22 +271,9 @@ def benchmark_inference(process_idx, args, result_pipe):
             logger.info(f"  P99:    {p99_latency:.2f}ms")
             logger.info(f"  Min:    {min_latency:.2f}ms")
             logger.info(f"  Max:    {max_latency:.2f}ms")
-            
-            # Cross-GPU Transfer Latency Summary
-            if warmup_cross_gpu_latencies:
-                logger.info(f"\n[CROSS_GPU_TRANSFER_LATENCY]")
-                logger.info(f"  Mean:   {cross_gpu_mean:.2f}ms")
-                logger.info(f"  Median: {cross_gpu_median:.2f}ms")
-                logger.info(f"  P95:    {cross_gpu_p95:.2f}ms")
-                logger.info(f"  P99:    {cross_gpu_p99:.2f}ms")
-            
-            # Server Processing Latency Summary
-            if warmup_server_processing_latencies:
-                logger.info(f"\n[SERVER_PROCESSING_LATENCY]")
-                logger.info(f"  Mean:   {server_mean:.2f}ms")
-                logger.info(f"  Median: {server_median:.2f}ms")
-                logger.info(f"  P95:    {server_p95:.2f}ms")
-                logger.info(f"  P99:    {server_p99:.2f}ms")
+            logger.info(f"\n[CLIENT_METRIC_NOTE]")
+            logger.info("  The latency above is client-observed end-to-end step latency.")
+            logger.info("  Use server [PAPER_TIMING_TABLE] / [PIPELINE_GPU2GPU] for per-stage transport breakdown.")
             
             logger.info(f"{'='*80}\n")
     
