@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 # Optimize shared memory usage for systems with limited /dev/shm
 # Set environment variables before importing PyTorch to limit shared memory allocation
@@ -46,6 +46,8 @@ from bloombee.utils.hivemind_compat import (
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
+from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+from bloombee.server.speculative_pruner.utils import PruningConfig, PruningMethod
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
@@ -91,10 +93,6 @@ offload_logger.setLevel(logging.INFO)
 # 	print(logger)
 
 logger = get_logger(__name__)
-
-if TYPE_CHECKING:
-    from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
-
 
 class Server:
     """
@@ -334,12 +332,22 @@ class Server:
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
-        
-        # Speculative decoding runs without the pruning stack by default.
-        # The pruning/training path is intentionally left inactive because it
-        # pulls in extra assets and is not needed for the main serving path.
-        self.pruner_manager = None
-        
+
+        hidden_size = 4096
+        vocab_size = 32000
+
+        config = PruningConfig(
+            method=PruningMethod.ADAPTIVE_NEURAL,
+            neural_threshold=0.9,
+            simple_threshold=0.1,
+        )
+
+        self.pruner_manager = SpeculativePrunerManager(
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            config=config,
+        )
+
         ##############################################################
         
         # see_memory_usage("-----------------------------------------in server: after policy  ")
@@ -722,6 +730,15 @@ class ModuleContainer(threading.Thread):
                             dtype=torch.int64,
                             compression=compression
                         ),
+                        BatchTensorDescriptor(
+                            1, 64, 64, dtype=torch.bool
+                        ), # tree_attention_mask
+                        BatchTensorDescriptor(
+                            1, 128, dtype=torch.int64
+                        ), #  kv_cache_position_ids
+                        BatchTensorDescriptor(
+                            1, 128, dtype=torch_dtype
+                        ), # draft_tokens
                     ),
                     min_batch_size=min_batch_size,
                     max_batch_size=max_batch_size,

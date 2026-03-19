@@ -55,7 +55,6 @@ from bloombee.utils.microbatch_schema import (
     create_microbatch_result_metadata,
     MBPIPE_SCHEMA_PREFIX,
 )
-
 # [MBPIPE] Cross-stage streaming push support
 _cross_stage_push_callback = None  # Will be set by handler for cross-stage streaming
 
@@ -489,6 +488,27 @@ def restore_hidden_states(
     restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flat_hidden
     
     return restored_hidden_states
+
+def ensure_tensors(flat_tensors):
+    result = []
+    for i, t in enumerate(flat_tensors):
+        if t is None:
+            result.append(torch.tensor(0))
+        elif isinstance(t, torch.Tensor):
+            result.append(t)
+        elif isinstance(t, (list, tuple)):
+            t_clean = [x for x in t if x is not None]
+            if len(t_clean) == 0:
+                result.append(torch.tensor(0))
+            elif isinstance(t_clean[0], torch.Tensor):
+                result.append(torch.stack(t_clean))
+            else:
+                result.append(torch.tensor(t_clean))
+        elif isinstance(t, (int, float, bool)):
+            result.append(torch.tensor(t))
+        else:
+            raise TypeError(f"flat_tensors[{i}] cant trans to tensor: type={type(t)}, value={t}")
+    return tuple(result)
 
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
@@ -1705,7 +1725,7 @@ async def iterate_rpc_inference(
         if args_structure is not None:
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
-        hidden_states, keep_indices, need_pruning1, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, *_ = flat_tensors
+        hidden_states, keep_indices, need_pruning1, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, prompts, hypo_ids, *_ = flat_tensors
         draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
@@ -1748,7 +1768,7 @@ async def iterate_rpc_inference(
         # logger.info(f"hidden_states: {hidden_states.shape}")
         # logger.info(f"keep_indices: {keep_indices.shape}")
         # logger.info(f"draft_tokens: {draft_tokens.shape}")
-            
+
         if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
             
@@ -2494,7 +2514,17 @@ async def iterate_rpc_inference(
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)
         transport_phase = "prefill" if hidden_states.ndim >= 2 and int(hidden_states.shape[1]) > 1 else "decode"
-        output_debug_names = ("hidden_states", "keep_indices", "need_pruning_next")
+        output_debug_names = (
+            "hidden_states",
+            "keep_indices",
+            "need_pruning_next",
+            "tree_attention_mask",
+            "kv_cache_position_ids",
+            "draft_tokens",
+        )
+        flat_tensors = ensure_tensors(
+            (hidden_states, keep_indices, need_pruning_next, tree_attention_mask, kv_cache_position_ids, draft_tokens)
+        )
         with transport_profile_scope() as full_serialize_profile:
             output_tensors = [
                 serialize_torch_tensor(
@@ -2511,7 +2541,7 @@ async def iterate_rpc_inference(
                     },
                 )
                 for idx, (result, proto) in enumerate(
-                    zip((hidden_states, keep_indices, need_pruning_next), nested_flatten(requested_backends[-1].outputs_schema))
+                    zip(flat_tensors, nested_flatten(requested_backends[-1].outputs_schema))
                 )
             ]
         full_serialize_summary = summarize_transport_profile(full_serialize_profile)

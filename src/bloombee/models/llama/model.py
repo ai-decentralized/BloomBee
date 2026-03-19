@@ -112,6 +112,12 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
 
         # Add last hidden state
         hidden_states = self.norm(hidden_states)
+        if hidden_states.ndim == 3 and hidden_states.shape != output_shape:
+            logger.warning(
+                "Adjusting llama output shape after remote session recovery: "
+                f"expected={output_shape}, actual={tuple(hidden_states.shape)}"
+            )
+            output_shape = (hidden_states.size(0), hidden_states.size(1), hidden_states.size(2))
         hidden_states = hidden_states.view(output_shape)
 
         return BaseModelOutputWithPast(
