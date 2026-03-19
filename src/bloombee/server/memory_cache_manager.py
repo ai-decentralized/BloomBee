@@ -433,6 +433,16 @@ class KVCacheManager:
             full_batch_size: Total batch size for micro-batch support (0 = no micro-batch)
             micro_batch_size: Actual size of this micro-batch (0 = use full_batch_size - batch_offset)
         """
+        if self._verbose_kv_logs:
+            logger.info(
+                "[MBPIPE_UPDATE_CACHE] start_position=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s active_cache_id=%s",
+                start_position,
+                batch_offset,
+                full_batch_size,
+                micro_batch_size,
+                type(new_kvs).__name__ if new_kvs is not None else "None",
+                self._get_active_cache_slot_id(),
+            )
         self._write_kvs(new_kvs, start_position, batch_offset, full_batch_size, micro_batch_size)
     
     def tokens_left(self) -> int:
@@ -1723,16 +1733,16 @@ class KVCacheManager:
         
         if full_batch_size > 0 and micro_batch_size > 0:
             if gpu_multiplexing:
-                # GPU multiplexing: 所有 micro-batch 都使用 offset=0
-                actual_mb_size = micro_batch_size if micro_batch_size > 0 else full_batch_in_cache
-                BH_offset_start = 0
-                BH_offset_end = min(actual_mb_size * H, BH_full)
-                
-                # 处理 prefetch 逻辑
                 mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size, full_batch_size)
-                slot_id = self._get_active_cache_slot_id()
-                current_mb = self._current_gpu_mb.get(slot_id) if slot_id is not None else None
-                pending_mb = self._pending_gpu_mb.get(slot_id) if slot_id is not None else None
+                working_slot, slot_batch_start, active_batch_size, _ = self._resolve_working_slot(
+                    mb_index, full_batch_in_cache, micro_batch_size
+                )
+                slot_state_key = self._get_slot_state_key(working_slot)
+                current_mb = self._current_gpu_mb.get(slot_state_key) if slot_state_key is not None else None
+                pending_mb = self._pending_gpu_mb.get(slot_state_key) if slot_state_key is not None else None
+                actual_mb_size = active_batch_size if active_batch_size > 0 else full_batch_in_cache
+                BH_offset_start = slot_batch_start * H
+                BH_offset_end = min(BH_offset_start + actual_mb_size * H, BH_full)
                 
                 if cache_len > 0:
                     if current_mb != mb_index:

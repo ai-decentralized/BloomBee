@@ -475,6 +475,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         micro_batch_size=inference_info.micro_batch_size,
                         cache_tensors=cache_tensors,)
                 else:
+                    if getattr(self.cache_manager, "_verbose_kv_logs", False):
+                        logger.info(
+                            "[MBPIPE_BACKEND_WRITE] update_cache start: uid=%s cache_len=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s",
+                            inference_info.uid,
+                            cache_len,
+                            inference_info.batch_offset,
+                            inference_info.full_batch_size,
+                            inference_info.micro_batch_size,
+                            type(new_kvs).__name__ if new_kvs is not None else "None",
+                        )
                     self.cache_manager.update_cache(
                         new_kvs, 
                         cache_len,
