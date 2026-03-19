@@ -69,30 +69,30 @@ def benchmark_inference(process_idx, args, result_pipe):
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
-    batch_size = getattr(args, 'batch_size', 8)
+    batch_size = getattr(args, 'batch_size', 1)
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
     indices = random.sample(range(len(dataset)), batch_size)
     sampled = dataset.select(indices)
     test_prompts = []
-    # for item in sampled:
-        # test_prompts.append(item["instruction"])
+    for item in sampled:
+        test_prompts.append(item["instruction"])
         
-    base_prompt = (
-        "Quantum mechanics explains the behavior of particles at very small scales. "
-        "Neural networks learn patterns by adjusting weights through backpropagation. "
-        "Distributed systems require robust consensus mechanisms to maintain state. "
-        "Optimization algorithms like gradient descent are fundamental to machine learning. "
-        "Transformer architectures rely on attention mechanisms to capture dependencies. "
-        "Reinforcement learning optimizes actions by maximizing cumulative rewards. "
-        "Bayesian inference updates beliefs based on observed evidence and prior knowledge. "
-        "Convex optimization problems guarantee global minima under certain conditions. "
-        "Signal processing extracts meaningful information from noisy measurements. "
-    )
-    prompts = [
-        f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
-        for i in range(batch_size)
-    ]
-    test_prompts = prompts
+    # base_prompt = (
+    #     "Quantum mechanics explains the behavior of particles at very small scales. "
+    #     "Neural networks learn patterns by adjusting weights through backpropagation. "
+    #     "Distributed systems require robust consensus mechanisms to maintain state. "
+    #     "Optimization algorithms like gradient descent are fundamental to machine learning. "
+    #     "Transformer architectures rely on attention mechanisms to capture dependencies. "
+    #     "Reinforcement learning optimizes actions by maximizing cumulative rewards. "
+    #     "Bayesian inference updates beliefs based on observed evidence and prior knowledge. "
+    #     "Convex optimization problems guarantee global minima under certain conditions. "
+    #     "Signal processing extracts meaningful information from noisy measurements. "
+    # )
+    # prompts = [
+    #     f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
+    #     for i in range(batch_size)
+    # ]
+    # test_prompts = prompts
 
     tokenizer.pad_token = tokenizer.eos_token
     input_ids = tokenizer(test_prompts, return_tensors="pt", padding=True).to(device)["input_ids"]

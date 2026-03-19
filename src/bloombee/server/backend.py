@@ -262,7 +262,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # Mark as already set to skip future checks
         self._device_already_set = True
 
-    @torch.inference_mode() # Enter inference mode, no gradient computation to save memory
     def inference_step( # Each block will execute once
         self,
         hidden_states: torch.Tensor,  # Input hidden state tensor
@@ -296,11 +295,17 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             return False
                         return bool(value.bool().any().item())
                     return bool(value)
+                
+                
 
                 # Parse flags per request (not just first-ever call), otherwise spec/non-spec
                 # mode can get stuck after the first request served by this backend.
                 self._need_pruning = _flag_to_bool(inference_info.need_pruning)
                 self._is_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
+                
+                training_mode = True
+                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.16':
+                    self.pruner_manager.middle_states = hidden_states
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
                 # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
@@ -450,9 +455,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
                 
                 # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
-                training_mode = False
-                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.15':
-                    self.pruner_manager.middle_states = output_hidden_states
                 
                 training_model_mode = False
                 if training_mode and training_model_mode and self._is_spec_decoding and self._is_last_block:
@@ -461,8 +463,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
                     self.pruner_manager.train_model(middle_norm_hidden_states, final_logits, full_mask, inference_info.draft_tokens)
                     
-                training_lm_head_mode = False
-                if training_mode and training_lm_head_mode and self._is_spec_decoding and self._is_last_block:
+                training_lm_head_mode = True
+                if training_mode and training_lm_head_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.31':
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
                     self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
@@ -1040,7 +1042,6 @@ class _MergedInferenceStep:
         delta["_valid"] = 1 if (before is not None and after is not None) else 0
         return delta
 
-    @torch.inference_mode()
     def __call__(
         self,
         hidden_states: torch.Tensor,
