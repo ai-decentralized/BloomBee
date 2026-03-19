@@ -1480,7 +1480,8 @@ class TransformerConnectionHandler(ConnectionHandler):
 
 
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
-            next_tensors = normalized_outputs + list(request.tensors[3:])
+            next_tensors_data = normalized_outputs + list(request.tensors[6:])
+            next_tensors = serialized_outputs + request.tensors[6:]
             
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
@@ -1488,7 +1489,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_metadata["clock_sync_sender_send_us"] = sender_send_us
 
             stub = self.get_stub(self._p2p, next_peer_id)
-            push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
+            push_tensor_bytes = sum(len(t.buffer) for t in next_tensors_data)
             serialized_next_metadata = MSGPackSerializer.dumps(next_metadata)
             push_metadata_bytes = len(serialized_next_metadata)
 

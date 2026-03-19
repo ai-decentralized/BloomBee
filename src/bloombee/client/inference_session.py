@@ -175,13 +175,14 @@ class _ServerInferenceSession:
         input_tensors, args_structure = pack_args_kwargs(
             inputs, 
             normalize_arg(keep_indices),
-            normalize_arg(torch.tensor(1 if need_pruning else 0)),
-            prompts, hypo_ids, 
+            normalize_arg(torch.tensor(1 if need_pruning else 0)), 
             normalize_arg(tree_attention_mask),
             normalize_arg(kv_cache_position_ids),
             normalize_arg(draft_tokens),
             normalize_arg(prefill_length),
             normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
+            prompts, 
+            hypo_ids,
         )
         logger.debug(f"_ServerInferenceSession  step id {step_id}")
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
@@ -199,12 +200,10 @@ class _ServerInferenceSession:
                 request_metadata["start_from_position"] = self._position
         # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
         # Speculative decoding keeps strict full-batch semantics; avoid cross-stage push.
-        if self.config.use_server_to_server and not is_spec_dec:
+        if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
             if next_servers:
                 request_metadata["next_servers"] = next_servers
-        elif is_spec_dec:
-            request_metadata["disable_cross_stage_push"] = 1
 
         request_metadata["args_structure"] = args_structure
 
@@ -495,7 +494,7 @@ class InferenceSession:
                     # 🔍 CLIENT DEBUG: Log server span processing start
                     span_start_time = time.perf_counter()
                     
-                    inputs, keep_indices, need_pruning_next = server_session.step( 
+                    inputs, keep_indices, *_ = server_session.step( 
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
@@ -516,7 +515,7 @@ class InferenceSession:
                     # 🔍 CLIENT DEBUG: Log server span processing end
                     span_end_time = time.perf_counter()
                     span_duration = (span_end_time - span_start_time) * 1000  # ms
-                    logger.debug(f"[CLIENT_SERVER_END] ServerIdx={server_idx} | Blocks={server_session.span.start}:{server_session.span.end} | Duration={span_duration:.2f}ms")
+                    logger.info(f"[CLIENT_SERVER_END] ServerIdx={server_idx} | Blocks={server_session.span.start}:{server_session.span.end} | Duration={span_duration:.2f}ms")
                     # print('inputs ', inputs)
                     # print('inputs.shape ', inputs.shape)
                     server_idx += 1
@@ -551,7 +550,7 @@ class InferenceSession:
         # 🔍 CLIENT DEBUG: Log inference step end
         inference_step_end = time.perf_counter()
         inference_step_duration = (inference_step_end - inference_step_start) * 1000  # ms
-        logger.debug(f"[CLIENT_INFERENCE_END] Position={self._position} | Duration={inference_step_duration:.2f}ms | Servers={server_idx}")
+        logger.info(f"[CLIENT_INFERENCE_END] Position={self._position} | Duration={inference_step_duration:.2f}ms | Servers={server_idx}")
         
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         # print('client inference session outputs ', outputs.shape)

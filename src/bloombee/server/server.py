@@ -330,7 +330,7 @@ class Server:
         # Create configuration
         config = PruningConfig(
             method=PruningMethod.ADAPTIVE_NEURAL,
-            neural_threshold=0.5,
+            neural_threshold=0.9,
             simple_threshold=0.1
         )
         
@@ -716,6 +716,15 @@ class ModuleContainer(threading.Thread):
                             dtype=torch.int64,
                             compression=compression
                         ),
+                        BatchTensorDescriptor(
+                            1, 64, 64, dtype=torch.bool
+                        ), # tree_attention_mask
+                        BatchTensorDescriptor(
+                            1, 128, dtype=torch.int64
+                        ), #  kv_cache_position_ids
+                        BatchTensorDescriptor(
+                            1, 128, dtype=torch_dtype
+                        ), # draft_tokens
                     ),
                     min_batch_size=min_batch_size,
                     max_batch_size=max_batch_size,
