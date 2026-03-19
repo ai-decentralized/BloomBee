@@ -42,6 +42,7 @@ from bloombee.flexgen_utils.task import Task
 from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice, DeviceType, general_copy
 from bloombee.flexgen_utils.compression import TorchCompressedDevice, general_copy_compressed
 from bloombee.flexgen_utils.utils import torch_dtype_to_np_dtype
+from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 import numpy as np
 
 logger = get_logger(__name__)
@@ -53,7 +54,11 @@ offload_logger.setLevel(logging.INFO)
 
 def _is_verbose_kv_alloc_logs() -> bool:
     """Enable detailed KV allocation logs with BLOOMBEE_VERBOSE_KV_LOGS=1."""
-    return os.environ.get("BLOOMBEE_VERBOSE_KV_LOGS", "0") == "1"
+    return get_env_bool_with_debug_fallback(
+        "BLOOMBEE_VERBOSE_KV_LOGS",
+        default=False,
+        groups=("kv_cache",),
+    )
 
 
 class MemoryCache:
@@ -85,6 +90,7 @@ class MemoryCache:
         self.allocation_policy = policy
         self.block_config = block_config
         self.device = device
+        self._cache_home_probe_emitted = False
         
 
     @property
@@ -192,6 +198,71 @@ class MemoryCache:
                 )
             self._memory_freed_event.clear()
 
+    def _emit_cache_home_probe(
+        self,
+        allocated_cache: Any,
+        policy: Policy,
+        handle: Handle,
+        batch_size: int,
+        seq_len: int,
+    ) -> None:
+        if self._cache_home_probe_emitted:
+            return
+
+        try:
+            k_cache, v_cache = allocated_cache
+            device_type = getattr(self.device, "device_type", None)
+            cache_device_type = getattr(getattr(k_cache, "device", None), "device_type", None)
+
+            total_kv_mb = 0.0
+            if hasattr(k_cache, "bytes") and hasattr(v_cache, "bytes"):
+                total_kv_mb = (k_cache.bytes + v_cache.bytes) / (1024 ** 2)
+
+            gpu_alloc_mb = 0.0
+            gpu_reserved_mb = 0.0
+            if torch.cuda.is_available():
+                gpu_alloc_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+                gpu_reserved_mb = torch.cuda.memory_reserved() / (1024 ** 2)
+
+            msg = (
+                f"[CACHE_HOME_PROBE] handle={handle} "
+                f"policy_cache_gpu={policy.cache_gpu_percent} "
+                f"policy_cache_cpu={policy.cache_cpu_percent} "
+                f"policy_cache_disk={policy.cache_disk_percent} "
+                f"policy_gpu_batch_size={policy.gpu_batch_size} "
+                f"alloc_batch_size={batch_size} alloc_seq_len={seq_len} "
+                f"allocator_device_type={device_type} "
+                f"cache_device_type={cache_device_type} "
+                f"shape={tuple(getattr(k_cache, 'shape', ()))} "
+                f"kv_total_mb={total_kv_mb:.2f} "
+                f"gpu_alloc_mb={gpu_alloc_mb:.2f} gpu_reserved_mb={gpu_reserved_mb:.2f}"
+            )
+
+            if cache_device_type == DeviceType.MIXED and isinstance(getattr(k_cache, "data", None), tuple):
+                segments, seg_points = k_cache.data
+                seg_lengths = [seg_points[i + 1] - seg_points[i] for i in range(len(seg_points) - 1)]
+                seg_devices = [
+                    str(getattr(getattr(seg, "device", None), "device_type", None)) if seg is not None else "None"
+                    for seg in segments
+                ]
+                seg_k_mb = [
+                    round(seg.bytes / (1024 ** 2), 2) if seg is not None and hasattr(seg, "bytes") else 0.0
+                    for seg in segments
+                ]
+                msg += (
+                    f" seg_lengths={seg_lengths} "
+                    f"seg_devices={seg_devices} "
+                    f"seg_kv_mb={[round(x * 2, 2) for x in seg_k_mb]}"
+                )
+            elif torch.is_tensor(getattr(k_cache, "data", None)):
+                msg += f" cache_data_is_cuda={bool(k_cache.data.is_cuda)}"
+
+            logger.info(msg)
+        except Exception as e:
+            logger.warning(f"[CACHE_HOME_PROBE] failed in MemoryCache: {e}")
+        finally:
+            self._cache_home_probe_emitted = True
+
     @contextlib.contextmanager
     def use_cache(self, *handles: Handle) -> Sequence[torch.Tensor]:
         """
@@ -253,6 +324,13 @@ class MemoryCache:
                     
                     allocated_cache = self.device.init_cache_one_gpu_batch(
                         self.block_config, self.mocked_task, override_policy
+                    )
+                    self._emit_cache_home_probe(
+                        allocated_cache,
+                        override_policy,
+                        handle=handle,
+                        batch_size=descr_batch_size,
+                        seq_len=seq_len,
                     )
                     
                     # [MBPIPE_DEBUG] Log the allocated cache shape (handle different structures)

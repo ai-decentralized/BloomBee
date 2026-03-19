@@ -1,9 +1,7 @@
 from typing import Optional
 
-import hivemind
 import torch
 import torch.nn as nn
-from hivemind.utils.logging import get_logger
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.models.falcon import (
     FalconForCausalLM,
@@ -19,6 +17,7 @@ from bloombee.client.remote_generation import RemoteGenerationMixin, RemotePastK
 from bloombee.client.remote_sequential import RemoteSequential
 from bloombee.models.falcon.config import DistributedFalconConfig
 from bloombee.utils.auto_config import DefaultRevisionMixin
+from bloombee.utils.hivemind_compat import DHT, get_logger
 
 logger = get_logger(__name__)
 
@@ -31,7 +30,7 @@ class DistributedFalconModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
 
     config_class = DistributedFalconConfig
 
-    def __init__(self, config: DistributedFalconConfig, *, dht: Optional[hivemind.DHT] = None):
+    def __init__(self, config: DistributedFalconConfig, *, dht: Optional[DHT] = None):
         n_layer, config.num_hidden_layers = config.num_hidden_layers, 0  # Prevent initialization
         super().__init__(config)
         assert len(self.h) == 0

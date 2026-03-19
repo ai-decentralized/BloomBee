@@ -6,7 +6,7 @@ This script captures intermediate layer activations during inference
 and saves them for compression analysis.
 
 Usage:
-    python benchmarks/activation_dumper.py \
+    python benchmarks/compression/activation_dumper.py \
         --model huggyllama/llama-13b \
         --initial_peers $BBSERVER \
         --output_dir /tmp/activation_dump \
@@ -26,11 +26,10 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import numpy as np
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add repo src directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from transformers import AutoTokenizer
-
 from bloombee.utils.hivemind_compat import get_logger
 
 logger = get_logger(__name__)
@@ -421,10 +420,10 @@ def main():
         parser.print_help()
         print("\nExamples:")
         print("  # Generate synthetic activations for testing:")
-        print("  python activation_dumper.py synthetic --output_dir /tmp/activations --num_samples 20")
+        print("  python benchmarks/compression/activation_dumper.py synthetic --output_dir /tmp/activations --num_samples 20")
         print("")
         print("  # Dump real activations during inference:")
-        print("  python activation_dumper.py infer --model huggyllama/llama-13b \\")
+        print("  python benchmarks/compression/activation_dumper.py infer --model huggyllama/llama-13b \\")
         print("      --initial_peers $BBSERVER --output_dir /tmp/activations")
 
 

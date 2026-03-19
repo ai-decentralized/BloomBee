@@ -41,9 +41,35 @@ class SpeculativePrunerManager:
         self.pruned_tokens = 0
         self.iteration = 0
         self.middle_states = None
-        
-        train_lm_head_mode = True
-        self.lm_head_trainer = LM_head_trainer(hidden_size, vocab_size, device, config) if train_lm_head_mode else None
+
+        # The auxiliary LM-head trainer depends on an out-of-band weight file.
+        # Server startup should not fail if that file is absent because inference
+        # and pruning do not require online LM-head training.
+        self.lm_head_trainer = None
+        self._lm_head_trainer_unavailable = False
+
+    def _ensure_lm_head_trainer(self) -> Optional[LM_head_trainer]:
+        if self.lm_head_trainer is not None:
+            return self.lm_head_trainer
+        if self._lm_head_trainer_unavailable:
+            return None
+
+        try:
+            self.lm_head_trainer = LM_head_trainer(
+                self.hidden_size,
+                self.vocab_size,
+                self.device,
+                self.config,
+            )
+        except FileNotFoundError as e:
+            self._lm_head_trainer_unavailable = True
+            logger.warning(
+                "Disabling auxiliary LM-head trainer because its weight file is missing: %s",
+                e,
+            )
+            return None
+
+        return self.lm_head_trainer
         
     def switch_method(self, method: Union[str, PruningMethod], keep_stats: bool = False):
         """Switch to a different pruning method"""
@@ -100,8 +126,8 @@ class SpeculativePrunerManager:
                 self.iteration = self.iteration + 1
                 
     def train_lm_head(self, middle_hidden_states, final_hidden_states):
-        if self.lm_head_trainer is not None:
+        trainer = self._ensure_lm_head_trainer()
+        if trainer is not None:
             with torch.enable_grad():
-                self.lm_head_trainer.train_step(middle_hidden_states, final_hidden_states)
+                trainer.train_step(middle_hidden_states, final_hidden_states)
                 self.iteration = self.iteration + 1
-        

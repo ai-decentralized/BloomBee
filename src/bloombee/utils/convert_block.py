@@ -15,6 +15,7 @@ from transformers import PretrainedConfig
 from pynvml import *
 from bloombee.utils.debug import dprint
 from bloombee.utils.memory_usage import see_memory_usage, log_mem
+from bloombee.server.flexgen_tensor_parallel import FlexgenLlamaTensorParallel
 
 logger = get_logger(__name__)
 
@@ -115,6 +116,15 @@ def convert_block(
     """
     if freeze:
         block.requires_grad_(False)
+    if len(tensor_parallel_devices) > 1 and config.model_type == "llama":
+        return make_tensor_parallel(
+            block,
+            config,
+            tensor_parallel_devices,
+            output_device,
+            policy=policy,
+        )
+
     # Skip tensor parallelism for FlexGen blocks - they manage their own weights and devices
     log_prefix = f"[convert_block:{block_index}]"
     # log_mem(f"{log_prefix} skipping tensor parallelism - FlexGen manages weights directly")
@@ -222,9 +232,15 @@ def convert_block(
 
         def named_parameters(self, *args, **kwargs):
             return self._module.named_parameters(*args, **kwargs)
+
+        def parameters(self, *args, **kwargs):
+            return self._module.parameters(*args, **kwargs)
             
         def named_buffers(self, *args, **kwargs):
             return self._module.named_buffers(*args, **kwargs)
+
+        def buffers(self, *args, **kwargs):
+            return self._module.buffers(*args, **kwargs)
         
         def rms_norm(self, *args, **kwargs):
             if hasattr(self._module, 'rms_norm'):
@@ -276,8 +292,36 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
 
 
 def make_tensor_parallel(
-    block: nn.Module, model_config: PretrainedConfig, devices: Sequence[torch.device], output_device: torch.device
+    block: nn.Module,
+    model_config: PretrainedConfig,
+    devices: Sequence[torch.device],
+    output_device: torch.device,
+    policy=None,
 ) -> nn.Module:
+    if model_config.model_type == "llama":
+        num_kv_heads = getattr(model_config, "num_key_value_heads", model_config.num_attention_heads)
+        if (
+            not hasattr(block, "env")
+            or not hasattr(block, "path")
+            or num_kv_heads != model_config.num_attention_heads
+            or model_config.num_attention_heads % len(devices) != 0
+            or model_config.intermediate_size % len(devices) != 0
+        ):
+            raise ValueError(
+                "BloomBee only supports FlexGen-native LLaMA tensor parallelism. "
+                f"Unsupported config: num_attention_heads={model_config.num_attention_heads}, "
+                f"num_key_value_heads={num_kv_heads}, intermediate_size={model_config.intermediate_size}, "
+                f"tp_world_size={len(devices)}"
+            )
+
+        return FlexgenLlamaTensorParallel(
+            block,
+            model_config,
+            devices,
+            output_device,
+            policy=policy,
+        )
+
     if model_config.model_type == "bloom":
         tp_config = get_bloom_config(model_config, devices)
         del tp_config.state_rules[re.compile(".*word_embeddings.weight$")]
@@ -295,7 +339,8 @@ def make_tensor_parallel(
             # print("submodule ", submodule)
             if isinstance(submodule, model_config.attn_class):
                 total_heads += submodule.num_heads
-    assert total_heads == model_config.num_attention_heads
+    if model_config.model_type == "bloom":
+        assert total_heads == model_config.num_attention_heads
     return tp_block
 
 

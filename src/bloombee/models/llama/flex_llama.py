@@ -517,6 +517,50 @@ class FLEX_LlamaAttention(LlamaAttention):
         )
         
         cache = device.init_cache_one_gpu_batch(self.config, task_copy, self.policy)
+        if not getattr(self, "_cache_home_probe_emitted", False):
+            try:
+                k_cache, v_cache = cache
+                total_kv_mb = (k_cache.bytes + v_cache.bytes) / (1024 ** 2)
+                gpu_alloc_mb = 0.0
+                gpu_reserved_mb = 0.0
+                if torch.cuda.is_available():
+                    gpu_alloc_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+                    gpu_reserved_mb = torch.cuda.memory_reserved() / (1024 ** 2)
+
+                cache_device_type = getattr(getattr(k_cache, "device", None), "device_type", None)
+                msg = (
+                    f"[CACHE_HOME_PROBE] layer={self.layer_id} "
+                    f"policy_cache_gpu={self.policy.cache_gpu_percent} "
+                    f"policy_cache_cpu={self.policy.cache_cpu_percent} "
+                    f"selected_device_type={getattr(device, 'device_type', None)} "
+                    f"cache_device_type={cache_device_type} "
+                    f"shape={tuple(k_cache.shape)} kv_total_mb={total_kv_mb:.2f} "
+                    f"gpu_alloc_mb={gpu_alloc_mb:.2f} gpu_reserved_mb={gpu_reserved_mb:.2f}"
+                )
+
+                if cache_device_type == DeviceType.MIXED and isinstance(k_cache.data, tuple) and len(k_cache.data) == 2:
+                    segments, seg_points = k_cache.data
+                    seg_lengths = [seg_points[i + 1] - seg_points[i] for i in range(len(seg_points) - 1)]
+                    seg_devices = [
+                        str(getattr(getattr(seg, "device", None), "device_type", None)) if seg is not None else "None"
+                        for seg in segments
+                    ]
+                    seg_k_mb = [
+                        round(seg.bytes / (1024 ** 2), 2) if seg is not None else 0.0
+                        for seg in segments
+                    ]
+                    seg_kv_mb = [round(x * 2, 2) for x in seg_k_mb]
+                    msg += (
+                        f" seg_lengths={seg_lengths} seg_devices={seg_devices} "
+                        f"seg_kv_mb={seg_kv_mb}"
+                    )
+                elif torch.is_tensor(k_cache.data):
+                    msg += f" cache_data_is_cuda={bool(k_cache.data.is_cuda)}"
+
+                logger.info(msg)
+            except Exception as e:
+                logger.warning(f"[CACHE_HOME_PROBE] failed for layer={self.layer_id}: {e}")
+            self._cache_home_probe_emitted = True
         cache_home.store(cache)
 
     def load_cache(self, cache_home, cache_read_buf, i):

@@ -13,11 +13,10 @@ import torch.mps
 from hivemind.utils.logging import get_logger
 from transformers import PretrainedConfig
 
-from bloombee.server.block_utils import get_model_block, resolve_block_dtype
+from bloombee.server.block_utils import resolve_block_dtype
+from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.utils.convert_block import QuantType, convert_block
 from bloombee.utils.disk_cache import DEFAULT_CACHE_DIR
-from bloombee.utils.misc import DUMMY_KEY_PAST
-
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
@@ -59,6 +58,9 @@ def get_server_throughput(
     relay_penalty: float = 0.2,
     force_eval: bool = False,
     cache_dir: Optional[str] = None,
+    revision: Optional[str] = None,
+    token: Optional[Union[str, bool]] = None,
+    max_disk_space: Optional[int] = None,
 ) -> Dict[str, float]:
     dtype = resolve_block_dtype(config, dtype)
 
@@ -93,7 +95,20 @@ def get_server_throughput(
 
         if cache_key not in cache:
             cache[cache_key] = measure_throughput_info(
-                config, device, dtype, env, policy,weight_home,path, quant_type=quant_type, tensor_parallel_devices=tensor_parallel_devices
+                model_name,
+                config,
+                device,
+                dtype,
+                env,
+                policy,
+                weight_home,
+                path,
+                quant_type=quant_type,
+                tensor_parallel_devices=tensor_parallel_devices,
+                revision=revision,
+                token=token,
+                cache_dir=cache_dir,
+                max_disk_space=max_disk_space,
             )
 
             try:
@@ -121,6 +136,7 @@ def get_server_throughput(
 
 
 def measure_throughput_info(
+    model_name: str,
     config: PretrainedConfig,
     device: torch.device,
     dtype: torch.dtype,
@@ -131,12 +147,17 @@ def measure_throughput_info(
     *,
     quant_type: QuantType,
     tensor_parallel_devices: Sequence[torch.device],
+    revision: Optional[str] = None,
+    token: Optional[Union[str, bool]] = None,
+    cache_dir: Optional[str] = None,
+    max_disk_space: Optional[int] = None,
 ) -> Dict[str, float]:
     logger.info(
         "Measuring network and compute throughput. This takes about a minute and will be cached for future runs"
     )
     return {
         "inference_rps": measure_compute_rps(
+            model_name,
             config,
             device,
             dtype,
@@ -146,11 +167,16 @@ def measure_throughput_info(
             path, ####
             quant_type=quant_type,
             tensor_parallel_devices=tensor_parallel_devices,
+            revision=revision,
+            token=token,
+            cache_dir=cache_dir,
+            max_disk_space=max_disk_space,
             n_tokens=1,
             n_steps=100,
             inference=True,
         ),
         "forward_rps": measure_compute_rps(
+            model_name,
             config,
             device,
             dtype,
@@ -160,6 +186,10 @@ def measure_throughput_info(
             path, ####
             quant_type=quant_type,
             tensor_parallel_devices=tensor_parallel_devices,
+            revision=revision,
+            token=token,
+            cache_dir=cache_dir,
+            max_disk_space=max_disk_space,
             n_tokens=1024,
             n_steps=10,
             inference=False,
@@ -212,6 +242,7 @@ def _measure_bits_per_second(pipe_send: mp.Pipe):
 
 
 def measure_compute_rps(
+    model_name: str,
     config: PretrainedConfig,
     device: torch.device,
     dtype: torch.dtype,
@@ -222,6 +253,10 @@ def measure_compute_rps(
     *,
     quant_type: QuantType,
     tensor_parallel_devices: Sequence[torch.device],
+    revision: Optional[str] = None,
+    token: Optional[Union[str, bool]] = None,
+    cache_dir: Optional[str] = None,
+    max_disk_space: Optional[int] = None,
     n_tokens: int,
     n_steps: int,
     inference: bool,
@@ -238,34 +273,56 @@ def measure_compute_rps(
     logger.info(f"[THROUGHPUT_DEBUG] Device: {device}, Dtype: {dtype}")
     
     with torch.inference_mode():
-        block = get_model_block(config, env, policy, weight_home, path) #####
+        block = load_pretrained_block(
+            model_name,
+            block_index=0,
+            env=env,
+            policy=policy,
+            weight_home=weight_home,
+            path=path,
+            config=config,
+            torch_dtype=dtype,
+            revision=revision,
+            token=token,
+            cache_dir=cache_dir,
+            max_disk_space=max_disk_space,
+            tensor_parallel_devices=tensor_parallel_devices,
+        )
 
         block = block.to(dtype)
         # hack
         # tensor_parallel_devices = tensor_parallel_devices + (torch.device("cuda", index=1),)
 
-        block = convert_block(block, 0, config, tensor_parallel_devices, device, quant_type=quant_type, freeze=True)
-        # import pdb;pdb.set_trace()
-        cache = (DUMMY_KEY_PAST.to(dtype=dtype, device=device), DUMMY_KEY_PAST.to(dtype=dtype, device=device))
-        elapsed = 0
+        block = convert_block(
+            block,
+            0,
+            config,
+            tensor_parallel_devices,
+            device,
+            quant_type=quant_type,
+            freeze=True,
+            policy=policy,
+        )
+        cache = None
         dummy_input = torch.randn(1, n_tokens, config.hidden_size, device=device, dtype=dtype)
+        sync_devices = tensor_parallel_devices if len(tensor_parallel_devices) > 1 else (device,)
         
         dprint('measure_compute_rps: dummy_input', dummy_input)
         dprint('measure_compute_rps: dummy_input.shape', dummy_input.shape)
-        # Skip the 1st step to exclude the initialization time
+        # Warm up once to exclude one-time kernel/materialization overheads.
         def step(cache_):
             dprint('step cache_ block', block)
             outputs = block.forward(dummy_input, use_cache=inference, layer_past=cache_ if inference else None)
             return outputs[1] if inference else None
 
-        # cache = step(cache)
-        synchronize(device)
+        cache = step(cache)
+        synchronize_devices(sync_devices)
 
         start_time = time.perf_counter()
-        # for _ in range(n_steps):
-        #     cache = step(cache)
-        synchronize(device)
-        elapsed = time.perf_counter() - start_time
+        for _ in range(n_steps):
+            cache = step(cache)
+        synchronize_devices(sync_devices)
+        elapsed = max(time.perf_counter() - start_time, 1e-12)
         device_rps = n_steps * n_tokens / elapsed
 
     devices_repr = get_device_name(device)
@@ -291,6 +348,16 @@ def synchronize(device: torch.device):
         torch.cuda.synchronize(device)
     elif device.type == "mps":
         torch.mps.synchronize()
+
+
+def synchronize_devices(devices: Sequence[torch.device]):
+    seen = set()
+    for device in map(torch.device, devices):
+        key = (device.type, device.index)
+        if key in seen:
+            continue
+        seen.add(key)
+        synchronize(device)
 
 
 def get_device_name(device: torch.device) -> str:

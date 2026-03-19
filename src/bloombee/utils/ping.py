@@ -13,6 +13,21 @@ from bloombee.utils.hivemind_compat import DHT, DHTNode, PeerID, TimedStorage, g
 logger = get_logger(__name__)
 
 
+def _is_ping_protocol_unsupported(error_text: str) -> bool:
+    return (
+        "protocol not supported" in error_text
+        or ("protocols not supported" in error_text and "rpc_ping" in error_text)
+    )
+
+
+def _is_ping_route_unavailable(error_text: str) -> bool:
+    return (
+        error_text == "routing: not found"
+        or "failed to dial" in error_text
+        or "all dials failed" in error_text
+    )
+
+
 async def ping(
     peer_id: PeerID,
     _dht: DHT,
@@ -20,14 +35,17 @@ async def ping(
     *,
     wait_timeout: float = 5,
 ) -> float:
+    start_time = time.perf_counter()
     try:
         ping_request = dht_pb2.PingRequest(peer=node.protocol.node_info)
-        start_time = time.perf_counter()
         await node.protocol.get_stub(peer_id).rpc_ping(ping_request, timeout=wait_timeout)
         return time.perf_counter() - start_time
     except Exception as e:
-        if str(e) == "protocol not supported":  # Happens on servers with client-mode DHT (e.g., reachable via relays)
+        error_text = str(e).strip().lower()
+        if _is_ping_protocol_unsupported(error_text):
             return time.perf_counter() - start_time
+        if _is_ping_route_unavailable(error_text):
+            return math.inf
 
         logger.debug(f"Failed to ping {peer_id}:", exc_info=True)
         return math.inf

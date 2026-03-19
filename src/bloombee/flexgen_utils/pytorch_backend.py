@@ -29,6 +29,8 @@ global_cpu_device = None
 global_disk_device = None
 
 logger = get_logger(__name__)
+_MHA_GEN_DECODE_PROBE_EMITTED = False
+_MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = False
 
 
 def fix_recursive_import():
@@ -654,8 +656,12 @@ class TorchDevice:
             w_v = w_v.device.decompress(w_v)
             w_out = w_out.device.decompress(w_out)
             
-        bsz, q_len, h = hidden_states.shape
-        head_dim = h // num_attention_heads
+        bsz, q_len, hidden_size = hidden_states.shape
+        qkv_hidden_size = w_q.shape[0]
+        assert qkv_hidden_size % num_attention_heads == 0, (
+            f"q_proj rows={qkv_hidden_size} must be divisible by num_attention_heads={num_attention_heads}"
+        )
+        head_dim = qkv_hidden_size // num_attention_heads
         
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
@@ -690,7 +696,7 @@ class TorchDevice:
         
         attn_weights = attn_weights.view(bsz * num_attention_heads, q_len, q_len)
         value = torch.bmm(attn_weights, v).view(bsz, num_attention_heads, q_len, head_dim)
-        value = value.transpose(1, 2).reshape(bsz, q_len, h)
+        value = value.transpose(1, 2).reshape(bsz, q_len, qkv_hidden_size)
 
         value = F.linear(value, w_out.data)
         value.add_(hidden_states.data)
@@ -713,6 +719,7 @@ class TorchDevice:
                 w_out, n_head, k_cache, v_cache, donate,
                 attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids):
         """Multi-head attention (decoding phase)."""
+        global _MHA_GEN_DECODE_PROBE_EMITTED, _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -720,9 +727,13 @@ class TorchDevice:
             w_v = w_v.device.decompress(w_v)
             w_out = w_out.device.decompress(w_out)
             
-        b, tgt_s, h = inputs.shape
+        b, tgt_s, hidden_size = inputs.shape
         src_s = attention_mask.shape[-1]
-        head_dim = h // n_head
+        qkv_hidden_size = w_q.shape[0]
+        assert qkv_hidden_size % n_head == 0, (
+            f"q_proj rows={qkv_hidden_size} must be divisible by n_head={n_head}"
+        )
+        head_dim = qkv_hidden_size // n_head
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
 
@@ -769,6 +780,34 @@ class TorchDevice:
         if not isinstance(k_cache, TorchTensor):
             k_cache = TorchTensor.create_from_torch(k_cache, attention_mask.device)
             v_cache = TorchTensor.create_from_torch(v_cache, attention_mask.device)
+
+        if not _MHA_GEN_DECODE_PROBE_EMITTED:
+            cache_type = type(k_cache).__name__
+            is_torch_tensor = isinstance(k_cache, TorchTensor)
+            cache_device_type = None
+            cache_data_type = None
+            cache_data_is_cuda = None
+            if is_torch_tensor:
+                cache_device_type = getattr(getattr(k_cache, "device", None), "device_type", None)
+                cache_data = getattr(k_cache, "data", None)
+                cache_data_type = type(cache_data).__name__
+                if torch.is_tensor(cache_data):
+                    cache_data_is_cuda = bool(cache_data.is_cuda)
+                elif isinstance(cache_data, tuple):
+                    cache_data_is_cuda = False
+            logger.info(
+                f"[CACHE_PATH_PROBE] backend_device_type={getattr(self, 'device_type', None)} "
+                f"compress_cache={compress_cache} attn_sparsity={attn_sparsity} "
+                f"k_cache_type={cache_type} is_torch_tensor={is_torch_tensor} "
+                f"cache_device_type={cache_device_type} cache_data_type={cache_data_type} "
+                f"cache_data_is_cuda={cache_data_is_cuda}"
+            )
+            if is_torch_tensor and cache_device_type == DeviceType.MIXED:
+                logger.warning(
+                    "[CACHE_PATH_PROBE] k_cache is MIXED, but decode will still enter the TorchTensor branch "
+                    "before _mixed_device_attention(). If you expected mixed-device attention, verify this path."
+                )
+            _MHA_GEN_DECODE_PROBE_EMITTED = True
         
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
@@ -787,9 +826,15 @@ class TorchDevice:
                 # shape: (b * n_head, s, head_dim)
                 v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
                 if k.is_cuda:
+                    if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
+                        logger.info("[CACHE_PATH_BRANCH] decode_branch=dense_cuda")
+                        _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = True
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim)
                 else:
+                    if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
+                        logger.info("[CACHE_PATH_BRANCH] decode_branch=dense_cpu")
+                        _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = True
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
                     value = self._attention_value(q, k, v, attention_mask.data,
@@ -813,12 +858,15 @@ class TorchDevice:
                         attn_sparsity).cuda().half()
         else:  # Mixed device attention
             assert attn_sparsity >= 1.0
+            if not _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED:
+                logger.info("[CACHE_PATH_BRANCH] decode_branch=mixed_device")
+                _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = True
             value = self._mixed_device_attention(q, k_cache, v_cache,
                 k_new, v_new, attention_mask.data, b, src_s, tgt_s,
                 n_head, head_dim)
 
         # shape: (b, 1, h)
-        value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, h)
+        value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, qkv_hidden_size)
         
         value = F.linear(value, w_out.data)
 

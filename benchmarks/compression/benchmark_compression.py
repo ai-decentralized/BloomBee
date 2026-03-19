@@ -7,10 +7,10 @@ on activation tensors to evaluate compression ratio, speed, and accuracy impact.
 
 Usage:
     # First generate or dump activations:
-    python activation_dumper.py synthetic --output_dir /tmp/activations --num_samples 20
+    python benchmarks/compression/activation_dumper.py synthetic --output_dir /tmp/activations --num_samples 20
 
     # Then run compression benchmark:
-    python benchmark_compression.py --input_dir /tmp/activations --output_report /tmp/compression_report.json
+    python benchmarks/compression/benchmark_compression.py --input_dir /tmp/activations --output_report /tmp/compression_report.json
 
 Dependencies:
     pip install lz4 zstandard tabulate
@@ -51,8 +51,8 @@ except ImportError:
     HAS_TABULATE = False
     warnings.warn("tabulate not installed. Install with: pip install tabulate")
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add repo src directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from bloombee.utils.hivemind_compat import get_logger
 

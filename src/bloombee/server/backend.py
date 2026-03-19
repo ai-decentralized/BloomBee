@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from itertools import chain
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
 from time import perf_counter
 
 import torch
@@ -18,7 +18,6 @@ from transformers import PretrainedConfig
 from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
-from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
@@ -37,6 +36,9 @@ import time
 import threading
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 
 # Create dedicated offloading debug logger
 offload_logger = logging.getLogger('bloombee.offloading')
@@ -83,7 +85,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         *args,
         config: PretrainedConfig,
         cache_manager: KVCacheManager,
-        pruner_manager: SpeculativePrunerManager,
+        pruner_manager: Optional[SpeculativePrunerManager],
         is_last_block: bool,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
@@ -110,7 +112,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         max_batch_size = self.forward_pool.max_batch_size
         device = self.module.devices[self.module.output_device_index]
         self.inference_pool = PrioritizedTaskPool(
-            self.inference_step, max_batch_size=max_batch_size, device=device, name=f"{self.name}_inference"
+            self.inference_step,
+            max_batch_size=max_batch_size,
+            device=device,
+            name=f"{self.name}_inference",
+            track_transfer_timing=True,
         )  # note: inference_pools may be merged later, see merge_inference_pools_inplace
         self.forward_pool = PrioritizedTaskPool(
             self.forward, max_batch_size=max_batch_size, device=device, name=f"{self.name}_forward"
@@ -121,11 +127,15 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
-        self.shard_num_heads = []
-        for shard in self.module.module_shards:
-            for submodule in shard.modules():
-                if isinstance(submodule, config.attn_class):
-                    self.shard_num_heads.append(submodule.num_heads)
+        provided_shard_num_heads = getattr(self.module, "shard_num_heads", None)
+        if provided_shard_num_heads is not None:
+            self.shard_num_heads = list(provided_shard_num_heads)
+        else:
+            self.shard_num_heads = []
+            for shard in self.module.module_shards:
+                for submodule in shard.modules():
+                    if isinstance(submodule, config.attn_class):
+                        self.shard_num_heads.append(submodule.num_heads)
         assert len(self.shard_num_heads) == len(self.module.devices)
         assert sum(self.shard_num_heads) == config.num_attention_heads
 
@@ -189,6 +199,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if is_last_block:
             self.module.load_lm_head()
         self._last_keep_indices = None
+
+    def _is_identity_hypo_ids(self, hypo_ids: Optional[torch.Tensor]) -> bool:
+        if hypo_ids is None:
+            return True
+        if hypo_ids.ndim != 1:
+            return False
+        expected = torch.arange(hypo_ids.numel(), device=hypo_ids.device, dtype=hypo_ids.dtype)
+        return torch.equal(hypo_ids, expected)
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""
@@ -300,7 +318,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # Parse flags per request (not just first-ever call), otherwise spec/non-spec
                 # mode can get stuck after the first request served by this backend.
                 self._need_pruning = _flag_to_bool(inference_info.need_pruning)
-                self._is_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
+                requested_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
+                self._is_spec_decoding = requested_spec_decoding
+                if self._need_pruning and self.pruner_manager is None:
+                    logger.debug(
+                        "%s speculative decoding requested without an active pruner; pruning is disabled",
+                        self.name,
+                    )
+                    self._need_pruning = False
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
                 # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
@@ -321,7 +346,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
                     k_pkv, v_pkv, cache_len = self.cache_manager.select_cache_without_reorder(
-                        kv_cache_position_ids, 
+                        kv_cache_position_ids,
                         batch_offset=inference_info.batch_offset,
                         full_batch_size=inference_info.full_batch_size,
                         micro_batch_size=inference_info.micro_batch_size,
@@ -338,11 +363,29 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         micro_batch_size=inference_info.micro_batch_size,
                     )
                     cache_len = k_pkv.shape[2] if k_pkv is not None else 0
-                    
+
                 # t2 = time.perf_counter()
                 # logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
 
                 layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
+                if hasattr(self.module, "set_remote_cache_reuse_enabled"):
+                    policy = self.cache_manager.offloading_policy
+                    reuse_allowed = not (
+                        self._is_spec_decoding
+                        or (kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0)
+                        or not self._is_identity_hypo_ids(hypo_ids)
+                        or policy.cache_gpu_percent < 100
+                        or policy.cache_cpu_percent > 0
+                        or policy.cache_disk_percent > 0
+                        or policy.compress_cache
+                        or policy.cpu_cache_compute
+                        or (
+                            inference_info.full_batch_size > 0
+                            and int(getattr(policy, "gpu_batch_size", inference_info.full_batch_size))
+                            < int(inference_info.full_batch_size)
+                        )
+                    )
+                    self.module.set_remote_cache_reuse_enabled(reuse_allowed)
 
                 full_mask = None
                 device = hidden_states.device
@@ -410,7 +453,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         #     offload_logger.info(f"   - new_kvs[0] device: {new_kvs[0].device}")
                         
                     except Exception as e:
-                        logger.error(f'ERROR in module.forward: {type(e).__name__}: {e}')
+                        print(f' ERROR in module.forward: {type(e).__name__}: {e}')
                         import traceback
                         traceback.print_exc()
                         return (hidden_states, None)
@@ -432,13 +475,23 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         micro_batch_size=inference_info.micro_batch_size,
                         cache_tensors=cache_tensors,)
                 else:
+                    if getattr(self.cache_manager, "_verbose_kv_logs", False):
+                        logger.info(
+                            "[MBPIPE_BACKEND_WRITE] update_cache start: uid=%s cache_len=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s",
+                            inference_info.uid,
+                            cache_len,
+                            inference_info.batch_offset,
+                            inference_info.full_batch_size,
+                            inference_info.micro_batch_size,
+                            type(new_kvs).__name__ if new_kvs is not None else "None",
+                        )
                     self.cache_manager.update_cache(
                         new_kvs, 
                         cache_len,
                         batch_offset=inference_info.batch_offset,
                         full_batch_size=inference_info.full_batch_size,
                         micro_batch_size=inference_info.micro_batch_size,) 
-                    
+
                 keep_indices = self._normalize_keep_indices(
                     inference_info.keep_indices,
                     batch_size=output_hidden_states.shape[0],
@@ -898,8 +951,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # Explicitly free the GPU memory. This is not necessary at the time this code is written,
         # but may help to avoid future issues when the module is not garbage-collected for some reasons
         dummy = torch.tensor([])
-        for p in self.module.parameters():
-            p.data = dummy
+        try:
+            params_iter = self.module.parameters() if hasattr(self.module, "parameters") else ()
+            for p in params_iter:
+                p.data = dummy
+        except Exception:
+            logger.warning("Failed to clear module parameters during backend.shutdown", exc_info=True)
 
 
 def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend]):
@@ -912,6 +969,7 @@ def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend])
         max_batch_size=first_pool.max_batch_size,
         device=first_pool.device,
         name=f"merged_inference",
+        track_transfer_timing=True,
     )
     for backend in backends.values():
         assert not backend.inference_pool.is_alive()
@@ -926,7 +984,7 @@ class _MergedInferenceStep:
         self._offloaded_slices: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         # Get cache_manager from first backend for offloading operations
         self._cache_manager = next(iter(backends.values())).cache_manager if backends else None
-        self._kv_timing_keys = (
+        self._kv_counter_keys = (
             "prefetch_wait_ms",
             "offload_wait_ms",
             "prefetch_wait_calls",
@@ -935,6 +993,19 @@ class _MergedInferenceStep:
             "offload_launch_ms",
             "prefetch_launch_calls",
             "offload_launch_calls",
+            "offload_calls",
+            "prefetch_calls",
+            "offload_bytes",
+            "prefetch_bytes",
+        )
+        self._kv_gauge_keys = (
+            "staging_peak_bytes",
+            "staging_live_bytes",
+            "active_staged_entries",
+            "async_kv_transfer",
+            "gpu_alloc_mb",
+            "gpu_reserved_mb",
+            "gpu_max_alloc_mb",
         )
 
     def _offload_completed_microbatch(self, k_cache: torch.Tensor, v_cache: torch.Tensor, 
@@ -1017,7 +1088,7 @@ class _MergedInferenceStep:
             return None
 
         normalized: Dict[str, float] = {}
-        for key in self._kv_timing_keys:
+        for key in self._kv_counter_keys + self._kv_gauge_keys:
             try:
                 normalized[key] = float(snapshot.get(key, 0.0))
             except Exception:
@@ -1028,7 +1099,7 @@ class _MergedInferenceStep:
         self, before: Optional[Dict[str, float]], after: Optional[Dict[str, float]]
     ) -> Dict[str, float]:
         delta: Dict[str, float] = {}
-        for key in self._kv_timing_keys:
+        for key in self._kv_counter_keys:
             b = 0.0 if before is None else float(before.get(key, 0.0))
             a = 0.0 if after is None else float(after.get(key, 0.0))
             v = max(0.0, a - b)
@@ -1036,6 +1107,8 @@ class _MergedInferenceStep:
                 delta[key] = int(v)
             else:
                 delta[key] = v
+        for key in self._kv_gauge_keys:
+            delta[key] = 0.0 if after is None else float(after.get(key, 0.0))
         delta["_source"] = "runtime_kv_timing"
         delta["_valid"] = 1 if (before is not None and after is not None) else 0
         return delta

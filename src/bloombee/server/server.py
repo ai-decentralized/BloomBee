@@ -47,8 +47,7 @@ from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
-from bloombee.server.speculative_pruner.utils import PruningMethod
-from bloombee.server.speculative_pruner.utils import PruningConfig
+from bloombee.server.speculative_pruner.utils import PruningConfig, PruningMethod
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
@@ -94,7 +93,6 @@ offload_logger.setLevel(logging.INFO)
 # 	print(logger)
 
 logger = get_logger(__name__)
-
 
 class Server:
     """
@@ -239,6 +237,12 @@ class Server:
         if len(self.tensor_parallel_devices) > 1:
             logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
             check_device_balance(self.tensor_parallel_devices)
+            if self.block_config.model_type == "llama":
+                logger.info(
+                    "[TP_LAYOUT] intra-host FlexGen tensor parallelism across %s devices; "
+                    "inter-node pipeline parallelism remains span-based",
+                    len(self.tensor_parallel_devices),
+                )
 
         # Quantization is disabled by default. Use FlexGen compression internally if needed.
         if quant_type is None:
@@ -273,29 +277,41 @@ class Server:
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
-        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU
-        # [TRUE MICRO-BATCH MULTIPLEXING] When micro-batching is enabled:
-        # - gpu_batch_size = micro_batch_size (GPU only holds ONE micro-batch)
-        # - Other micro-batches stay 100% on CPU, swapped via offload/prefetch
-        # When disabled: use full batch_size for backwards compatibility
+        # Policy: keep weights, KV cache, and activations on GPU by default.
+        #
+        # Micro-batching has two distinct modes:
+        # - overlap_only: split execution for overlap, but keep full logical KV capacity
+        # - multiplexing: shrink active GPU KV capacity down to micro_batch_size
+        #
+        # Only multiplexing should reduce policy.gpu_batch_size. Overlap-only must keep
+        # full-batch capacity, otherwise handler._allocate_cache() will reject normal
+        # client batch sizes before the overlap path even starts.
         from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
         mb_config = get_micro_batch_config()
         micro_batch_size = get_micro_batch_size()
 
-        if mb_config['enabled']:
-            gpu_batch_size = micro_batch_size  # GPU only allocates for ONE micro-batch
-            logger.info(f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
-                        f"client can request up to batch_size={batch_size} (handled via offload/prefetch)")
+        if mb_config['enabled'] and mb_config.get('gpu_multiplexing', False):
+            gpu_batch_size = micro_batch_size
+            logger.info(
+                f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
+                f"client can request up to batch_size={batch_size} (handled via offload/prefetch)"
+            )
+        elif mb_config['enabled']:
+            gpu_batch_size = batch_size
+            logger.info(
+                f"[POLICY_MB_OVERLAP] GPU batch_size={gpu_batch_size} (full logical batch), "
+                f"micro_batch_size={micro_batch_size} used for overlap scheduling only"
+            )
         else:
-            gpu_batch_size = batch_size  # Full batch for backwards compatibility
+            gpu_batch_size = batch_size
             logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
 
         self.policy = Policy(
-            gpu_batch_size, 1,        # gpu_batch_size controls GPU cache allocation
-            50, 50,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent=100% (GPU cache only holds micro_batch_size slots)
-            100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
-            overlap=False, sep_layer=True, pin_weight=True,
+            gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
+            100, 0,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # cache_gpu_percent, cache_cpu_percent (multiplexing uses CPU staging for KV offload)
+            100, 0,                   # act_gpu_percent, act_cpu_percent (mixed activation offload is unsupported)
+            overlap=True, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
             compress_weight=False,
             comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
@@ -317,29 +333,29 @@ class Server:
             block_indices = range(start_block, end_block)
             num_blocks = len(block_indices)
         self.strict_block_indices, self.num_blocks = block_indices, num_blocks
-        
         # Log compression configuration
         self.policy.log_batch_size_strategy()
 
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
-        
-        hidden_size = 4096
-        vocab_size = 32000
-        
-        # Create configuration
-        config = PruningConfig(
-            method=PruningMethod.ADAPTIVE_NEURAL,
-            neural_threshold=0.9,
-            simple_threshold=0.1
-        )
-        
-        self.pruner_manager = SpeculativePrunerManager(
-            hidden_size=hidden_size,
-            vocab_size=vocab_size,
-            config=config
-        )
-        
+
+        # Temporarily disable speculative pruner initialization during server startup.
+        # hidden_size = 4096
+        # vocab_size = 32000
+        #
+        # config = PruningConfig(
+        #     method=PruningMethod.ADAPTIVE_NEURAL,
+        #     neural_threshold=0.9,
+        #     simple_threshold=0.1,
+        # )
+        #
+        # self.pruner_manager = SpeculativePrunerManager(
+        #     hidden_size=hidden_size,
+        #     vocab_size=vocab_size,
+        #     config=config,
+        # )
+        self.pruner_manager = None
+
         ##############################################################
         
         # see_memory_usage("-----------------------------------------in server: after policy  ")
@@ -362,6 +378,9 @@ class Server:
                 reachable_via_relay=reachable_via_relay,
                 force_eval=force_eval,
                 cache_dir=cache_dir,
+                revision=revision,
+                token=token,
+                max_disk_space=max_disk_space,
             )
             if throughput == "dry_run":
                 logger.info("Finished estimating throughput, exiting")
@@ -667,6 +686,7 @@ class ModuleContainer(threading.Thread):
                     token=token,
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
+                    tensor_parallel_devices=tensor_parallel_devices,
                 )
                 # see_memory_usage("-----------------------------------------after petals load pretrained block ")
                 # print('block nn.module() before convert_block() ', block )

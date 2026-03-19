@@ -4,6 +4,9 @@ Micro-batch Pipeline Configuration Module.
 The feature is controlled via environment variables:
 - BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: "1" to enable (default), "0" to disable
 - BLOOMBEE_MICRO_BATCH_SIZE: positive integer micro-batch size
+- BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING: "1" to enable bounded GPU working-slot
+  reuse. Default is "0", which keeps micro-batching in overlap-only mode so
+  FlexGen cache offload remains available.
 
 Non-positive micro-batch sizes are treated as disabled to make local toggling safe.
 All logs from this feature use the prefix [MBPIPE].
@@ -15,16 +18,23 @@ from typing import Tuple, List, Optional, Sequence, Any
 
 import torch
 
+from bloombee.utils.debug_config import is_log_channel_enabled
+
 # Prefix for all micro-batch pipeline logs
 MBPIPE_LOG_PREFIX = "[MBPIPE]"
+
+
+def mbpipe_info_logs_enabled() -> bool:
+    return is_log_channel_enabled("microbatch_logs")
 
 # Environment variable names
 ENV_ENABLE_MICROBATCH = "BLOOMBEE_ENABLE_MICROBATCH_PIPELINE"
 ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
+ENV_ENABLE_GPU_MULTIPLEXING = "BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
-DEFAULT_MICRO_BATCH_SIZE = 0  # Default micro-batch size for pipeline overlap
+DEFAULT_MICRO_BATCH_SIZE = 0 # Default micro-batch size for pipeline overlap
 
 
 def _is_microbatch_flag_enabled() -> bool:
@@ -71,6 +81,18 @@ def is_microbatch_enabled() -> bool:
     return _is_microbatch_flag_enabled() and get_micro_batch_size() > 0
 
 
+def is_microbatch_gpu_multiplexing_enabled() -> bool:
+    """
+    Check whether micro-batching should also shrink active GPU KV capacity.
+
+    This is intentionally disabled by default. The default micro-batch behavior
+    is overlap-only: split execution for pipeline overlap while keeping a full
+    logical KV cache allocation, which preserves FlexGen static cache offload.
+    """
+    env_value = os.environ.get(ENV_ENABLE_GPU_MULTIPLEXING, "0")
+    return env_value == "1"
+
+
 def get_micro_batch_config() -> dict:
     """
     Get the complete micro-batch configuration as a dictionary.
@@ -79,10 +101,22 @@ def get_micro_batch_config() -> dict:
         A dictionary with:
         - 'enabled': bool - whether micro-batching is enabled
         - 'micro_batch_size': int - the configured micro-batch size
+        - 'gpu_multiplexing': bool - whether to shrink active GPU KV working set
+        - 'mode': str - one of "legacy", "overlap_only", or "multiplexing"
     """
+    enabled = is_microbatch_enabled()
+    gpu_multiplexing = is_microbatch_gpu_multiplexing_enabled()
+    if not enabled:
+        mode = "legacy"
+    elif gpu_multiplexing:
+        mode = "multiplexing"
+    else:
+        mode = "overlap_only"
     return {
-        'enabled': is_microbatch_enabled(),
-        'micro_batch_size': get_micro_batch_size()
+        'enabled': enabled,
+        'micro_batch_size': get_micro_batch_size(),
+        'gpu_multiplexing': gpu_multiplexing,
+        'mode': mode,
     }
 
 
@@ -91,9 +125,9 @@ def get_current_path() -> str:
     Get the current execution path name.
     
     Returns:
-        "microbatch" if micro-batch pipeline is enabled, "legacy" otherwise.
+        One of: "legacy", "overlap_only", or "multiplexing".
     """
-    return "microbatch" if is_microbatch_enabled() else "legacy"
+    return get_micro_batch_config()["mode"]
 
 
 def get_config_summary() -> str:
@@ -110,7 +144,8 @@ def get_config_summary() -> str:
     return (
         f"enabled={enabled}, "
         f"micro_batch_size={micro_batch_size}, "
-        f"path={path}"
+        f"path={path}, "
+        f"gpu_multiplexing={path == 'multiplexing'}"
     )
 
 
@@ -122,6 +157,8 @@ def log_config(logger: logging.Logger, context: str = "") -> None:
         logger: The logger to use for output.
         context: Optional context string to include in the log message.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     enabled = is_microbatch_enabled()
     micro_batch_size = get_micro_batch_size()
     path = get_current_path()
@@ -129,7 +166,8 @@ def log_config(logger: logging.Logger, context: str = "") -> None:
     context_str = f" ({context})" if context else ""
     logger.info(
         f"{MBPIPE_LOG_PREFIX} Config{context_str}: "
-        f"enabled={enabled}, micro_batch_size={micro_batch_size}, path={path}"
+        f"enabled={enabled}, micro_batch_size={micro_batch_size}, "
+        f"path={path}, gpu_multiplexing={path == 'multiplexing'}"
     )
 
 
@@ -143,34 +181,49 @@ def log_memory_savings_diagnosis(logger: logging.Logger, batch_size: int = 8) ->
         logger: The logger to use for output.
         batch_size: The client's batch size for analysis.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     enabled = is_microbatch_enabled()
     micro_batch_size = get_micro_batch_size()
+    gpu_multiplexing = is_microbatch_gpu_multiplexing_enabled()
     
-    logger.debug(f"{MBPIPE_LOG_PREFIX} ===== MEMORY SAVINGS DIAGNOSIS =====")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} Client batch_size: {batch_size}")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} Micro-batch enabled: {enabled}")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} Micro-batch size: {micro_batch_size}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ===== MEMORY SAVINGS DIAGNOSIS =====")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Client batch_size: {batch_size}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch enabled: {enabled}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch size: {micro_batch_size}")
     
     if not enabled or micro_batch_size <= 0:
-        logger.debug(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro-batching disabled)")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro-batching disabled)")
         return
     
     if micro_batch_size >= batch_size:
-        logger.debug(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro_batch_size >= batch_size)")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro_batch_size >= batch_size)")
+        return
+
+    if not gpu_multiplexing:
+        logger.info(f"{MBPIPE_LOG_PREFIX} ")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Current behavior (overlap-only micro-batching):")
+        logger.info(f"{MBPIPE_LOG_PREFIX}   1. Requests are split into micro-batches for pipeline overlap")
+        logger.info(f"{MBPIPE_LOG_PREFIX}   2. KV cache is still allocated for the FULL logical batch")
+        logger.info(f"{MBPIPE_LOG_PREFIX}   3. FlexGen static cache offload remains available")
+        logger.info(f"{MBPIPE_LOG_PREFIX}   4. GPU KV memory is NOT reduced by micro_batch_size")
+        logger.info(f"{MBPIPE_LOG_PREFIX} ")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO GPU memory savings (overlap-only mode)")
+        logger.info(f"{MBPIPE_LOG_PREFIX} ===== END DIAGNOSIS =====")
         return
     
-    logger.debug(f"{MBPIPE_LOG_PREFIX} ")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} Current behavior (GPU multiplexing):")
-    logger.debug(f"{MBPIPE_LOG_PREFIX}   1. KV cache is allocated for MICRO batch ({micro_batch_size} items)")
-    logger.debug(f"{MBPIPE_LOG_PREFIX}   2. Each micro-batch reuses the same GPU slots (offset=0)")
-    logger.debug(f"{MBPIPE_LOG_PREFIX}   3. offload/prefetch swaps micro-batch KV state via CPU staging")
-    logger.debug(f"{MBPIPE_LOG_PREFIX}   4. GPU KV memory is controlled by micro_batch_size")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} ")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} Expected memory:")
-    logger.debug(f"{MBPIPE_LOG_PREFIX}   - GPU cache for {micro_batch_size} items (micro-batch)")
-    logger.debug(f"{MBPIPE_LOG_PREFIX}   - CPU staging for {batch_size} items (all micro-batches)")
-    logger.debug(f"{MBPIPE_LOG_PREFIX}   - Savings: {(1 - micro_batch_size/batch_size)*100:.1f}% GPU memory reduction")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} ===== END DIAGNOSIS =====")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Current behavior (GPU multiplexing):")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   1. KV cache is allocated for MICRO batch ({micro_batch_size} items)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   2. Each micro-batch reuses the same GPU slots (offset=0)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   3. offload/prefetch swaps micro-batch KV state via CPU staging")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   4. GPU KV memory is controlled by micro_batch_size")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Expected memory:")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - GPU cache for {micro_batch_size} items (micro-batch)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - CPU staging for {batch_size} items (all micro-batches)")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   - Savings: {(1 - micro_batch_size/batch_size)*100:.1f}% GPU memory reduction")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ===== END DIAGNOSIS =====")
 
 
 def log_path_entry(logger: logging.Logger, component: str, batch_size: int = 0) -> None:
@@ -182,11 +235,13 @@ def log_path_entry(logger: logging.Logger, component: str, batch_size: int = 0) 
         component: Name of the component logging this entry (e.g., "handler", "backend").
         batch_size: Optional batch size being processed.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     path = get_current_path()
     micro_batch_size = get_micro_batch_size()
     
     batch_info = f", batch_size={batch_size}" if batch_size > 0 else ""
-    logger.debug(
+    logger.info(
         f"{MBPIPE_LOG_PREFIX} {component}: entering {path} path, "
         f"micro_batch_size={micro_batch_size}{batch_info}"
     )
@@ -209,36 +264,47 @@ def log_microbatch_runtime_info(
         num_blocks: Number of transformer blocks.
         context: Optional context string.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     enabled = is_microbatch_enabled()
     micro_batch_size = get_micro_batch_size()
+    gpu_multiplexing = is_microbatch_gpu_multiplexing_enabled()
     
     context_str = f" ({context})" if context else ""
     
-    logger.debug(f"{MBPIPE_LOG_PREFIX} ===== MICRO-BATCH RUNTIME INFO{context_str} =====")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} Enabled: {enabled}")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} Global batch_size: {batch_size}")
-    logger.debug(f"{MBPIPE_LOG_PREFIX} Micro-batch size: {micro_batch_size}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ===== MICRO-BATCH RUNTIME INFO{context_str} =====")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Enabled: {enabled}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Global batch_size: {batch_size}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Micro-batch size: {micro_batch_size}")
     
     if enabled and micro_batch_size > 0 and micro_batch_size < batch_size:
         num_microbatches = (batch_size + micro_batch_size - 1) // micro_batch_size
-        logger.debug(f"{MBPIPE_LOG_PREFIX} Number of micro-batches: {num_microbatches}")
-        logger.debug(f"{MBPIPE_LOG_PREFIX} GPU memory mode: MULTIPLEXING (cache sized for {micro_batch_size})")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Number of micro-batches: {num_microbatches}")
+        if not gpu_multiplexing:
+            logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: OVERLAP_ONLY (cache sized for full batch)")
+            logger.info(f"{MBPIPE_LOG_PREFIX} FlexGen static cache offload remains active")
+            logger.info(f"{MBPIPE_LOG_PREFIX} ===========================================")
+            return
+        logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: MULTIPLEXING (cache sized for {micro_batch_size})")
         
-        kv_per_block_full = 2 * seq_len * batch_size * 32 * 128 * 2 / (1024 * 1024)
-        kv_per_block_micro = 2 * seq_len * micro_batch_size * 32 * 128 * 2 / (1024 * 1024)
+        # Estimate memory
+        # KV cache per block: 2 * seq_len * batch * heads * head_dim * dtype_size
+        # Assuming LLaMA-7B: hidden=4096, heads=32, head_dim=128, dtype=fp16 (2 bytes)
+        kv_per_block_full = 2 * seq_len * batch_size * 32 * 128 * 2 / (1024 * 1024)  # MB
+        kv_per_block_micro = 2 * seq_len * micro_batch_size * 32 * 128 * 2 / (1024 * 1024)  # MB
         
         total_kv_full = kv_per_block_full * num_blocks
         total_kv_micro = kv_per_block_micro * num_blocks
         savings = total_kv_full - total_kv_micro
         savings_pct = (savings / total_kv_full * 100) if total_kv_full > 0 else 0
         
-        logger.debug(f"{MBPIPE_LOG_PREFIX} Estimated KV cache (full batch): {total_kv_full:.1f} MB")
-        logger.debug(f"{MBPIPE_LOG_PREFIX} Estimated KV cache (micro-batch): {total_kv_micro:.1f} MB")
-        logger.debug(f"{MBPIPE_LOG_PREFIX} Estimated savings: {savings:.1f} MB ({savings_pct:.1f}%)")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated KV cache (full batch): {total_kv_full:.1f} MB")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated KV cache (micro-batch): {total_kv_micro:.1f} MB")
+        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated savings: {savings:.1f} MB ({savings_pct:.1f}%)")
     else:
-        logger.debug(f"{MBPIPE_LOG_PREFIX} GPU memory mode: LEGACY (no multiplexing)")
+        logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: LEGACY (no multiplexing)")
     
-    logger.debug(f"{MBPIPE_LOG_PREFIX} ===========================================")
+    logger.info(f"{MBPIPE_LOG_PREFIX} ===========================================")
 
 
 # =============================================================================
@@ -375,6 +441,8 @@ def log_microbatch_split(
         component: Optional component name for context.
     """
     micro_batch_size = get_micro_batch_size()
+    if not mbpipe_info_logs_enabled():
+        return
     context = f" ({component})" if component else ""
     logger.info(
         f"{MBPIPE_LOG_PREFIX} Split{context}: "
@@ -398,6 +466,8 @@ def log_microbatch_merge(
         merged_batch_size: Final merged batch size.
         component: Optional component name for context.
     """
+    if not mbpipe_info_logs_enabled():
+        return
     context = f" ({component})" if component else ""
     logger.info(
         f"{MBPIPE_LOG_PREFIX} Merge{context}: "
@@ -608,11 +678,12 @@ def log_stage_timing(
     if comm_time_ms > 0:
         tracker.record_stage_comm(stage_id, comm_time_ms)
         tracker.record_cross_stage_comm(comm_time_ms)
-    
+    if not mbpipe_info_logs_enabled():
+        return
     context = f" ({component})" if component else ""
     use_buffer, buffer_pos = tracker.should_use_buffer()
     
-    logger.debug(
+    logger.info(
         f"{MBPIPE_LOG_PREFIX} StageTiming{context}: stage={stage_id}, "
         f"compute={compute_time_ms:.1f}ms, comm={comm_time_ms:.1f}ms, "
         f"buffer_decision=({use_buffer}, {buffer_pos})"
@@ -624,7 +695,7 @@ def log_timing_summary(logger: logging.Logger) -> None:
     tracker = get_timing_tracker()
     summary = tracker.get_summary()
     
-    logger.debug(f"{MBPIPE_LOG_PREFIX} TimingSummary: {summary}")
+    logger.info(f"{MBPIPE_LOG_PREFIX} TimingSummary: {summary}")
 
 
 # =============================================================================
@@ -632,7 +703,7 @@ def log_timing_summary(logger: logging.Logger) -> None:
 # =============================================================================
 
 import asyncio
-from typing import Callable, Any
+from typing import Callable
 from time import perf_counter as _perf_counter
 
 
@@ -680,9 +751,11 @@ class AsyncOutputBuffer:
         self._send_task: Optional[asyncio.Task] = None
         self._push_fn: Optional[Callable] = None
         self._running = False
+        self._first_error: Optional[Exception] = None
         self._stats = {
             "total_puts": 0,
             "total_sends": 0,
+            "total_send_failures": 0,
             "total_send_time_ms": 0.0,
             "max_queue_depth": 0,
         }
@@ -700,6 +773,7 @@ class AsyncOutputBuffer:
         
         self._push_fn = push_fn
         self._running = True
+        self._first_error = None
         self._send_task = asyncio.create_task(self._sender_loop())
         
         if self.logger:
@@ -735,6 +809,9 @@ class AsyncOutputBuffer:
                             f"queue_size={self._queue.qsize()})"
                         )
                 except Exception as e:
+                    self._stats["total_send_failures"] += 1
+                    if self._first_error is None:
+                        self._first_error = e
                     if self.logger:
                         self.logger.warning(
                             f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer[{self.name}] "
@@ -766,6 +843,10 @@ class AsyncOutputBuffer:
         """
         if not self._running:
             raise RuntimeError("Buffer not started. Call start_sender() first.")
+        if self._first_error is not None:
+            raise RuntimeError(
+                f"AsyncOutputBuffer[{self.name}] has a prior send failure"
+            ) from self._first_error
         
         wait_start = _perf_counter()
         
@@ -794,19 +875,26 @@ class AsyncOutputBuffer:
     async def flush(self) -> None:
         """Wait for all buffered items to be sent."""
         await self._queue.join()
+        self._raise_if_failed()
         
         if self.logger:
             self.logger.debug(
                 f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer[{self.name}] flushed"
             )
     
-    async def stop(self) -> None:
+    def _raise_if_failed(self) -> None:
+        if self._first_error is not None:
+            raise RuntimeError(
+                f"AsyncOutputBuffer[{self.name}] send failed"
+            ) from self._first_error
+
+    async def stop(self, raise_on_error: bool = True) -> None:
         """Stop the background sender and wait for completion."""
         self._running = False
         
         if self._send_task:
-            # Give sender time to finish remaining items
-            await self.flush()
+            # Give sender time to finish remaining items.
+            await self._queue.join()
             self._send_task.cancel()
             try:
                 await self._send_task
@@ -822,9 +910,12 @@ class AsyncOutputBuffer:
                 f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer[{self.name}] stopped: "
                 f"puts={self._stats['total_puts']}, "
                 f"sends={self._stats['total_sends']}, "
+                f"failures={self._stats['total_send_failures']}, "
                 f"avg_send={avg_send_time:.1f}ms, "
                 f"max_depth={self._stats['max_queue_depth']}"
             )
+        if raise_on_error:
+            self._raise_if_failed()
     
     @property
     def stats(self) -> dict:
@@ -883,7 +974,7 @@ class BufferedPipelineManager:
     async def stop_all(self) -> None:
         """Stop all buffers."""
         for buffer in self._buffers.values():
-            await buffer.stop()
+            await buffer.stop()   
         self._buffers.clear()
     
     def should_use_buffer_for_stage(self, stage_id: str) -> bool:
