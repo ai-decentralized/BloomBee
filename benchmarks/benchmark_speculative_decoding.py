@@ -99,7 +99,8 @@ def benchmark_inference(process_idx, args, result_pipe):
 
     result = ""
     start_time = perf_counter()
-    result = model.generate(input_ids=input_ids, drafter=drafter)
+    max_new_tokens = getattr(args, 'seq_len', 128)
+    result = model.generate(input_ids=input_ids, drafter=drafter, max_new_tokens=max_new_tokens)
     time = perf_counter() - start_time
     generated_tokens_nums = []
     for i in range(batch_size):

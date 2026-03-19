@@ -2134,11 +2134,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                     f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}"
                 )
 
-            # `serialized_outputs` already contains the next-stage hidden states and
-            # accompanying routing tensors. Skip the original request tensor at index 2
-            # (`need_pruning`) so the downstream tensor layout stays aligned.
+            # `serialized_outputs` now carries the updated routing tensors for
+            # indices 0..5: hidden_states, keep_indices, need_pruning,
+            # tree_attention_mask, kv_cache_position_ids, draft_tokens.
+            # Preserve only the remaining request tensors starting from
+            # prefill_length so the downstream layout stays aligned.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
-            next_tensors = normalized_outputs + list(request.tensors[3:])
+            next_tensors = normalized_outputs + list(request.tensors[6:])
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
             next_metadata["sender_blocks"] = sender_blocks

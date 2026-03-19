@@ -182,12 +182,13 @@ class _ServerInferenceSession:
             inputs, 
             normalize_arg(keep_indices),
             normalize_arg(torch.tensor(1 if need_pruning else 0)),
-            prompts, hypo_ids, 
             normalize_arg(tree_attention_mask),
             normalize_arg(kv_cache_position_ids),
             normalize_arg(draft_tokens),
             normalize_arg(prefill_length),
             normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
+            prompts,
+            hypo_ids,
         )
         client_inference_logs_enabled = is_log_channel_enabled("client_inference_logs")
         if client_inference_logs_enabled:
@@ -207,12 +208,10 @@ class _ServerInferenceSession:
                 request_metadata["start_from_position"] = self._position
         # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
         # Speculative decoding keeps strict full-batch semantics; avoid cross-stage push.
-        if self.config.use_server_to_server and not is_spec_dec:
+        if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
             if next_servers:
                 request_metadata["next_servers"] = next_servers
-        elif is_spec_dec:
-            request_metadata["disable_cross_stage_push"] = 1
 
         request_metadata["args_structure"] = args_structure
 
@@ -543,7 +542,7 @@ class InferenceSession:
                     # 🔍 CLIENT DEBUG: Log server span processing start
                     span_start_time = time.perf_counter()
                     
-                    inputs, keep_indices, need_pruning_next = server_session.step( 
+                    inputs, keep_indices, *_ = server_session.step(
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
