@@ -333,20 +333,22 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
 
-        hidden_size = 4096
-        vocab_size = 32000
-
-        config = PruningConfig(
-            method=PruningMethod.ADAPTIVE_NEURAL,
-            neural_threshold=0.9,
-            simple_threshold=0.1,
-        )
-
-        self.pruner_manager = SpeculativePrunerManager(
-            hidden_size=hidden_size,
-            vocab_size=vocab_size,
-            config=config,
-        )
+        # Temporarily disable speculative pruner initialization during server startup.
+        # hidden_size = 4096
+        # vocab_size = 32000
+        #
+        # config = PruningConfig(
+        #     method=PruningMethod.ADAPTIVE_NEURAL,
+        #     neural_threshold=0.9,
+        #     simple_threshold=0.1,
+        # )
+        #
+        # self.pruner_manager = SpeculativePrunerManager(
+        #     hidden_size=hidden_size,
+        #     vocab_size=vocab_size,
+        #     config=config,
+        # )
+        self.pruner_manager = None
 
         ##############################################################
         
