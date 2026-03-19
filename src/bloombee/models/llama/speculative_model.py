@@ -35,11 +35,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         streamer: Optional["BaseStreamer"] = None,
-        beam_width: int = 2,
+        beam_width: int = 1,
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 128,
         session_max_length: Optional[int] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
@@ -132,6 +132,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         initial_len = input_ids.shape[1]
         t0 = time.perf_counter()  # 用于记录第一个达标的时间
         has_printed_first_reach = False # 确保只打印一次
+        sample_finish_times = [None] * batch_size
+        sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
         while not finished and (seq_lengths.min().item() - initial_len) < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
@@ -207,16 +209,24 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             finished = unfinished_sequences.max() == 0
             total_time = time.perf_counter() - t1
             logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
-            step_idx += 1
             current_generations = seq_lengths - initial_len
-            if not has_printed_first_reach and current_generations.max().item() >= max_new_tokens:
-                first_reach_time = time.perf_counter() - t0
-                logger.info(f"🚀 [First Reach] 第一个样本达到 max_new_tokens，耗时: {first_reach_time:.4f}s")
-                has_printed_first_reach = True
-            
+            for i in range(batch_size):
+                if (current_generations[i] >= max_new_tokens and not sample_finished[i]):
+                    finish_time = time.perf_counter() - t0
+                    sample_finish_times[i] = finish_time
+                    sample_finished[i] = True
+                    logger.info(f"step {step_idx} Sample {i} finished generation ({max_new_tokens} tokens) at {finish_time:.4f}s")
+            step_idx += 1
 
         if streamer is not None:
             streamer.end()
+            
+        logger.info("====== Batch Generation Summary ======")
+        for i, t in enumerate(sample_finish_times):
+            if t is not None:
+                logger.info(f"Sample {i}: finished at {t:.4f}s")
+            else:
+                logger.info(f"Sample {i}: did not reach max_new_tokens")
         
         return current_input_ids
 
