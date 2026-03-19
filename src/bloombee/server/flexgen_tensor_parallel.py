@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from hivemind.utils.logging import get_logger
 from transformers import PretrainedConfig
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.policy import Policy
@@ -17,6 +18,24 @@ from bloombee.flexgen_utils.llama_config import download_llama_weights
 
 logger = get_logger(__name__)
 DUMMY_WEIGHT = "_DUMMY_"
+
+
+def _build_score_attention_mask(
+    batch_size: int,
+    query_length: int,
+    past_key_values_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    total_length = query_length + past_key_values_length
+    scores = torch.full(
+        (batch_size, 1, query_length, total_length),
+        -65504.0,
+        dtype=torch.float32,
+        device=device,
+    )
+    for i in range(query_length):
+        scores[:, :, i, : past_key_values_length + i + 1] = 0.0
+    return scores
 
 
 def _infer_llama_model_name(config: PretrainedConfig) -> str:
@@ -225,6 +244,38 @@ class _FlexgenLlamaShard(nn.Module):
         if layer_past is None:
             return None
         key_states, value_states = layer_past
+        if key_states.dim() == 3 and value_states.dim() == 3:
+            total_heads = self.config.num_attention_heads
+            head_dim = self.config.hidden_size // total_heads
+            bh, d1, d2 = key_states.shape
+            if total_heads <= 0 or bh % total_heads != 0:
+                raise ValueError(
+                    f"Unexpected Bloom-style cache shape for TP layer past: key={tuple(key_states.shape)} "
+                    f"value={tuple(value_states.shape)} total_heads={total_heads}"
+                )
+            batch_size = bh // total_heads
+            if d2 == head_dim:
+                seq_len = d1
+                key_bhsd = key_states
+            elif d1 == head_dim:
+                seq_len = d2
+                key_bhsd = key_states.permute(0, 2, 1)
+            else:
+                raise ValueError(
+                    f"Unable to infer head_dim={head_dim} from key cache shape {tuple(key_states.shape)}"
+                )
+
+            if value_states.shape[-1] == head_dim:
+                value_bhsd = value_states
+            elif value_states.shape[1] == head_dim:
+                value_bhsd = value_states.permute(0, 2, 1)
+            else:
+                raise ValueError(
+                    f"Unable to infer head_dim={head_dim} from value cache shape {tuple(value_states.shape)}"
+                )
+
+            key_states = key_bhsd.view(batch_size, total_heads, seq_len, head_dim)
+            value_states = value_bhsd.view(batch_size, total_heads, seq_len, head_dim)
         local_key = key_states[:, self.layout.q_head_start : self.layout.q_head_end].to(self.device, non_blocking=True)
         local_value = value_states[:, self.layout.q_head_start : self.layout.q_head_end].to(self.device, non_blocking=True)
         bsz, local_heads, seq_len, head_dim = local_key.shape
@@ -426,7 +477,32 @@ class FlexgenLlamaTensorParallel(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         del position_ids, kwargs
         if attention_mask is None:
-            raise ValueError("FlexgenLlamaTensorParallel requires an explicit attention_mask")
+            batch_size, seq_length, _ = hidden_states.shape
+            past_key_values_length = 0
+            if layer_past is not None:
+                key_states, _ = layer_past
+                past_key_values_length = key_states.shape[-1] if key_states.dim() == 3 else key_states.shape[2]
+            attention_mask = _build_score_attention_mask(
+                batch_size=batch_size,
+                query_length=seq_length,
+                past_key_values_length=past_key_values_length,
+                device=hidden_states.device,
+            )
+        elif attention_mask.dim() == 3:
+            # FlexGen prefill expects a singleton head axis so mask broadcasts over local heads.
+            attention_mask = attention_mask.unsqueeze(1)
+        elif attention_mask.dim() != 4:
+            batch_size, seq_length, _ = hidden_states.shape
+            past_key_values_length = 0
+            if layer_past is not None:
+                key_states, _ = layer_past
+                past_key_values_length = key_states.shape[2]
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask=attention_mask,
+                input_shape=(batch_size, seq_length),
+                inputs_embeds=hidden_states,
+                past_key_values_length=past_key_values_length,
+            )
 
         attn_live = []
         attn_owned = []
