@@ -464,6 +464,50 @@ class FlexgenLlamaTensorParallel(nn.Module):
             reduced = partial_out if reduced is None else reduced + partial_out
         return reduced - (len(partials) - 1) * residual_input.to(self.output_device, non_blocking=True)
 
+    def _merge_cache_parts(self, cache_parts: List[torch.Tensor], *, is_key: bool) -> torch.Tensor:
+        if not cache_parts:
+            raise ValueError("Expected at least one cache shard")
+
+        merged_parts: List[torch.Tensor] = []
+        batch_size: Optional[int] = None
+        seq_len: Optional[int] = None
+        head_dim: Optional[int] = None
+        total_heads = 0
+
+        for shard, cache_part in zip(self.tp_shards, cache_parts):
+            cache_part = cache_part.to(self.output_device, non_blocking=True)
+            if cache_part.ndim != 3:
+                raise ValueError(f"Unexpected TP cache shape: {tuple(cache_part.shape)}")
+
+            seq_len_i, batch_heads_i, head_dim_i = cache_part.shape
+            local_heads = shard.layout.local_heads
+            if local_heads <= 0 or batch_heads_i % local_heads != 0:
+                raise ValueError(
+                    f"Unable to recover batch dimension from cache shard shape {tuple(cache_part.shape)} "
+                    f"with local_heads={local_heads}"
+                )
+
+            batch_size_i = batch_heads_i // local_heads
+            if batch_size is None:
+                batch_size = batch_size_i
+                seq_len = seq_len_i
+                head_dim = head_dim_i
+            elif (batch_size, seq_len, head_dim) != (batch_size_i, seq_len_i, head_dim_i):
+                raise ValueError(
+                    "Inconsistent TP cache shard shapes: "
+                    f"expected (S={seq_len}, B={batch_size}, D={head_dim}), "
+                    f"got (S={seq_len_i}, B={batch_size_i}, D={head_dim_i})"
+                )
+
+            merged_parts.append(cache_part.view(seq_len_i, batch_size_i, local_heads, head_dim_i))
+            total_heads += local_heads
+
+        merged = torch.cat(merged_parts, dim=2).contiguous()
+        assert batch_size is not None and seq_len is not None and head_dim is not None
+        if is_key:
+            return merged.permute(1, 2, 3, 0).reshape(batch_size * total_heads, head_dim, seq_len).contiguous()
+        return merged.permute(1, 2, 0, 3).reshape(batch_size * total_heads, seq_len, head_dim).contiguous()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -554,10 +598,8 @@ class FlexgenLlamaTensorParallel(nn.Module):
         if not use_cache:
             return output_hidden_states, None
 
-        k_cat = torch.cat([k_part.to(self.output_device, non_blocking=True) for k_part in k_parts], dim=1)
-        v_cat = torch.cat([v_part.to(self.output_device, non_blocking=True) for v_part in v_parts], dim=1)
-        key = k_cat.permute(1, 2, 0).contiguous()
-        value = v_cat.permute(1, 0, 2).contiguous()
+        key = self._merge_cache_parts(k_parts, is_key=True)
+        value = self._merge_cache_parts(v_parts, is_key=False)
         return output_hidden_states, (key, value)
 
     def rms_norm(self, hidden_states: torch.Tensor):
