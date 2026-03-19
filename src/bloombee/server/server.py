@@ -237,6 +237,12 @@ class Server:
         if len(self.tensor_parallel_devices) > 1:
             logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
             check_device_balance(self.tensor_parallel_devices)
+            if self.block_config.model_type == "llama":
+                logger.info(
+                    "[TP_LAYOUT] intra-host FlexGen tensor parallelism across %s devices; "
+                    "inter-node pipeline parallelism remains span-based",
+                    len(self.tensor_parallel_devices),
+                )
 
         # Quantization is disabled by default. Use FlexGen compression internally if needed.
         if quant_type is None:
@@ -271,7 +277,7 @@ class Server:
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
-        # Policy: weights on GPU, KV cache on GPU (100%), activations on GPU.
+        # Policy: keep weights, KV cache, and activations on GPU by default.
         #
         # Micro-batching has two distinct modes:
         # - overlap_only: split execution for overlap, but keep full logical KV capacity
@@ -302,7 +308,7 @@ class Server:
 
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
-            50, 50,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # w_gpu_percent, w_cpu_percent
             100, 0,                   # cache_gpu_percent=100% (overlap-only keeps full logical cache on GPU)
             100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
@@ -372,6 +378,9 @@ class Server:
                 reachable_via_relay=reachable_via_relay,
                 force_eval=force_eval,
                 cache_dir=cache_dir,
+                revision=revision,
+                token=token,
+                max_disk_space=max_disk_space,
             )
             if throughput == "dry_run":
                 logger.info("Finished estimating throughput, exiting")
@@ -678,11 +687,6 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                     tensor_parallel_devices=tensor_parallel_devices,
-                    force_hf_llama=(
-                        len(tensor_parallel_devices) > 1
-                        and block_config.model_type == "llama"
-                        and os.environ.get("BLOOMBEE_TP_FORCE_HF_LLAMA", "0") == "1"
-                    ),
                 )
                 # see_memory_usage("-----------------------------------------after petals load pretrained block ")
                 # print('block nn.module() before convert_block() ', block )

@@ -13,7 +13,8 @@ import torch.mps
 from hivemind.utils.logging import get_logger
 from transformers import PretrainedConfig
 
-from bloombee.server.block_utils import get_model_block, resolve_block_dtype
+from bloombee.server.block_utils import resolve_block_dtype
+from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.utils.convert_block import QuantType, convert_block
 from bloombee.utils.disk_cache import DEFAULT_CACHE_DIR
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -57,6 +58,9 @@ def get_server_throughput(
     relay_penalty: float = 0.2,
     force_eval: bool = False,
     cache_dir: Optional[str] = None,
+    revision: Optional[str] = None,
+    token: Optional[Union[str, bool]] = None,
+    max_disk_space: Optional[int] = None,
 ) -> Dict[str, float]:
     dtype = resolve_block_dtype(config, dtype)
 
@@ -91,7 +95,20 @@ def get_server_throughput(
 
         if cache_key not in cache:
             cache[cache_key] = measure_throughput_info(
-                config, device, dtype, env, policy,weight_home,path, quant_type=quant_type, tensor_parallel_devices=tensor_parallel_devices
+                model_name,
+                config,
+                device,
+                dtype,
+                env,
+                policy,
+                weight_home,
+                path,
+                quant_type=quant_type,
+                tensor_parallel_devices=tensor_parallel_devices,
+                revision=revision,
+                token=token,
+                cache_dir=cache_dir,
+                max_disk_space=max_disk_space,
             )
 
             try:
@@ -119,6 +136,7 @@ def get_server_throughput(
 
 
 def measure_throughput_info(
+    model_name: str,
     config: PretrainedConfig,
     device: torch.device,
     dtype: torch.dtype,
@@ -129,12 +147,17 @@ def measure_throughput_info(
     *,
     quant_type: QuantType,
     tensor_parallel_devices: Sequence[torch.device],
+    revision: Optional[str] = None,
+    token: Optional[Union[str, bool]] = None,
+    cache_dir: Optional[str] = None,
+    max_disk_space: Optional[int] = None,
 ) -> Dict[str, float]:
     logger.info(
         "Measuring network and compute throughput. This takes about a minute and will be cached for future runs"
     )
     return {
         "inference_rps": measure_compute_rps(
+            model_name,
             config,
             device,
             dtype,
@@ -144,11 +167,16 @@ def measure_throughput_info(
             path, ####
             quant_type=quant_type,
             tensor_parallel_devices=tensor_parallel_devices,
+            revision=revision,
+            token=token,
+            cache_dir=cache_dir,
+            max_disk_space=max_disk_space,
             n_tokens=1,
             n_steps=100,
             inference=True,
         ),
         "forward_rps": measure_compute_rps(
+            model_name,
             config,
             device,
             dtype,
@@ -158,6 +186,10 @@ def measure_throughput_info(
             path, ####
             quant_type=quant_type,
             tensor_parallel_devices=tensor_parallel_devices,
+            revision=revision,
+            token=token,
+            cache_dir=cache_dir,
+            max_disk_space=max_disk_space,
             n_tokens=1024,
             n_steps=10,
             inference=False,
@@ -210,6 +242,7 @@ def _measure_bits_per_second(pipe_send: mp.Pipe):
 
 
 def measure_compute_rps(
+    model_name: str,
     config: PretrainedConfig,
     device: torch.device,
     dtype: torch.dtype,
@@ -220,6 +253,10 @@ def measure_compute_rps(
     *,
     quant_type: QuantType,
     tensor_parallel_devices: Sequence[torch.device],
+    revision: Optional[str] = None,
+    token: Optional[Union[str, bool]] = None,
+    cache_dir: Optional[str] = None,
+    max_disk_space: Optional[int] = None,
     n_tokens: int,
     n_steps: int,
     inference: bool,
@@ -236,7 +273,21 @@ def measure_compute_rps(
     logger.info(f"[THROUGHPUT_DEBUG] Device: {device}, Dtype: {dtype}")
     
     with torch.inference_mode():
-        block = get_model_block(config, env, policy, weight_home, path) #####
+        block = load_pretrained_block(
+            model_name,
+            block_index=0,
+            env=env,
+            policy=policy,
+            weight_home=weight_home,
+            path=path,
+            config=config,
+            torch_dtype=dtype,
+            revision=revision,
+            token=token,
+            cache_dir=cache_dir,
+            max_disk_space=max_disk_space,
+            tensor_parallel_devices=tensor_parallel_devices,
+        )
 
         block = block.to(dtype)
         # hack

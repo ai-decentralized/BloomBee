@@ -200,6 +200,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             self.module.load_lm_head()
         self._last_keep_indices = None
 
+    def _is_identity_hypo_ids(self, hypo_ids: Optional[torch.Tensor]) -> bool:
+        if hypo_ids is None:
+            return True
+        if hypo_ids.ndim != 1:
+            return False
+        expected = torch.arange(hypo_ids.numel(), device=hypo_ids.device, dtype=hypo_ids.dtype)
+        return torch.equal(hypo_ids, expected)
+
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""
         head_dim = self.config.hidden_size // self.config.num_attention_heads
@@ -338,7 +346,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
                     k_pkv, v_pkv, cache_len = self.cache_manager.select_cache_without_reorder(
-                        kv_cache_position_ids, 
+                        kv_cache_position_ids,
                         batch_offset=inference_info.batch_offset,
                         full_batch_size=inference_info.full_batch_size,
                         micro_batch_size=inference_info.micro_batch_size,
@@ -355,11 +363,29 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         micro_batch_size=inference_info.micro_batch_size,
                     )
                     cache_len = k_pkv.shape[2] if k_pkv is not None else 0
-                    
+
                 # t2 = time.perf_counter()
                 # logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
 
                 layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
+                if hasattr(self.module, "set_remote_cache_reuse_enabled"):
+                    policy = self.cache_manager.offloading_policy
+                    reuse_allowed = not (
+                        self._is_spec_decoding
+                        or (kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0)
+                        or not self._is_identity_hypo_ids(hypo_ids)
+                        or policy.cache_gpu_percent < 100
+                        or policy.cache_cpu_percent > 0
+                        or policy.cache_disk_percent > 0
+                        or policy.compress_cache
+                        or policy.cpu_cache_compute
+                        or (
+                            inference_info.full_batch_size > 0
+                            and int(getattr(policy, "gpu_batch_size", inference_info.full_batch_size))
+                            < int(inference_info.full_batch_size)
+                        )
+                    )
+                    self.module.set_remote_cache_reuse_enabled(reuse_allowed)
 
                 full_mask = None
                 device = hidden_states.device
@@ -455,7 +481,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         batch_offset=inference_info.batch_offset,
                         full_batch_size=inference_info.full_batch_size,
                         micro_batch_size=inference_info.micro_batch_size,) 
-                    
+
                 keep_indices = self._normalize_keep_indices(
                     inference_info.keep_indices,
                     batch_size=output_hidden_states.shape[0],

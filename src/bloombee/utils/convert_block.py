@@ -16,7 +16,6 @@ from pynvml import *
 from bloombee.utils.debug import dprint
 from bloombee.utils.memory_usage import see_memory_usage, log_mem
 from bloombee.server.flexgen_tensor_parallel import FlexgenLlamaTensorParallel
-from bloombee.server.tensor_parallel import LlamaTensorParallelAdapter
 
 logger = get_logger(__name__)
 
@@ -118,7 +117,13 @@ def convert_block(
     if freeze:
         block.requires_grad_(False)
     if len(tensor_parallel_devices) > 1 and config.model_type == "llama":
-        return make_tensor_parallel(block, config, tensor_parallel_devices, output_device, policy=policy)
+        return make_tensor_parallel(
+            block,
+            config,
+            tensor_parallel_devices,
+            output_device,
+            policy=policy,
+        )
 
     # Skip tensor parallelism for FlexGen blocks - they manage their own weights and devices
     log_prefix = f"[convert_block:{block_index}]"
@@ -295,36 +300,25 @@ def make_tensor_parallel(
 ) -> nn.Module:
     if model_config.model_type == "llama":
         num_kv_heads = getattr(model_config, "num_key_value_heads", model_config.num_attention_heads)
-        can_use_flexgen_native = (
-            hasattr(block, "env")
-            and hasattr(block, "path")
-            and num_kv_heads == model_config.num_attention_heads
-            and model_config.num_attention_heads % len(devices) == 0
-            and model_config.intermediate_size % len(devices) == 0
-        )
-        if can_use_flexgen_native:
-            return FlexgenLlamaTensorParallel(
-                block,
-                model_config,
-                devices,
-                output_device,
-                policy=policy,
+        if (
+            not hasattr(block, "env")
+            or not hasattr(block, "path")
+            or num_kv_heads != model_config.num_attention_heads
+            or model_config.num_attention_heads % len(devices) != 0
+            or model_config.intermediate_size % len(devices) != 0
+        ):
+            raise ValueError(
+                "BloomBee only supports FlexGen-native LLaMA tensor parallelism. "
+                f"Unsupported config: num_attention_heads={model_config.num_attention_heads}, "
+                f"num_key_value_heads={num_kv_heads}, intermediate_size={model_config.intermediate_size}, "
+                f"tp_world_size={len(devices)}"
             )
 
-        if len(devices) > 1:
-            logger.warning(
-                "Falling back to HF-based LLaMA TP because FlexGen-native TP is unavailable for this config "
-                "(num_attention_heads=%s, num_key_value_heads=%s, intermediate_size=%s, tp_world_size=%s)",
-                model_config.num_attention_heads,
-                num_kv_heads,
-                model_config.intermediate_size,
-                len(devices),
-            )
-        tp_block = tp.TensorParallel(block, devices, config=None, output_device=output_device, delay_init=True)
-        return LlamaTensorParallelAdapter(
-            tp_block,
+        return FlexgenLlamaTensorParallel(
+            block,
             model_config,
-            layer_idx=getattr(block, "layer_idx", 0),
+            devices,
+            output_device,
             policy=policy,
         )
 

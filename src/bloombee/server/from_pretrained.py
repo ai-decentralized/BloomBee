@@ -20,7 +20,6 @@ from hivemind.utils.logging import get_logger
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import PretrainedConfig, PreTrainedModel
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.utils import get_file_from_repo
 
 from bloombee.constants import DTYPE_MAP
@@ -67,7 +66,6 @@ def load_pretrained_block(
     cache_dir: Optional[str] = None,
     max_disk_space: Optional[int] = None,
     tensor_parallel_devices: Optional[Sequence[torch.device]] = None,
-    force_hf_llama: bool = False,
 ) -> nn.Module:
     if config is None:
         config = AutoDistributedConfig.from_pretrained(model_name, use_auth_token=token)
@@ -81,11 +79,10 @@ def load_pretrained_block(
         getattr(config, "model_type", None) == "llama"
         and tensor_parallel_devices is not None
         and len(tensor_parallel_devices) > 1
-        and not force_hf_llama
     )
 
     # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral)
-    _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock) or force_hf_llama
+    _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock)
 
     if use_native_flexgen_llama_tp:
         with init_empty_weights():
@@ -105,10 +102,7 @@ def load_pretrained_block(
             )
     elif _is_hf_model:
         # For HF-based models: create block normally (weights on CPU) then load state dict
-        if force_hf_llama and getattr(config, "model_type", None) == "llama":
-            block = LlamaDecoderLayer(config, layer_idx=block_index)
-        else:
-            block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
+        block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
         block = _load_hf_block_weights(
             block, model_name, block_index, config,
             token=token, cache_dir=cache_dir, max_disk_space=max_disk_space, torch_dtype=torch_dtype,

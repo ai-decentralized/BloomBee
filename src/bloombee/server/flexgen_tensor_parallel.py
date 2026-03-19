@@ -7,6 +7,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.cuda import comm as cuda_comm
 from hivemind.utils.logging import get_logger
 from transformers import PretrainedConfig
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
@@ -18,6 +19,20 @@ from bloombee.flexgen_utils.llama_config import download_llama_weights
 
 logger = get_logger(__name__)
 DUMMY_WEIGHT = "_DUMMY_"
+
+
+def _storage_ptr(tensor: torch.Tensor) -> int:
+    try:
+        return int(tensor.untyped_storage().data_ptr())
+    except Exception:
+        return int(tensor.data_ptr())
+
+
+def _next_capacity(required: int) -> int:
+    capacity = 1
+    while capacity < required:
+        capacity <<= 1
+    return max(capacity, 1)
 
 
 def _build_score_attention_mask(
@@ -140,6 +155,20 @@ class _ShardLayout:
         return self.ffn_end - self.ffn_start
 
 
+@dataclass
+class _RemoteShardCacheState:
+    key_ptr: int
+    value_ptr: int
+    key_offset: int
+    value_offset: int
+    batch_size: int
+    head_dim: int
+    seq_len: int
+    capacity: int
+    key_buffer: torch.Tensor
+    value_buffer: torch.Tensor
+
+
 class _FlexgenLlamaShard(nn.Module):
     def __init__(
         self,
@@ -151,6 +180,7 @@ class _FlexgenLlamaShard(nn.Module):
         device: torch.device,
         layout: _ShardLayout,
         expanded_path: str,
+        is_output_shard: bool,
     ):
         super().__init__()
         self.config = config
@@ -158,11 +188,17 @@ class _FlexgenLlamaShard(nn.Module):
         self.layer_idx = int(layer_idx)
         self.device = torch.device(device)
         self.layout = layout
+        self.is_output_shard = is_output_shard
         self.env = _create_shard_env(self.device, base_env)
         self.compute = self.env.gpu
         self.weight_load_dst = self.compute.compressed_device if policy.compress_weight else self.compute
         self.attention_compute = self.env.cpu if self.policy.cpu_cache_compute else self.env.gpu
         self.expanded_path = expanded_path
+        self._remote_cache_state: Optional[_RemoteShardCacheState] = None
+        self.remote_cache_reuse_enabled = True
+        self._hidden_input_buffer: Optional[torch.Tensor] = None
+        self._mask_buffer: Optional[torch.Tensor] = None
+        self._rotary_ids_buffer: Optional[torch.Tensor] = None
 
         self.attn_weight_home = self._init_attention_weights()
         self.mlp_weight_home = self._init_mlp_weights()
@@ -219,12 +255,14 @@ class _FlexgenLlamaShard(nn.Module):
     def _copy_weight_bundle(self, home_weights, compute_mask):
         live_weights = []
         owned_weights = []
+        needs_sync = False
         for weight, use_compute in zip(home_weights, compute_mask):
             dst = self.compute if use_compute else self.weight_load_dst
             copied, owned = weight.smart_copy(dst)
             live_weights.append(copied)
             owned_weights.append((copied, owned))
-        return tuple(live_weights), owned_weights
+            needs_sync = needs_sync or owned
+        return tuple(live_weights), owned_weights, needs_sync
 
     def _cleanup_owned_weights(self, owned_weights) -> None:
         for copied, owned in owned_weights:
@@ -244,46 +282,186 @@ class _FlexgenLlamaShard(nn.Module):
         if layer_past is None:
             return None
         key_states, value_states = layer_past
-        if key_states.dim() == 3 and value_states.dim() == 3:
-            total_heads = self.config.num_attention_heads
-            head_dim = self.config.hidden_size // total_heads
-            bh, d1, d2 = key_states.shape
-            if total_heads <= 0 or bh % total_heads != 0:
-                raise ValueError(
-                    f"Unexpected Bloom-style cache shape for TP layer past: key={tuple(key_states.shape)} "
-                    f"value={tuple(value_states.shape)} total_heads={total_heads}"
-                )
-            batch_size = bh // total_heads
-            if d2 == head_dim:
-                seq_len = d1
-                key_bhsd = key_states
-            elif d1 == head_dim:
-                seq_len = d2
-                key_bhsd = key_states.permute(0, 2, 1)
-            else:
-                raise ValueError(
-                    f"Unable to infer head_dim={head_dim} from key cache shape {tuple(key_states.shape)}"
-                )
+        key_states, value_states, batch_size, seq_len, head_dim = self._unpack_layer_past(key_states, value_states)
 
-            if value_states.shape[-1] == head_dim:
-                value_bhsd = value_states
-            elif value_states.shape[1] == head_dim:
-                value_bhsd = value_states.permute(0, 2, 1)
-            else:
-                raise ValueError(
-                    f"Unable to infer head_dim={head_dim} from value cache shape {tuple(value_states.shape)}"
-                )
+        if self.is_output_shard:
+            key_sbhd, value_sbhd = self._build_local_cache_tensors(key_states, value_states, seq_start=0)
+            return (
+                TorchTensor.create_from_torch(key_sbhd, self.compute),
+                TorchTensor.create_from_torch(value_sbhd, self.compute),
+            )
 
-            key_states = key_bhsd.view(batch_size, total_heads, seq_len, head_dim)
-            value_states = value_bhsd.view(batch_size, total_heads, seq_len, head_dim)
-        local_key = key_states[:, self.layout.q_head_start : self.layout.q_head_end].to(self.device, non_blocking=True)
-        local_value = value_states[:, self.layout.q_head_start : self.layout.q_head_end].to(self.device, non_blocking=True)
+        if not self.remote_cache_reuse_enabled:
+            self._remote_cache_state = None
+            key_sbhd, value_sbhd = self._build_local_cache_tensors(key_states, value_states, seq_start=0)
+            return (
+                TorchTensor.create_from_torch(key_sbhd, self.compute),
+                TorchTensor.create_from_torch(value_sbhd, self.compute),
+            )
+
+        state = self._remote_cache_state
+        key_ptr = _storage_ptr(key_states)
+        value_ptr = _storage_ptr(value_states)
+        key_offset = int(key_states.storage_offset())
+        value_offset = int(value_states.storage_offset())
+
+        if (
+            state is not None
+            and state.key_ptr == key_ptr
+            and state.value_ptr == value_ptr
+            and state.key_offset == key_offset
+            and state.value_offset == value_offset
+            and state.batch_size == batch_size
+            and state.head_dim == head_dim
+        ):
+            if seq_len == state.seq_len:
+                return self._wrap_cached_remote_past(state)
+            if seq_len > state.seq_len:
+                tail_key, tail_value = self._build_local_cache_tensors(key_states, value_states, seq_start=state.seq_len)
+                new_required = seq_len
+                if new_required > state.capacity:
+                    new_capacity = _next_capacity(max(new_required, seq_len + 32))
+                    new_key_buffer = torch.empty(
+                        (new_capacity, batch_size * self.layout.local_heads, head_dim),
+                        dtype=state.key_buffer.dtype,
+                        device=self.device,
+                    )
+                    new_value_buffer = torch.empty(
+                        (new_capacity, batch_size * self.layout.local_heads, head_dim),
+                        dtype=state.value_buffer.dtype,
+                        device=self.device,
+                    )
+                    new_key_buffer[: state.seq_len].copy_(state.key_buffer[: state.seq_len], non_blocking=True)
+                    new_value_buffer[: state.seq_len].copy_(state.value_buffer[: state.seq_len], non_blocking=True)
+                    state.key_buffer = new_key_buffer
+                    state.value_buffer = new_value_buffer
+                    state.capacity = new_capacity
+                if tail_key.numel() > 0:
+                    state.key_buffer[state.seq_len : seq_len].copy_(tail_key, non_blocking=True)
+                    state.value_buffer[state.seq_len : seq_len].copy_(tail_value, non_blocking=True)
+                state.seq_len = seq_len
+                return self._wrap_cached_remote_past(state)
+
+        key_sbhd, value_sbhd = self._build_local_cache_tensors(key_states, value_states, seq_start=0)
+        capacity = _next_capacity(max(seq_len, seq_len + 32))
+        key_buffer = torch.empty(
+            (capacity, batch_size * self.layout.local_heads, head_dim),
+            dtype=key_sbhd.dtype,
+            device=self.device,
+        )
+        value_buffer = torch.empty(
+            (capacity, batch_size * self.layout.local_heads, head_dim),
+            dtype=value_sbhd.dtype,
+            device=self.device,
+        )
+        key_buffer[:seq_len].copy_(key_sbhd, non_blocking=True)
+        value_buffer[:seq_len].copy_(value_sbhd, non_blocking=True)
+        self._remote_cache_state = _RemoteShardCacheState(
+            key_ptr=key_ptr,
+            value_ptr=value_ptr,
+            key_offset=key_offset,
+            value_offset=value_offset,
+            batch_size=batch_size,
+            head_dim=head_dim,
+            seq_len=seq_len,
+            capacity=capacity,
+            key_buffer=key_buffer,
+            value_buffer=value_buffer,
+        )
+        return self._wrap_cached_remote_past(self._remote_cache_state)
+
+    def _unpack_layer_past(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, int, int]:
+        total_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // total_heads
+        if key_states.dim() == 4 and value_states.dim() == 4:
+            batch_size, total_heads_i, seq_len, head_dim_i = key_states.shape
+            if total_heads_i != total_heads or head_dim_i != head_dim:
+                raise ValueError(
+                    f"Unexpected TP cache shape: key={tuple(key_states.shape)} value={tuple(value_states.shape)}"
+                )
+            return key_states, value_states, batch_size, seq_len, head_dim
+
+        if key_states.dim() != 3 or value_states.dim() != 3:
+            raise ValueError(
+                f"Unexpected Bloom-style cache shape for TP layer past: key={tuple(key_states.shape)} "
+                f"value={tuple(value_states.shape)}"
+            )
+
+        bh, d1, d2 = key_states.shape
+        if total_heads <= 0 or bh % total_heads != 0:
+            raise ValueError(
+                f"Unexpected Bloom-style cache shape for TP layer past: key={tuple(key_states.shape)} "
+                f"value={tuple(value_states.shape)} total_heads={total_heads}"
+            )
+        batch_size = bh // total_heads
+        if d2 == head_dim:
+            seq_len = d1
+            key_bhsd = key_states
+        elif d1 == head_dim:
+            seq_len = d2
+            key_bhsd = key_states.permute(0, 2, 1)
+        else:
+            raise ValueError(f"Unable to infer head_dim={head_dim} from key cache shape {tuple(key_states.shape)}")
+
+        if value_states.shape[-1] == head_dim:
+            value_bhsd = value_states
+        elif value_states.shape[1] == head_dim:
+            value_bhsd = value_states.permute(0, 2, 1)
+        else:
+            raise ValueError(f"Unable to infer head_dim={head_dim} from value cache shape {tuple(value_states.shape)}")
+
+        key_states = key_bhsd.view(batch_size, total_heads, seq_len, head_dim)
+        value_states = value_bhsd.view(batch_size, total_heads, seq_len, head_dim)
+        return key_states, value_states, batch_size, seq_len, head_dim
+
+    def _build_local_cache_tensors(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        *,
+        seq_start: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        local_key = key_states[:, self.layout.q_head_start : self.layout.q_head_end, seq_start:, :]
+        local_value = value_states[:, self.layout.q_head_start : self.layout.q_head_end, seq_start:, :]
+        if local_key.device != self.device:
+            local_key = local_key.to(self.device, non_blocking=True)
+        if local_value.device != self.device:
+            local_value = local_value.to(self.device, non_blocking=True)
         bsz, local_heads, seq_len, head_dim = local_key.shape
-        key_sbhd = local_key.permute(2, 0, 1, 3).reshape(seq_len, bsz * local_heads, head_dim)
-        value_sbhd = local_value.permute(2, 0, 1, 3).reshape(seq_len, bsz * local_heads, head_dim)
+        key_sbhd = local_key.permute(2, 0, 1, 3).reshape(seq_len, bsz * local_heads, head_dim).contiguous()
+        value_sbhd = local_value.permute(2, 0, 1, 3).reshape(seq_len, bsz * local_heads, head_dim).contiguous()
+        return key_sbhd, value_sbhd
+
+    def _copy_input_to_device(self, tensor: Optional[torch.Tensor], *, buffer_attr: str) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.device == self.device and tensor.is_contiguous():
+            return tensor
+
+        source = tensor.contiguous()
+        buffer = getattr(self, buffer_attr)
+        if (
+            buffer is None
+            or buffer.shape != source.shape
+            or buffer.dtype != source.dtype
+            or buffer.device != self.device
+        ):
+            buffer = torch.empty_like(source, device=self.device)
+            setattr(self, buffer_attr, buffer)
+        buffer.copy_(source, non_blocking=True)
+        return buffer
+
+    def _wrap_cached_remote_past(
+        self,
+        state: _RemoteShardCacheState,
+    ) -> Tuple[TorchTensor, TorchTensor]:
         return (
-            TorchTensor.create_from_torch(key_sbhd, self.compute),
-            TorchTensor.create_from_torch(value_sbhd, self.compute),
+            TorchTensor.create_from_torch(state.key_buffer[: state.seq_len], self.compute),
+            TorchTensor.create_from_torch(state.value_buffer[: state.seq_len], self.compute),
         )
 
     def attention_forward(
@@ -294,9 +472,11 @@ class _FlexgenLlamaShard(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],
         live_weights,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_tt = TorchTensor.create_from_torch(hidden_states.to(self.device, non_blocking=True), self.compute)
-        mask_tt = TorchTensor.create_from_torch(attention_mask.to(self.device, non_blocking=True), self.attention_compute)
-        rotary_ids = rotary_position_ids.to(self.device, non_blocking=True) if rotary_position_ids is not None else None
+        hidden_local = self._copy_input_to_device(hidden_states, buffer_attr="_hidden_input_buffer")
+        mask_local = self._copy_input_to_device(attention_mask, buffer_attr="_mask_buffer")
+        rotary_ids = self._copy_input_to_device(rotary_position_ids, buffer_attr="_rotary_ids_buffer")
+        hidden_tt = TorchTensor.create_from_torch(hidden_local, self.compute)
+        mask_tt = TorchTensor.create_from_torch(mask_local, self.attention_compute)
         donate = [False] * 16
         w_q, w_k, w_v, w_out, input_layernorm, rotary_emb_inv_freq = live_weights
 
@@ -341,7 +521,8 @@ class _FlexgenLlamaShard(nn.Module):
         return _as_torch_tensor(output_tt), _as_torch_tensor(k_new), _as_torch_tensor(v_new)
 
     def mlp_forward(self, hidden_states: torch.Tensor, live_weights) -> torch.Tensor:
-        hidden_tt = TorchTensor.create_from_torch(hidden_states.to(self.device, non_blocking=True), self.compute)
+        hidden_local = self._copy_input_to_device(hidden_states, buffer_attr="_hidden_input_buffer")
+        hidden_tt = TorchTensor.create_from_torch(hidden_local, self.compute)
         gate, down, up, post_attention_layernorm = live_weights
         donate = [False] * 9
         output_tt = self.compute.mlp_llama(
@@ -432,11 +613,13 @@ class FlexgenLlamaTensorParallel(nn.Module):
                     device=torch.device(device),
                     layout=layout,
                     expanded_path=self.expanded_path,
+                    is_output_shard=(torch.device(device) == self.output_device),
                 )
                 for device, layout in zip(devices, shard_layouts)
             ]
         )
         self.module_shards = nn.ModuleList([self.tp_shards[0]])
+        self.remote_cache_reuse_enabled = True
 
         self.input_layernorm = FLEX_LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = SimpleLMHead(hidden_size=config.hidden_size, vocab_size=config.vocab_size)
@@ -450,6 +633,16 @@ class FlexgenLlamaTensorParallel(nn.Module):
             local_intermediate,
         )
 
+    def set_remote_cache_reuse_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self.remote_cache_reuse_enabled == enabled:
+            return
+        self.remote_cache_reuse_enabled = enabled
+        for shard in self.tp_shards:
+            shard.remote_cache_reuse_enabled = enabled
+            if not enabled:
+                shard._remote_cache_state = None
+
     def _synchronize_weight_loads(self) -> None:
         first_shard = self.tp_shards[0]
         first_shard.env.disk.synchronize()
@@ -458,11 +651,26 @@ class FlexgenLlamaTensorParallel(nn.Module):
                 torch.cuda.synchronize(shard.device)
 
     def _reduce_partials(self, partials: List[torch.Tensor], residual_input: torch.Tensor) -> torch.Tensor:
-        reduced = None
-        for partial in partials:
-            partial_out = partial.to(self.output_device, non_blocking=True)
-            reduced = partial_out if reduced is None else reduced + partial_out
-        return reduced - (len(partials) - 1) * residual_input.to(self.output_device, non_blocking=True)
+        if not partials:
+            raise ValueError("Expected at least one TP partial")
+
+        if len(partials) == 1:
+            reduced = partials[0]
+        elif all(partial.device.type == "cuda" for partial in partials):
+            destination = self.output_device.index if self.output_device.index is not None else 0
+            reduced = cuda_comm.reduce_add(partials, destination=destination)
+        else:
+            reduced = None
+            for partial in partials:
+                partial_out = partial.to(self.output_device, non_blocking=True)
+                reduced = partial_out if reduced is None else reduced + partial_out
+
+        if reduced.device != self.output_device:
+            reduced = reduced.to(self.output_device, non_blocking=True)
+        residual = residual_input if residual_input.device == self.output_device else residual_input.to(
+            self.output_device, non_blocking=True
+        )
+        return reduced - (len(partials) - 1) * residual
 
     def _merge_cache_parts(self, cache_parts: List[torch.Tensor], *, is_key: bool) -> torch.Tensor:
         if not cache_parts:
@@ -475,7 +683,8 @@ class FlexgenLlamaTensorParallel(nn.Module):
         total_heads = 0
 
         for shard, cache_part in zip(self.tp_shards, cache_parts):
-            cache_part = cache_part.to(self.output_device, non_blocking=True)
+            if cache_part.device != self.output_device:
+                cache_part = cache_part.to(self.output_device, non_blocking=True)
             if cache_part.ndim != 3:
                 raise ValueError(f"Unexpected TP cache shape: {tuple(cache_part.shape)}")
 
@@ -550,11 +759,14 @@ class FlexgenLlamaTensorParallel(nn.Module):
 
         attn_live = []
         attn_owned = []
+        attn_needs_sync = False
         for shard in self.tp_shards:
-            live_weights, owned = shard.load_attention_weights()
+            live_weights, owned, needs_sync = shard.load_attention_weights()
             attn_live.append(live_weights)
             attn_owned.append(owned)
-        self._synchronize_weight_loads()
+            attn_needs_sync = attn_needs_sync or needs_sync
+        if attn_needs_sync:
+            self._synchronize_weight_loads()
 
         attn_partials: List[torch.Tensor] = []
         k_parts: List[torch.Tensor] = []
@@ -579,11 +791,14 @@ class FlexgenLlamaTensorParallel(nn.Module):
 
         mlp_live = []
         mlp_owned = []
+        mlp_needs_sync = False
         for shard in self.tp_shards:
-            live_weights, owned = shard.load_mlp_weights()
+            live_weights, owned, needs_sync = shard.load_mlp_weights()
             mlp_live.append(live_weights)
             mlp_owned.append(owned)
-        self._synchronize_weight_loads()
+            mlp_needs_sync = mlp_needs_sync or needs_sync
+        if mlp_needs_sync:
+            self._synchronize_weight_loads()
 
         mlp_partials: List[torch.Tensor] = []
         try:
