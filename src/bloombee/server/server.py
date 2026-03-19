@@ -308,7 +308,7 @@ class Server:
 
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
-            50, 50,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # w_gpu_percent, w_cpu_percent
             100, 0,                   # cache_gpu_percent, cache_cpu_percent (multiplexing uses CPU staging for KV offload)
             100, 0,                   # act_gpu_percent, act_cpu_percent (mixed activation offload is unsupported)
             overlap=True, sep_layer=True, pin_weight=True,

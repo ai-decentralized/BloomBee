@@ -99,6 +99,15 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         output_attentions = False
         assert not output_attentions
 
+        # FlexGen's internal pipeline passes activations around as ValueHolder/TorchTensor
+        # wrappers. Use the underlying torch.Tensor only for shape/device inference when
+        # we need to synthesize fallback position_ids during throughput self-measurement.
+        hidden_tensor = hidden_states
+        if isinstance(hidden_tensor, ValueHolder):
+            hidden_tensor = hidden_tensor.val
+        if hasattr(hidden_tensor, "data") and isinstance(hidden_tensor.data, torch.Tensor):
+            hidden_tensor = hidden_tensor.data
+
         # print(' OptimizedLlamaAttention.forward(): received position_ids:', position_ids)
         # if position_ids is not None:
         #     print(f' position_ids shape: {position_ids.shape}, dtype: {position_ids.dtype}')
@@ -108,8 +117,8 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
             past_seen_tokens = past_key_value[0].shape[2] if past_key_value is not None else 0
             position_ids = torch.arange(
                 past_seen_tokens,
-                past_seen_tokens + hidden_states.shape[1],
-                device=hidden_states.device,
+                past_seen_tokens + hidden_tensor.shape[1],
+                device=hidden_tensor.device,
                 dtype=torch.long
             ).unsqueeze(0) # pyright: ignore[reportAssignmentType]
             # print(f' Generated fallback position_ids: {position_ids}')
