@@ -29,12 +29,12 @@ class SpeculativePrunerManager:
         self.device = device
         
         # Create initial pruner
-        self.pruner = SpeculativePrunerFactory.create_pruner(
-            self.config.method,
-            hidden_size,
-            vocab_size,
-            self.config
-        )
+        # self.pruner = SpeculativePrunerFactory.create_pruner(
+        #     self.config.method,
+        #     hidden_size,
+        #     vocab_size,
+        #     self.config
+        # )
         
         # Metrics tracking
         self.total_tokens = 0

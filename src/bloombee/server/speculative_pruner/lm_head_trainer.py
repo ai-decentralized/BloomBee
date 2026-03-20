@@ -4,8 +4,11 @@ import torch.nn.functional as F
 
 from bloombee.server.speculative_pruner.mid_layer_LM_head import MidLMHead
 from bloombee.utils.debug import dprint
+from hivemind.utils import get_logger
 
 CHECKPOINT_PATH = "checkpoints/lmhead/lm_head_checkpoint.pt"
+
+logger = get_logger(__name__)
 
 
 class LM_head_trainer:
@@ -23,13 +26,13 @@ class LM_head_trainer:
 
         # ── 用于推理 target 的 frozen 原始 LM head ─────────────
         self.original_lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
-        self.original_lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
+        self.original_lm_head.load_weight("/tmp/data/llama_weights/llama-13b-np")
         self.original_lm_head.requires_grad_(False)
         self.original_lm_head.to(dtype=torch.bfloat16)
 
         # ── 待训练的 LM head ────────────────────────────────────
         self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
-        self.lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
+        self.lm_head.load_weight("/tmp/data/llama_weights/llama-13b-np")
         self.lm_head.to(dtype=torch.bfloat16)
 
         self.optimizer_head = torch.optim.AdamW(self.lm_head.parameters(), lr=1e-4)
@@ -82,8 +85,9 @@ class LM_head_trainer:
         loss.backward()
         self.optimizer_head.step()
 
-        if self.ite % 1000 == 0:
+        if self.ite % 200 == 0:
             self._save_trained_head(CHECKPOINT_PATH)
+            logger.info(f"current loss: {loss}")
 
         return loss.item()
 
@@ -96,4 +100,4 @@ class LM_head_trainer:
             'optimizer_state_dict': self.optimizer_head.state_dict(),
         }
         torch.save(checkpoint, path)
-        dprint(f"[SUCCESS] Checkpoint saved to '{path}' (iteration {self.ite})")
+        logger.info(f"[SUCCESS] Checkpoint saved to '{path}' (iteration {self.ite})")
