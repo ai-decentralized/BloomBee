@@ -489,197 +489,41 @@ class TransformerConnectionHandler(ConnectionHandler):
         async with timeout(self.session_timeout):
             
             try:
-                recv_start = perf_counter()
                 request = await asyncio.wait_for(anext(requests), self.step_timeout)
-                recv_end = perf_counter()
             except asyncio.TimeoutError:
                 self._log_request("rpc_inference.open", None, context, warning="timed out")
                 return
 
-            # [NETWORK_TIMING] Log received request size and timing
-            request_tensor_sizes = [len(tensor.buffer) for tensor in request.tensors]
-            request_metadata_size = len(request.metadata) if request.metadata else 0
-            total_request_size = sum(request_tensor_sizes) + request_metadata_size
-            recv_time_ms = (recv_end - recv_start) * 1000
-            
-            logger.debug(f"[NETWORK_RX] SERVER_RECV | "
-                       f"tensor_size={sum(request_tensor_sizes)/1024:.2f}KB | "
-                       f"metadata_size={request_metadata_size}B | "
-                       f"total={total_request_size/1024:.2f}KB | "
-                       f"recv_time={recv_time_ms:.2f}ms")
-            
-
             requested_uids = self._check_uids(request.uid)
-            self._log_request("rpc_inference.open", requested_uids, context)
+            
+            logger.info(f"received rpc_inference: {requested_uids}")
             try:
-                start_time = perf_counter()
-                
-                metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-                end_msg_serial_time = perf_counter()
-                # print_time_now('')
-                
-                requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-                max_length = metadata.get("max_length")
-                points = metadata.get("points", 0)
-                session_id = metadata.get("session_id")
-                alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
-                args_structure = metadata.get("args_structure")
-
-                def _flag_to_bool(value: Any) -> bool:
-                    if value is None:
-                        return False
-                    if torch.is_tensor(value):
-                        if value.numel() == 0:
-                            return False
-                        return bool(value.bool().any().item())
-                    return bool(value)
-
-                raw_is_spec = metadata.get("is_spec_dec", None)
-                if raw_is_spec is not None:
-                    is_spec_request = _flag_to_bool(raw_is_spec)
+                if request.metadata is not None:
+                    metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
+                    max_length = metadata.get("max_length")
+                    points = metadata.get("points", 0)
+                    session_id = metadata.get("session_id")
+                    alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
+                    args_structure = metadata.get("args_structure")
+                    batch_size = request.tensors[0].size[0] if request.tensors else 1
                 else:
-                    # Backward-compatible robust fallback:
-                    # reconstruct args via args_structure instead of assuming tensor order.
-                    is_spec_request = False
-                    try:
-                        if request.tensors and args_structure is not None:
-                            flat_request_tensors = [deserialize_torch_tensor(t) for t in request.tensors]
-                            unpacked_args, _ = unpack_args_kwargs(flat_request_tensors, args_structure)
-                            # Expected order:
-                            # [hidden, keep_idx, need_pruning, prompts, hypo_ids,
-                            #  tree_mask, kv_pos, draft_tokens, prefill_length, is_spec_dec]
-                            if isinstance(unpacked_args, (tuple, list)) and len(unpacked_args) >= 10:
-                                maybe_tree_mask = unpacked_args[5]
-                                maybe_draft = unpacked_args[7]
-                                maybe_is_spec = unpacked_args[9]
-                                is_spec_request = _flag_to_bool(maybe_is_spec)
-                                # If explicit flag is unavailable/zero, non-empty draft/tree
-                                # strongly implies speculative path.
-                                if not is_spec_request:
-                                    has_draft = torch.is_tensor(maybe_draft) and maybe_draft.numel() > 0
-                                    has_tree = torch.is_tensor(maybe_tree_mask) and maybe_tree_mask.numel() > 0
-                                    is_spec_request = bool(has_draft or has_tree)
-                    except Exception as e:
-                        logger.debug(f"{MBPIPE_LOG_PREFIX} spec detection fallback failed: {e}")
-                        is_spec_request = False
-                if not requested_uids:
-                    raise ValueError("User must specify at least one block for inference, but got none")
-                assert isinstance(
-                    max_length, int
-                ), f"rpc_inference metadata must contain int max_length, got {max_length}"
-                assert isinstance(
-                    points, (float, int)
-                ), f"rpc_inference should have number of points as a number or None, got {points}"
-                if not 0 <= max_length <= self.inference_max_length:
-                    raise ValueError(
-                        f"Cannot allocate KV cache for {max_length} tokens, max = {self.inference_max_length}"
-                    )
-
-                original_batch_size = request.tensors[0].size[0] if request.tensors else 1
-                batch_size = original_batch_size
-                metadata_full_batch_size = metadata.get("full_batch_size")
-                try:
-                    metadata_full_batch_size = int(metadata_full_batch_size) if metadata_full_batch_size is not None else None
-                except Exception:
-                    metadata_full_batch_size = None
-                if metadata_full_batch_size is not None and metadata_full_batch_size <= 0:
-                    metadata_full_batch_size = None
-                
-                # [MB_DEBUG] Log initial batch size detection
-                logger.debug(f"[MB_DEBUG] === BATCH SIZE DETECTION ===")
-                logger.debug(f"[MB_DEBUG] Original batch_size from tensor[0]: {original_batch_size}")
-                logger.debug(f"[MB_DEBUG] Metadata keys: {list(metadata.keys())}")
-                logger.debug(f"[MB_DEBUG] metadata.type={metadata.get('type')}, metadata.full_batch_size={metadata.get('full_batch_size')}")
-                
-                # [MBPIPE_STREAMING] For cross-stage micro-batch streaming, use full_batch_size for KV cache allocation
-                # This is critical for decode overlap: Stage 2 must allocate cache for full batch on first MB arrival
-                is_streaming_decode = is_microbatch_queue_item(request) or metadata.get("type") == "micro_batch"
-                logger.debug(f"[MB_DEBUG] is_streaming_decode={is_streaming_decode}, is_microbatch_queue_item={is_microbatch_queue_item(request)}")
-                
-                if is_streaming_decode:
-                    streaming_full_batch_size = metadata_full_batch_size if metadata_full_batch_size is not None else batch_size
-                    logger.debug(f"[MB_DEBUG] Streaming decode detected! streaming_full_batch_size={streaming_full_batch_size}")
+                    metadata = None
+                    max_length = 720
+                    points = 0
+                    session_id = 0
+                    alloc_timeout = 10000
+                    args_structure = None
+                    batch_size = 1
                     
-                    if is_spec_request and streaming_full_batch_size > batch_size:
-                        logger.info(
-                            f"{MBPIPE_LOG_PREFIX} Spec streaming request: using full_batch_size={streaming_full_batch_size} "
-                            f"for KV allocation (actual incoming mb={batch_size})"
-                        )
-                        batch_size = streaming_full_batch_size
-                    # [MBPIPE_FIX] If using micro-batch pipeline, DO NOT override batch_size with full_batch_size
-                    # We want to allocate cache ONLY for the micro-batch size to enable GPU multiplexing
-                    elif is_microbatch_enabled() and streaming_full_batch_size > batch_size:
-                        logger.debug(f"[MBPIPE_FIX] Micro-batch enabled: Keeping batch_size={batch_size} (micro-batch size) "
-                                    f"instead of full_batch_size={streaming_full_batch_size} to enable GPU multiplexing")
-                    elif streaming_full_batch_size > batch_size:
-                        logger.info(f"{MBPIPE_LOG_PREFIX} [STREAMING_DECODE] Detected streaming micro-batch (LEGACY), "
-                                    f"using full_batch_size={streaming_full_batch_size} for KV cache (actual MB size={batch_size})")
-                        batch_size = streaming_full_batch_size
-                        logger.debug(f"[MB_DEBUG] KV cache will use batch_size={batch_size} (overridden from {original_batch_size})")
-                else:
-                    if is_spec_request and metadata_full_batch_size is not None and metadata_full_batch_size > batch_size:
-                        logger.info(
-                            f"{MBPIPE_LOG_PREFIX} Spec request: override batch_size {batch_size} -> "
-                            f"full_batch_size {metadata_full_batch_size} for stable KV allocation"
-                        )
-                        batch_size = metadata_full_batch_size
-                    # Non-streaming RPC path keeps logical full batch size here.
-                    # Physical KV cache allocation is decided in _allocate_cache():
-                    # when micro-batching is enabled and batch_size > micro_batch_size,
-                    # we allocate only micro_batch_size slots and multiplex on GPU.
-                    if is_microbatch_enabled():
-                        micro_batch_size = get_micro_batch_size()
-                        logger.debug(f"[MBPIPE_FIX] Non-streaming: logical batch_size={batch_size}, "
-                                    f"physical alloc will use micro_batch_size={micro_batch_size} in _allocate_cache")
-                    else:
-                        logger.debug(f"[MB_DEBUG] NOT streaming decode, using original batch_size={batch_size}")
-                
-                logger.debug(f"[MB_DEBUG] Batch size detection completed, final batch_size={batch_size}")
-                # print_time_now('')
-                
-                # [MBPIPE] Log current path at rpc_inference entry
-                mbpipe_log_path_entry(logger, "handler.rpc_inference", batch_size=batch_size)
-                if is_spec_request:
-                    logger.info(
-                        f"{MBPIPE_LOG_PREFIX} Speculative decoding request detected; "
-                        f"forcing full-batch KV allocation for this session"
-                    )
-                
-                # [MBPIPE] Log comprehensive runtime info
-                from bloombee.utils.microbatch_config import log_microbatch_runtime_info
-                log_microbatch_runtime_info(
-                    logger,
-                    batch_size=batch_size,
-                    seq_len=max_length,
-                    num_blocks=len(requested_backends),
-                    context="rpc_inference entry"
-                )
+                requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
 
-                
-                push_time = []
-                
-                # [KVCACHE_DEBUG] Log before cache allocation
-                cache_alloc_start = perf_counter()
-                logger.debug(f"[KVCACHE_DEBUG] === KV CACHE ALLOCATION ===")
-                logger.debug(f"[KVCACHE_DEBUG] Allocating cache: batch_size={batch_size}, max_length={max_length}, timeout={alloc_timeout}")
-                logger.debug(f"[KVCACHE_DEBUG] Requested backends: {len(requested_backends)}, UIDs: {requested_uids}")
-                
                 async with self._allocate_cache(
                     requested_backends,
                     batch_size=batch_size,
                     max_length=max_length,
                     timeout=alloc_timeout,
-                    force_full_batch_alloc=is_spec_request,
+                    force_full_batch_alloc=True,
                 ) as cache_handles:
-                    end_cache_time = perf_counter()
-                    cache_alloc_ms = (end_cache_time - cache_alloc_start) * 1000
-                    
-                    # [KVCACHE_DEBUG] Log cache allocation result
-                    logger.debug(f"[KVCACHE_DEBUG] Cache allocated in {cache_alloc_ms:.2f}ms")
-                    logger.debug(f"[KVCACHE_DEBUG] cache_handles count: {len(cache_handles) if cache_handles else 0}")
-                    if cache_handles:
-                        for i, handles in enumerate(cache_handles):
-                            logger.debug(f"[KVCACHE_DEBUG] cache_handles[{i}]: {len(handles) if handles else 0} handles")
                     
                     background_tasks = set()
                     step_=0
@@ -687,48 +531,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                     
                     # [MBPIPE] Async Output Buffer for compute/communication overlap
                     output_buffer: Optional[AsyncOutputBuffer] = None
-                    use_buffer = False
-                    
-                    # Check if we should use async buffer (based on timing data)
-                    # Server-to-server communication is determined by next_servers in metadata
-                    if is_microbatch_enabled():
-                        # Check timing data for buffer decision
-                        tracker = get_timing_tracker()
-                        use_buffer, buffer_pos = tracker.should_use_buffer()
-                        
-                        if use_buffer and buffer_pos == "producer":
-                            output_buffer = AsyncOutputBuffer(
-                                max_pending=2,  # Allow up to 2 pending sends
-                                logger=logger,
-                                name=f"server_{requested_uids[0]}"
-                            )
-                            
-                            # Define the async push function for the buffer
-                            # Must be async because _push_outputs is async
-                            async def buffered_push_fn(item):
-                                req, tensors, meta = item
-                                await self._push_outputs(req, tensors, meta)
-                            
-                            await output_buffer.start_sender(buffered_push_fn)
-                            logger.info(
-                                f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer started for cross-stage overlap"
-                            )
                     
                     # [MBPIPE] Cross-stage streaming push callback (for micro-batch level streaming)
                     # This enables Server2 to start processing micro-batch N while Server1 computes N+1
                     cross_stage_push_microbatch = None
-                    
-                    if is_microbatch_enabled():
-                        # Create the cross-stage push function that captures required context
-                        async def _cross_stage_push_wrapper(mb_hidden, mb_keep, push_metadata):
-                            """Wrapper that calls _push_microbatch with required backends."""
-                            await self._push_microbatch(
-                                mb_hidden, mb_keep, push_metadata, requested_backends
-                            )
-                        
-                        cross_stage_push_microbatch = _cross_stage_push_wrapper
-                        logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
-                    
+                    first_request = request
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
                     # offload_logger.info(" Start inference iteration")
@@ -737,7 +544,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         requested_backends=requested_backends,
                         active_adapter=self._get_active_adapter(metadata),
                         input_iterator=self._iterate_inference_steps(
-                            request, requests, session_id, requested_uids, context
+                            first_request, requests, session_id, requested_uids, context
                         ),
                         cache_handles=cache_handles,
                         pruner_manager=self.pruner_manager,
@@ -770,6 +577,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                             self._cleanup_warmup_shared_memory()
                         
                         can_push_case_time=perf_counter() ###
+                        
+                        next_servers = step_metadata.get("next_servers")
+                        first_request = None
+                        has_next_server = False if not next_servers else True
+                        if not has_next_server:
+                            logger.info("[DEBUG] _push_outputs: No next_servers, returning early")
 
                         if can_push:
                             # [MBPIPE] Skip _push_outputs if data was already sent via cross-stage micro-batch push
@@ -788,14 +601,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                                     task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
                                     background_tasks.add(task)
                                     task.add_done_callback(background_tasks.discard)
-                            else:
+                            elif has_next_server:
                                 # Original direct task creation
+                                logger.info(f"_push_outputs to next server")
                                 task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
                                 background_tasks.add(task)  # Keep reference until it is done to save it from GC
                                 task.add_done_callback(background_tasks.discard)
+                                yield runtime_pb2.ExpertResponse(tensors=None)
+                                continue
                         start_ExpertResponse_time=perf_counter() ###
                         push_schedule_ms = (start_ExpertResponse_time - can_push_case_time) * 1000.0
-                        push_time.append(push_schedule_ms) ###
                         # print('current step push outputs task prepare time ', start_ExpertResponse_time-can_push_case_time) ###
                         # print_time_now('')
                         yield runtime_pb2.ExpertResponse(tensors=output_tensors)
@@ -1053,154 +868,138 @@ class TransformerConnectionHandler(ConnectionHandler):
         context: P2PContext,
     ) -> AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]]:
         processed_step_ids = set()
-        # [MBPIPE_FIX] Track step routing to avoid double-processing the same step through
-        # both micro-batch queue path and direct request path.
-        microbatch_step_ids = set()
-        processed_microbatch_ids = set()
         n_pushes = n_late_pushes = 0
         request = first_request
         anext_task = get_push_task = None
         queue_wait_ms = 0.0
         queue_source = "initial"
+
+        # [FAKE_REQUEST] 两个槽位，分别缓存 client 假请求的 metadata 和 session 的 tensor
+        pending_routing_metadata = None
+        pending_session_request = None
+
         try:
-            start_iterate_inference_steps_time = perf_counter()
-            
             with self._managed_session(session_id) if session_id is not None else contextlib.nullcontext():
-                while request is not None:
-                    # Start fetching the NEXT request early so network/queue wait can overlap with
-                    # current step processing in iterate_rpc_inference.
+                
+                # 处理 first_request
+                if first_request is not None:
+                    if not first_request.tensors:
+                        # first_request 是假请求，只取 metadata
+                        pending_routing_metadata = MSGPackSerializer.loads(first_request.metadata) if first_request.metadata else {}
+                        logger.debug(f"[FAKE_REQUEST] first_request is fake, cached routing metadata")
+                    else:
+                        # first_request 是真实请求（兼容旧逻辑）
+                        metadata = MSGPackSerializer.loads(first_request.metadata) if first_request.metadata else {}
+                        step_id = metadata.get("step_id")
+                        metadata["_queue_wait_ms"] = 0.0
+                        metadata["_queue_source"] = "initial"
+                        yield first_request, metadata
+                        if step_id is not None:
+                            processed_step_ids.add(step_id)
+
+                while True:
+                    # 按需创建 task
                     if anext_task is None:
                         anext_task = asyncio.create_task(anext(requests))
                     if get_push_task is None:
                         if session_id is not None:
                             get_push_task = asyncio.create_task(self._get_from_session_queue(session_id))
                         else:
-                            get_push_task = asyncio.create_task(asyncio.Event().wait())  # Dummy never-ending task
+                            # 没有 session，只等 client stream
+                            get_push_task = asyncio.create_task(asyncio.Event().wait())
 
-                    # [MBPIPE] Check if this is a micro-batch queue item (dict with type="micro_batch")
-                    if is_microbatch_queue_item(request):
-                        # Yield micro-batch directly with type marker
-                        mb_item = request
-                        mb_metadata = mb_item.get("metadata", {}).copy()
-                        mb_step_id = mb_metadata.get("step_id")
-                        mb_idx = mb_item.get("mb_idx", 0)
-                        skip_mb_item = False
-
-                        # If this step was already processed through full-batch path, ignore late micro-batch pushes.
-                        if mb_step_id is not None and mb_step_id in processed_step_ids and mb_step_id not in microbatch_step_ids:
-                            logger.info(
-                                f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping late micro-batch "
-                                f"(step_id={mb_step_id}, mb_idx={mb_idx}) because full-batch path already processed it"
-                            )
-                            request = None
-                            skip_mb_item = True
-
-                        # Idempotency at consume side: prevent duplicate enqueue/replay from being processed twice.
-                        if not skip_mb_item:
-                            mb_dedup_key = (mb_step_id, mb_idx)
-                            if mb_dedup_key in processed_microbatch_ids:
-                                logger.info(
-                                    f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping duplicate micro-batch "
-                                    f"(step_id={mb_step_id}, mb_idx={mb_idx})"
-                                )
-                                request = None
-                                skip_mb_item = True
-                            else:
-                                processed_microbatch_ids.add(mb_dedup_key)
-                                if mb_step_id is not None:
-                                    microbatch_step_ids.add(mb_step_id)
-
-                        if not skip_mb_item:
-                            mb_metadata["type"] = "micro_batch"
-                            mb_metadata["mb_idx"] = mb_idx
-                            mb_metadata["expected_num_mb"] = mb_item.get("expected_num_mb", 1)
-                            mb_metadata["offset"] = mb_item.get("offset", 0)
-                            mb_metadata["size"] = mb_item.get("size", 1)
-                            mb_metadata["full_batch_size"] = mb_item.get("full_batch_size", 1)
-                            mb_metadata["pushed"] = True
-                            mb_metadata["_queue_wait_ms"] = float(queue_wait_ms)
-                            mb_metadata["_queue_source"] = queue_source
-                            
-                            logger.debug(
-                                f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
-                                f"mb_idx={mb_item.get('mb_idx')} for immediate processing"
-                            )
-                            
-                            yield mb_item.get("payload"), mb_metadata
-                            
-                            # Continue to next item from queue
-                            request = None
-                    elif hasattr(request, 'tensors') and (request.tensors or (request.metadata and not request.tensors)):
-                        # Original full-batch request path
-                        start_meta_time = perf_counter()
-                        metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-                        step_id = metadata.get("step_id")
-                        pushed = metadata.get("pushed")
-                        skip_direct_request = False
-                        
-                        # [MBPIPE] Note: Micro-batch signal handling removed.
-                        if metadata.get("is_mb_start_signal"):
-                            logger.info(
-                                f"{MBPIPE_LOG_PREFIX} iterate_steps: ignoring mb_start_signal (incompatible format)"
-                            )
-                            request = None
-                            skip_direct_request = True
-                        
-                        if pushed and not skip_direct_request:
-                            n_pushes += 1
-                            self._log_request("rpc_inference.push", requested_uids, context, debug=f"session received push")
-
-                        # [MBPIPE_FIX] If this step is already being handled via micro-batch queue,
-                        # skip direct/full-batch request to avoid double compute and KV corruption.
-                        if (not skip_direct_request) and step_id is not None and step_id in microbatch_step_ids:
-                            logger.info(
-                                f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping direct request for step_id={step_id} "
-                                f"because micro-batch path is active"
-                            )
-                            request = None
-                            skip_direct_request = True
-
-                        if (not skip_direct_request) and (step_id is None or step_id not in processed_step_ids):
-                            metadata["_queue_wait_ms"] = float(queue_wait_ms)
-                            metadata["_queue_source"] = queue_source
-                            yield request, metadata
-                            if step_id is not None:
-                                processed_step_ids.add(step_id)
-                        elif (not skip_direct_request) and pushed:
-                            n_late_pushes += 1
-                            self._log_request(
-                                "rpc_inference.push",
-                                requested_uids,
-                                context,
-                                debug=f"arrived late {n_late_pushes / n_pushes * 100:.1f}% of the time",
-                            )
-                        
-                        request = None  # Mark as processed, will fetch next
-                    else:
-                        # Empty or None request - break out
-                        break
-                    
-                    # Wait for next request, coming either from stream or push queue.
+                    # 等任意一个先到
                     wait_start_time = perf_counter()
                     done, _ = await asyncio.wait(
-                        [anext_task, get_push_task], timeout=self.step_timeout, return_when=asyncio.FIRST_COMPLETED
+                        [anext_task, get_push_task],
+                        timeout=self.step_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
                     queue_wait_ms = (perf_counter() - wait_start_time) * 1000.0
-                    
-                    # Prefer push_queue when both are ready to keep micro-batch pipeline flowing.
-                    if get_push_task in done:
-                        request = await get_push_task
-                        get_push_task = None
-                        queue_source = "push_queue"
-                    elif anext_task in done:
-                        request = await anext_task
-                        anext_task = None
-                        queue_source = "stream"
-                    else:
+
+                    if not done:
+                        # 超时
                         self._log_request("rpc_inference.step", requested_uids, context, warning="timed out")
                         anext_task.cancel()
                         get_push_task.cancel()
                         return
+
+                    # client stream 有数据
+                    if anext_task in done:
+                        incoming = await anext_task
+                        anext_task = None
+
+                        if incoming is None or not hasattr(incoming, 'tensors'):
+                            # stream 结束
+                            logger.debug("[FAKE_REQUEST] client stream ended")
+                            return
+
+                        if not incoming.tensors:
+                            # 假请求，只取 metadata
+                            pending_routing_metadata = MSGPackSerializer.loads(incoming.metadata) if incoming.metadata else {}
+                            queue_source = "stream"
+                            logger.info(f"[FAKE_REQUEST] Got fake request from client, step_id={pending_routing_metadata.get('step_id')}")
+                        else:
+                            
+                            metadata = MSGPackSerializer.loads(incoming.metadata) if incoming.metadata else {}
+                            step_id = metadata.get("step_id")
+                            pushed = metadata.get("pushed")
+                            logger.info(f"[first server] Got fake request from client, step_id={step_id}")
+                            if pushed:
+                                n_pushes += 1
+                                self._log_request("rpc_inference.push", requested_uids, context, debug="session received push")
+                            if step_id is None or step_id not in processed_step_ids:
+                                metadata["_queue_wait_ms"] = float(queue_wait_ms)
+                                metadata["_queue_source"] = "stream"
+                                yield incoming, metadata
+                                if step_id is not None:
+                                    processed_step_ids.add(step_id)
+                            elif pushed:
+                                n_late_pushes += 1
+                                self._log_request(
+                                    "rpc_inference.push", requested_uids, context,
+                                    debug=f"arrived late {n_late_pushes / n_pushes * 100:.1f}% of the time",
+                                )
+                            continue
+
+                    # session queue 有数据
+                    if get_push_task in done:
+                        incoming = await get_push_task
+                        get_push_task = None
+
+                        if incoming is None:
+                            logger.info("[FAKE_REQUEST] session queue returned None, ending")
+                            return
+
+                        pending_session_request = incoming
+                        queue_source = "push_queue"
+                        logger.info(f"[FAKE_REQUEST] Got session data")
+
+                    # 两个槽位都满了，合并 yield
+                    if pending_routing_metadata is not None and pending_session_request is not None:
+                        merged_metadata = {**pending_routing_metadata}
+                        merged_metadata["_queue_wait_ms"] = float(queue_wait_ms)
+                        merged_metadata["_queue_source"] = queue_source
+
+                        merged_request = runtime_pb2.ExpertRequest(
+                            uid=pending_session_request.uid,
+                            tensors=pending_session_request.tensors,  # tensor 来自 session
+                            metadata=MSGPackSerializer.dumps(merged_metadata),  # metadata 来自 client
+                        )
+
+                        step_id = merged_metadata.get("step_id")
+                        logger.info(f"start compute, step_id: {step_id}")
+                        if step_id is None or step_id not in processed_step_ids:
+                            yield merged_request, merged_metadata
+                            if step_id is not None:
+                                processed_step_ids.add(step_id)
+                        else:
+                            logger.info(f"[FAKE_REQUEST] step_id={step_id} already processed, skipping")
+
+                        # 清空槽位，准备下一个 step
+                        pending_routing_metadata = None
+                        pending_session_request = None
+
         except Exception:
             raise
         finally:
@@ -1463,14 +1262,10 @@ class TransformerConnectionHandler(ConnectionHandler):
         request: runtime_pb2.ExpertRequest,
         serialized_outputs: Sequence[runtime_pb2.Tensor],
         metadata: dict,
-    ) -> None:
+    ) -> Any:
         push_start_time = perf_counter()
         try:
             next_servers = metadata.get("next_servers")
-            if not next_servers:
-                logger.debug("[DEBUG] _push_outputs: No next_servers, returning early")
-                return
-
             next_peer_id, next_session_id, next_start, next_end = next_servers[0]
             next_peer_id_str = str(next_peer_id)
             next_peer_id = PeerID.from_base58(next_peer_id)
@@ -2020,6 +1815,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                     yield runtime_pb2.ExpertResponse(tensors=[part])
 
     def _get_active_adapter(self, metadata: dict) -> str:
+        if metadata is None:
+            return self.adapters[0]
         active_adapter = metadata.get("active_adapter", "")
         if active_adapter and (active_adapter not in self.adapters):
             raise KeyError(f"adapter {active_adapter} not found")

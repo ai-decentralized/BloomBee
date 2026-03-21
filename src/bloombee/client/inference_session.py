@@ -123,6 +123,39 @@ class _ServerInferenceSession:
         :prompts: optional DEEP prompts, added to a prefix of each layer's outputs,
           if specified, deep prompts should have shape [num_layers, batch_size, prefix_len, hid_size]
         """
+        if inputs is None:
+            if is_spec_dec:
+                n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
+            else:
+                n_input_tokens = 1
+            request_metadata = dict(session_id=self.session_id, step_id=step_id)
+            if not self.stepped:
+                request_metadata.update(self.session_metadata)
+            if self.config.use_server_to_server:
+                next_servers = self._collect_next_servers()
+                if next_servers:
+                    request_metadata["next_servers"] = next_servers
+                    
+            logger.info(f"next_servers: {next_servers}")
+            serialized_metadata = MSGPackSerializer.dumps(request_metadata)
+            outputs_serialized = RemoteExpertWorker.run_coroutine(
+                self._step(
+                    runtime_pb2.ExpertRequest(
+                        uid=self.uid,
+                        tensors=None,
+                        metadata=serialized_metadata,
+                    )
+                )
+            )
+            if outputs_serialized is None:
+                logger.info(f"outputs_serialized is None")
+                return None
+            
+            outputs = list(map(deserialize_torch_tensor, outputs_serialized.tensors))  
+
+            self._position += n_input_tokens
+            return outputs
+        
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
         if is_spec_dec:
@@ -204,6 +237,7 @@ class _ServerInferenceSession:
             next_servers = self._collect_next_servers()
             if next_servers:
                 request_metadata["next_servers"] = next_servers
+        logger.info(f"next_servers: {next_servers}")
 
         request_metadata["args_structure"] = args_structure
 
@@ -257,6 +291,10 @@ class _ServerInferenceSession:
                 )
             )
         )
+        
+        if outputs_serialized is None:
+            logger.info(f"outputs_serialized is None")
+            return None
         
         network_end = time.perf_counter()
         network_rtt_ms = (network_end - network_start) * 1000
@@ -487,14 +525,16 @@ class InferenceSession:
                 try:
                     if not self._server_sessions or attempt_no >= 1:
                         self._update_sequence(server_idx, block_idx, attempt_no)
-
+                    # if inputs is not None:
                     server_session = self._server_sessions[server_idx]
+                    # else:
+                    #     server_session = self._server_sessions[1]
                     # assert server_session.position == self.position, f"{server_session.position} and {self.position}"
                     
                     # 🔍 CLIENT DEBUG: Log server span processing start
                     span_start_time = time.perf_counter()
                     
-                    inputs, keep_indices, *_ = server_session.step( 
+                    outputs = server_session.step( 
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
@@ -507,6 +547,12 @@ class InferenceSession:
                         is_spec_dec,
                         step_id=step_id,
                     )
+                    logger.info(f"block_idx: {block_idx}, outputs: {outputs}")
+                    if not outputs:
+                        inputs = None
+                    else:
+                        inputs, keep_indices, *_ = outputs
+                        
                     if is_spec_dec and need_pruning:
                         self.keep_indices = keep_indices
                     
