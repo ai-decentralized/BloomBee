@@ -1891,9 +1891,17 @@ async def iterate_rpc_inference(
         deserialize_time = (perf_counter() - deserialize_start) * 1000.0
         full_deserialize_summary = summarize_transport_profile(full_deserialize_profile)
         inference_layout = step_metadata.get("inference_layout")
-        if inference_layout == "decode_minimal_v2" or (
-            inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 3
-        ):
+        inferred_layout = inference_layout
+        if inferred_layout is None:
+            is_spec_layout = _as_python_bool(step_metadata.get("is_spec_dec", 0))
+            if not is_spec_layout and len(flat_tensors) == 3:
+                inferred_layout = "decode_minimal_v2"
+            elif not is_spec_layout and len(flat_tensors) == 5:
+                inferred_layout = "decode_compact_v2"
+            elif is_spec_layout and len(flat_tensors) == 8:
+                inferred_layout = "spec_compact_v1"
+
+        if inferred_layout == "decode_minimal_v2":
             hidden_states, keep_indices, prefill_length, *_ = flat_tensors
             need_pruning1 = None
             tree_attention_mask = None
@@ -1902,23 +1910,23 @@ async def iterate_rpc_inference(
             is_spec_dec1 = None
             prompts = DUMMY
             hypo_ids = DUMMY_INT64
-        elif inference_layout == "decode_compact_v2" or (
-            inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 5
-        ):
+        elif inferred_layout == "decode_compact_v2":
             hidden_states, keep_indices, prefill_length, prompts, hypo_ids, *_ = flat_tensors
             need_pruning1 = None
             tree_attention_mask = None
             kv_cache_position_ids = None
             draft_tokens = None
             is_spec_dec1 = None
-        elif inference_layout == "spec_compact_v1" or (
-            inference_layout is None and _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 8
-        ):
+        elif inferred_layout == "spec_compact_v1":
             hidden_states, keep_indices, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, prompts, hypo_ids, *_ = flat_tensors
             need_pruning1 = None
             is_spec_dec1 = None
         else:
-            hidden_states, keep_indices, need_pruning1, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, prompts, hypo_ids, *_ = flat_tensors
+            raise ValueError(
+                "Unsupported rpc_inference tensor layout: "
+                f"inference_layout={inference_layout!r}, inferred_layout={inferred_layout!r}, "
+                f"num_tensors={len(flat_tensors)}, is_spec_dec={step_metadata.get('is_spec_dec', 0)!r}"
+            )
         draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
