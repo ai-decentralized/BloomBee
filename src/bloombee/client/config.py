@@ -8,6 +8,12 @@ from bloombee.constants import PUBLIC_INITIAL_PEERS
 
 _max_retries = os.getenv("BLOOMBEE_MAX_RETRIES")
 DEFAULT_MAX_RETRIES = int(_max_retries) if isinstance(_max_retries, str) else None
+_push_only_downstream_decode = os.getenv("BLOOMBEE_PUSH_ONLY_DOWNSTREAM_DECODE")
+DEFAULT_PUSH_ONLY_DOWNSTREAM_DECODE = (
+    _push_only_downstream_decode.strip().lower() not in {"0", "false", "no", "off"}
+    if isinstance(_push_only_downstream_decode, str)
+    else True
+)
 
 
 @dataclasses.dataclass
@@ -20,6 +26,7 @@ class ClientConfig:
     allowed_servers: Optional[Sequence[Union[PeerID, str]]] = None  # if defined, send requests only to these servers
     blocked_servers: Optional[Sequence[Union[PeerID, str]]] = None  # if defined, do not use these servers
     use_server_to_server: bool = True  # Use direct server-to-server communication
+    push_only_downstream_decode: bool = DEFAULT_PUSH_ONLY_DOWNSTREAM_DECODE  # downstream decode waits for upstream rpc_push after warmup
 
     connect_timeout: float = 5  # timeout for opening a connection
     request_timeout: float = 3 * 60  # timeout for forward/backward/inference requests

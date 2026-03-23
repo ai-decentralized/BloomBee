@@ -79,11 +79,18 @@ def slice_microbatch_inputs(
     else:
         mb_hypo = hypo_ids[mb_start:mb_end]
 
+    # Micro-batches are processed sequentially on the current runtime path, so we
+    # can pass a view into the original hidden-state batch instead of eagerly
+    # cloning each slice. This avoids an extra GPU copy on every micro-batch.
+    mb_hidden_states = hidden_states[mb_start:mb_end]
+    if not mb_hidden_states.is_contiguous():
+        mb_hidden_states = mb_hidden_states.contiguous()
+
     return MicrobatchInputs(
-        hidden_states=hidden_states[mb_start:mb_end].clone(),
+        hidden_states=mb_hidden_states,
         hypo_ids=mb_hypo,
         tree_attention_mask=slice_batch_aligned(tree_attention_mask, mb_start, mb_end, full_batch_size),
-        kv_cache_position_ids=kv_cache_position_ids,
+        kv_cache_position_ids=slice_batch_aligned(kv_cache_position_ids, mb_start, mb_end, full_batch_size),
         draft_tokens=slice_batch_aligned(draft_tokens, mb_start, mb_end, full_batch_size),
         prefill_length=slice_batch_aligned(prefill_length, mb_start, mb_end, full_batch_size),
         keep_indices=slice_keep_indices(keep_indices, mb_start, mb_end, full_batch_size),

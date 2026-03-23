@@ -435,13 +435,13 @@ class KVCacheManager:
         """
         if self._verbose_kv_logs:
             logger.info(
-                "[MBPIPE_UPDATE_CACHE] start_position=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s active_cache_id=%s",
+                "[MBPIPE_UPDATE_CACHE] start_position=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s active_cache_depth=%s",
                 start_position,
                 batch_offset,
                 full_batch_size,
                 micro_batch_size,
                 type(new_kvs).__name__ if new_kvs is not None else "None",
-                self._get_active_cache_slot_id(),
+                len(self._active_cache_tensors_stack),
             )
         self._write_kvs(new_kvs, start_position, batch_offset, full_batch_size, micro_batch_size)
     
@@ -1725,8 +1725,16 @@ class KVCacheManager:
         if not valid_mask.any():
             return None, None, 0
         
-        max_position = kv_cache_position_ids[valid_mask].max().item()
-        cache_len = int(max_position) + 1
+        # Speculative kv_cache_position_ids describe the positions that are already
+        # materialized in cache from the previous verified step. The cache window we
+        # need to read is therefore bounded by the largest valid position + 1, which
+        # must stay consistent with prepare_incremental_tree_batch().
+        max_positions = torch.where(
+            valid_mask,
+            kv_cache_position_ids,
+            torch.full_like(kv_cache_position_ids, -1),
+        ).max(dim=1).values
+        cache_len = int((max_positions + 1).max().item())
         
         # 2. 计算 BH 切片范围 (与 select_cache 保持一致)
         gpu_multiplexing = full_batch_size > 0 and full_batch_in_cache < full_batch_size
@@ -1762,7 +1770,6 @@ class KVCacheManager:
             BH_offset_end = BH_full
         
         BH = BH_offset_end - BH_offset_start
-        B = BH // H
         
         # 3. 取出 [0, cache_len) 的 cache
         compute_dst = self.attention_compute
@@ -1771,11 +1778,50 @@ class KVCacheManager:
         def _as_torch(x):
             return x.data if hasattr(x, "data") else x
         
-        k_sel, _ = k_cache.smart_copy(compute_dst, idx_all)
-        v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
-        k_sbh = _as_torch(k_sel)  # (cache_len, BH, D)
-        v_sbh = _as_torch(v_sel)
+        if hasattr(k_cache, "device") and getattr(k_cache.device, "device_type", None) == DeviceType.MIXED:
+            tensors, seg_points = k_cache.data
+            v_tensors, _ = v_cache.data
+            s_slice, bh_slice = idx_all[:2]
+            bh_start, bh_end = bh_slice.start, bh_slice.stop
+
+            k_parts = []
+            v_parts = []
+            for i, (k_seg, v_seg) in enumerate(zip(tensors, v_tensors)):
+                if k_seg is None:
+                    continue
+                seg_start = seg_points[i]
+                seg_end = seg_points[i + 1]
+                overlap_start = max(bh_start, seg_start)
+                overlap_end = min(bh_end, seg_end)
+                if overlap_start >= overlap_end:
+                    continue
+
+                local_bh_start = overlap_start - seg_start
+                local_bh_end = overlap_end - seg_start
+                k_data = k_seg.data if hasattr(k_seg, "data") else k_seg
+                v_data = v_seg.data if hasattr(v_seg, "data") else v_seg
+                k_parts.append(k_data[s_slice, local_bh_start:local_bh_end, :].to(compute_dst.dev, non_blocking=True))
+                v_parts.append(v_data[s_slice, local_bh_start:local_bh_end, :].to(compute_dst.dev, non_blocking=True))
+
+            if not k_parts:
+                return None, None, cache_len
+            if len(k_parts) == 1:
+                k_sbh = k_parts[0]
+                v_sbh = v_parts[0]
+            else:
+                k_sbh = torch.cat(k_parts, dim=1)
+                v_sbh = torch.cat(v_parts, dim=1)
+        else:
+            k_sel, _ = k_cache.smart_copy(compute_dst, idx_all)
+            v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
+            k_sbh = _as_torch(k_sel)  # (cache_len, BH, D)
+            v_sbh = _as_torch(v_sel)
         
+        if BH < H:
+            H = BH
+        assert H > 0 and (BH % H) == 0, f"BH={BH} not divisible by H={H}"
+        B = BH // H
+
         def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:
             return x_sbh.view(cache_len, B, H, D).permute(1, 2, 0, 3)
         

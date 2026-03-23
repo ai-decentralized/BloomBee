@@ -2,7 +2,7 @@
 Micro-batch Pipeline Configuration Module.
 
 The feature is controlled via environment variables:
-- BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: "1" to enable (default), "0" to disable
+- BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: "1" to enable, "0" to disable (default)
 - BLOOMBEE_MICRO_BATCH_SIZE: positive integer micro-batch size
 - BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING: "1" to enable bounded GPU working-slot
   reuse. Default is "0", which keeps micro-batching in overlap-only mode so
@@ -42,10 +42,10 @@ def _is_microbatch_flag_enabled() -> bool:
     Check if micro-batch pipeline is enabled via environment variable.
 
     Returns:
-        True by default, or if BLOOMBEE_ENABLE_MICROBATCH_PIPELINE is set to "1".
-        False only if explicitly set to "0".
+        True only if BLOOMBEE_ENABLE_MICROBATCH_PIPELINE is set to "1".
+        False by default.
     """
-    env_value = os.environ.get(ENV_ENABLE_MICROBATCH, "1")  # Default: enabled
+    env_value = os.environ.get(ENV_ENABLE_MICROBATCH, "0")  # Default: disabled
     return env_value == "1"
 
 
@@ -422,7 +422,127 @@ def merge_microbatch_outputs(
     if not valid_outputs:
         return None
     
-    return torch.cat(valid_outputs, dim=dim)
+    first = valid_outputs[0]
+    if not torch.is_tensor(first):
+        return torch.cat(valid_outputs, dim=dim)
+
+    same_shape = all(
+        torch.is_tensor(out)
+        and out.ndim == first.ndim
+        and all(
+            out.shape[axis] == first.shape[axis]
+            for axis in range(first.ndim)
+            if axis != dim
+        )
+        for out in valid_outputs[1:]
+    )
+    if same_shape:
+        return torch.cat(valid_outputs, dim=dim)
+
+    max_shape = list(first.shape)
+    for out in valid_outputs[1:]:
+        if not torch.is_tensor(out) or out.ndim != first.ndim:
+            raise ValueError("Incompatible tensors for micro-batch merge")
+        for axis, size in enumerate(out.shape):
+            if axis == dim:
+                continue
+            max_shape[axis] = max(max_shape[axis], int(size))
+
+    padded_outputs = []
+    for out in valid_outputs:
+        padded_shape = list(out.shape)
+        for axis, size in enumerate(max_shape):
+            if axis == dim:
+                continue
+            padded_shape[axis] = size
+        if list(out.shape) == padded_shape:
+            padded_outputs.append(out)
+            continue
+        padded = torch.zeros(
+            padded_shape,
+            dtype=out.dtype,
+            device=out.device,
+        )
+        slices = [slice(None)] * out.ndim
+        for axis, size in enumerate(out.shape):
+            if axis == dim:
+                continue
+            slices[axis] = slice(0, int(size))
+        padded[tuple(slices)] = out
+        padded_outputs.append(padded)
+
+    return torch.cat(padded_outputs, dim=dim)
+
+
+def merge_microbatch_keep_indices(
+    outputs: List[torch.Tensor],
+    dim: int = 0,
+    pad_value: int = -1,
+) -> Optional[torch.Tensor]:
+    """
+    Merge per-micro-batch keep_indices tensors.
+
+    Speculative pruning can produce a different number of kept positions per
+    micro-batch. Pad non-batch dimensions with -1 so the merged tensor keeps a
+    valid mask compatible with restore_hidden_states().
+    """
+    valid_outputs = [o for o in outputs if o is not None]
+    if not valid_outputs:
+        return None
+    if len(valid_outputs) == 1:
+        return valid_outputs[0]
+
+    first = valid_outputs[0]
+    if not torch.is_tensor(first):
+        return torch.cat(valid_outputs, dim=dim)
+
+    same_shape = all(
+        torch.is_tensor(out)
+        and out.ndim == first.ndim
+        and all(
+            out.shape[axis] == first.shape[axis]
+            for axis in range(first.ndim)
+            if axis != dim
+        )
+        for out in valid_outputs[1:]
+    )
+    if same_shape:
+        return torch.cat(valid_outputs, dim=dim)
+
+    max_shape = list(first.shape)
+    for out in valid_outputs[1:]:
+        if not torch.is_tensor(out) or out.ndim != first.ndim:
+            raise ValueError("Incompatible keep_indices tensors for micro-batch merge")
+        for axis, size in enumerate(out.shape):
+            if axis == dim:
+                continue
+            max_shape[axis] = max(max_shape[axis], int(size))
+
+    padded_outputs = []
+    for out in valid_outputs:
+        padded_shape = list(out.shape)
+        for axis, size in enumerate(max_shape):
+            if axis == dim:
+                continue
+            padded_shape[axis] = size
+        if list(out.shape) == padded_shape:
+            padded_outputs.append(out)
+            continue
+        padded = torch.full(
+            padded_shape,
+            pad_value,
+            dtype=out.dtype,
+            device=out.device,
+        )
+        slices = [slice(None)] * out.ndim
+        for axis, size in enumerate(out.shape):
+            if axis == dim:
+                continue
+            slices[axis] = slice(0, int(size))
+        padded[tuple(slices)] = out
+        padded_outputs.append(padded)
+
+    return torch.cat(padded_outputs, dim=dim)
 
 
 def log_microbatch_split(

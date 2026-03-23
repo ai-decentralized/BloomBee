@@ -149,7 +149,12 @@ class SimpleProbabilityPruner(PrunerInterface):
                 ).indices
 
                 # 判断 draft token 是否在 topk
-                draft_id = draft_tokens[b, i].item()
+                draft_id = int(draft_tokens[b, i].item())
+                if draft_id < 0 or draft_id >= probs.shape[0]:
+                    keep_mask[i] = False
+                    discarded[i] = True
+                    continue
+
                 label = 1.0 if draft_id in topk_ids.tolist() else 0.0
                 
                 draft_prob = probs[draft_id].item()

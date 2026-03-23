@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import multiprocessing as mp
+import os
 import sys
 from collections import deque
 from enum import Enum
@@ -42,7 +43,6 @@ from bloombee.utils.lossless_transport import (
     tensor_nnz_ratio,
     tensor_raw_nbytes,
 )
-from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -53,13 +53,23 @@ from bloombee.utils.microbatch_config import (
     get_timing_tracker,
 )
 from bloombee.utils.microbatch_schema import (
-    RequestContext,
     create_microbatch_queue_item,
     is_microbatch_queue_item,
     MBPIPE_SCHEMA_PREFIX,
 )
 
 logger = get_logger(__name__)
+
+_s2s_output_compression_name = os.getenv("BLOOMBEE_S2S_OUTPUT_COMPRESSION", "").strip().upper()
+_s2s_output_compression = None
+if _s2s_output_compression_name:
+    try:
+        _s2s_output_compression = getattr(runtime_pb2.CompressionType, _s2s_output_compression_name)
+    except AttributeError:
+        logger.warning(
+            "Unknown BLOOMBEE_S2S_OUTPUT_COMPRESSION=%r, falling back to default rpc_push compression",
+            _s2s_output_compression_name,
+        )
 
 if TYPE_CHECKING:
     from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
@@ -104,26 +114,6 @@ import fcntl
 import os
 import tempfile
 from dataclasses import dataclass, field
-from typing import Set as TypingSet
-
-
-# [MBPIPE] Streaming decode state for cross-stage overlap
-# Tracks state when processing micro-batches as they arrive from upstream
-@dataclass
-class StreamingDecodeState:
-    """State for a streaming decode session where micro-batches are processed as they arrive."""
-    session_id: str
-    step_id: str
-    total_mbs: int                          # Expected total micro-batches
-    full_batch_size: int                    # Full batch size across all MBs
-    received_mbs: TypingSet[int] = field(default_factory=set)  # Set of received MB indices
-    results: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)  # mb_idx -> (hidden, keep_indices)
-    cache_allocated: bool = False           # Whether KV cache is allocated
-    cache_handles: Optional[List] = None    # KV cache handles
-    first_mb_metadata: Optional[Dict] = None  # Metadata from first MB for context
-    start_time: float = 0.0                 # Start time for timing
-
-
 @dataclass
 class S2SLinkTelemetry:
     """
@@ -423,9 +413,6 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._mb_expected: Dict[tuple, int] = {}
         # Key: (session_id, step_id) -> count of received micro-batches
         self._mb_received: Dict[tuple, int] = {}
-        # [MBPIPE] Cross-stage pipeline: request context cache (Step C/D)
-        # Key: (session_id, step_id) -> RequestContext with cached mb0 fields
-        self._request_contexts: Dict[tuple, RequestContext] = {}
         # Key: (session_id, step_id) -> set of (mb_idx) already processed (idempotency)
         self._mb_processed: Dict[tuple, set] = {}
         # Feature flag for immediate queuing - ENABLED for cross-stage pipeline overlap
@@ -445,10 +432,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"(set BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE=1 for legacy behavior)"
         )
         
-        # [MBPIPE] Streaming decode: process micro-batches as they arrive for cross-stage overlap
-        # Key: (session_id, step_id) -> StreamingDecodeState
-        self._streaming_decode_sessions: Dict[tuple, StreamingDecodeState] = {}
-
         # [CLOCK_SYNC] Per-peer clock offset estimator for cross-machine strict overlap.
         # offset_us is "remote_clock - local_clock" for the target peer.
         self._clock_sync_state: Dict[str, Dict[str, float]] = {}
@@ -857,8 +840,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points = metadata.get("points", 0)
                 session_id = metadata.get("session_id")
                 alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
-                args_structure = metadata.get("args_structure")
-
                 def _flag_to_bool(value: Any) -> bool:
                     if value is None:
                         return False
@@ -868,34 +849,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         return bool(value.bool().any().item())
                     return bool(value)
 
-                raw_is_spec = metadata.get("is_spec_dec", None)
-                if raw_is_spec is not None:
-                    is_spec_request = _flag_to_bool(raw_is_spec)
-                else:
-                    # Backward-compatible robust fallback:
-                    # reconstruct args via args_structure instead of assuming tensor order.
-                    is_spec_request = False
-                    try:
-                        if request.tensors and args_structure is not None:
-                            flat_request_tensors = [deserialize_torch_tensor(t) for t in request.tensors]
-                            unpacked_args, _ = unpack_args_kwargs(flat_request_tensors, args_structure)
-                            # Expected order:
-                            # [hidden, keep_idx, need_pruning, prompts, hypo_ids,
-                            #  tree_mask, kv_pos, draft_tokens, prefill_length, is_spec_dec]
-                            if isinstance(unpacked_args, (tuple, list)) and len(unpacked_args) >= 10:
-                                maybe_tree_mask = unpacked_args[5]
-                                maybe_draft = unpacked_args[7]
-                                maybe_is_spec = unpacked_args[9]
-                                is_spec_request = _flag_to_bool(maybe_is_spec)
-                                # If explicit flag is unavailable/zero, non-empty draft/tree
-                                # strongly implies speculative path.
-                                if not is_spec_request:
-                                    has_draft = torch.is_tensor(maybe_draft) and maybe_draft.numel() > 0
-                                    has_tree = torch.is_tensor(maybe_tree_mask) and maybe_tree_mask.numel() > 0
-                                    is_spec_request = bool(has_draft or has_tree)
-                    except Exception as e:
-                        logger.debug(f"{MBPIPE_LOG_PREFIX} spec detection fallback failed: {e}")
-                        is_spec_request = False
+                is_spec_request = _flag_to_bool(metadata.get("is_spec_dec", 0))
                 if is_spec_request and not self._speculative_pruner_enabled:
                     logger.info(
                         f"{MBPIPE_LOG_PREFIX} Speculative decoding requested without an active pruner; "
@@ -1141,7 +1095,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                         prioritizer=self._prioritizer,
                         points=points,
                         quant_type=self.quant_type,
-                        args_structure=args_structure,
                         cross_stage_push_fn=cross_stage_push_microbatch,  # [MBPIPE] Cross-stage streaming (currently disabled)
                     ):
                         handler_step_start = perf_counter()
@@ -1721,63 +1674,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             except Exception as e:
                 logger.exception(e)
 
-    async def _poll_microbatch_file(
-        self,
-        acc_key: str,
-        mb_idx: int,
-        timeout: float = 5.0,
-        poll_interval: float = 0.01,
-    ) -> Optional[Tuple[runtime_pb2.ExpertRequest, dict]]:
-        """
-        [MBPIPE] Poll for a specific micro-batch from file storage.
-        
-        This is used for cross-stage pipeline where micro-batches are stored
-        by one handler and read by another (file-based IPC).
-        
-        Returns (request, metadata) when available, or None on timeout.
-        """
-        file_path = _get_mb_file_path(acc_key, mb_idx)
-        lock_path = _get_mb_lock_path(acc_key)
-        start_time = perf_counter()
-        
-        while (perf_counter() - start_time) < timeout:
-            try:
-                if os.path.exists(file_path):
-                    with open(lock_path, 'w') as lock_file:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                        try:
-                            if os.path.exists(file_path):
-                                with open(file_path, 'rb') as f:
-                                    data = pickle.load(f)
-                                    tensor_bytes = data['tensor_bytes']
-                                    metadata = data['metadata']
-                                    
-                                # Reconstruct the request
-                                tensors = [runtime_pb2.Tensor.FromString(t) for t in tensor_bytes]
-                                request = runtime_pb2.ExpertRequest(
-                                    uid=acc_key.split('|')[0],  # session_id
-                                    tensors=tensors,
-                                    metadata=MSGPackSerializer.dumps(metadata),
-                                )
-                                
-                                logger.info(
-                                    f"{MBPIPE_LOG_PREFIX} poll_file: mb_idx={mb_idx} found "
-                                    f"after {(perf_counter() - start_time)*1000:.1f}ms"
-                                )
-                                return request, metadata
-                        finally:
-                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            except Exception as e:
-                logger.debug(f"{MBPIPE_LOG_PREFIX} poll_file error: {e}")
-            
-            await asyncio.sleep(poll_interval)
-        
-        logger.warning(
-            f"{MBPIPE_LOG_PREFIX} poll_file: timeout waiting for mb_idx={mb_idx} "
-            f"after {timeout}s"
-        )
-        return None
-
     async def _iterate_inference_steps(
         self,
         first_request: runtime_pb2.ExpertRequest,
@@ -2227,7 +2123,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 self._mb_expected.pop(mb_key, None)
                 self._mb_received.pop(mb_key, None)
                 self._mb_processed.pop(mb_key, None)
-                self._request_contexts.pop(mb_key, None)
         else:
             # ========== LEGACY PATH (wait-all-then-assemble) ==========
             logger.info(
@@ -2372,15 +2267,87 @@ class TransformerConnectionHandler(ConnectionHandler):
                     f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}"
                 )
 
-            # `serialized_outputs` now carries the updated routing tensors for
-            # indices 0..5: hidden_states, keep_indices, need_pruning,
-            # tree_attention_mask, kv_cache_position_ids, draft_tokens.
-            # Preserve only the remaining request tensors starting from
-            # prefill_length so the downstream layout stays aligned.
+            # `serialized_outputs` carries the updated routing tensors for the
+            # next stage. Regular decode emits a compact 2-tensor prefix
+            # (hidden_states, keep_indices), while speculative
+            # decoding emits a 6-tensor routing prefix that also includes
+            # tree_attention_mask, kv_cache_position_ids and draft_tokens.
+            # Reconstruct the downstream rpc_inference tensor layout according
+            # to the original request metadata and keep control flags in
+            # metadata when possible.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
-            next_tensors = normalized_outputs + list(request.tensors[6:])
-            next_metadata = metadata.copy()
-            next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
+            next_need_pruning = None
+            if len(normalized_outputs) == 2:
+                inference_layout = metadata.get("inference_layout")
+                if inference_layout in {"decode_minimal_v2", "decode_compact_v2"}:
+                    if inference_layout == "decode_minimal_v2":
+                        next_tensors = [
+                            normalized_outputs[0],
+                            normalized_outputs[1],
+                            request.tensors[2],
+                        ]
+                    else:
+                        next_tensors = [
+                            normalized_outputs[0],
+                            normalized_outputs[1],
+                            *list(request.tensors[2:]),
+                        ]
+                else:
+                    next_tensors = normalized_outputs + list(request.tensors[2:])
+            elif len(normalized_outputs) == 6:
+                inference_layout = metadata.get("inference_layout")
+                if inference_layout == "spec_compact_v1":
+                    need_pruning_next = deserialize_torch_tensor(normalized_outputs[2])
+                    if torch.is_tensor(need_pruning_next) and need_pruning_next.numel() > 0:
+                        next_need_pruning = int(bool(need_pruning_next.bool().any().item()))
+                    else:
+                        next_need_pruning = 0
+                    next_tensors = [
+                        normalized_outputs[0],
+                        normalized_outputs[1],
+                        normalized_outputs[3],
+                        normalized_outputs[4],
+                        normalized_outputs[5],
+                        request.tensors[5],
+                        request.tensors[6],
+                        request.tensors[7],
+                    ]
+                else:
+                    next_tensors = normalized_outputs + list(request.tensors[6:])
+            else:
+                raise ValueError(
+                    f"Unexpected routing tensor count from upstream stage: {len(normalized_outputs)}"
+                )
+            # Preserve only execution-relevant routing/control fields for the next
+            # stage. Local timing/debug keys (notably `_...`) are recomputed on each
+            # hop and do not need to be forwarded over the wire.
+            next_metadata = {
+                "session_id": next_session_id,
+                "pushed": True,
+            }
+            remaining_next_servers = next_servers[1:]
+            if remaining_next_servers:
+                next_metadata["next_servers"] = remaining_next_servers
+            for key in (
+                "step_id",
+                "max_length",
+                "is_spec_dec",
+                "prefill_length",
+                "full_batch_size",
+                "micro_batch_size",
+                "inference_layout",
+                "start_from_position",
+                "points",
+                "active_adapter",
+            ):
+                if key in metadata:
+                    next_metadata[key] = metadata[key]
+            if (
+                len(normalized_outputs) == 6
+                and metadata.get("inference_layout") == "spec_compact_v1"
+                and next_need_pruning
+            ):
+                next_metadata["need_pruning"] = next_need_pruning
             next_metadata["sender_blocks"] = sender_blocks
             next_metadata["receiver_blocks"] = f"{next_start}:{next_end}"
             next_metadata["s2s_channel"] = "full_batch"
@@ -2548,7 +2515,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
             
             # Serialize the micro-batch tensors
-            outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
+            outputs_schema = requested_backends[-1].decode_outputs_schema
             sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
             serialize_start_us = self._now_us()
             transport_phase = "prefill" if mb_hidden.ndim >= 2 and int(mb_hidden.shape[1]) > 1 else "decode"
@@ -2558,7 +2525,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             with transport_profile_scope() as push_transport_profile:
                 serialized_hidden = serialize_torch_tensor(
                     mb_hidden.to(outputs_schema[0].dtype),
-                    outputs_schema[0].compression,
+                    _s2s_output_compression if _s2s_output_compression is not None else outputs_schema[0].compression,
                     allow_inplace=True,
                     debug_context={
                         "phase": transport_phase,
@@ -2663,7 +2630,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"invariant=1"
             )
             
-            # Build metadata for micro-batch push
+            # Build metadata for micro-batch push. cpu2nic time depends on the
+            # final metadata/request assembly below, so initialize it after the
+            # request is fully prepared instead of referencing an unbound local.
             push_metadata = {
                 "session_id": next_session_id,
                 "next_servers": next_servers[1:] if len(next_servers) > 1 else [],
@@ -2682,7 +2651,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "s2s_sender_serialize_end_us": int(serialize_end_us),
                 "s2s_sender_compute_to_serialize_start_ms": float(sender_compute_to_serialize_start_ms),
                 "s2s_sender_gpu2cpu_ms": float(t_gpu2cpu_ms),
-                "s2s_sender_cpu2nic_ms": float(t_cpu2nic_ms),
             }
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
@@ -2698,7 +2666,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             for key in [
                 "step_id",
                 "max_length",
-                "args_structure",
                 "is_spec_dec",
                 "need_pruning",
                 "prefill_length",
@@ -2747,6 +2714,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                 metadata=serialized_push_metadata,
             )
             t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
+            push_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
+            rpc_request.metadata = MSGPackSerializer.dumps(push_metadata)
             push_tensor_bytes = len(serialized_hidden.buffer) + len(serialized_keep.buffer)
             
             # Create task for background sending - don't await
@@ -2902,7 +2871,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
             active_adapter = self._get_active_adapter(metadata)
             points = metadata.get("points", 0)
-            args_structure = metadata.get("args_structure")
             assert isinstance(
                 points, (float, int)
             ), f"rpc_forward should have number of points as number or None, got {points}"
@@ -2918,7 +2886,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 prioritizer=self._prioritizer,
                 active_adapter=active_adapter,
                 points=points,
-                args_structure=args_structure,
             )
             network_end_time = perf_counter()
             network_transfer_time = (network_end_time - network_start_time) * 1000
@@ -2950,7 +2917,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
             active_adapter = self._get_active_adapter(metadata)
             points = metadata.get("points", 0)
-            args_structure = metadata.get("args_structure")
             assert isinstance(
                 points, (float, int)
             ), f"rpc_forward_stream should have number of points as number or None, got {points}"
@@ -2961,7 +2927,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 prioritizer=self._prioritizer,
                 active_adapter=active_adapter,
                 points=points,
-                args_structure=args_structure,
             )
 
             # Split the serialized_output for streaming and respond to client
@@ -3003,7 +2968,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
             active_adapter = self._get_active_adapter(metadata)
             points = metadata.get("points", 0)
-            args_structure = metadata.get("args_structure")
             assert isinstance(
                 points, (float, int)
             ), f"rpc_backward should have number of points as number or None, got {points}"
@@ -3014,7 +2978,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 prioritizer=self._prioritizer,
                 active_adapter=active_adapter,
                 points=points,
-                args_structure=args_structure,
             )
 
             return runtime_pb2.ExpertResponse(tensors=self._serialize_grads(grads, requested_backends, metadata))
@@ -3030,7 +2993,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
             active_adapter = self._get_active_adapter(metadata)
             points = metadata.get("points", 0)
-            args_structure = metadata.get("args_structure")
             assert isinstance(
                 points, (float, int)
             ), f"rpc_backward_stream should have number of points as number or None, got {points}"
@@ -3041,7 +3003,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 prioritizer=self._prioritizer,
                 active_adapter=active_adapter,
                 points=points,
-                args_structure=args_structure,
             )
             # Split the serialized_grad_inputs for streaming and respond
             for tensor in self._serialize_grads(grads, requested_backends, metadata):

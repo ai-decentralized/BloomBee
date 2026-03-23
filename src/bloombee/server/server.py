@@ -196,7 +196,7 @@ class Server:
             num_workers=self.block_config.num_hidden_layers,
             use_relay=use_relay,
             use_auto_relay=use_auto_relay,
-            client_mode=reachable_via_relay,
+            client_mode=False,
             **kwargs,
         )
         self.reachability_protocol = ReachabilityProtocol.attach_to_dht(self.dht) if not reachable_via_relay else None
@@ -309,7 +309,7 @@ class Server:
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
             100, 0,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent, cache_cpu_percent (multiplexing uses CPU staging for KV offload)
+            100, 0,                   # cache_gpu_percent, cache_cpu_percent
             100, 0,                   # act_gpu_percent, act_cpu_percent (mixed activation offload is unsupported)
             overlap=True, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
@@ -339,22 +339,25 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
 
-        # Temporarily disable speculative pruner initialization during server startup.
-        # hidden_size = 4096
-        # vocab_size = 32000
-        #
-        # config = PruningConfig(
-        #     method=PruningMethod.ADAPTIVE_NEURAL,
-        #     neural_threshold=0.9,
-        #     simple_threshold=0.1,
-        # )
-        #
-        # self.pruner_manager = SpeculativePrunerManager(
-        #     hidden_size=hidden_size,
-        #     vocab_size=vocab_size,
-        #     config=config,
-        # )
-        self.pruner_manager = None
+        enable_spec_pruner = os.environ.get("BLOOMBEE_ENABLE_SPEC_PRUNER", "1") == "1"
+        if enable_spec_pruner:
+            pruner_method = os.environ.get(
+                "BLOOMBEE_SPEC_PRUNER_METHOD",
+                PruningMethod.SIMPLE_PROBABILITY.value,
+            ).strip().lower()
+            config = PruningConfig(method=PruningMethod(pruner_method))
+            self.pruner_manager = SpeculativePrunerManager(
+                hidden_size=self.block_config.hidden_size,
+                vocab_size=self.block_config.vocab_size,
+                config=config,
+            )
+            logger.info(
+                "Speculative pruner enabled (lazy init), method=%s",
+                pruner_method,
+            )
+        else:
+            self.pruner_manager = None
+            logger.info("Speculative pruner disabled via BLOOMBEE_ENABLE_SPEC_PRUNER=0")
 
         ##############################################################
         
@@ -706,7 +709,10 @@ class ModuleContainer(threading.Thread):
                     policy=policy,
                 )
                 # see_memory_usage("-----------------------------------------sever: after convert_block  ")
-                is_last_block = block_index == block_indices[-1]
+                # Speculative decoding's prune/flatten logic must run only on the
+                # global last transformer block, not merely the last block hosted
+                # by the current server span.
+                is_last_block = block_index == (block_config.num_hidden_layers - 1)
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
                     block,  ###### block instance
@@ -723,6 +729,11 @@ class ModuleContainer(threading.Thread):
                     ),
                     kwargs_schema={},
                     outputs_schema=(
+                        BatchTensorDescriptor(
+                            1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression
+                        ),
+                    ),
+                    inference_outputs_schema=(
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression
                         ),

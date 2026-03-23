@@ -18,7 +18,7 @@ from transformers import PretrainedConfig
 from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
-from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor
+from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor, nested_flatten
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
 from bloombee.utils.microbatch_config import (
@@ -31,7 +31,6 @@ from bloombee.utils.microbatch_config import (
 from bloombee.utils.real_activation_dumper import capture_activation
 from pynvml import *
 import logging
-import hashlib
 import time
 import threading
 
@@ -43,37 +42,6 @@ if TYPE_CHECKING:
 # Create dedicated offloading debug logger
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
-
-
-def compute_tensor_hash(tensor):
-    """Compute SHA256 hash of tensor for debugging - optimized CPU conversion"""
-    if tensor is None:
-        return "None"
-    try:
-        # Optimization: Only perform CPU conversion in debug mode to avoid unnecessary performance overhead
-        if not getattr(compute_tensor_hash, '_debug_enabled', False):
-            return "hash_disabled"  # Disable hash computation in production environment
-        return hashlib.sha256(tensor.detach().cpu().numpy().tobytes()).hexdigest()[:16]
-    except:
-        return "error"
-
-# This flag can be set to enable/disable hash computation
-compute_tensor_hash._debug_enabled = False
-
-# def see_memory_usage(message, force=True):
-# 	logger = ''
-# 	logger += message
-# 	nvmlInit()
-#  
-# 	# nvidia_smi.nvmlInit()
-# 	handle = nvmlDeviceGetHandleByIndex(0)
-# 	info = nvmlDeviceGetMemoryInfo(handle)
-# 	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-# 	
-# 	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-# 	logger +=   'Max Memory Allocated: ' + str(
-# 		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-# 	print(logger)
 
 class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Module
     """A wrapper for a transformer block that can process requests for forward, backward and inference"""
@@ -89,6 +57,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         is_last_block: bool,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
+        inference_outputs_schema: Optional[Tuple[BatchTensorDescriptor, ...]] = None,
         **kwargs,
     ):
         import bloombee.utils.peft as _peft_module
@@ -103,6 +72,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.cache_manager = cache_manager
         self.pruner_manager = pruner_manager
         self.max_chunk_size_bytes = max_chunk_size_bytes
+        if inference_outputs_schema is None:
+            inference_outputs_schema = tuple(nested_flatten(self.outputs_schema))
+        else:
+            inference_outputs_schema = tuple(inference_outputs_schema)
+        self.inference_outputs_schema = inference_outputs_schema
+        self.decode_outputs_schema = self.inference_outputs_schema[:2]
+        self.spec_outputs_schema = self.inference_outputs_schema[:6]
 
         for name, param in self.module.named_parameters():
             assert not param.requires_grad, f"Block parameters must not accumulate gradients, but {name} does"
@@ -248,14 +224,52 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         with self._peft_module.using_adapter(active_adapter):
             # Before forward, ensure model is on correct device
             self._ensure_model_on_device()
-            return super().forward(*inputs)
+            outputs = super().forward(*inputs)
+            if isinstance(outputs, tuple):
+                if len(outputs) == 1:
+                    return outputs
+                if outputs and torch.is_tensor(outputs[0]):
+                    return (outputs[0],)
+            if torch.is_tensor(outputs):
+                return (outputs,)
+            return outputs
 
     def backward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
         *inputs, active_adapter = inputs
         with self._peft_module.using_adapter(active_adapter):
             # Before backward, ensure model is on correct device
             self._ensure_model_on_device()
-            return super().backward(*inputs)
+            if len(inputs) != 2:
+                return super().backward(*inputs)
+
+            hidden_states, grad_outputs = inputs
+            with torch.enable_grad():
+                hidden_states = (
+                    hidden_states.detach().requires_grad_(True)
+                    if hidden_states.is_floating_point()
+                    else hidden_states.detach()
+                )
+                outputs = self.module(hidden_states)
+                if isinstance(outputs, tuple):
+                    output_hidden_states = outputs[0]
+                else:
+                    output_hidden_states = outputs
+
+                grad_outputs = grad_outputs.to(
+                    device=output_hidden_states.device,
+                    dtype=output_hidden_states.dtype,
+                    non_blocking=True,
+                )
+                torch.autograd.backward(
+                    (output_hidden_states,),
+                    grad_tensors=(grad_outputs,),
+                    create_graph=False,
+                    retain_graph=False,
+                )
+                self.on_backward(hidden_states.size(0))
+
+            grad_inputs = hidden_states.grad if isinstance(hidden_states.grad, torch.Tensor) else torch.zeros_like(hidden_states)
+            return (grad_inputs,)
 
     def _ensure_model_on_device(self):
         """Ensure model is on correct device, load from CPU to GPU if needed"""
@@ -392,7 +406,36 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 if self._is_spec_decoding:
                     full_mask = inference_info.tree_attention_mask.to(device)
-                    attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                    if full_mask is not None:
+                        expected_rows = seq_len
+                        expected_cols = cache_len + seq_len
+                        if full_mask.ndim == 3:
+                            if full_mask.shape[1] > expected_rows or full_mask.shape[2] > expected_cols:
+                                logger.info(
+                                    "[SPEC_MASK_ALIGN] %s cropping tree_attention_mask from %s to (%s, %s, %s) "
+                                    "(cache_len=%s, batch_offset=%s, micro_batch=%s)",
+                                    self.name,
+                                    tuple(full_mask.shape),
+                                    int(full_mask.shape[0]),
+                                    expected_rows,
+                                    expected_cols,
+                                    cache_len,
+                                    inference_info.batch_offset,
+                                    inference_info.micro_batch_size,
+                                )
+                                full_mask = full_mask[:, :expected_rows, :expected_cols].contiguous()
+                            elif full_mask.shape[1] != expected_rows or full_mask.shape[2] != expected_cols:
+                                logger.warning(
+                                    "[SPEC_MASK_ALIGN] %s tree_attention_mask shape %s does not match "
+                                    "expected_rows=%s expected_cols=%s",
+                                    self.name,
+                                    tuple(full_mask.shape),
+                                    expected_rows,
+                                    expected_cols,
+                                )
+                        attention_mask = self.convert_mask_to_scores(full_mask)
+                    else:
+                        attention_mask = None
                 if full_mask == None:
                     full_mask = self._create_causal_attention_mask(batch_size, (seq_len + cache_len), cache_len, hidden_states.device)
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
@@ -494,38 +537,20 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
                 keep_indices = self._normalize_keep_indices(
                     inference_info.keep_indices,
-                    batch_size=output_hidden_states.shape[0],
-                    seq_len=output_hidden_states.shape[1],
+                    batch_size=batch_size,
+                    seq_len=seq_len,
                     device=output_hidden_states.device,
                 )
                 
                 
                 # logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
                 
-                # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
-                training_mode = False
-                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.15':
-                    self.pruner_manager.middle_states = output_hidden_states
-                
-                training_model_mode = False
-                if training_mode and training_model_mode and self._is_spec_decoding and self._is_last_block:
-                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    final_logits = self.module.lm_head_forward(norm_hidden_states)
-                    middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
-                    self.pruner_manager.train_model(middle_norm_hidden_states, final_logits, full_mask, inference_info.draft_tokens)
-                    
-                training_lm_head_mode = False
-                if training_mode and training_lm_head_mode and self._is_spec_decoding and self._is_last_block:
-                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
-                    self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
-                
-                if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block:
+                if self._is_spec_decoding and self._need_pruning and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
                     
-                if not training_mode and self._is_spec_decoding and self._is_last_block:
+                if self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states
                     batch_size, seq_len, hidden_size = original_hidden_states.shape
                     device = original_hidden_states.device
@@ -762,22 +787,29 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         else:
             # Generation 阶段：基于有效 token 数量计算 position
             kv_cache_position_ids = kv_cache_position_ids.to(device)
-            kv_cache_position_ids = self._slice_batch_aligned(kv_cache_position_ids, batch_offset, batch_offset + B, kv_cache_position_ids.shape[0])
+            # Micro-batch inputs may already carry a per-micro-batch slice.
+            # Only apply logical batch_offset slicing when the incoming tensor
+            # still represents the full logical batch.
+            if kv_cache_position_ids.ndim >= 2 and kv_cache_position_ids.shape[0] != B:
+                kv_cache_position_ids = self._slice_batch_aligned(
+                    kv_cache_position_ids,
+                    batch_offset,
+                    batch_offset + B,
+                    kv_cache_position_ids.shape[0],
+                )
             valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
-            
-            # 计算每个 batch 的有效 token 数量
-            # 有效数量 = root_position + kv_cache_position_ids 中的有效值数量
-            batch_indices = torch.arange(B, device=device)
-            first_valid_idx = valid_mask.int().argmax(dim=1)
-            root_positions = kv_cache_position_ids[batch_indices, first_valid_idx]  # (B,)
-            
-            tree_valid_counts = valid_mask.sum(dim=1)  # (B,)
-            
-            # 有效 token 总数 = root_position + tree_valid_counts
-            effective_token_counts = root_positions + tree_valid_counts  # (B,)
-            
-            # 新 token 的 base position = 有效 token 总数
-            base_positions = effective_token_counts  # (B,)
+
+            # kv_cache_position_ids stores the positions that are already present in
+            # cache after the previous speculative verification step. The next tree
+            # should therefore start right after the largest valid cached position.
+            # Using root_position + valid_count underestimates the base when previous
+            # accepted positions are sparse after pruning.
+            max_positions = torch.where(
+                valid_mask,
+                kv_cache_position_ids,
+                torch.full_like(kv_cache_position_ids, -1),
+            ).max(dim=1).values
+            base_positions = max_positions + 1
             
             # 生成 position_ids
             # 如果指定了 target_seq_len，使用它；否则使用 tree_len
@@ -950,11 +982,20 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         # Explicitly free the GPU memory. This is not necessary at the time this code is written,
         # but may help to avoid future issues when the module is not garbage-collected for some reasons
-        dummy = torch.tensor([])
+        def _release_storage_inplace(tensor: torch.Tensor) -> None:
+            empty = tensor.detach().new_empty((0,))
+            tensor.data = empty
+
         try:
             params_iter = self.module.parameters() if hasattr(self.module, "parameters") else ()
             for p in params_iter:
-                p.data = dummy
+                _release_storage_inplace(p)
+                p.grad = None
+            buffers_iter = self.module.buffers() if hasattr(self.module, "buffers") else ()
+            for buf in buffers_iter:
+                _release_storage_inplace(buf)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception:
             logger.warning("Failed to clear module parameters during backend.shutdown", exc_info=True)
 

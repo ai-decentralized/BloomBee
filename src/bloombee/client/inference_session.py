@@ -25,7 +25,7 @@ from bloombee.utils.lossless_transport import (
     log_transport_profile_event,
 )
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
-from bloombee.utils.packaging import pack_args_kwargs, normalize_arg
+from bloombee.utils.packaging import normalize_arg
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -175,119 +175,167 @@ class _ServerInferenceSession:
             _infer_batch_dim(tree_attention_mask),
             1,
         )
-
-        # serialize inputs and put them into the queue
-        
-        input_tensors, args_structure = pack_args_kwargs(
-            inputs, 
-            normalize_arg(keep_indices),
-            normalize_arg(torch.tensor(1 if need_pruning else 0)),
-            normalize_arg(tree_attention_mask),
-            normalize_arg(kv_cache_position_ids),
-            normalize_arg(draft_tokens),
-            normalize_arg(prefill_length),
-            normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
-            prompts,
-            hypo_ids,
+        push_only_decode = (
+            self.config.use_server_to_server
+            and getattr(self.config, "push_only_downstream_decode", False)
+            and self.stepped
+            and self.span.start > 0
+            and not is_spec_dec
         )
+        transport_phase = "push_only_decode" if push_only_decode else (
+            "spec_decode" if is_spec_dec else ("prefill" if not self.stepped else "decode")
+        )
+
         client_inference_logs_enabled = is_log_channel_enabled("client_inference_logs")
         if client_inference_logs_enabled:
             logger.info(f"_ServerInferenceSession  step id {step_id}")
-        request_metadata = dict(session_id=self.session_id, step_id=step_id)
-        if not self.stepped:
-            request_metadata.update(self.session_metadata)
-        # Explicitly expose speculative-decoding mode in metadata so the server
-        # can make safe KV allocation decisions before first step processing.
-        request_metadata["is_spec_dec"] = 1 if is_spec_dec else 0
-        request_metadata["full_batch_size"] = int(logical_full_batch_size)
-        request_metadata["micro_batch_size"] = int(inputs.shape[0]) if inputs.ndim >= 1 else 1
-        if is_spec_dec:
-            request_metadata["start_from_position"] = self._position + n_input_tokens
-        else:
-            if self._position is not None:
-                request_metadata["start_from_position"] = self._position
-        # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
-        # Speculative decoding keeps strict full-batch semantics; avoid cross-stage push.
-        if self.config.use_server_to_server:
-            next_servers = self._collect_next_servers()
-            if next_servers:
-                request_metadata["next_servers"] = next_servers
+        if push_only_decode and client_inference_logs_enabled:
+            logger.info(
+                f"[NETWORK_TX] PUSH_ONLY_WAIT | step_id={step_id} | "
+                f"blocks={self.span.start}:{self.span.end} | session_id={self.session_id}"
+            )
 
-        request_metadata["args_structure"] = args_structure
-
-        # TODO: make possible to use different compression method for different tensors
-        server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
-        compression = server_side_inference_schema[0].compression
-        inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
-        transport_phase = "spec_decode" if is_spec_dec else ("prefill" if not self.stepped else "decode")
-        tensor_debug_names = (
-            "hidden_states",
-            "keep_indices",
-            "need_pruning",
-            "prompts",
-            "hypo_ids",
-            "tree_attention_mask",
-            "kv_cache_position_ids",
-            "draft_tokens",
-            "prefill_length",
-            "is_spec_dec",
-        )
-
-        # TODO: create more explicit way to check servers schema and client's structure
-        # assert len(input_tensors) >= len(
-        #     server_side_inference_schema
-        # ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
+        total_send_bytes = 0
+        serialize_time_ms = 0.0
 
         with transport_profile_scope() as transport_profile:
-            # [NETWORK_TIMING] Measure serialization time
-            serialize_start = time.perf_counter()
-
-            # Serialize and send data (debug output removed for performance)
-            # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
-            serialized_tensors = [
-                serialize_torch_tensor(
-                    tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
-                    proto.compression,
-                    debug_context={
-                        "phase": transport_phase,
-                        "tensor_name": tensor_debug_names[idx] if idx < len(tensor_debug_names) else f"arg_{idx}",
-                        "source": "client",
-                        "channel": "rpc_inference",
-                        "blocks": f"{self.span.start}:{self.span.end}",
-                        "batch": int(logical_full_batch_size),
-                    },
+            if not push_only_decode:
+                # Regular decode does not need speculative-only tensors on the
+                # hot path. Keep a compact positional layout and let metadata
+                # carry control flags such as is_spec_dec.
+                use_compact_decode_layout = not is_spec_dec
+                if use_compact_decode_layout:
+                    has_prompt_payload = prompts is not None and not is_dummy(prompts)
+                    has_hypo_payload = hypo_ids is not None and not is_dummy(hypo_ids)
+                    if has_prompt_payload or has_hypo_payload:
+                        input_tensors = (
+                            inputs,
+                            normalize_arg(keep_indices),
+                            normalize_arg(prefill_length),
+                            prompts,
+                            hypo_ids,
+                        )
+                        tensor_debug_names = (
+                            "hidden_states",
+                            "keep_indices",
+                            "prefill_length",
+                            "prompts",
+                            "hypo_ids",
+                        )
+                        regular_layout_name = "decode_compact_v2"
+                    else:
+                        input_tensors = (
+                            inputs,
+                            normalize_arg(keep_indices),
+                            normalize_arg(prefill_length),
+                        )
+                        tensor_debug_names = (
+                            "hidden_states",
+                            "keep_indices",
+                            "prefill_length",
+                        )
+                        regular_layout_name = "decode_minimal_v2"
+                else:
+                    input_tensors = (
+                        inputs,
+                        normalize_arg(keep_indices),
+                        normalize_arg(tree_attention_mask),
+                        normalize_arg(kv_cache_position_ids),
+                        normalize_arg(draft_tokens),
+                        normalize_arg(prefill_length),
+                        prompts,
+                        hypo_ids,
+                    )
+                    tensor_debug_names = (
+                        "hidden_states",
+                        "keep_indices",
+                        "tree_attention_mask",
+                        "kv_cache_position_ids",
+                        "draft_tokens",
+                        "prefill_length",
+                        "prompts",
+                        "hypo_ids",
+                    )
+                request_metadata = dict(session_id=self.session_id, step_id=step_id)
+                if not self.stepped:
+                    request_metadata.update(self.session_metadata)
+                # Only send non-default control flags; the server already
+                # treats missing values as false/zero.
+                if is_spec_dec:
+                    request_metadata["is_spec_dec"] = 1
+                if need_pruning:
+                    request_metadata["need_pruning"] = 1
+                request_metadata["full_batch_size"] = int(logical_full_batch_size)
+                request_metadata["micro_batch_size"] = int(inputs.shape[0]) if inputs.ndim >= 1 else 1
+                request_metadata["inference_layout"] = (
+                    regular_layout_name if use_compact_decode_layout else "spec_compact_v1"
                 )
-                for idx, (tensor, proto) in enumerate(zip(input_tensors, inference_schema))
-            ]
-            serialized_metadata = MSGPackSerializer.dumps(request_metadata)
+                if is_spec_dec:
+                    request_metadata["start_from_position"] = self._position + n_input_tokens
+                elif self._position is not None:
+                    request_metadata["start_from_position"] = self._position
+                # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
+                # Speculative decoding keeps strict full-batch semantics; avoid cross-stage push.
+                if self.config.use_server_to_server:
+                    next_servers = self._collect_next_servers()
+                    if next_servers:
+                        request_metadata["next_servers"] = next_servers
 
-            serialize_end = time.perf_counter()
-            serialize_time_ms = (serialize_end - serialize_start) * 1000
+                # TODO: make possible to use different compression method for different tensors
+                server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
+                compression = server_side_inference_schema[0].compression
+                inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
+                # [NETWORK_TIMING] Measure serialization time
+                serialize_start = time.perf_counter()
 
-            # [NETWORK_TIMING] Measure serialized data size
-            total_tensor_bytes = sum(len(t.buffer) for t in serialized_tensors)
-            metadata_bytes = len(serialized_metadata)
-            total_send_bytes = total_tensor_bytes + metadata_bytes
+                # Serialize and send data (debug output removed for performance)
+                # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
+                serialized_tensors = [
+                    serialize_torch_tensor(
+                        tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
+                        proto.compression,
+                        debug_context={
+                            "phase": transport_phase,
+                            "tensor_name": tensor_debug_names[idx] if idx < len(tensor_debug_names) else f"arg_{idx}",
+                            "source": "client",
+                            "channel": "rpc_inference",
+                            "blocks": f"{self.span.start}:{self.span.end}",
+                            "batch": int(logical_full_batch_size),
+                        },
+                    )
+                    for idx, (tensor, proto) in enumerate(zip(input_tensors, inference_schema))
+                ]
+                serialized_metadata = MSGPackSerializer.dumps(request_metadata)
 
-            if client_inference_logs_enabled:
-                logger.info(f"[NETWORK_TX] SEND_START | step_id={step_id} | "
-                           f"tensor_size={total_tensor_bytes/1024:.2f}KB | "
-                           f"metadata_size={metadata_bytes}B | "
-                           f"total={total_send_bytes/1024:.2f}KB | "
-                           f"serialize_time={serialize_time_ms:.2f}ms")
+                serialize_end = time.perf_counter()
+                serialize_time_ms = (serialize_end - serialize_start) * 1000
+
+                # [NETWORK_TIMING] Measure serialized data size
+                total_tensor_bytes = sum(len(t.buffer) for t in serialized_tensors)
+                metadata_bytes = len(serialized_metadata)
+                total_send_bytes = total_tensor_bytes + metadata_bytes
+
+                if client_inference_logs_enabled:
+                    logger.info(f"[NETWORK_TX] SEND_START | step_id={step_id} | "
+                               f"tensor_size={total_tensor_bytes/1024:.2f}KB | "
+                               f"metadata_size={metadata_bytes}B | "
+                               f"total={total_send_bytes/1024:.2f}KB | "
+                               f"serialize_time={serialize_time_ms:.2f}ms")
 
             # [NETWORK_TIMING] Measure network round-trip time
             network_start = time.perf_counter()
-
-            outputs_serialized = RemoteExpertWorker.run_coroutine(
-                self._step(
-                    runtime_pb2.ExpertRequest(
-                        uid=self.uid,
-                        tensors=serialized_tensors,
-                        metadata=serialized_metadata,
+            if push_only_decode:
+                outputs_serialized = RemoteExpertWorker.run_coroutine(self._await_pushed_step())
+            else:
+                outputs_serialized = RemoteExpertWorker.run_coroutine(
+                    self._step(
+                        runtime_pb2.ExpertRequest(
+                            uid=self.uid,
+                            tensors=serialized_tensors,
+                            metadata=serialized_metadata,
+                        )
                     )
                 )
-            )
 
             network_end = time.perf_counter()
             network_rtt_ms = (network_end - network_start) * 1000
@@ -351,6 +399,10 @@ class _ServerInferenceSession:
         """Inference step on serialized data. This code is meant to be run inside RemoteExpertWorker"""
         await self._inputs_queue.put(inputs_serialized)
         self.stepped = True
+        return await asyncio.wait_for(anext(self._outputs_stream), self.config.request_timeout)
+
+    async def _await_pushed_step(self) -> runtime_pb2.ExpertResponse:
+        """Wait for the next pushed decode output on an already-open downstream session."""
         return await asyncio.wait_for(anext(self._outputs_stream), self.config.request_timeout)
 
     def close(self):
@@ -424,7 +476,9 @@ class InferenceSession:
         try:
             for span in chosen_spans:
                 span_uids = CHAIN_DELIMITER.join(self._sequence_manager.block_uids[span.start : span.end])
-                metadata = self._sequence_manager.get_request_metadata("rpc_inference", span_uids, peer_id=span.peer_id)
+                metadata = self._sequence_manager.get_request_metadata(
+                    "rpc_inference", span_uids, peer_id=span.peer_id
+                )
                 session = RemoteExpertWorker.run_coroutine(
                     _ServerInferenceSession.create(
                         self._sequence_manager.config,
@@ -600,11 +654,12 @@ class InferenceSession:
         # A retried downstream server session may resend full history to rebuild its
         # server-side cache, which means the final stage can legitimately return
         # hidden states for the whole cached prefix instead of only the current
-        # step's token(s). The caller of InferenceSession.step() expects outputs
-        # for the logical current input only, so trim the recovered full-history
-        # output back to the current token increment.
+        # step's token(s). Regular decode expects only the newly-advanced token
+        # window here, but speculative verification needs the full per-tree output
+        # tensor, so do not trim speculative steps back to the committed token count.
         if (
-            torch.is_tensor(outputs)
+            not is_spec_dec
+            and torch.is_tensor(outputs)
             and outputs.ndim == 3
             and n_input_tokens > 0
             and outputs.shape[1] > n_input_tokens
@@ -659,15 +714,59 @@ class InferenceSession:
         device = flattened_hidden_states.device
         dtype = flattened_hidden_states.dtype
         
+        def _flatten_hidden_with_keep_layout(hidden_states: torch.Tensor) -> torch.Tensor:
+            if hidden_states.ndim == 2:
+                return hidden_states
+
+            if hidden_states.ndim != 3:
+                raise ValueError(f"Unexpected flattened_hidden_states dim: {hidden_states.ndim}")
+
+            if tuple(hidden_states.shape[:2]) == tuple(keep_indices.shape):
+                valid_mask_local = keep_indices >= 0
+                return hidden_states[valid_mask_local]
+
+            num_groups, _, local_hidden_size = hidden_states.shape
+            total_batch = int(keep_indices.shape[0])
+
+            if num_groups > 0 and total_batch % num_groups == 0:
+                batch_per_group = total_batch // num_groups
+                grouped_rows = []
+                for group_idx in range(num_groups):
+                    keep_chunk = keep_indices[
+                        group_idx * batch_per_group : (group_idx + 1) * batch_per_group
+                    ]
+                    valid_count = int((keep_chunk >= 0).sum().item())
+                    if valid_count == 0:
+                        continue
+
+                    group_hidden = hidden_states[group_idx]
+                    if int(group_hidden.shape[0]) < valid_count:
+                        raise ValueError(
+                            f"Spec micro-batch hidden rows are shorter than valid keep entries: "
+                            f"group={group_idx}, hidden_rows={group_hidden.shape[0]}, valid_keep={valid_count}"
+                        )
+                    grouped_rows.append(group_hidden[:valid_count])
+
+                if grouped_rows:
+                    return torch.cat(grouped_rows, dim=0)
+                return hidden_states.new_empty((0, local_hidden_size))
+
+            flat_hidden_local = hidden_states.reshape(-1, local_hidden_size)
+            expected_valid = int((keep_indices >= 0).sum().item())
+            if flat_hidden_local.shape[0] > expected_valid:
+                trailing = flat_hidden_local[expected_valid:]
+                if trailing.numel() == 0 or not torch.count_nonzero(trailing).item():
+                    flat_hidden_local = flat_hidden_local[:expected_valid]
+            return flat_hidden_local
+
         # 处理不同维度的输入
         if flattened_hidden_states.ndim == 2:
             # [N_total_valid, hidden_size] -> 直接使用
             flat_hidden = flattened_hidden_states
             hidden_size = flattened_hidden_states.shape[-1]
         elif flattened_hidden_states.ndim == 3:
-            # [num_micro_batches, N_valid_per_mb, hidden_size] -> 合并前两维
-            num_mb, n_valid_per_mb, hidden_size = flattened_hidden_states.shape
-            flat_hidden = flattened_hidden_states.reshape(-1, hidden_size)  # [num_mb * N_valid_per_mb, hidden_size]
+            hidden_size = flattened_hidden_states.shape[-1]
+            flat_hidden = _flatten_hidden_with_keep_layout(flattened_hidden_states)
         else:
             raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
         

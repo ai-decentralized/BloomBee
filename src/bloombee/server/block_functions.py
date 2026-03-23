@@ -33,8 +33,7 @@ from bloombee.utils.lossless_transport import (
     tensor_raw_nbytes,
     transport_profile_scope,
 )
-from bloombee.utils.misc import DUMMY, is_dummy
-from bloombee.utils.packaging import unpack_args_kwargs
+from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -43,6 +42,7 @@ from bloombee.utils.microbatch_config import (
     compute_micro_batch_ranges,
     split_tensor_to_microbatches,
     merge_microbatch_outputs,
+    merge_microbatch_keep_indices,
     log_microbatch_split,
     log_microbatch_merge,
     log_stage_timing,
@@ -250,7 +250,6 @@ async def run_rpc_forward(
     active_adapter: str = "",
     prioritizer: TaskPrioritizerBase,
     points: int = 0,
-    args_structure: Any = None,
 ) -> torch.Tensor:
     """
     Run forward pass on deserialized inputs and prompts, used by rpc_forward and rpc_forward_stream
@@ -263,9 +262,6 @@ async def run_rpc_forward(
     # Start timing for Cross-GPU Transfer Latency measurement
     cross_gpu_start_time = perf_counter()
     
-    if args_structure is not None:
-        # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-        flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     hidden_states, prompts, *_ = flat_tensors
 
     # Fix for bus error in cross-machine setups: ensure tensors are contiguous
@@ -364,11 +360,7 @@ async def run_rpc_backward(
     active_adapter: str = "",
     prioritizer: TaskPrioritizerBase,
     points: int = 0,
-    args_structure: Any = None,
 ) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
-    if args_structure is not None:
-        # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-        flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     inputs, grad_outputs, prompts, *_ = flat_tensors
 
     # Fix for bus error in cross-machine setups: ensure tensors are contiguous
@@ -448,15 +440,64 @@ def restore_hidden_states(
     device = flattened_hidden_states.device
     dtype = flattened_hidden_states.dtype
     
+    def _flatten_hidden_with_keep_layout(hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.ndim == 2:
+            return hidden_states
+
+        if hidden_states.ndim != 3:
+            raise ValueError(f"Unexpected flattened_hidden_states dim: {hidden_states.ndim}")
+
+        if tuple(hidden_states.shape[:2]) == tuple(keep_indices.shape):
+            valid_mask_local = keep_indices >= 0
+            return hidden_states[valid_mask_local]
+
+        num_groups, _, local_hidden_size = hidden_states.shape
+        total_batch = int(keep_indices.shape[0])
+
+        # Speculative micro-batch merges can arrive as
+        # [num_micro_batches, max_valid_per_mb, hidden_size] while keep_indices is
+        # [full_batch, max_keep_len]. Recover the flattened valid rows by consuming
+        # each micro-batch slice according to the number of valid keep entries for
+        # the corresponding batch group.
+        if num_groups > 0 and total_batch % num_groups == 0:
+            batch_per_group = total_batch // num_groups
+            grouped_rows = []
+            for group_idx in range(num_groups):
+                keep_chunk = keep_indices[
+                    group_idx * batch_per_group : (group_idx + 1) * batch_per_group
+                ]
+                valid_count = int((keep_chunk >= 0).sum().item())
+                if valid_count == 0:
+                    continue
+
+                group_hidden = hidden_states[group_idx]
+                if int(group_hidden.shape[0]) < valid_count:
+                    raise ValueError(
+                        f"Spec micro-batch hidden rows are shorter than valid keep entries: "
+                        f"group={group_idx}, hidden_rows={group_hidden.shape[0]}, valid_keep={valid_count}"
+                    )
+                grouped_rows.append(group_hidden[:valid_count])
+
+            if grouped_rows:
+                return torch.cat(grouped_rows, dim=0)
+            return hidden_states.new_empty((0, local_hidden_size))
+
+        flat_hidden_local = hidden_states.reshape(-1, local_hidden_size)
+        expected_valid = int((keep_indices >= 0).sum().item())
+        if flat_hidden_local.shape[0] > expected_valid:
+            trailing = flat_hidden_local[expected_valid:]
+            if trailing.numel() == 0 or not torch.count_nonzero(trailing).item():
+                flat_hidden_local = flat_hidden_local[:expected_valid]
+        return flat_hidden_local
+
     # 处理不同维度的输入
     if flattened_hidden_states.ndim == 2:
         # [N_total_valid, hidden_size] -> 直接使用
         flat_hidden = flattened_hidden_states
         hidden_size = flattened_hidden_states.shape[-1]
     elif flattened_hidden_states.ndim == 3:
-        # [num_micro_batches, N_valid_per_mb, hidden_size] -> 合并前两维
-        num_mb, n_valid_per_mb, hidden_size = flattened_hidden_states.shape
-        flat_hidden = flattened_hidden_states.reshape(-1, hidden_size)  # [num_mb * N_valid_per_mb, hidden_size]
+        hidden_size = flattened_hidden_states.shape[-1]
+        flat_hidden = _flatten_hidden_with_keep_layout(flattened_hidden_states)
     else:
         raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
     
@@ -489,6 +530,63 @@ def restore_hidden_states(
     
     return restored_hidden_states
 
+
+def _should_restore_spec_hidden_states(
+    hidden_states: torch.Tensor,
+    keep_indices: Optional[torch.Tensor],
+    draft_tokens: Optional[torch.Tensor],
+) -> bool:
+    if (
+        keep_indices is None
+        or draft_tokens is None
+        or not torch.is_tensor(hidden_states)
+        or not torch.is_tensor(keep_indices)
+        or not torch.is_tensor(draft_tokens)
+        or hidden_states.ndim < 3
+        or keep_indices.ndim < 2
+        or draft_tokens.ndim < 2
+    ):
+        return False
+
+    expected_batch = int(keep_indices.shape[0])
+    expected_seq = int(draft_tokens.shape[-1])
+    actual_batch = int(hidden_states.shape[0])
+    actual_seq = int(hidden_states.shape[1])
+    return actual_batch != expected_batch or actual_seq != expected_seq
+
+
+def _merge_inference_microbatch_hidden_states(
+    outputs: Sequence[torch.Tensor],
+    requested_backends: Sequence[TransformerBackend],
+    *,
+    is_spec_dec: bool,
+) -> Optional[torch.Tensor]:
+    valid_outputs = [out for out in outputs if out is not None]
+    if not valid_outputs:
+        return None
+
+    if not is_spec_dec or not bool(getattr(requested_backends[-1], "_is_last_block", False)):
+        return merge_microbatch_outputs(list(valid_outputs), dim=0)
+
+    # The last speculative stage returns flattened valid rows as [1, N_valid, H]
+    # per micro-batch. Merge them back into the canonical full-batch spec layout
+    # [1, N_total_valid, H] so downstream/client restore logic sees the same shape
+    # as the non-microbatched speculative path.
+    flattened_chunks = []
+    for out in valid_outputs:
+        if not torch.is_tensor(out):
+            return merge_microbatch_outputs(list(valid_outputs), dim=0)
+        if out.ndim == 3 and int(out.shape[0]) == 1:
+            flattened_chunks.append(out.squeeze(0))
+        elif out.ndim == 2:
+            flattened_chunks.append(out)
+        else:
+            return merge_microbatch_outputs(list(valid_outputs), dim=0)
+
+    if not flattened_chunks:
+        return None
+    return torch.cat(flattened_chunks, dim=0).unsqueeze(0)
+
 def ensure_tensors(flat_tensors):
     result = []
     for i, t in enumerate(flat_tensors):
@@ -510,6 +608,24 @@ def ensure_tensors(flat_tensors):
             raise TypeError(f"flat_tensors[{i}] cant trans to tensor: type={type(t)}, value={t}")
     return tuple(result)
 
+
+def _optional_output_tensor(value: Any, empty_tensor: torch.Tensor) -> torch.Tensor:
+    if value is None:
+        return empty_tensor
+    if torch.is_tensor(value) and is_dummy(value):
+        return empty_tensor
+    return value
+
+
+def _select_inference_output_schema(
+    requested_backends: Sequence[TransformerBackend],
+    *,
+    is_spec_dec: bool,
+):
+    if is_spec_dec:
+        return requested_backends[-1].spec_outputs_schema
+    return requested_backends[-1].decode_outputs_schema
+
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
     requested_backends: Sequence[TransformerBackend],
@@ -522,7 +638,6 @@ async def iterate_rpc_inference(
     prioritizer: TaskPrioritizerBase,
     points: int,
     quant_type: QuantType,
-    args_structure: Any = None,
     cross_stage_push_fn=None,  # [MBPIPE] Optional callback for cross-stage micro-batch streaming
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
     assert len(cache_handles) == len(requested_backends)
@@ -745,7 +860,15 @@ async def iterate_rpc_inference(
                 mb_hidden_states, mb_keep_indices, request_context, len(requested_backends)
             )
             
-            if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
+            if is_spec_dec and _should_restore_spec_hidden_states(hidden_states, keep_indices, draft_tokens):
+                logger.info(
+                    "%s Restoring speculative hidden states for downstream processing: "
+                    "hidden=%s keep=%s draft=%s",
+                    MBPIPE_LOG_PREFIX,
+                    tuple(hidden_states.shape),
+                    tuple(keep_indices.shape) if torch.is_tensor(keep_indices) else None,
+                    tuple(draft_tokens.shape) if torch.is_tensor(draft_tokens) else None,
+                )
                 hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
             
             # [MB_DEBUG] Log after fill_microbatch_defaults
@@ -1120,15 +1243,21 @@ async def iterate_rpc_inference(
                     )
 
                 merged_hidden_list = []
+                merged_keep_list = []
                 for idx in sorted_indices:
                     h, k, offset = accum['results'][idx]
                     merged_hidden_list.append(h)
-                
-                # Merge hidden states
-                merged_hidden_states = torch.cat(merged_hidden_list, dim=0)
-                
-                # Use last keep_indices (they should all be the same per-token)
-                _, merged_keep_indices, _ = accum['results'][sorted_indices[-1]]
+                    merged_keep_list.append(k)
+
+                # Merge hidden states and keep_indices consistently across micro-batches.
+                # Speculative decoding can produce variable-width keep tensors per micro-batch,
+                # so both tensors must be merged with the same padding-aware logic.
+                merged_hidden_states = _merge_inference_microbatch_hidden_states(
+                    merged_hidden_list,
+                    requested_backends,
+                    is_spec_dec=is_spec_dec,
+                )
+                merged_keep_indices = merge_microbatch_keep_indices(merged_keep_list, dim=0)
                 
                 if log_mb_detail:
                     logger.info(
@@ -1560,12 +1689,15 @@ async def iterate_rpc_inference(
                         device=merged_hidden_states.device
                     )
                 
-                need_pruning_next = torch.tensor(0)
                 merge_serialize_start = perf_counter()
                 transport_phase = (
                     "prefill" if merged_hidden_states.ndim >= 2 and int(merged_hidden_states.shape[1]) > 1 else "decode"
                 )
-                output_debug_names = ("hidden_states", "keep_indices", "need_pruning_next")
+                output_debug_names = ("hidden_states", "keep_indices")
+                output_schema = _select_inference_output_schema(
+                    requested_backends,
+                    is_spec_dec=False,
+                )
                 with transport_profile_scope() as merge_transport_profile:
                     output_tensors = [
                         serialize_torch_tensor(
@@ -1582,8 +1714,8 @@ async def iterate_rpc_inference(
                             },
                         )
                         for idx, (result, proto) in enumerate(zip(
-                            (merged_hidden_states, merged_keep_indices, need_pruning_next),
-                            nested_flatten(requested_backends[-1].outputs_schema)
+                            (merged_hidden_states, merged_keep_indices),
+                            output_schema,
                         ))
                     ]
                 merge_transport_summary = summarize_transport_profile(merge_transport_profile)
@@ -1748,10 +1880,43 @@ async def iterate_rpc_inference(
             flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
         deserialize_time = (perf_counter() - deserialize_start) * 1000.0
         full_deserialize_summary = summarize_transport_profile(full_deserialize_profile)
-        if args_structure is not None:
-            flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
+        inference_layout = step_metadata.get("inference_layout")
+        inferred_layout = inference_layout
+        if inferred_layout is None:
+            is_spec_layout = _as_python_bool(step_metadata.get("is_spec_dec", 0))
+            if not is_spec_layout and len(flat_tensors) == 3:
+                inferred_layout = "decode_minimal_v2"
+            elif not is_spec_layout and len(flat_tensors) == 5:
+                inferred_layout = "decode_compact_v2"
+            elif is_spec_layout and len(flat_tensors) == 8:
+                inferred_layout = "spec_compact_v1"
 
-        hidden_states, keep_indices, need_pruning1, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, prompts, hypo_ids, *_ = flat_tensors
+        if inferred_layout == "decode_minimal_v2":
+            hidden_states, keep_indices, prefill_length, *_ = flat_tensors
+            need_pruning1 = None
+            tree_attention_mask = None
+            kv_cache_position_ids = None
+            draft_tokens = None
+            is_spec_dec1 = None
+            prompts = DUMMY
+            hypo_ids = DUMMY_INT64
+        elif inferred_layout == "decode_compact_v2":
+            hidden_states, keep_indices, prefill_length, prompts, hypo_ids, *_ = flat_tensors
+            need_pruning1 = None
+            tree_attention_mask = None
+            kv_cache_position_ids = None
+            draft_tokens = None
+            is_spec_dec1 = None
+        elif inferred_layout == "spec_compact_v1":
+            hidden_states, keep_indices, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, prompts, hypo_ids, *_ = flat_tensors
+            need_pruning1 = None
+            is_spec_dec1 = None
+        else:
+            raise ValueError(
+                "Unsupported rpc_inference tensor layout: "
+                f"inference_layout={inference_layout!r}, inferred_layout={inferred_layout!r}, "
+                f"num_tensors={len(flat_tensors)}, is_spec_dec={step_metadata.get('is_spec_dec', 0)!r}"
+            )
         draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
@@ -1795,7 +1960,14 @@ async def iterate_rpc_inference(
         # logger.info(f"keep_indices: {keep_indices.shape}")
         # logger.info(f"draft_tokens: {draft_tokens.shape}")
 
-        if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
+        if is_spec_dec and _should_restore_spec_hidden_states(hidden_states, keep_indices, draft_tokens):
+            logger.info(
+                "%s Restoring speculative hidden states in full-batch path: hidden=%s keep=%s draft=%s",
+                MBPIPE_LOG_PREFIX,
+                tuple(hidden_states.shape),
+                tuple(keep_indices.shape) if torch.is_tensor(keep_indices) else None,
+                tuple(draft_tokens.shape) if torch.is_tensor(draft_tokens) else None,
+            )
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
             
         batch_size, length_increment, _ = hidden_states.shape
@@ -2218,8 +2390,12 @@ async def iterate_rpc_inference(
                     micro_hidden_list = [r[0] for r in results]
                     micro_keep_list = [r[1] for r in results]
                     
-                    hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
-                    keep_indices = merge_microbatch_outputs(micro_keep_list, dim=0)
+                    hidden_states = _merge_inference_microbatch_hidden_states(
+                        micro_hidden_list,
+                        requested_backends,
+                        is_spec_dec=is_spec_dec,
+                    )
+                    keep_indices = merge_microbatch_keep_indices(micro_keep_list, dim=0)
                     
                     # Calculate overlap statistics
                     total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
@@ -2281,7 +2457,6 @@ async def iterate_rpc_inference(
                                            f"efficiency={mb_eff:.1f}%")
                     
                     log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.merged_pools")
-                    
                 else:
                     execution_mode = "merged_fullbatch"
                     # Legacy path: process entire batch at once
@@ -2307,7 +2482,7 @@ async def iterate_rpc_inference(
             else:
                 # Separate pools path: process backends one by one
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
-                if should_split_batch(batch_size) and not is_spec_dec:
+                if should_split_batch(batch_size):
                     execution_mode = "separate_microbatch"
                     # Micro-batch pipeline path: split batch, process with overlap
                     micro_ranges = compute_micro_batch_ranges(batch_size)
@@ -2441,8 +2616,12 @@ async def iterate_rpc_inference(
                     micro_hidden_list = [r[0] for r in results]
                     micro_keep_list = [r[1] for r in results]
                     
-                    hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
-                    keep_indices = merge_microbatch_outputs(micro_keep_list, dim=0)
+                    hidden_states = _merge_inference_microbatch_hidden_states(
+                        micro_hidden_list,
+                        requested_backends,
+                        is_spec_dec=is_spec_dec,
+                    )
+                    keep_indices = merge_microbatch_keep_indices(micro_keep_list, dim=0)
                     
                     # Calculate overlap statistics
                     total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
@@ -2545,18 +2724,36 @@ async def iterate_rpc_inference(
             ).unsqueeze(0).expand(hidden_states.shape[0], -1)
         
         serialize_start = perf_counter()
-        need_pruning_next = torch.tensor(0)
         transport_phase = "prefill" if hidden_states.ndim >= 2 and int(hidden_states.shape[1]) > 1 else "decode"
-        output_debug_names = (
-            "hidden_states",
-            "keep_indices",
-            "need_pruning_next",
-            "tree_attention_mask",
-            "kv_cache_position_ids",
-            "draft_tokens",
+        output_schema = _select_inference_output_schema(
+            requested_backends,
+            is_spec_dec=is_spec_dec,
         )
-        flat_tensors = ensure_tensors(
-            (hidden_states, keep_indices, need_pruning_next, tree_attention_mask, kv_cache_position_ids, draft_tokens)
+        flat_tensors = (
+            ensure_tensors((hidden_states, keep_indices))
+            if not is_spec_dec
+            else ensure_tensors(
+                (
+                    hidden_states,
+                    keep_indices,
+                    torch.tensor(0),
+                    _optional_output_tensor(tree_attention_mask, torch.empty(0, dtype=torch.bool)),
+                    _optional_output_tensor(kv_cache_position_ids, DUMMY_INT64),
+                    _optional_output_tensor(draft_tokens, DUMMY),
+                )
+            )
+        )
+        output_debug_names = (
+            ("hidden_states", "keep_indices")
+            if not is_spec_dec
+            else (
+                "hidden_states",
+                "keep_indices",
+                "need_pruning_next",
+                "tree_attention_mask",
+                "kv_cache_position_ids",
+                "draft_tokens",
+            )
         )
         with transport_profile_scope() as full_serialize_profile:
             output_tensors = [
@@ -2574,7 +2771,7 @@ async def iterate_rpc_inference(
                     },
                 )
                 for idx, (result, proto) in enumerate(
-                    zip(flat_tensors, nested_flatten(requested_backends[-1].outputs_schema))
+                    zip(flat_tensors, output_schema)
                 )
             ]
         full_serialize_summary = summarize_transport_profile(full_serialize_profile)

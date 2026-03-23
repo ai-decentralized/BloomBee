@@ -226,6 +226,9 @@ def convert_block(
                         param.data = param.data.to('cpu', non_blocking=True)
                 return result
             return self._module.forward(*args, **kwargs)
+
+        def __call__(self, *args, **kwargs):
+            return self.forward(*args, **kwargs)
             
         def parameters(self, *args, **kwargs):
             return self._module.parameters(*args, **kwargs)

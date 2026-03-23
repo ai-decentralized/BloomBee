@@ -27,14 +27,9 @@ class SpeculativePrunerManager:
         self.vocab_size = vocab_size
         self.config = config or PruningConfig()
         self.device = device
-        
-        # Create initial pruner
-        self.pruner = SpeculativePrunerFactory.create_pruner(
-            self.config.method,
-            hidden_size,
-            vocab_size,
-            self.config
-        )
+        self.pruner = None
+        self._pruner_unavailable = False
+        self._pruner_unavailable_reason = None
         
         # Metrics tracking
         self.total_tokens = 0
@@ -47,6 +42,58 @@ class SpeculativePrunerManager:
         # and pruning do not require online LM-head training.
         self.lm_head_trainer = None
         self._lm_head_trainer_unavailable = False
+
+    def _ensure_pruner(self):
+        if self.pruner is not None:
+            return self.pruner
+        if self._pruner_unavailable:
+            return None
+
+        try:
+            self.pruner = SpeculativePrunerFactory.create_pruner(
+                self.config.method,
+                self.hidden_size,
+                self.vocab_size,
+                self.config,
+            )
+        except Exception as e:
+            self._pruner_unavailable = True
+            self._pruner_unavailable_reason = repr(e)
+            logger.warning(
+                "Disabling speculative pruner because initialization failed: %s",
+                e,
+                exc_info=True,
+            )
+            return None
+
+        return self.pruner
+
+    def _build_keep_all_result(
+        self,
+        middle_hidden_states: torch.Tensor,
+        draft_tokens: Union[List[int], torch.Tensor],
+    ) -> Dict[str, Any]:
+        if middle_hidden_states.dim() == 2:
+            middle_hidden_states = middle_hidden_states.unsqueeze(0)
+
+        batch_size, seq_len = middle_hidden_states.shape[:2]
+        device = middle_hidden_states.device
+        keep_indices = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        prune_indices = torch.empty((batch_size, 0), dtype=torch.long, device=device)
+        keep_probs = torch.ones((batch_size, seq_len), dtype=middle_hidden_states.dtype, device=device)
+        keep_mask = torch.ones((batch_size, seq_len), dtype=torch.bool, device=device)
+        valid_lengths = torch.full((batch_size,), seq_len, dtype=torch.long, device=device)
+        return {
+            'keep_indices': keep_indices,
+            'prune_indices': prune_indices,
+            'keep_probs': keep_probs,
+            'keep_mask': keep_mask,
+            'valid_lengths': valid_lengths,
+            'metadata': {
+                'fallback': 'keep_all',
+                'reason': self._pruner_unavailable_reason or 'pruner_unavailable',
+            },
+        }
 
     def _ensure_lm_head_trainer(self) -> Optional[LM_head_trainer]:
         if self.lm_head_trainer is not None:
@@ -73,19 +120,21 @@ class SpeculativePrunerManager:
         
     def switch_method(self, method: Union[str, PruningMethod], keep_stats: bool = False):
         """Switch to a different pruning method"""
-        old_metrics = self.pruner.get_metrics() if keep_stats else None
+        current_pruner = self._ensure_pruner() if keep_stats else self.pruner
+        old_metrics = current_pruner.get_metrics() if keep_stats and current_pruner is not None else None
+
+        if isinstance(method, str):
+            method = PruningMethod(method)
+        self.config.method = method
+        self.pruner = None
+        self._pruner_unavailable = False
+        self._pruner_unavailable_reason = None
+        pruner = self._ensure_pruner()
         
-        self.pruner = SpeculativePrunerFactory.create_pruner(
-            method,
-            self.hidden_size,
-            self.vocab_size,
-            self.config
-        )
-        
-        if keep_stats and old_metrics:
+        if keep_stats and old_metrics and pruner is not None:
             # Transfer relevant statistics
-            if hasattr(self.pruner, 'acceptance_history'):
-                self.pruner.acceptance_history = deque(old_metrics.get('acceptance_history', []), maxlen=100)
+            if hasattr(pruner, 'acceptance_history'):
+                pruner.acceptance_history = deque(old_metrics.get('acceptance_history', []), maxlen=100)
     
     def prune_speculation_tree(
         self,
@@ -93,9 +142,12 @@ class SpeculativePrunerManager:
         draft_tokens: List[int],
         tree_attention_mask: torch.Tensor,
     ) -> Dict[str, Any]:
-        
+        pruner = self._ensure_pruner()
+        if pruner is None:
+            return self._build_keep_all_result(norm_hidden_states, draft_tokens)
+
         kwargs = {}
-        results = self.pruner.prune_branches(
+        results = pruner.prune_branches(
             norm_hidden_states,
             draft_tokens,
             tree_attention_mask,
@@ -120,9 +172,10 @@ class SpeculativePrunerManager:
         return results
         
     def train_model(self, middle_norm_hidden_states, final_logits, attention_mask, draft_tokens):
-        if hasattr(self.pruner, 'train_step'):
+        pruner = self._ensure_pruner()
+        if pruner is not None and hasattr(pruner, 'train_step'):
             with torch.enable_grad():
-                self.pruner.train_step(middle_norm_hidden_states, final_logits, attention_mask, draft_tokens)
+                pruner.train_step(middle_norm_hidden_states, final_logits, attention_mask, draft_tokens)
                 self.iteration = self.iteration + 1
                 
     def train_lm_head(self, middle_hidden_states, final_hidden_states):

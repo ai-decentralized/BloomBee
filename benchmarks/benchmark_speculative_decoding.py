@@ -8,7 +8,6 @@ from time import perf_counter
 
 import numpy as np
 import torch
-from datasets import load_dataset
 from hivemind.utils.logging import get_logger
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -70,13 +69,6 @@ def benchmark_inference(process_idx, args, result_pipe):
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
     batch_size = getattr(args, 'batch_size', 8)
-    dataset = load_dataset("tatsu-lab/alpaca")["train"]
-    indices = random.sample(range(len(dataset)), batch_size)
-    sampled = dataset.select(indices)
-    test_prompts = []
-    # for item in sampled:
-        # test_prompts.append(item["instruction"])
-        
     base_prompt = (
         "Quantum mechanics explains the behavior of particles at very small scales. "
         "Neural networks learn patterns by adjusting weights through backpropagation. "
