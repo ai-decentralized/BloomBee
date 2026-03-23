@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import multiprocessing as mp
+import os
 import sys
 from collections import deque
 from enum import Enum
@@ -60,6 +61,17 @@ from bloombee.utils.microbatch_schema import (
 )
 
 logger = get_logger(__name__)
+
+_s2s_output_compression_name = os.getenv("BLOOMBEE_S2S_OUTPUT_COMPRESSION", "").strip().upper()
+_s2s_output_compression = None
+if _s2s_output_compression_name:
+    try:
+        _s2s_output_compression = getattr(runtime_pb2.CompressionType, _s2s_output_compression_name)
+    except AttributeError:
+        logger.warning(
+            "Unknown BLOOMBEE_S2S_OUTPUT_COMPRESSION=%r, falling back to default rpc_push compression",
+            _s2s_output_compression_name,
+        )
 
 if TYPE_CHECKING:
     from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
@@ -2558,7 +2570,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             with transport_profile_scope() as push_transport_profile:
                 serialized_hidden = serialize_torch_tensor(
                     mb_hidden.to(outputs_schema[0].dtype),
-                    outputs_schema[0].compression,
+                    _s2s_output_compression if _s2s_output_compression is not None else outputs_schema[0].compression,
                     allow_inplace=True,
                     debug_context={
                         "phase": transport_phase,
