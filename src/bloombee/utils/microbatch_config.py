@@ -2,7 +2,7 @@
 Micro-batch Pipeline Configuration Module.
 
 The feature is controlled via environment variables:
-- BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: "1" to enable (default), "0" to disable
+- BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: "1" to enable, "0" to disable (default)
 - BLOOMBEE_MICRO_BATCH_SIZE: positive integer micro-batch size
 - BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING: "1" to enable bounded GPU working-slot
   reuse. Default is "0", which keeps micro-batching in overlap-only mode so
@@ -42,10 +42,10 @@ def _is_microbatch_flag_enabled() -> bool:
     Check if micro-batch pipeline is enabled via environment variable.
 
     Returns:
-        True by default, or if BLOOMBEE_ENABLE_MICROBATCH_PIPELINE is set to "1".
-        False only if explicitly set to "0".
+        True only if BLOOMBEE_ENABLE_MICROBATCH_PIPELINE is set to "1".
+        False by default.
     """
-    env_value = os.environ.get(ENV_ENABLE_MICROBATCH, "1")  # Default: enabled
+    env_value = os.environ.get(ENV_ENABLE_MICROBATCH, "0")  # Default: disabled
     return env_value == "1"
 
 
