@@ -565,7 +565,6 @@ async def iterate_rpc_inference(
     prioritizer: TaskPrioritizerBase,
     points: int,
     quant_type: QuantType,
-    args_structure: Any = None,
     cross_stage_push_fn=None,  # [MBPIPE] Optional callback for cross-stage micro-batch streaming
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
     assert len(cache_handles) == len(requested_backends)
@@ -1803,9 +1802,6 @@ async def iterate_rpc_inference(
             flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
         deserialize_time = (perf_counter() - deserialize_start) * 1000.0
         full_deserialize_summary = summarize_transport_profile(full_deserialize_profile)
-        if args_structure is not None:
-            flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
-
         inference_layout = step_metadata.get("inference_layout")
         if inference_layout == "decode_minimal_v1" or (
             inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 4

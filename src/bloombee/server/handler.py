@@ -841,8 +841,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points = metadata.get("points", 0)
                 session_id = metadata.get("session_id")
                 alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
-                args_structure = metadata.get("args_structure")
-
                 def _flag_to_bool(value: Any) -> bool:
                     if value is None:
                         return False
@@ -852,34 +850,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         return bool(value.bool().any().item())
                     return bool(value)
 
-                raw_is_spec = metadata.get("is_spec_dec", None)
-                if raw_is_spec is not None:
-                    is_spec_request = _flag_to_bool(raw_is_spec)
-                else:
-                    # Backward-compatible robust fallback:
-                    # reconstruct args via args_structure instead of assuming tensor order.
-                    is_spec_request = False
-                    try:
-                        if request.tensors and args_structure is not None:
-                            flat_request_tensors = [deserialize_torch_tensor(t) for t in request.tensors]
-                            unpacked_args, _ = unpack_args_kwargs(flat_request_tensors, args_structure)
-                            # Expected order:
-                            # [hidden, keep_idx, need_pruning, prompts, hypo_ids,
-                            #  tree_mask, kv_pos, draft_tokens, prefill_length, is_spec_dec]
-                            if isinstance(unpacked_args, (tuple, list)) and len(unpacked_args) >= 10:
-                                maybe_tree_mask = unpacked_args[5]
-                                maybe_draft = unpacked_args[7]
-                                maybe_is_spec = unpacked_args[9]
-                                is_spec_request = _flag_to_bool(maybe_is_spec)
-                                # If explicit flag is unavailable/zero, non-empty draft/tree
-                                # strongly implies speculative path.
-                                if not is_spec_request:
-                                    has_draft = torch.is_tensor(maybe_draft) and maybe_draft.numel() > 0
-                                    has_tree = torch.is_tensor(maybe_tree_mask) and maybe_tree_mask.numel() > 0
-                                    is_spec_request = bool(has_draft or has_tree)
-                    except Exception as e:
-                        logger.debug(f"{MBPIPE_LOG_PREFIX} spec detection fallback failed: {e}")
-                        is_spec_request = False
+                is_spec_request = _flag_to_bool(metadata.get("is_spec_dec", 0))
                 if is_spec_request and not self._speculative_pruner_enabled:
                     logger.info(
                         f"{MBPIPE_LOG_PREFIX} Speculative decoding requested without an active pruner; "
@@ -1125,7 +1096,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                         prioritizer=self._prioritizer,
                         points=points,
                         quant_type=self.quant_type,
-                        args_structure=args_structure,
                         cross_stage_push_fn=cross_stage_push_microbatch,  # [MBPIPE] Cross-stage streaming (currently disabled)
                     ):
                         handler_step_start = perf_counter()

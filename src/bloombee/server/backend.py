@@ -43,21 +43,6 @@ if TYPE_CHECKING:
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
 
-# def see_memory_usage(message, force=True):
-# 	logger = ''
-# 	logger += message
-# 	nvmlInit()
-#  
-# 	# nvidia_smi.nvmlInit()
-# 	handle = nvmlDeviceGetHandleByIndex(0)
-# 	info = nvmlDeviceGetMemoryInfo(handle)
-# 	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-# 	
-# 	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-# 	logger +=   'Max Memory Allocated: ' + str(
-# 		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-# 	print(logger)
-
 class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Module
     """A wrapper for a transformer block that can process requests for forward, backward and inference"""
 
