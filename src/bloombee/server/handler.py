@@ -2325,11 +2325,41 @@ class TransformerConnectionHandler(ConnectionHandler):
                 raise ValueError(
                     f"Unexpected routing tensor count from upstream stage: {len(normalized_outputs)}"
                 )
-            next_metadata = metadata.copy()
-            next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
-            if len(normalized_outputs) == 3 and metadata.get("inference_layout") in {"decode_minimal_v2", "decode_compact_v2"}:
+            # Preserve only execution-relevant routing/control fields for the next
+            # stage. Local timing/debug keys (notably `_...`) are recomputed on each
+            # hop and do not need to be forwarded over the wire.
+            next_metadata = {
+                "session_id": next_session_id,
+                "pushed": True,
+            }
+            remaining_next_servers = next_servers[1:]
+            if remaining_next_servers:
+                next_metadata["next_servers"] = remaining_next_servers
+            for key in (
+                "step_id",
+                "max_length",
+                "is_spec_dec",
+                "prefill_length",
+                "full_batch_size",
+                "micro_batch_size",
+                "inference_layout",
+                "start_from_position",
+                "points",
+                "active_adapter",
+            ):
+                if key in metadata:
+                    next_metadata[key] = metadata[key]
+            if (
+                len(normalized_outputs) == 3
+                and metadata.get("inference_layout") in {"decode_minimal_v2", "decode_compact_v2"}
+                and next_need_pruning
+            ):
                 next_metadata["need_pruning"] = next_need_pruning
-            if len(normalized_outputs) == 6 and metadata.get("inference_layout") == "spec_compact_v1":
+            if (
+                len(normalized_outputs) == 6
+                and metadata.get("inference_layout") == "spec_compact_v1"
+                and next_need_pruning
+            ):
                 next_metadata["need_pruning"] = next_need_pruning
             next_metadata["sender_blocks"] = sender_blocks
             next_metadata["receiver_blocks"] = f"{next_start}:{next_end}"
