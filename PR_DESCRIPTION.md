@@ -2,12 +2,15 @@
 
 This PR improves the stage-to-stage inference path and cleans up several runtime hot-path and shutdown issues.
 
-It combines four changesets:
+It combines seven changesets:
 
 1. `Optimize downstream decode push path`
 2. `Clean inference metadata and runtime cleanup`
 3. `Restore speculative pruner startup path`
 4. speculative-decoding stability fixes validated locally
+5. `Avoid redundant microbatch input cloning`
+6. `Use empty optional tensors for decode outputs`
+7. `Split decode inference output schema`
 
 The current focus is same-machine validation for a cross-machine-oriented codebase. The changes therefore avoid adding local-only fast paths and instead reduce overhead in the existing BloomBee + Hivemind transport/runtime path.
 
@@ -54,6 +57,15 @@ The current focus is same-machine validation for a cross-machine-oriented codeba
 - Preserve full speculative verification outputs instead of trimming them back to the committed token count on the client path.
 - Add a guarded fallback for empty logits slices during speculative verification.
 
+### 7. Remove extra copy / placeholder work in regular decode
+
+- Stop cloning `hidden_states` for every micro-batch slice in the sequential overlap path.
+- Return empty dummy tensors for absent decode-only optional outputs instead of scalar placeholder tensors.
+- Split regular decode final outputs from speculative final outputs:
+  - regular decode now emits a compact 3-tensor prefix
+  - speculative decoding keeps the 6-tensor routing prefix
+- Update `_push_outputs()` so stage-to-stage forwarding accepts either compact decode outputs or full speculative outputs and reconstructs the downstream request layout correctly.
+
 ## Validation
 
 ### Local end-to-end inference
@@ -73,12 +85,18 @@ Representative successful result after the cleanup pass:
 - `throughput=5.52 tokens/sec/sequence`
 - `effective_throughput=11.04 tokens/sec`
 
+Representative successful result after the later decode-path cleanup/splitting pass:
+
+- `throughput=5.65 tokens/sec/sequence`
+- `effective_throughput=22.59 tokens/sec`
+
 ### Micro-batching
 
 Validated that:
 
 - `micro_batch_size=2` enables the overlap-only path
 - `batch_size=4, micro_batch_size=2` actually splits into 2 micro-batches
+- removing eager micro-batch `hidden_states.clone()` does not break local 2-server inference
 - current implementation is still **overlap-only**, not KV-memory-saving micro-batching
 
 ### KV cache offload
@@ -108,15 +126,22 @@ Representative successful result after the speculative fixes:
 - `Final result: speed=0.70`
 - 4 speculative verification iterations executed successfully in the local test run
 
+Representative successful result after the later decode-schema split:
+
+- speculative benchmark still completes successfully with the compact regular-decode output schema in place
+- `Final result: speed=0.56`
+
 ## Notes
 
 - This PR does **not** yet replace Hivemind unary protobuf `rpc_push` with a binary streaming path.
 - The branch currently includes the active local server policy/testing settings used during validation.
 - Speculative decoding is now locally runnable again, but this PR does not yet try to optimize speculative throughput.
+- Regular decode output tensors are now slimmer, but regular decode input tensors still use the older shared request layout.
 
 ## Next steps
 
-1. Continue simplifying speculative request/control state, especially fields still duplicated across tensors and metadata.
-2. Revisit why speculative cross-stage transfer is still taking the `rpc_push` path even when the code intends to keep full speculative context.
-3. Benchmark speculative decoding with larger `seq_len` / `batch_size` combinations and check whether 50/50 KV offload remains stable.
-4. Revisit transport-level optimization for cross-machine runs, especially the unary `rpc_push` path over Hivemind.
+1. Split the regular decode input layout from the speculative/shared `rpc_inference` request layout to remove the remaining placeholder tensors on the client send path.
+2. Continue simplifying speculative request/control state, especially fields still duplicated across tensors and metadata.
+3. Revisit why speculative cross-stage transfer is still taking the `rpc_push` path even when the code intends to keep full speculative context.
+4. Benchmark speculative decoding with larger `seq_len` / `batch_size` combinations and check whether 50/50 KV offload remains stable.
+5. Revisit transport-level optimization for cross-machine runs, especially the unary `rpc_push` path over Hivemind.
