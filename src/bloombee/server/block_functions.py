@@ -1698,12 +1698,11 @@ async def iterate_rpc_inference(
                         device=merged_hidden_states.device
                     )
                 
-                need_pruning_next = torch.tensor(0)
                 merge_serialize_start = perf_counter()
                 transport_phase = (
                     "prefill" if merged_hidden_states.ndim >= 2 and int(merged_hidden_states.shape[1]) > 1 else "decode"
                 )
-                output_debug_names = ("hidden_states", "keep_indices", "need_pruning_next")
+                output_debug_names = ("hidden_states", "keep_indices")
                 output_schema = _select_inference_output_schema(
                     requested_backends,
                     is_spec_dec=False,
@@ -1724,7 +1723,7 @@ async def iterate_rpc_inference(
                             },
                         )
                         for idx, (result, proto) in enumerate(zip(
-                            (merged_hidden_states, merged_keep_indices, need_pruning_next),
+                            (merged_hidden_states, merged_keep_indices),
                             output_schema,
                         ))
                     ]
@@ -2734,20 +2733,19 @@ async def iterate_rpc_inference(
             ).unsqueeze(0).expand(hidden_states.shape[0], -1)
         
         serialize_start = perf_counter()
-        need_pruning_next = torch.tensor(0)
         transport_phase = "prefill" if hidden_states.ndim >= 2 and int(hidden_states.shape[1]) > 1 else "decode"
         output_schema = _select_inference_output_schema(
             requested_backends,
             is_spec_dec=is_spec_dec,
         )
         flat_tensors = (
-            ensure_tensors((hidden_states, keep_indices, need_pruning_next))
+            ensure_tensors((hidden_states, keep_indices))
             if not is_spec_dec
             else ensure_tensors(
                 (
                     hidden_states,
                     keep_indices,
-                    need_pruning_next,
+                    torch.tensor(0),
                     _optional_output_tensor(tree_attention_mask, torch.empty(0, dtype=torch.bool)),
                     _optional_output_tensor(kv_cache_position_ids, DUMMY_INT64),
                     _optional_output_tensor(draft_tokens, DUMMY),
@@ -2755,7 +2753,7 @@ async def iterate_rpc_inference(
             )
         )
         output_debug_names = (
-            ("hidden_states", "keep_indices", "need_pruning_next")
+            ("hidden_states", "keep_indices")
             if not is_spec_dec
             else (
                 "hidden_states",

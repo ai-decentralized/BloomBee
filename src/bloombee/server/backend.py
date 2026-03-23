@@ -77,7 +77,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         else:
             inference_outputs_schema = tuple(inference_outputs_schema)
         self.inference_outputs_schema = inference_outputs_schema
-        self.decode_outputs_schema = self.inference_outputs_schema[:3]
+        self.decode_outputs_schema = self.inference_outputs_schema[:2]
         self.spec_outputs_schema = self.inference_outputs_schema[:6]
 
         for name, param in self.module.named_parameters():

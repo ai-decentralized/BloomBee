@@ -2269,22 +2269,18 @@ class TransformerConnectionHandler(ConnectionHandler):
                 )
 
             # `serialized_outputs` carries the updated routing tensors for the
-            # next stage. Regular decode emits a compact 3-tensor prefix
-            # (hidden_states, keep_indices, need_pruning), while speculative
+            # next stage. Regular decode emits a compact 2-tensor prefix
+            # (hidden_states, keep_indices), while speculative
             # decoding emits a 6-tensor routing prefix that also includes
             # tree_attention_mask, kv_cache_position_ids and draft_tokens.
             # Reconstruct the downstream rpc_inference tensor layout according
             # to the original request metadata and keep control flags in
             # metadata when possible.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
-            if len(normalized_outputs) == 3:
+            next_need_pruning = None
+            if len(normalized_outputs) == 2:
                 inference_layout = metadata.get("inference_layout")
                 if inference_layout in {"decode_minimal_v2", "decode_compact_v2"}:
-                    need_pruning_next = deserialize_torch_tensor(normalized_outputs[2])
-                    if torch.is_tensor(need_pruning_next) and need_pruning_next.numel() > 0:
-                        next_need_pruning = int(bool(need_pruning_next.bool().any().item()))
-                    else:
-                        next_need_pruning = 0
                     if inference_layout == "decode_minimal_v2":
                         next_tensors = [
                             normalized_outputs[0],
@@ -2298,8 +2294,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             *list(request.tensors[2:]),
                         ]
                 else:
-                    next_need_pruning = None
-                    next_tensors = normalized_outputs + list(request.tensors[3:])
+                    next_tensors = normalized_outputs + list(request.tensors[2:])
             elif len(normalized_outputs) == 6:
                 inference_layout = metadata.get("inference_layout")
                 if inference_layout == "spec_compact_v1":
@@ -2319,7 +2314,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                         request.tensors[7],
                     ]
                 else:
-                    next_need_pruning = None
                     next_tensors = normalized_outputs + list(request.tensors[6:])
             else:
                 raise ValueError(
@@ -2349,12 +2343,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             ):
                 if key in metadata:
                     next_metadata[key] = metadata[key]
-            if (
-                len(normalized_outputs) == 3
-                and metadata.get("inference_layout") in {"decode_minimal_v2", "decode_compact_v2"}
-                and next_need_pruning
-            ):
-                next_metadata["need_pruning"] = next_need_pruning
             if (
                 len(normalized_outputs) == 6
                 and metadata.get("inference_layout") == "spec_compact_v1"
