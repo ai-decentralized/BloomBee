@@ -548,10 +548,9 @@ def _select_inference_output_schema(
     *,
     is_spec_dec: bool,
 ):
-    outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
     if is_spec_dec:
-        return outputs_schema[:6]
-    return outputs_schema[:3]
+        return requested_backends[-1].spec_outputs_schema
+    return requested_backends[-1].decode_outputs_schema
 
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],

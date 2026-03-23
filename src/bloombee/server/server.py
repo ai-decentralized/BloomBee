@@ -729,6 +729,11 @@ class ModuleContainer(threading.Thread):
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression
                         ),
+                    ),
+                    inference_outputs_schema=(
+                        BatchTensorDescriptor(
+                            1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression
+                        ),
                         BatchTensorDescriptor(
                             1, 64,                             # keep_indices_padded: [B, 64]
                             dtype=torch.int64,

@@ -2498,7 +2498,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
             
             # Serialize the micro-batch tensors
-            outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
+            outputs_schema = requested_backends[-1].decode_outputs_schema
             sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
             serialize_start_us = self._now_us()
             transport_phase = "prefill" if mb_hidden.ndim >= 2 and int(mb_hidden.shape[1]) > 1 else "decode"

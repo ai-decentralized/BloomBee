@@ -18,7 +18,7 @@ from transformers import PretrainedConfig
 from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
-from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor
+from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor, nested_flatten
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
 from bloombee.utils.microbatch_config import (
@@ -57,6 +57,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         is_last_block: bool,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
+        inference_outputs_schema: Optional[Tuple[BatchTensorDescriptor, ...]] = None,
         **kwargs,
     ):
         import bloombee.utils.peft as _peft_module
@@ -71,6 +72,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.cache_manager = cache_manager
         self.pruner_manager = pruner_manager
         self.max_chunk_size_bytes = max_chunk_size_bytes
+        if inference_outputs_schema is None:
+            inference_outputs_schema = tuple(nested_flatten(self.outputs_schema))
+        else:
+            inference_outputs_schema = tuple(inference_outputs_schema)
+        self.inference_outputs_schema = inference_outputs_schema
+        self.decode_outputs_schema = self.inference_outputs_schema[:3]
+        self.spec_outputs_schema = self.inference_outputs_schema[:6]
 
         for name, param in self.module.named_parameters():
             assert not param.requires_grad, f"Block parameters must not accumulate gradients, but {name} does"
