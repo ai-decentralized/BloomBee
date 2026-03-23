@@ -196,7 +196,7 @@ class Server:
             num_workers=self.block_config.num_hidden_layers,
             use_relay=use_relay,
             use_auto_relay=use_auto_relay,
-            client_mode=reachable_via_relay,
+            client_mode=False,
             **kwargs,
         )
         self.reachability_protocol = ReachabilityProtocol.attach_to_dht(self.dht) if not reachable_via_relay else None
@@ -309,7 +309,7 @@ class Server:
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
             100, 0,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent, cache_cpu_percent (multiplexing uses CPU staging for KV offload)
+            50, 50,                   # cache_gpu_percent, cache_cpu_percent
             100, 0,                   # act_gpu_percent, act_cpu_percent (mixed activation offload is unsupported)
             overlap=True, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,

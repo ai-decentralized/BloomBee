@@ -31,7 +31,6 @@ from bloombee.utils.microbatch_config import (
 from bloombee.utils.real_activation_dumper import capture_activation
 from pynvml import *
 import logging
-import hashlib
 import time
 import threading
 
@@ -43,22 +42,6 @@ if TYPE_CHECKING:
 # Create dedicated offloading debug logger
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
-
-
-def compute_tensor_hash(tensor):
-    """Compute SHA256 hash of tensor for debugging - optimized CPU conversion"""
-    if tensor is None:
-        return "None"
-    try:
-        # Optimization: Only perform CPU conversion in debug mode to avoid unnecessary performance overhead
-        if not getattr(compute_tensor_hash, '_debug_enabled', False):
-            return "hash_disabled"  # Disable hash computation in production environment
-        return hashlib.sha256(tensor.detach().cpu().numpy().tobytes()).hexdigest()[:16]
-    except:
-        return "error"
-
-# This flag can be set to enable/disable hash computation
-compute_tensor_hash._debug_enabled = False
 
 # def see_memory_usage(message, force=True):
 # 	logger = ''
@@ -502,30 +485,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 # logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
                 
-                # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
-                training_mode = False
-                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.15':
-                    self.pruner_manager.middle_states = output_hidden_states
-                
-                training_model_mode = False
-                if training_mode and training_model_mode and self._is_spec_decoding and self._is_last_block:
-                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    final_logits = self.module.lm_head_forward(norm_hidden_states)
-                    middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
-                    self.pruner_manager.train_model(middle_norm_hidden_states, final_logits, full_mask, inference_info.draft_tokens)
-                    
-                training_lm_head_mode = False
-                if training_mode and training_lm_head_mode and self._is_spec_decoding and self._is_last_block:
-                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
-                    self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
-                
-                if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block:
+                if self._is_spec_decoding and self._need_pruning and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
                     
-                if not training_mode and self._is_spec_decoding and self._is_last_block:
+                if self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states
                     batch_size, seq_len, hidden_size = original_hidden_states.shape
                     device = original_hidden_states.device
@@ -950,11 +915,20 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         # Explicitly free the GPU memory. This is not necessary at the time this code is written,
         # but may help to avoid future issues when the module is not garbage-collected for some reasons
-        dummy = torch.tensor([])
+        def _release_storage_inplace(tensor: torch.Tensor) -> None:
+            empty = tensor.detach().new_empty((0,))
+            tensor.data = empty
+
         try:
             params_iter = self.module.parameters() if hasattr(self.module, "parameters") else ()
             for p in params_iter:
-                p.data = dummy
+                _release_storage_inplace(p)
+                p.grad = None
+            buffers_iter = self.module.buffers() if hasattr(self.module, "buffers") else ()
+            for buf in buffers_iter:
+                _release_storage_inplace(buf)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception:
             logger.warning("Failed to clear module parameters during backend.shutdown", exc_info=True)
 

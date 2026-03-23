@@ -25,7 +25,7 @@ from bloombee.utils.lossless_transport import (
     log_transport_profile_event,
 )
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
-from bloombee.utils.packaging import pack_args_kwargs, normalize_arg
+from bloombee.utils.packaging import normalize_arg
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -200,7 +200,9 @@ class _ServerInferenceSession:
 
         with transport_profile_scope() as transport_profile:
             if not push_only_decode:
-                input_tensors, args_structure = pack_args_kwargs(
+                # rpc_inference uses a fixed positional tensor layout, so we can
+                # skip generic args_structure packing on this hot path.
+                input_tensors = (
                     inputs,
                     normalize_arg(keep_indices),
                     normalize_arg(torch.tensor(1 if need_pruning else 0)),
@@ -230,8 +232,6 @@ class _ServerInferenceSession:
                     next_servers = self._collect_next_servers()
                     if next_servers:
                         request_metadata["next_servers"] = next_servers
-
-                request_metadata["args_structure"] = args_structure
 
                 # TODO: make possible to use different compression method for different tensors
                 server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
@@ -441,7 +441,9 @@ class InferenceSession:
         try:
             for span in chosen_spans:
                 span_uids = CHAIN_DELIMITER.join(self._sequence_manager.block_uids[span.start : span.end])
-                metadata = self._sequence_manager.get_request_metadata("rpc_inference", span_uids, peer_id=span.peer_id)
+                metadata = self._sequence_manager.get_request_metadata(
+                    "rpc_inference", None, span_uids, peer_id=span.peer_id
+                )
                 session = RemoteExpertWorker.run_coroutine(
                     _ServerInferenceSession.create(
                         self._sequence_manager.config,

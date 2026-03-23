@@ -504,11 +504,19 @@ class RemoteSequenceManager:
         :param kwargs: additional request context, such as remote peer ID
         :returns: msgpack-serialized metadata dict that will be passed alongside a given request
         """
-        return dict(
+        if protocol == "rpc_inference" and isinstance(args_structure, str):
+            # Keep rpc_inference resilient against legacy positional call sites that
+            # accidentally pass span_uids as the second positional argument.
+            args = (args_structure, *args)
+            args_structure = None
+
+        metadata = dict(
             points=self.policy.get_points(protocol, *args, **kwargs),
             active_adapter=self.config.active_adapter,
-            args_structure=args_structure,
         )
+        if args_structure is not None:
+            metadata["args_structure"] = args_structure
+        return metadata
 
     def shutdown(self):
         if self._closed:

@@ -54,7 +54,6 @@ from bloombee.utils.microbatch_config import (
     get_timing_tracker,
 )
 from bloombee.utils.microbatch_schema import (
-    RequestContext,
     create_microbatch_queue_item,
     is_microbatch_queue_item,
     MBPIPE_SCHEMA_PREFIX,
@@ -116,26 +115,6 @@ import fcntl
 import os
 import tempfile
 from dataclasses import dataclass, field
-from typing import Set as TypingSet
-
-
-# [MBPIPE] Streaming decode state for cross-stage overlap
-# Tracks state when processing micro-batches as they arrive from upstream
-@dataclass
-class StreamingDecodeState:
-    """State for a streaming decode session where micro-batches are processed as they arrive."""
-    session_id: str
-    step_id: str
-    total_mbs: int                          # Expected total micro-batches
-    full_batch_size: int                    # Full batch size across all MBs
-    received_mbs: TypingSet[int] = field(default_factory=set)  # Set of received MB indices
-    results: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)  # mb_idx -> (hidden, keep_indices)
-    cache_allocated: bool = False           # Whether KV cache is allocated
-    cache_handles: Optional[List] = None    # KV cache handles
-    first_mb_metadata: Optional[Dict] = None  # Metadata from first MB for context
-    start_time: float = 0.0                 # Start time for timing
-
-
 @dataclass
 class S2SLinkTelemetry:
     """
@@ -435,9 +414,6 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._mb_expected: Dict[tuple, int] = {}
         # Key: (session_id, step_id) -> count of received micro-batches
         self._mb_received: Dict[tuple, int] = {}
-        # [MBPIPE] Cross-stage pipeline: request context cache (Step C/D)
-        # Key: (session_id, step_id) -> RequestContext with cached mb0 fields
-        self._request_contexts: Dict[tuple, RequestContext] = {}
         # Key: (session_id, step_id) -> set of (mb_idx) already processed (idempotency)
         self._mb_processed: Dict[tuple, set] = {}
         # Feature flag for immediate queuing - ENABLED for cross-stage pipeline overlap
@@ -457,10 +433,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"(set BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE=1 for legacy behavior)"
         )
         
-        # [MBPIPE] Streaming decode: process micro-batches as they arrive for cross-stage overlap
-        # Key: (session_id, step_id) -> StreamingDecodeState
-        self._streaming_decode_sessions: Dict[tuple, StreamingDecodeState] = {}
-
         # [CLOCK_SYNC] Per-peer clock offset estimator for cross-machine strict overlap.
         # offset_us is "remote_clock - local_clock" for the target peer.
         self._clock_sync_state: Dict[str, Dict[str, float]] = {}
@@ -1733,63 +1705,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             except Exception as e:
                 logger.exception(e)
 
-    async def _poll_microbatch_file(
-        self,
-        acc_key: str,
-        mb_idx: int,
-        timeout: float = 5.0,
-        poll_interval: float = 0.01,
-    ) -> Optional[Tuple[runtime_pb2.ExpertRequest, dict]]:
-        """
-        [MBPIPE] Poll for a specific micro-batch from file storage.
-        
-        This is used for cross-stage pipeline where micro-batches are stored
-        by one handler and read by another (file-based IPC).
-        
-        Returns (request, metadata) when available, or None on timeout.
-        """
-        file_path = _get_mb_file_path(acc_key, mb_idx)
-        lock_path = _get_mb_lock_path(acc_key)
-        start_time = perf_counter()
-        
-        while (perf_counter() - start_time) < timeout:
-            try:
-                if os.path.exists(file_path):
-                    with open(lock_path, 'w') as lock_file:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                        try:
-                            if os.path.exists(file_path):
-                                with open(file_path, 'rb') as f:
-                                    data = pickle.load(f)
-                                    tensor_bytes = data['tensor_bytes']
-                                    metadata = data['metadata']
-                                    
-                                # Reconstruct the request
-                                tensors = [runtime_pb2.Tensor.FromString(t) for t in tensor_bytes]
-                                request = runtime_pb2.ExpertRequest(
-                                    uid=acc_key.split('|')[0],  # session_id
-                                    tensors=tensors,
-                                    metadata=MSGPackSerializer.dumps(metadata),
-                                )
-                                
-                                logger.info(
-                                    f"{MBPIPE_LOG_PREFIX} poll_file: mb_idx={mb_idx} found "
-                                    f"after {(perf_counter() - start_time)*1000:.1f}ms"
-                                )
-                                return request, metadata
-                        finally:
-                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            except Exception as e:
-                logger.debug(f"{MBPIPE_LOG_PREFIX} poll_file error: {e}")
-            
-            await asyncio.sleep(poll_interval)
-        
-        logger.warning(
-            f"{MBPIPE_LOG_PREFIX} poll_file: timeout waiting for mb_idx={mb_idx} "
-            f"after {timeout}s"
-        )
-        return None
-
     async def _iterate_inference_steps(
         self,
         first_request: runtime_pb2.ExpertRequest,
@@ -2239,7 +2154,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 self._mb_expected.pop(mb_key, None)
                 self._mb_received.pop(mb_key, None)
                 self._mb_processed.pop(mb_key, None)
-                self._request_contexts.pop(mb_key, None)
         else:
             # ========== LEGACY PATH (wait-all-then-assemble) ==========
             logger.info(
@@ -2710,7 +2624,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             for key in [
                 "step_id",
                 "max_length",
-                "args_structure",
                 "is_spec_dec",
                 "need_pruning",
                 "prefill_length",

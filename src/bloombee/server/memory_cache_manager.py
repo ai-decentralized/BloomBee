@@ -435,13 +435,13 @@ class KVCacheManager:
         """
         if self._verbose_kv_logs:
             logger.info(
-                "[MBPIPE_UPDATE_CACHE] start_position=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s active_cache_id=%s",
+                "[MBPIPE_UPDATE_CACHE] start_position=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s active_cache_depth=%s",
                 start_position,
                 batch_offset,
                 full_batch_size,
                 micro_batch_size,
                 type(new_kvs).__name__ if new_kvs is not None else "None",
-                self._get_active_cache_slot_id(),
+                len(self._active_cache_tensors_stack),
             )
         self._write_kvs(new_kvs, start_position, batch_offset, full_batch_size, micro_batch_size)
     
