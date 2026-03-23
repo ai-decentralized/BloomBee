@@ -1,193 +1,165 @@
 ## Summary
 
-This PR improves the stage-to-stage inference path and cleans up several runtime hot-path and shutdown issues.
+This PR consolidates the current BloomBee runtime cleanup and inference-path work on top of upstream `fdff45c`.
 
-It combines nine changesets:
+It focuses on three areas:
 
-1. `Optimize downstream decode push path`
-2. `Clean inference metadata and runtime cleanup`
-3. `Restore speculative pruner startup path`
-4. speculative-decoding stability fixes validated locally
-5. `Avoid redundant microbatch input cloning`
-6. `Use empty optional tensors for decode outputs`
-7. `Split decode inference output schema`
-8. `Split and slim regular decode input layouts`
-9. `Move speculative control flags to metadata`
+1. slimming the regular decode request/response path
+2. restoring and hardening speculative decoding and micro-batching
+3. removing stale compatibility layers from inference and forward/backward RPC paths
 
-The current focus is same-machine validation for a cross-machine-oriented codebase. The changes therefore avoid adding local-only fast paths and instead reduce overhead in the existing BloomBee + Hivemind transport/runtime path.
+This document reflects the **final tree state** on `main`, not intermediate experiments that were later reverted.
 
-## What changed
+## Final change set
 
-### 1. Reduce downstream decode-path contention
+### 1. Downstream decode now follows upstream push more directly
 
-- Keep downstream decode aligned with upstream `rpc_push` once the session is warm.
-- Reuse the already-open downstream inference stream instead of repeatedly sending equivalent decode requests on the client path.
-- Preserve an opt-in hook for server-to-server output compression experiments.
+- Downstream decode reuses the already-open inference session stream instead of repeatedly sending equivalent decode requests.
+- The downstream steady-state path is aligned with upstream `rpc_push`.
+- An opt-in hook for server-to-server output compression experiments is preserved.
 
-### 2. Trim redundant `rpc_inference` metadata work
+### 2. Regular decode no longer uses the old speculative-style `rpc_inference` request layout
 
-- Stop building and sending `args_structure` for the `rpc_inference` hot path, since inference already uses a fixed positional tensor layout.
-- Keep `rpc_forward` / `rpc_backward` packaging unchanged.
-- Fix legacy `rpc_inference` metadata call sites that accidentally passed `span_uids` in the `args_structure` position.
-- Avoid serializing `args_structure=None` into request metadata.
+- Regular decode was split away from the shared speculative request layout.
+- The regular path now uses compact layouts instead of the old large shared tensor bundle.
+- Regular decode no longer carries speculative-only prompt/hypothesis placeholders in the hot path.
 
-### 3. Clean up stale runtime code
+### 3. Control flags were moved out of regular/spec request tensors
 
-- Remove dead speculative-training branches in `TransformerBackend`.
-- Remove unused tensor-hash debug code.
-- Remove unused streaming/micro-batch state from `TransformerConnectionHandler`.
-- Remove an unused file-polling helper for micro-batch IPC.
-- Remove unused `args_structure` propagation in stage-to-stage micro-batch push metadata.
+- `need_pruning` and `is_spec_dec` are no longer sent as regular/spec request tensors.
+- These flags now travel in metadata instead.
+- Regular decode pruning state was also removed from the output tensor path and kept metadata-only.
 
-### 4. Fix runtime diagnostics / shutdown behavior
+### 4. Decode outputs were split from speculative outputs
 
-- Fix a KV verbose-log bug in `KVCacheManager.update_cache()` that referenced a non-existent helper.
-- Replace backend shutdown parameter clearing with a dtype/device-safe release path.
-- Backend shutdown no longer emits the previous incompatible-tensor-type warnings during local validation.
+- Regular decode final outputs were split away from speculative routing outputs.
+- The regular path now uses a smaller decode output schema.
+- Forward/inference schema handling is now explicitly separated instead of sharing one drifting superset.
 
-### 5. Keep current local validation knobs enabled
+### 5. Legacy inference compatibility layers were removed
 
-- Default `DEFAULT_MICRO_BATCH_SIZE` is set to `2` for overlap-path testing.
-- Server policy keeps KV cache at `50/50` GPU/CPU for current offload validation.
+- The old legacy `rpc_inference` layout fallback was removed.
+- Unused decode `v1` layout fallbacks were removed.
+- Old compatibility plumbing around `args_structure` in the inference hot path was removed.
 
-### 6. Restore speculative decoding to a runnable local state
+### 6. Forward/backward RPC no longer depends on `args_structure`
 
-- Restore the LLaMA-7B speculative pruner startup path and make it lazy-initialized instead of hard-failing server startup.
-- Fix speculative pruner construction for `SimpleProbabilityPruner`.
-- Remove the obsolete `datasets` dependency from `benchmarks/benchmark_speculative_decoding.py`.
-- Restore pruned speculative hidden states before downstream processing when batch/sequence shape no longer matches the original draft tree.
-- Preserve full speculative verification outputs instead of trimming them back to the committed token count on the client path.
-- Add a guarded fallback for empty logits slices during speculative verification.
+- `args_structure` was removed from the forward/backward request metadata path.
+- Client forward/backward calls now send fixed flat tensor layouts directly.
+- Server-side `rpc_forward` / `rpc_backward` no longer unpack requests via `args_structure`.
+- The old packaging helpers used only for this path were removed.
 
-### 7. Remove extra copy / placeholder work in regular decode
+### 7. Forward/backward runtime behavior was hardened after removing that compatibility layer
 
-- Stop cloning `hidden_states` for every micro-batch slice in the sequential overlap path.
-- Return empty dummy tensors for absent decode-only optional outputs instead of scalar placeholder tensors.
-- Split regular decode final outputs from speculative final outputs:
-  - regular decode now emits a compact 3-tensor prefix
-  - speculative decoding keeps the 6-tensor routing prefix
-- Update `_push_outputs()` so stage-to-stage forwarding accepts either compact decode outputs or full speculative outputs and reconstructs the downstream request layout correctly.
+- `RemoteSequential` now tolerates LLaMA inference-only kwargs in the autograd path instead of asserting.
+- `PipelineParallelWrapper` is callable, so it behaves correctly under `ModuleBackend`.
+- Forward/backward RPC was normalized back to the intended single-output hidden-state contract for training/forward benchmarks.
 
-### 8. Slim regular decode request inputs and harden the speculative pruner
+### 8. Speculative decoding was restored to a stable local state
 
-- Split regular decode request inputs away from the old shared speculative-style `rpc_inference` layout.
-- Regular decode now uses:
-  - a 6-tensor compact layout when prompt/hypothesis payloads are actually present
-  - a 4-tensor minimal layout for the common case with no prompt/hypothesis payload
-- Server-side full-batch inference now accepts and defaults both compact/minimal regular layouts without changing speculative request handling.
-- Fix `SimpleProbabilityPruner` token indexing by casting draft-token ids to integers before indexing logits/probabilities.
+- The LLaMA speculative pruner startup path was restored and made lazy-initialized.
+- Session recovery issues in speculative decoding were fixed.
+- Pruned speculative hidden states are restored before downstream processing when needed.
+- Verification no longer trims speculative outputs incorrectly on the client path.
+- Empty-logit edge cases in verification were guarded.
+- The speculative pruner indexing path was fixed for integer token ids.
 
-### 9. Remove duplicated speculative control tensors from the request path
+### 9. Micro-batch and speculative micro-batch execution were hardened
 
-- Stop sending `need_pruning` and `is_spec_dec` as speculative request tensors.
-- Keep those control flags in request metadata instead.
-- Add `spec_compact_v1` full-batch parsing on the server side for speculative requests.
-- Update stage-to-stage forwarding so speculative `rpc_push` reconstructs the downstream request layout without reintroducing the removed control tensors.
-- Preserve `need_pruning_next` semantics by carrying the forwarded value in metadata on the downstream request path.
+- Redundant `hidden_states.clone()` work in the micro-batch slice path was removed.
+- Micro-batch merge handling was fixed for padded `keep_indices` and 3D hidden-state restoration.
+- Speculative + micro-batching now runs successfully again in local end-to-end validation.
+- A regular micro-batch push bug was fixed so micro-batches are actually forwarded instead of stalling before push.
+
+### 10. Request / push metadata was trimmed without removing paper-useful timing fields
+
+- Default request metadata fields are now omitted when they carry default values.
+- Forwarded full-batch push metadata no longer carries stale local `_...` fields that are recomputed at each hop.
+- Timing fields used for paper measurements were intentionally preserved.
+
+### 11. Runtime cleanup / shutdown issues were fixed
+
+- A KV verbose-log bug in cache update handling was fixed.
+- Backend shutdown now releases parameters/buffers safely without the previous incompatible tensor warnings.
+- Several dead helpers and stale runtime branches were removed.
+
+### 12. Historical dead code was removed
+
+- Removed unused `inference_session_time_range.py`
+- Removed unused micro-batch polling helpers
+- Removed unused streaming/request context state
+- Removed unused hash/debug helpers
 
 ## Validation
 
-### Local end-to-end inference
-
-Validated multiple times with repo-source execution via:
+All validation below was run from source with:
 
 ```bash
 PYTHONPATH=/home/user/BloomBee/src
+```
+
+and a local 2-server setup:
+
+```bash
 python -m bloombee.cli.run_dht ...
 python -m bloombee.cli.run_server ... --block_indices 0:16 ...
 python -m bloombee.cli.run_server ... --block_indices 16:32 ...
-python BloomBee/benchmarks/benchmark_inference.py --model huggyllama/llama-7b --torch_dtype float32 --seq_len 4 --batch_size 2
 ```
 
-Representative successful result after the cleanup pass:
+### Forward / backward
 
-- `throughput=5.52 tokens/sec/sequence`
-- `effective_throughput=11.04 tokens/sec`
+The forward/backward path was revalidated after removing `args_structure`:
 
-Representative successful result after the later decode-path cleanup/splitting pass:
+- `benchmark_forward.py`: `Final result: speed=3.97`
+- `benchmark_training.py`: `Final result: fwd_speed=3.92 bwd_speed=6.67`
 
-- `throughput=5.65 tokens/sec/sequence`
-- `effective_throughput=22.59 tokens/sec`
+### Regular decode
 
-Representative successful result after the regular-decode input layout split:
-
-- `throughput=5.64 tokens/sec/sequence`
-- `effective_throughput=22.55 tokens/sec`
-
-Representative successful result after the speculative control-flag cleanup:
-
-- short local speculative benchmark still completes successfully
-- `Final result: speed=0.67`
-
-Representative successful result after rerunning regular inference with a longer decode window:
+Representative local regular-decode results on the current tree:
 
 - `seq_len=64`, `batch_size=1`
-- `throughput=7.66 tokens/sec/sequence`
-- full generated text remains coherent in the local end-to-end check
+- `Final result: throughput=5.61 tokens/sec/sequence, effective_throughput=5.61 tokens/sec`
 
-### Micro-batching
+Representative local regular micro-batch result:
 
-Validated that:
+- `seq_len=16`, `batch_size=4`
+- `Final result: throughput=5.24 tokens/sec/sequence, effective_throughput=20.97 tokens/sec`
 
-- `micro_batch_size=2` enables the overlap-only path
-- `batch_size=4, micro_batch_size=2` actually splits into 2 micro-batches
-- removing eager micro-batch `hidden_states.clone()` does not break local 2-server inference
-- current implementation is still **overlap-only**, not KV-memory-saving micro-batching
+### Speculative decoding
 
-### KV cache offload
+Representative local speculative micro-batch result on the current tree:
 
-Validated mixed cache placement through runtime logs:
+- `batch_size=4`, `seq_len=128`
+- `Final result: speed=3.75`
 
-- `Cache GPU%: 50% | CPU%: 50%`
-- `cache_device_type=DeviceType.MIXED`
-- cache segments split across `CUDA` and `CPU`
+### Error scan
 
-### Local speculative decoding
+The latest local regression pass completed without new:
 
-Validated locally with repo-source execution via:
+- `P2PHandlerError`
+- `TimeoutError`
+- `Dimension mismatch`
+- `Failed to push micro-batch`
+- Python traceback / assertion failures
 
-```bash
-PYTHONPATH=/home/user/BloomBee/src
-python -m bloombee.cli.run_dht ...
-python -m bloombee.cli.run_server ... --block_indices 0:16 --batch_size 1 ...
-python -m bloombee.cli.run_server ... --block_indices 16:32 --batch_size 1 ...
-python BloomBee/benchmarks/benchmark_speculative_decoding.py --model huggyllama/llama-7b --torch_dtype float32 --seq_len 4 --batch_size 1 --n_processes 1
-```
+## Current runtime defaults and assumptions
 
-Representative successful result after the speculative fixes:
+- `DEFAULT_MICRO_BATCH_SIZE` is currently back to `0`, so micro-batching is **disabled by default**
+- server policy still keeps:
+  - weights on GPU
+  - activations on GPU
+  - KV cache at `50/50` GPU/CPU
+- micro-batching and speculative micro-batching were validated explicitly during local tests even though the default is now off
 
-- benchmark completes without the previous server-side position-id crash
-- benchmark completes without the previous empty-logits crash in `_extract_best_verified_paths_fixed()`
-- `Final result: speed=0.70`
-- 4 speculative verification iterations executed successfully in the local test run
+## What is still not done
 
-Representative successful result after the later decode-schema split:
+- Hivemind unary `rpc_push` is still used; this PR does **not** replace it with a binary streaming path.
+- Cross-machine transport is still paying the BloomBee serialization + Hivemind protobuf/daemon overhead.
+- The remaining major optimization work is still transport-level or compute-level, not request-layout cleanup.
 
-- speculative benchmark still completes successfully with the compact regular-decode output schema in place
-- `Final result: speed=0.56`
+## Suggested next steps
 
-Representative successful result after the later regular-decode input split and pruner fix:
-
-- speculative benchmark still completes successfully after the compact/minimal regular-decode input layouts
-- `Final result: speed=1.12`
-
-Representative successful result after moving speculative control flags to metadata:
-
-- speculative benchmark still completes successfully with `spec_compact_v1`
-- `Final result: speed=0.67`
-
-## Notes
-
-- This PR does **not** yet replace Hivemind unary protobuf `rpc_push` with a binary streaming path.
-- The branch currently includes the active local server policy/testing settings used during validation.
-- Speculative decoding is now locally runnable again, but this PR does not yet try to optimize speculative throughput.
-- Regular decode input/output tensors are slimmer, but the regular path still carries a small routing/control prefix for downstream compatibility.
-- Speculative requests now rely on metadata for control flags, but speculative output/routing tensors are still more complex than regular decode.
-
-## Next steps
-
-1. Continue simplifying speculative request/control state, especially the remaining routing/output tensors that are still speculative-specific.
-2. Revisit why speculative cross-stage transfer is still taking the `rpc_push` path even when the code intends to keep full speculative context.
-3. Benchmark speculative decoding with larger `seq_len` / `batch_size` combinations and check whether 50/50 KV offload remains stable.
-4. Revisit whether the remaining regular-decode routing prefix can be reduced further without complicating downstream stage forwarding.
-5. Revisit transport-level optimization for cross-machine runs, especially the unary `rpc_push` path over Hivemind.
+1. Revisit transport-level optimization for cross-machine runs, especially unary `rpc_push` over Hivemind.
+2. Evaluate client-side `lm_head` / sampling placement if single-stream decode throughput is still limited by client-side work.
+3. Benchmark speculative decoding with larger `seq_len` / `batch_size` combinations under the now-stable micro-batch path.
+4. Re-evaluate quantization / kernel-side compute optimization, since the regular local decode path is now more compute-bound than metadata-bound.
