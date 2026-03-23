@@ -200,28 +200,82 @@ class _ServerInferenceSession:
 
         with transport_profile_scope() as transport_profile:
             if not push_only_decode:
-                # rpc_inference uses a fixed positional tensor layout, so we can
-                # skip generic args_structure packing on this hot path.
-                input_tensors = (
-                    inputs,
-                    normalize_arg(keep_indices),
-                    normalize_arg(torch.tensor(1 if need_pruning else 0)),
-                    normalize_arg(tree_attention_mask),
-                    normalize_arg(kv_cache_position_ids),
-                    normalize_arg(draft_tokens),
-                    normalize_arg(prefill_length),
-                    normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
-                    prompts,
-                    hypo_ids,
-                )
+                # Regular decode does not need speculative-only tensors on the
+                # hot path. Keep a compact positional layout and let metadata
+                # carry control flags such as is_spec_dec.
+                use_compact_decode_layout = not is_spec_dec
+                if use_compact_decode_layout:
+                    has_prompt_payload = prompts is not None and not is_dummy(prompts)
+                    has_hypo_payload = hypo_ids is not None and not is_dummy(hypo_ids)
+                    if has_prompt_payload or has_hypo_payload:
+                        input_tensors = (
+                            inputs,
+                            normalize_arg(keep_indices),
+                            normalize_arg(torch.tensor(1 if need_pruning else 0)),
+                            normalize_arg(prefill_length),
+                            prompts,
+                            hypo_ids,
+                        )
+                        tensor_debug_names = (
+                            "hidden_states",
+                            "keep_indices",
+                            "need_pruning",
+                            "prefill_length",
+                            "prompts",
+                            "hypo_ids",
+                        )
+                        regular_layout_name = "decode_compact_v1"
+                    else:
+                        input_tensors = (
+                            inputs,
+                            normalize_arg(keep_indices),
+                            normalize_arg(torch.tensor(1 if need_pruning else 0)),
+                            normalize_arg(prefill_length),
+                        )
+                        tensor_debug_names = (
+                            "hidden_states",
+                            "keep_indices",
+                            "need_pruning",
+                            "prefill_length",
+                        )
+                        regular_layout_name = "decode_minimal_v1"
+                else:
+                    input_tensors = (
+                        inputs,
+                        normalize_arg(keep_indices),
+                        normalize_arg(torch.tensor(1 if need_pruning else 0)),
+                        normalize_arg(tree_attention_mask),
+                        normalize_arg(kv_cache_position_ids),
+                        normalize_arg(draft_tokens),
+                        normalize_arg(prefill_length),
+                        normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
+                        prompts,
+                        hypo_ids,
+                    )
+                    tensor_debug_names = (
+                        "hidden_states",
+                        "keep_indices",
+                        "need_pruning",
+                        "tree_attention_mask",
+                        "kv_cache_position_ids",
+                        "draft_tokens",
+                        "prefill_length",
+                        "is_spec_dec",
+                        "prompts",
+                        "hypo_ids",
+                    )
                 request_metadata = dict(session_id=self.session_id, step_id=step_id)
                 if not self.stepped:
                     request_metadata.update(self.session_metadata)
                 # Explicitly expose speculative-decoding mode in metadata so the server
                 # can make safe KV allocation decisions before first step processing.
                 request_metadata["is_spec_dec"] = 1 if is_spec_dec else 0
+                request_metadata["need_pruning"] = 1 if need_pruning else 0
                 request_metadata["full_batch_size"] = int(logical_full_batch_size)
                 request_metadata["micro_batch_size"] = int(inputs.shape[0]) if inputs.ndim >= 1 else 1
+                request_metadata["inference_layout"] = (
+                    regular_layout_name if use_compact_decode_layout else "spec_full_v1"
+                )
                 if is_spec_dec:
                     request_metadata["start_from_position"] = self._position + n_input_tokens
                 elif self._position is not None:
@@ -237,19 +291,6 @@ class _ServerInferenceSession:
                 server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
                 compression = server_side_inference_schema[0].compression
                 inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
-                tensor_debug_names = (
-                    "hidden_states",
-                    "keep_indices",
-                    "need_pruning",
-                    "prompts",
-                    "hypo_ids",
-                    "tree_attention_mask",
-                    "kv_cache_position_ids",
-                    "draft_tokens",
-                    "prefill_length",
-                    "is_spec_dec",
-                )
-
                 # [NETWORK_TIMING] Measure serialization time
                 serialize_start = time.perf_counter()
 

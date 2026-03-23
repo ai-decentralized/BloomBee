@@ -1806,7 +1806,27 @@ async def iterate_rpc_inference(
         if args_structure is not None:
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
-        hidden_states, keep_indices, need_pruning1, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, prompts, hypo_ids, *_ = flat_tensors
+        inference_layout = step_metadata.get("inference_layout")
+        if inference_layout == "decode_minimal_v1" or (
+            inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 4
+        ):
+            hidden_states, keep_indices, need_pruning1, prefill_length, *_ = flat_tensors
+            tree_attention_mask = None
+            kv_cache_position_ids = None
+            draft_tokens = None
+            is_spec_dec1 = None
+            prompts = DUMMY
+            hypo_ids = DUMMY_INT64
+        elif inference_layout == "decode_compact_v1" or (
+            inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 6
+        ):
+            hidden_states, keep_indices, need_pruning1, prefill_length, prompts, hypo_ids, *_ = flat_tensors
+            tree_attention_mask = None
+            kv_cache_position_ids = None
+            draft_tokens = None
+            is_spec_dec1 = None
+        else:
+            hidden_states, keep_indices, need_pruning1, tree_attention_mask, kv_cache_position_ids, draft_tokens, prefill_length, is_spec_dec1, prompts, hypo_ids, *_ = flat_tensors
         draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous

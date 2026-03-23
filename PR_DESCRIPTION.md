@@ -2,7 +2,7 @@
 
 This PR improves the stage-to-stage inference path and cleans up several runtime hot-path and shutdown issues.
 
-It combines seven changesets:
+It combines eight changesets:
 
 1. `Optimize downstream decode push path`
 2. `Clean inference metadata and runtime cleanup`
@@ -11,6 +11,7 @@ It combines seven changesets:
 5. `Avoid redundant microbatch input cloning`
 6. `Use empty optional tensors for decode outputs`
 7. `Split decode inference output schema`
+8. `Split and slim regular decode input layouts`
 
 The current focus is same-machine validation for a cross-machine-oriented codebase. The changes therefore avoid adding local-only fast paths and instead reduce overhead in the existing BloomBee + Hivemind transport/runtime path.
 
@@ -66,6 +67,15 @@ The current focus is same-machine validation for a cross-machine-oriented codeba
   - speculative decoding keeps the 6-tensor routing prefix
 - Update `_push_outputs()` so stage-to-stage forwarding accepts either compact decode outputs or full speculative outputs and reconstructs the downstream request layout correctly.
 
+### 8. Slim regular decode request inputs and harden the speculative pruner
+
+- Split regular decode request inputs away from the old shared speculative-style `rpc_inference` layout.
+- Regular decode now uses:
+  - a 6-tensor compact layout when prompt/hypothesis payloads are actually present
+  - a 4-tensor minimal layout for the common case with no prompt/hypothesis payload
+- Server-side full-batch inference now accepts and defaults both compact/minimal regular layouts without changing speculative request handling.
+- Fix `SimpleProbabilityPruner` token indexing by casting draft-token ids to integers before indexing logits/probabilities.
+
 ## Validation
 
 ### Local end-to-end inference
@@ -89,6 +99,11 @@ Representative successful result after the later decode-path cleanup/splitting p
 
 - `throughput=5.65 tokens/sec/sequence`
 - `effective_throughput=22.59 tokens/sec`
+
+Representative successful result after the regular-decode input layout split:
+
+- `throughput=5.64 tokens/sec/sequence`
+- `effective_throughput=22.55 tokens/sec`
 
 ### Micro-batching
 
@@ -131,17 +146,22 @@ Representative successful result after the later decode-schema split:
 - speculative benchmark still completes successfully with the compact regular-decode output schema in place
 - `Final result: speed=0.56`
 
+Representative successful result after the later regular-decode input split and pruner fix:
+
+- speculative benchmark still completes successfully after the compact/minimal regular-decode input layouts
+- `Final result: speed=1.12`
+
 ## Notes
 
 - This PR does **not** yet replace Hivemind unary protobuf `rpc_push` with a binary streaming path.
 - The branch currently includes the active local server policy/testing settings used during validation.
 - Speculative decoding is now locally runnable again, but this PR does not yet try to optimize speculative throughput.
-- Regular decode output tensors are now slimmer, but regular decode input tensors still use the older shared request layout.
+- Regular decode input/output tensors are slimmer, but the regular path still carries a small routing/control prefix for downstream compatibility.
 
 ## Next steps
 
-1. Split the regular decode input layout from the speculative/shared `rpc_inference` request layout to remove the remaining placeholder tensors on the client send path.
-2. Continue simplifying speculative request/control state, especially fields still duplicated across tensors and metadata.
-3. Revisit why speculative cross-stage transfer is still taking the `rpc_push` path even when the code intends to keep full speculative context.
-4. Benchmark speculative decoding with larger `seq_len` / `batch_size` combinations and check whether 50/50 KV offload remains stable.
+1. Continue simplifying speculative request/control state, especially fields still duplicated across tensors and metadata.
+2. Revisit why speculative cross-stage transfer is still taking the `rpc_push` path even when the code intends to keep full speculative context.
+3. Benchmark speculative decoding with larger `seq_len` / `batch_size` combinations and check whether 50/50 KV offload remains stable.
+4. Revisit whether the remaining regular-decode routing prefix can be reduced further without complicating downstream stage forwarding.
 5. Revisit transport-level optimization for cross-machine runs, especially the unary `rpc_push` path over Hivemind.
