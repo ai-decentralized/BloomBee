@@ -43,6 +43,7 @@ from bloombee.utils.microbatch_config import (
     compute_micro_batch_ranges,
     split_tensor_to_microbatches,
     merge_microbatch_outputs,
+    merge_microbatch_keep_indices,
     log_microbatch_split,
     log_microbatch_merge,
     log_stage_timing,
@@ -454,9 +455,13 @@ def restore_hidden_states(
         flat_hidden = flattened_hidden_states
         hidden_size = flattened_hidden_states.shape[-1]
     elif flattened_hidden_states.ndim == 3:
-        # [num_micro_batches, N_valid_per_mb, hidden_size] -> 合并前两维
-        num_mb, n_valid_per_mb, hidden_size = flattened_hidden_states.shape
-        flat_hidden = flattened_hidden_states.reshape(-1, hidden_size)  # [num_mb * N_valid_per_mb, hidden_size]
+        hidden_size = flattened_hidden_states.shape[-1]
+        if tuple(flattened_hidden_states.shape[:2]) == tuple(keep_indices.shape):
+            valid_mask = keep_indices >= 0
+            flat_hidden = flattened_hidden_states[valid_mask]
+        else:
+            # [num_micro_batches, N_valid_per_mb, hidden_size] -> 合并前两维
+            flat_hidden = flattened_hidden_states.reshape(-1, hidden_size)
     else:
         raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
     
@@ -1969,7 +1974,7 @@ async def iterate_rpc_inference(
             if can_merge_pools:
                 # Merged pools path: all blocks processed in one call
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
-                if should_split_batch(batch_size):
+                if should_split_batch(batch_size) and not is_spec_dec:
                     execution_mode = "merged_microbatch"
                     # Micro-batch pipeline path: split batch, process with overlap
                     import asyncio
@@ -2304,7 +2309,7 @@ async def iterate_rpc_inference(
                     micro_keep_list = [r[1] for r in results]
                     
                     hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
-                    keep_indices = merge_microbatch_outputs(micro_keep_list, dim=0)
+                    keep_indices = merge_microbatch_keep_indices(micro_keep_list, dim=0)
                     
                     # Calculate overlap statistics
                     total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
@@ -2366,7 +2371,30 @@ async def iterate_rpc_inference(
                                            f"efficiency={mb_eff:.1f}%")
                     
                     log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.merged_pools")
-                    
+                elif should_split_batch(batch_size) and is_spec_dec:
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} Speculative decoding uses full-batch path in merged_pools "
+                        f"(skip default micro-batch split to preserve spec semantics)"
+                    )
+                    execution_mode = "merged_fullbatch"
+                    inference_infos = build_inference_metadata_batch(
+                        requested_uids,
+                        cache_handles,
+                        prefix_length,
+                        active_adapter,
+                        tree_attention_mask=tree_attention_mask,
+                        kv_cache_position_ids=kv_cache_position_ids,
+                        draft_tokens=draft_tokens,
+                        prefill_length=prefill_length,
+                        keep_indices=keep_indices,
+                        need_pruning=need_pruning,
+                        is_spec_dec=is_spec_dec,
+                    )
+                    submit_result = await requested_backends[0].inference_pool.submit_task(
+                        hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
+                    )
+                    hidden_states, keep_indices, runtime_timing = _unpack_inference_submit_result(submit_result)
+                    _accumulate_runtime_timing(runtime_timing_total, runtime_timing)
                 else:
                     execution_mode = "merged_fullbatch"
                     # Legacy path: process entire batch at once
@@ -2527,7 +2555,7 @@ async def iterate_rpc_inference(
                     micro_keep_list = [r[1] for r in results]
                     
                     hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
-                    keep_indices = merge_microbatch_outputs(micro_keep_list, dim=0)
+                    keep_indices = merge_microbatch_keep_indices(micro_keep_list, dim=0)
                     
                     # Calculate overlap statistics
                     total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
