@@ -211,7 +211,6 @@ class _ServerInferenceSession:
                         input_tensors = (
                             inputs,
                             normalize_arg(keep_indices),
-                            normalize_arg(torch.tensor(1 if need_pruning else 0)),
                             normalize_arg(prefill_length),
                             prompts,
                             hypo_ids,
@@ -219,26 +218,23 @@ class _ServerInferenceSession:
                         tensor_debug_names = (
                             "hidden_states",
                             "keep_indices",
-                            "need_pruning",
                             "prefill_length",
                             "prompts",
                             "hypo_ids",
                         )
-                        regular_layout_name = "decode_compact_v1"
+                        regular_layout_name = "decode_compact_v2"
                     else:
                         input_tensors = (
                             inputs,
                             normalize_arg(keep_indices),
-                            normalize_arg(torch.tensor(1 if need_pruning else 0)),
                             normalize_arg(prefill_length),
                         )
                         tensor_debug_names = (
                             "hidden_states",
                             "keep_indices",
-                            "need_pruning",
                             "prefill_length",
                         )
-                        regular_layout_name = "decode_minimal_v1"
+                        regular_layout_name = "decode_minimal_v2"
                 else:
                     input_tensors = (
                         inputs,

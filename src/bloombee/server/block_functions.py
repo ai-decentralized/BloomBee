@@ -1803,7 +1803,18 @@ async def iterate_rpc_inference(
         deserialize_time = (perf_counter() - deserialize_start) * 1000.0
         full_deserialize_summary = summarize_transport_profile(full_deserialize_profile)
         inference_layout = step_metadata.get("inference_layout")
-        if inference_layout == "decode_minimal_v1" or (
+        if inference_layout == "decode_minimal_v2" or (
+            inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 3
+        ):
+            hidden_states, keep_indices, prefill_length, *_ = flat_tensors
+            need_pruning1 = None
+            tree_attention_mask = None
+            kv_cache_position_ids = None
+            draft_tokens = None
+            is_spec_dec1 = None
+            prompts = DUMMY
+            hypo_ids = DUMMY_INT64
+        elif inference_layout == "decode_minimal_v1" or (
             inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 4
         ):
             hidden_states, keep_indices, need_pruning1, prefill_length, *_ = flat_tensors
@@ -1813,6 +1824,15 @@ async def iterate_rpc_inference(
             is_spec_dec1 = None
             prompts = DUMMY
             hypo_ids = DUMMY_INT64
+        elif inference_layout == "decode_compact_v2" or (
+            inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 5
+        ):
+            hidden_states, keep_indices, prefill_length, prompts, hypo_ids, *_ = flat_tensors
+            need_pruning1 = None
+            tree_attention_mask = None
+            kv_cache_position_ids = None
+            draft_tokens = None
+            is_spec_dec1 = None
         elif inference_layout == "decode_compact_v1" or (
             inference_layout is None and not _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) == 6
         ):

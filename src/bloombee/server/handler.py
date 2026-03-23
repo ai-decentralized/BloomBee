@@ -2278,7 +2278,28 @@ class TransformerConnectionHandler(ConnectionHandler):
             # metadata when possible.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
             if len(normalized_outputs) == 3:
-                next_tensors = normalized_outputs + list(request.tensors[3:])
+                inference_layout = metadata.get("inference_layout")
+                if inference_layout in {"decode_minimal_v2", "decode_compact_v2"}:
+                    need_pruning_next = deserialize_torch_tensor(normalized_outputs[2])
+                    if torch.is_tensor(need_pruning_next) and need_pruning_next.numel() > 0:
+                        next_need_pruning = int(bool(need_pruning_next.bool().any().item()))
+                    else:
+                        next_need_pruning = 0
+                    if inference_layout == "decode_minimal_v2":
+                        next_tensors = [
+                            normalized_outputs[0],
+                            normalized_outputs[1],
+                            request.tensors[2],
+                        ]
+                    else:
+                        next_tensors = [
+                            normalized_outputs[0],
+                            normalized_outputs[1],
+                            *list(request.tensors[2:]),
+                        ]
+                else:
+                    next_need_pruning = None
+                    next_tensors = normalized_outputs + list(request.tensors[3:])
             elif len(normalized_outputs) == 6:
                 inference_layout = metadata.get("inference_layout")
                 if inference_layout == "spec_compact_v1":
@@ -2306,6 +2327,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                 )
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
+            if len(normalized_outputs) == 3 and metadata.get("inference_layout") in {"decode_minimal_v2", "decode_compact_v2"}:
+                next_metadata["need_pruning"] = next_need_pruning
             if len(normalized_outputs) == 6 and metadata.get("inference_layout") == "spec_compact_v1":
                 next_metadata["need_pruning"] = next_need_pruning
             next_metadata["sender_blocks"] = sender_blocks
