@@ -504,10 +504,12 @@ class RemoteSequenceManager:
         :param kwargs: additional request context, such as remote peer ID
         :returns: msgpack-serialized metadata dict that will be passed alongside a given request
         """
-        metadata = dict(
-            points=self.policy.get_points(protocol, *args, **kwargs),
-            active_adapter=self.config.active_adapter,
-        )
+        metadata = {}
+        points = self.policy.get_points(protocol, *args, **kwargs)
+        if points:
+            metadata["points"] = points
+        if self.config.active_adapter:
+            metadata["active_adapter"] = self.config.active_adapter
         if args_structure is not None:
             metadata["args_structure"] = args_structure
         return metadata
