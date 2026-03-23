@@ -259,10 +259,12 @@ class _ServerInferenceSession:
                 request_metadata = dict(session_id=self.session_id, step_id=step_id)
                 if not self.stepped:
                     request_metadata.update(self.session_metadata)
-                # Explicitly expose speculative-decoding mode in metadata so the server
-                # can make safe KV allocation decisions before first step processing.
-                request_metadata["is_spec_dec"] = 1 if is_spec_dec else 0
-                request_metadata["need_pruning"] = 1 if need_pruning else 0
+                # Only send non-default control flags; the server already
+                # treats missing values as false/zero.
+                if is_spec_dec:
+                    request_metadata["is_spec_dec"] = 1
+                if need_pruning:
+                    request_metadata["need_pruning"] = 1
                 request_metadata["full_batch_size"] = int(logical_full_batch_size)
                 request_metadata["micro_batch_size"] = int(inputs.shape[0]) if inputs.ndim >= 1 else 1
                 request_metadata["inference_layout"] = (
