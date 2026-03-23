@@ -449,6 +449,56 @@ def restore_hidden_states(
     device = flattened_hidden_states.device
     dtype = flattened_hidden_states.dtype
     
+    def _flatten_hidden_with_keep_layout(hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.ndim == 2:
+            return hidden_states
+
+        if hidden_states.ndim != 3:
+            raise ValueError(f"Unexpected flattened_hidden_states dim: {hidden_states.ndim}")
+
+        if tuple(hidden_states.shape[:2]) == tuple(keep_indices.shape):
+            valid_mask_local = keep_indices >= 0
+            return hidden_states[valid_mask_local]
+
+        num_groups, _, local_hidden_size = hidden_states.shape
+        total_batch = int(keep_indices.shape[0])
+
+        # Speculative micro-batch merges can arrive as
+        # [num_micro_batches, max_valid_per_mb, hidden_size] while keep_indices is
+        # [full_batch, max_keep_len]. Recover the flattened valid rows by consuming
+        # each micro-batch slice according to the number of valid keep entries for
+        # the corresponding batch group.
+        if num_groups > 0 and total_batch % num_groups == 0:
+            batch_per_group = total_batch // num_groups
+            grouped_rows = []
+            for group_idx in range(num_groups):
+                keep_chunk = keep_indices[
+                    group_idx * batch_per_group : (group_idx + 1) * batch_per_group
+                ]
+                valid_count = int((keep_chunk >= 0).sum().item())
+                if valid_count == 0:
+                    continue
+
+                group_hidden = hidden_states[group_idx]
+                if int(group_hidden.shape[0]) < valid_count:
+                    raise ValueError(
+                        f"Spec micro-batch hidden rows are shorter than valid keep entries: "
+                        f"group={group_idx}, hidden_rows={group_hidden.shape[0]}, valid_keep={valid_count}"
+                    )
+                grouped_rows.append(group_hidden[:valid_count])
+
+            if grouped_rows:
+                return torch.cat(grouped_rows, dim=0)
+            return hidden_states.new_empty((0, local_hidden_size))
+
+        flat_hidden_local = hidden_states.reshape(-1, local_hidden_size)
+        expected_valid = int((keep_indices >= 0).sum().item())
+        if flat_hidden_local.shape[0] > expected_valid:
+            trailing = flat_hidden_local[expected_valid:]
+            if trailing.numel() == 0 or not torch.count_nonzero(trailing).item():
+                flat_hidden_local = flat_hidden_local[:expected_valid]
+        return flat_hidden_local
+
     # 处理不同维度的输入
     if flattened_hidden_states.ndim == 2:
         # [N_total_valid, hidden_size] -> 直接使用
@@ -456,12 +506,7 @@ def restore_hidden_states(
         hidden_size = flattened_hidden_states.shape[-1]
     elif flattened_hidden_states.ndim == 3:
         hidden_size = flattened_hidden_states.shape[-1]
-        if tuple(flattened_hidden_states.shape[:2]) == tuple(keep_indices.shape):
-            valid_mask = keep_indices >= 0
-            flat_hidden = flattened_hidden_states[valid_mask]
-        else:
-            # [num_micro_batches, N_valid_per_mb, hidden_size] -> 合并前两维
-            flat_hidden = flattened_hidden_states.reshape(-1, hidden_size)
+        flat_hidden = _flatten_hidden_with_keep_layout(flattened_hidden_states)
     else:
         raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
     
@@ -517,6 +562,39 @@ def _should_restore_spec_hidden_states(
     actual_batch = int(hidden_states.shape[0])
     actual_seq = int(hidden_states.shape[1])
     return actual_batch != expected_batch or actual_seq != expected_seq
+
+
+def _merge_inference_microbatch_hidden_states(
+    outputs: Sequence[torch.Tensor],
+    requested_backends: Sequence[TransformerBackend],
+    *,
+    is_spec_dec: bool,
+) -> Optional[torch.Tensor]:
+    valid_outputs = [out for out in outputs if out is not None]
+    if not valid_outputs:
+        return None
+
+    if not is_spec_dec or not bool(getattr(requested_backends[-1], "_is_last_block", False)):
+        return merge_microbatch_outputs(list(valid_outputs), dim=0)
+
+    # The last speculative stage returns flattened valid rows as [1, N_valid, H]
+    # per micro-batch. Merge them back into the canonical full-batch spec layout
+    # [1, N_total_valid, H] so downstream/client restore logic sees the same shape
+    # as the non-microbatched speculative path.
+    flattened_chunks = []
+    for out in valid_outputs:
+        if not torch.is_tensor(out):
+            return merge_microbatch_outputs(list(valid_outputs), dim=0)
+        if out.ndim == 3 and int(out.shape[0]) == 1:
+            flattened_chunks.append(out.squeeze(0))
+        elif out.ndim == 2:
+            flattened_chunks.append(out)
+        else:
+            return merge_microbatch_outputs(list(valid_outputs), dim=0)
+
+    if not flattened_chunks:
+        return None
+    return torch.cat(flattened_chunks, dim=0).unsqueeze(0)
 
 def ensure_tensors(flat_tensors):
     result = []
@@ -1174,15 +1252,21 @@ async def iterate_rpc_inference(
                     )
 
                 merged_hidden_list = []
+                merged_keep_list = []
                 for idx in sorted_indices:
                     h, k, offset = accum['results'][idx]
                     merged_hidden_list.append(h)
-                
-                # Merge hidden states
-                merged_hidden_states = torch.cat(merged_hidden_list, dim=0)
-                
-                # Use last keep_indices (they should all be the same per-token)
-                _, merged_keep_indices, _ = accum['results'][sorted_indices[-1]]
+                    merged_keep_list.append(k)
+
+                # Merge hidden states and keep_indices consistently across micro-batches.
+                # Speculative decoding can produce variable-width keep tensors per micro-batch,
+                # so both tensors must be merged with the same padding-aware logic.
+                merged_hidden_states = _merge_inference_microbatch_hidden_states(
+                    merged_hidden_list,
+                    requested_backends,
+                    is_spec_dec=is_spec_dec,
+                )
+                merged_keep_indices = merge_microbatch_keep_indices(merged_keep_list, dim=0)
                 
                 if log_mb_detail:
                     logger.info(
@@ -1974,7 +2058,7 @@ async def iterate_rpc_inference(
             if can_merge_pools:
                 # Merged pools path: all blocks processed in one call
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
-                if should_split_batch(batch_size) and not is_spec_dec:
+                if should_split_batch(batch_size):
                     execution_mode = "merged_microbatch"
                     # Micro-batch pipeline path: split batch, process with overlap
                     import asyncio
@@ -2308,7 +2392,11 @@ async def iterate_rpc_inference(
                     micro_hidden_list = [r[0] for r in results]
                     micro_keep_list = [r[1] for r in results]
                     
-                    hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
+                    hidden_states = _merge_inference_microbatch_hidden_states(
+                        micro_hidden_list,
+                        requested_backends,
+                        is_spec_dec=is_spec_dec,
+                    )
                     keep_indices = merge_microbatch_keep_indices(micro_keep_list, dim=0)
                     
                     # Calculate overlap statistics
@@ -2371,30 +2459,6 @@ async def iterate_rpc_inference(
                                            f"efficiency={mb_eff:.1f}%")
                     
                     log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.merged_pools")
-                elif should_split_batch(batch_size) and is_spec_dec:
-                    logger.info(
-                        f"{MBPIPE_LOG_PREFIX} Speculative decoding uses full-batch path in merged_pools "
-                        f"(skip default micro-batch split to preserve spec semantics)"
-                    )
-                    execution_mode = "merged_fullbatch"
-                    inference_infos = build_inference_metadata_batch(
-                        requested_uids,
-                        cache_handles,
-                        prefix_length,
-                        active_adapter,
-                        tree_attention_mask=tree_attention_mask,
-                        kv_cache_position_ids=kv_cache_position_ids,
-                        draft_tokens=draft_tokens,
-                        prefill_length=prefill_length,
-                        keep_indices=keep_indices,
-                        need_pruning=need_pruning,
-                        is_spec_dec=is_spec_dec,
-                    )
-                    submit_result = await requested_backends[0].inference_pool.submit_task(
-                        hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
-                    )
-                    hidden_states, keep_indices, runtime_timing = _unpack_inference_submit_result(submit_result)
-                    _accumulate_runtime_timing(runtime_timing_total, runtime_timing)
                 else:
                     execution_mode = "merged_fullbatch"
                     # Legacy path: process entire batch at once
@@ -2420,7 +2484,7 @@ async def iterate_rpc_inference(
             else:
                 # Separate pools path: process backends one by one
                 # [MBPIPE] Check if we should split into micro-batches with pipeline overlap
-                if should_split_batch(batch_size) and not is_spec_dec:
+                if should_split_batch(batch_size):
                     execution_mode = "separate_microbatch"
                     # Micro-batch pipeline path: split batch, process with overlap
                     micro_ranges = compute_micro_batch_ranges(batch_size)
@@ -2554,7 +2618,11 @@ async def iterate_rpc_inference(
                     micro_hidden_list = [r[0] for r in results]
                     micro_keep_list = [r[1] for r in results]
                     
-                    hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
+                    hidden_states = _merge_inference_microbatch_hidden_states(
+                        micro_hidden_list,
+                        requested_backends,
+                        is_spec_dec=is_spec_dec,
+                    )
                     keep_indices = merge_microbatch_keep_indices(micro_keep_list, dim=0)
                     
                     # Calculate overlap statistics

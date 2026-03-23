@@ -709,7 +709,10 @@ class ModuleContainer(threading.Thread):
                     policy=policy,
                 )
                 # see_memory_usage("-----------------------------------------sever: after convert_block  ")
-                is_last_block = block_index == block_indices[-1]
+                # Speculative decoding's prune/flatten logic must run only on the
+                # global last transformer block, not merely the last block hosted
+                # by the current server span.
+                is_last_block = block_index == (block_config.num_hidden_layers - 1)
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
                     block,  ###### block instance

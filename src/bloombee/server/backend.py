@@ -368,7 +368,36 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 if self._is_spec_decoding:
                     full_mask = inference_info.tree_attention_mask.to(device)
-                    attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                    if full_mask is not None:
+                        expected_rows = seq_len
+                        expected_cols = cache_len + seq_len
+                        if full_mask.ndim == 3:
+                            if full_mask.shape[1] > expected_rows or full_mask.shape[2] > expected_cols:
+                                logger.info(
+                                    "[SPEC_MASK_ALIGN] %s cropping tree_attention_mask from %s to (%s, %s, %s) "
+                                    "(cache_len=%s, batch_offset=%s, micro_batch=%s)",
+                                    self.name,
+                                    tuple(full_mask.shape),
+                                    int(full_mask.shape[0]),
+                                    expected_rows,
+                                    expected_cols,
+                                    cache_len,
+                                    inference_info.batch_offset,
+                                    inference_info.micro_batch_size,
+                                )
+                                full_mask = full_mask[:, :expected_rows, :expected_cols].contiguous()
+                            elif full_mask.shape[1] != expected_rows or full_mask.shape[2] != expected_cols:
+                                logger.warning(
+                                    "[SPEC_MASK_ALIGN] %s tree_attention_mask shape %s does not match "
+                                    "expected_rows=%s expected_cols=%s",
+                                    self.name,
+                                    tuple(full_mask.shape),
+                                    expected_rows,
+                                    expected_cols,
+                                )
+                        attention_mask = self.convert_mask_to_scores(full_mask)
+                    else:
+                        attention_mask = None
                 if full_mask == None:
                     full_mask = self._create_causal_attention_mask(batch_size, (seq_len + cache_len), cache_len, hidden_states.device)
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
@@ -470,8 +499,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
                 keep_indices = self._normalize_keep_indices(
                     inference_info.keep_indices,
-                    batch_size=output_hidden_states.shape[0],
-                    seq_len=output_hidden_states.shape[1],
+                    batch_size=batch_size,
+                    seq_len=seq_len,
                     device=output_hidden_states.device,
                 )
                 
@@ -720,22 +749,29 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         else:
             # Generation 阶段：基于有效 token 数量计算 position
             kv_cache_position_ids = kv_cache_position_ids.to(device)
-            kv_cache_position_ids = self._slice_batch_aligned(kv_cache_position_ids, batch_offset, batch_offset + B, kv_cache_position_ids.shape[0])
+            # Micro-batch inputs may already carry a per-micro-batch slice.
+            # Only apply logical batch_offset slicing when the incoming tensor
+            # still represents the full logical batch.
+            if kv_cache_position_ids.ndim >= 2 and kv_cache_position_ids.shape[0] != B:
+                kv_cache_position_ids = self._slice_batch_aligned(
+                    kv_cache_position_ids,
+                    batch_offset,
+                    batch_offset + B,
+                    kv_cache_position_ids.shape[0],
+                )
             valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
-            
-            # 计算每个 batch 的有效 token 数量
-            # 有效数量 = root_position + kv_cache_position_ids 中的有效值数量
-            batch_indices = torch.arange(B, device=device)
-            first_valid_idx = valid_mask.int().argmax(dim=1)
-            root_positions = kv_cache_position_ids[batch_indices, first_valid_idx]  # (B,)
-            
-            tree_valid_counts = valid_mask.sum(dim=1)  # (B,)
-            
-            # 有效 token 总数 = root_position + tree_valid_counts
-            effective_token_counts = root_positions + tree_valid_counts  # (B,)
-            
-            # 新 token 的 base position = 有效 token 总数
-            base_positions = effective_token_counts  # (B,)
+
+            # kv_cache_position_ids stores the positions that are already present in
+            # cache after the previous speculative verification step. The next tree
+            # should therefore start right after the largest valid cached position.
+            # Using root_position + valid_count underestimates the base when previous
+            # accepted positions are sparse after pruning.
+            max_positions = torch.where(
+                valid_mask,
+                kv_cache_position_ids,
+                torch.full_like(kv_cache_position_ids, -1),
+            ).max(dim=1).values
+            base_positions = max_positions + 1
             
             # 生成 position_ids
             # 如果指定了 target_seq_len，使用它；否则使用 tree_len

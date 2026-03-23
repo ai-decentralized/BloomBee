@@ -714,15 +714,59 @@ class InferenceSession:
         device = flattened_hidden_states.device
         dtype = flattened_hidden_states.dtype
         
+        def _flatten_hidden_with_keep_layout(hidden_states: torch.Tensor) -> torch.Tensor:
+            if hidden_states.ndim == 2:
+                return hidden_states
+
+            if hidden_states.ndim != 3:
+                raise ValueError(f"Unexpected flattened_hidden_states dim: {hidden_states.ndim}")
+
+            if tuple(hidden_states.shape[:2]) == tuple(keep_indices.shape):
+                valid_mask_local = keep_indices >= 0
+                return hidden_states[valid_mask_local]
+
+            num_groups, _, local_hidden_size = hidden_states.shape
+            total_batch = int(keep_indices.shape[0])
+
+            if num_groups > 0 and total_batch % num_groups == 0:
+                batch_per_group = total_batch // num_groups
+                grouped_rows = []
+                for group_idx in range(num_groups):
+                    keep_chunk = keep_indices[
+                        group_idx * batch_per_group : (group_idx + 1) * batch_per_group
+                    ]
+                    valid_count = int((keep_chunk >= 0).sum().item())
+                    if valid_count == 0:
+                        continue
+
+                    group_hidden = hidden_states[group_idx]
+                    if int(group_hidden.shape[0]) < valid_count:
+                        raise ValueError(
+                            f"Spec micro-batch hidden rows are shorter than valid keep entries: "
+                            f"group={group_idx}, hidden_rows={group_hidden.shape[0]}, valid_keep={valid_count}"
+                        )
+                    grouped_rows.append(group_hidden[:valid_count])
+
+                if grouped_rows:
+                    return torch.cat(grouped_rows, dim=0)
+                return hidden_states.new_empty((0, local_hidden_size))
+
+            flat_hidden_local = hidden_states.reshape(-1, local_hidden_size)
+            expected_valid = int((keep_indices >= 0).sum().item())
+            if flat_hidden_local.shape[0] > expected_valid:
+                trailing = flat_hidden_local[expected_valid:]
+                if trailing.numel() == 0 or not torch.count_nonzero(trailing).item():
+                    flat_hidden_local = flat_hidden_local[:expected_valid]
+            return flat_hidden_local
+
         # 处理不同维度的输入
         if flattened_hidden_states.ndim == 2:
             # [N_total_valid, hidden_size] -> 直接使用
             flat_hidden = flattened_hidden_states
             hidden_size = flattened_hidden_states.shape[-1]
         elif flattened_hidden_states.ndim == 3:
-            # [num_micro_batches, N_valid_per_mb, hidden_size] -> 合并前两维
-            num_mb, n_valid_per_mb, hidden_size = flattened_hidden_states.shape
-            flat_hidden = flattened_hidden_states.reshape(-1, hidden_size)  # [num_mb * N_valid_per_mb, hidden_size]
+            hidden_size = flattened_hidden_states.shape[-1]
+            flat_hidden = _flatten_hidden_with_keep_layout(flattened_hidden_states)
         else:
             raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
         

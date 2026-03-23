@@ -90,7 +90,7 @@ def slice_microbatch_inputs(
         hidden_states=mb_hidden_states,
         hypo_ids=mb_hypo,
         tree_attention_mask=slice_batch_aligned(tree_attention_mask, mb_start, mb_end, full_batch_size),
-        kv_cache_position_ids=kv_cache_position_ids,
+        kv_cache_position_ids=slice_batch_aligned(kv_cache_position_ids, mb_start, mb_end, full_batch_size),
         draft_tokens=slice_batch_aligned(draft_tokens, mb_start, mb_end, full_batch_size),
         prefill_length=slice_batch_aligned(prefill_length, mb_start, mb_end, full_batch_size),
         keep_indices=slice_keep_indices(keep_indices, mb_start, mb_end, full_batch_size),

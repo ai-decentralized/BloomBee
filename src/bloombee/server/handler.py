@@ -2643,7 +2643,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"invariant=1"
             )
             
-            # Build metadata for micro-batch push
+            # Build metadata for micro-batch push. cpu2nic time depends on the
+            # final metadata/request assembly below, so initialize it after the
+            # request is fully prepared instead of referencing an unbound local.
             push_metadata = {
                 "session_id": next_session_id,
                 "next_servers": next_servers[1:] if len(next_servers) > 1 else [],
@@ -2662,7 +2664,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "s2s_sender_serialize_end_us": int(serialize_end_us),
                 "s2s_sender_compute_to_serialize_start_ms": float(sender_compute_to_serialize_start_ms),
                 "s2s_sender_gpu2cpu_ms": float(t_gpu2cpu_ms),
-                "s2s_sender_cpu2nic_ms": float(t_cpu2nic_ms),
             }
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
@@ -2726,6 +2727,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                 metadata=serialized_push_metadata,
             )
             t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
+            push_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
+            rpc_request.metadata = MSGPackSerializer.dumps(push_metadata)
             push_tensor_bytes = len(serialized_hidden.buffer) + len(serialized_keep.buffer)
             
             # Create task for background sending - don't await
