@@ -2,10 +2,12 @@
 
 This PR improves the stage-to-stage inference path and cleans up several runtime hot-path and shutdown issues.
 
-It combines two changesets:
+It combines four changesets:
 
 1. `Optimize downstream decode push path`
 2. `Clean inference metadata and runtime cleanup`
+3. `Restore speculative pruner startup path`
+4. speculative-decoding stability fixes validated locally
 
 The current focus is same-machine validation for a cross-machine-oriented codebase. The changes therefore avoid adding local-only fast paths and instead reduce overhead in the existing BloomBee + Hivemind transport/runtime path.
 
@@ -43,6 +45,15 @@ The current focus is same-machine validation for a cross-machine-oriented codeba
 - Default `DEFAULT_MICRO_BATCH_SIZE` is set to `2` for overlap-path testing.
 - Server policy keeps KV cache at `50/50` GPU/CPU for current offload validation.
 
+### 6. Restore speculative decoding to a runnable local state
+
+- Restore the LLaMA-7B speculative pruner startup path and make it lazy-initialized instead of hard-failing server startup.
+- Fix speculative pruner construction for `SimpleProbabilityPruner`.
+- Remove the obsolete `datasets` dependency from `benchmarks/benchmark_speculative_decoding.py`.
+- Restore pruned speculative hidden states before downstream processing when batch/sequence shape no longer matches the original draft tree.
+- Preserve full speculative verification outputs instead of trimming them back to the committed token count on the client path.
+- Add a guarded fallback for empty logits slices during speculative verification.
+
 ## Validation
 
 ### Local end-to-end inference
@@ -78,15 +89,34 @@ Validated mixed cache placement through runtime logs:
 - `cache_device_type=DeviceType.MIXED`
 - cache segments split across `CUDA` and `CPU`
 
+### Local speculative decoding
+
+Validated locally with repo-source execution via:
+
+```bash
+PYTHONPATH=/home/user/BloomBee/src
+python -m bloombee.cli.run_dht ...
+python -m bloombee.cli.run_server ... --block_indices 0:16 --batch_size 1 ...
+python -m bloombee.cli.run_server ... --block_indices 16:32 --batch_size 1 ...
+python BloomBee/benchmarks/benchmark_speculative_decoding.py --model huggyllama/llama-7b --torch_dtype float32 --seq_len 4 --batch_size 1 --n_processes 1
+```
+
+Representative successful result after the speculative fixes:
+
+- benchmark completes without the previous server-side position-id crash
+- benchmark completes without the previous empty-logits crash in `_extract_best_verified_paths_fixed()`
+- `Final result: speed=0.70`
+- 4 speculative verification iterations executed successfully in the local test run
+
 ## Notes
 
-- This PR does **not** yet optimize speculative decoding specifically.
 - This PR does **not** yet replace Hivemind unary protobuf `rpc_push` with a binary streaming path.
 - The branch currently includes the active local server policy/testing settings used during validation.
+- Speculative decoding is now locally runnable again, but this PR does not yet try to optimize speculative throughput.
 
 ## Next steps
 
-1. Restore and verify the LLaMA-7B speculative pruner path if it was commented out.
-2. Run `benchmarks/benchmark_speculative_decoding.py` after each spec-decoding change.
-3. Continue removing duplicated control-plane state in inference requests, especially fields that are currently sent as both tensors and metadata.
+1. Continue simplifying speculative request/control state, especially fields still duplicated across tensors and metadata.
+2. Revisit why speculative cross-stage transfer is still taking the `rpc_push` path even when the code intends to keep full speculative context.
+3. Benchmark speculative decoding with larger `seq_len` / `batch_size` combinations and check whether 50/50 KV offload remains stable.
 4. Revisit transport-level optimization for cross-machine runs, especially the unary `rpc_push` path over Hivemind.

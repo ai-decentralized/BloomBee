@@ -606,6 +606,21 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             actual_len = seq_lengths[batch_idx].item()
             real_fallback_pos = actual_len if is_first_iteration else fallback_pos
             tree_root_position = actual_len - 1
+
+            def _ensure_non_empty_logits(token_logits: torch.Tensor, *, reason: str) -> torch.Tensor:
+                if token_logits.numel() > 0 and token_logits.shape[0] > 0:
+                    return token_logits
+                fallback_start = max(0, seq_len - 1)
+                logger.warning(
+                    "Speculative verification received an empty logits slice; "
+                    "falling back to the last available token logits "
+                    "(batch=%s reason=%s seq_len=%s fallback_start=%s)",
+                    batch_idx,
+                    reason,
+                    seq_len,
+                    fallback_start,
+                )
+                return logits[batch_idx, fallback_start:fallback_start + 1]
             
             node_paths = batch_node_paths[batch_idx]
             best_verified = []
@@ -639,6 +654,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             if len(best_verified) > 0:
                 pos = best_positions[-1] - tree_root_position
                 final_logits = logits[batch_idx, pos].unsqueeze(0)
+                final_logits = _ensure_non_empty_logits(final_logits, reason="best_verified")
                 
                 # 检查是否全 0（被裁剪），需要回退
                 if torch.all(final_logits == 0):
@@ -659,6 +675,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             else:
                 # fallback: 从 fallback_pos 采样
                 final_logits = logits[batch_idx, real_fallback_pos - 1:real_fallback_pos]
+                final_logits = _ensure_non_empty_logits(final_logits, reason="fallback")
                 processed_logits = final_logits.clone()
                 for processor in logits_processor:
                     processed_logits = processor(

@@ -489,6 +489,30 @@ def restore_hidden_states(
     
     return restored_hidden_states
 
+
+def _should_restore_spec_hidden_states(
+    hidden_states: torch.Tensor,
+    keep_indices: Optional[torch.Tensor],
+    draft_tokens: Optional[torch.Tensor],
+) -> bool:
+    if (
+        keep_indices is None
+        or draft_tokens is None
+        or not torch.is_tensor(hidden_states)
+        or not torch.is_tensor(keep_indices)
+        or not torch.is_tensor(draft_tokens)
+        or hidden_states.ndim < 3
+        or keep_indices.ndim < 2
+        or draft_tokens.ndim < 2
+    ):
+        return False
+
+    expected_batch = int(keep_indices.shape[0])
+    expected_seq = int(draft_tokens.shape[-1])
+    actual_batch = int(hidden_states.shape[0])
+    actual_seq = int(hidden_states.shape[1])
+    return actual_batch != expected_batch or actual_seq != expected_seq
+
 def ensure_tensors(flat_tensors):
     result = []
     for i, t in enumerate(flat_tensors):
@@ -745,7 +769,15 @@ async def iterate_rpc_inference(
                 mb_hidden_states, mb_keep_indices, request_context, len(requested_backends)
             )
             
-            if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
+            if is_spec_dec and _should_restore_spec_hidden_states(hidden_states, keep_indices, draft_tokens):
+                logger.info(
+                    "%s Restoring speculative hidden states for downstream processing: "
+                    "hidden=%s keep=%s draft=%s",
+                    MBPIPE_LOG_PREFIX,
+                    tuple(hidden_states.shape),
+                    tuple(keep_indices.shape) if torch.is_tensor(keep_indices) else None,
+                    tuple(draft_tokens.shape) if torch.is_tensor(draft_tokens) else None,
+                )
                 hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
             
             # [MB_DEBUG] Log after fill_microbatch_defaults
@@ -1795,7 +1827,14 @@ async def iterate_rpc_inference(
         # logger.info(f"keep_indices: {keep_indices.shape}")
         # logger.info(f"draft_tokens: {draft_tokens.shape}")
 
-        if is_spec_dec and draft_tokens is not None and draft_tokens.shape[0] != hidden_states.shape[0]:
+        if is_spec_dec and _should_restore_spec_hidden_states(hidden_states, keep_indices, draft_tokens):
+            logger.info(
+                "%s Restoring speculative hidden states in full-batch path: hidden=%s keep=%s draft=%s",
+                MBPIPE_LOG_PREFIX,
+                tuple(hidden_states.shape),
+                tuple(keep_indices.shape) if torch.is_tensor(keep_indices) else None,
+                tuple(draft_tokens.shape) if torch.is_tensor(draft_tokens) else None,
+            )
             hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
             
         batch_size, length_increment, _ = hidden_states.shape

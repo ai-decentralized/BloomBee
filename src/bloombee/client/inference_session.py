@@ -619,11 +619,12 @@ class InferenceSession:
         # A retried downstream server session may resend full history to rebuild its
         # server-side cache, which means the final stage can legitimately return
         # hidden states for the whole cached prefix instead of only the current
-        # step's token(s). The caller of InferenceSession.step() expects outputs
-        # for the logical current input only, so trim the recovered full-history
-        # output back to the current token increment.
+        # step's token(s). Regular decode expects only the newly-advanced token
+        # window here, but speculative verification needs the full per-tree output
+        # tensor, so do not trim speculative steps back to the committed token count.
         if (
-            torch.is_tensor(outputs)
+            not is_spec_dec
+            and torch.is_tensor(outputs)
             and outputs.ndim == 3
             and n_input_tokens > 0
             and outputs.shape[1] > n_input_tokens
