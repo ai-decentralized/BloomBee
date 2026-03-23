@@ -45,10 +45,9 @@ class SpeculativePrunerFactory:
         config.method = method
         
         if method == PruningMethod.SIMPLE_PROBABILITY:
-            return SimpleProbabilityPruner(hidden_size, vocab_size, config, tie_weights)
+            return SimpleProbabilityPruner(hidden_size, vocab_size, config, device="cuda")
         elif method == PruningMethod.ADAPTIVE_NEURAL:
             return AdaptiveNeuralPruner(hidden_size, vocab_size, 64, 'cuda', config)
         else:
             raise ValueError(f"Unknown pruning method: {method}")
-
 

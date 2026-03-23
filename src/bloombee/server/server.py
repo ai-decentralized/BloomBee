@@ -339,22 +339,25 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
 
-        # Temporarily disable speculative pruner initialization during server startup.
-        # hidden_size = 4096
-        # vocab_size = 32000
-        #
-        # config = PruningConfig(
-        #     method=PruningMethod.ADAPTIVE_NEURAL,
-        #     neural_threshold=0.9,
-        #     simple_threshold=0.1,
-        # )
-        #
-        # self.pruner_manager = SpeculativePrunerManager(
-        #     hidden_size=hidden_size,
-        #     vocab_size=vocab_size,
-        #     config=config,
-        # )
-        self.pruner_manager = None
+        enable_spec_pruner = os.environ.get("BLOOMBEE_ENABLE_SPEC_PRUNER", "1") == "1"
+        if enable_spec_pruner:
+            pruner_method = os.environ.get(
+                "BLOOMBEE_SPEC_PRUNER_METHOD",
+                PruningMethod.SIMPLE_PROBABILITY.value,
+            ).strip().lower()
+            config = PruningConfig(method=PruningMethod(pruner_method))
+            self.pruner_manager = SpeculativePrunerManager(
+                hidden_size=self.block_config.hidden_size,
+                vocab_size=self.block_config.vocab_size,
+                config=config,
+            )
+            logger.info(
+                "Speculative pruner enabled (lazy init), method=%s",
+                pruner_method,
+            )
+        else:
+            self.pruner_manager = None
+            logger.info("Speculative pruner disabled via BLOOMBEE_ENABLE_SPEC_PRUNER=0")
 
         ##############################################################
         
