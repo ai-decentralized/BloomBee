@@ -34,7 +34,6 @@ from bloombee.utils.lossless_transport import (
     transport_profile_scope,
 )
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
-from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -251,7 +250,6 @@ async def run_rpc_forward(
     active_adapter: str = "",
     prioritizer: TaskPrioritizerBase,
     points: int = 0,
-    args_structure: Any = None,
 ) -> torch.Tensor:
     """
     Run forward pass on deserialized inputs and prompts, used by rpc_forward and rpc_forward_stream
@@ -264,9 +262,6 @@ async def run_rpc_forward(
     # Start timing for Cross-GPU Transfer Latency measurement
     cross_gpu_start_time = perf_counter()
     
-    if args_structure is not None:
-        # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-        flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     hidden_states, prompts, *_ = flat_tensors
 
     # Fix for bus error in cross-machine setups: ensure tensors are contiguous
@@ -365,11 +360,7 @@ async def run_rpc_backward(
     active_adapter: str = "",
     prioritizer: TaskPrioritizerBase,
     points: int = 0,
-    args_structure: Any = None,
 ) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
-    if args_structure is not None:
-        # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-        flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     inputs, grad_outputs, prompts, *_ = flat_tensors
 
     # Fix for bus error in cross-machine setups: ensure tensors are contiguous

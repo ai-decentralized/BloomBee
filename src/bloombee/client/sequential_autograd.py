@@ -16,7 +16,6 @@ from bloombee.data_structures import CHAIN_DELIMITER, RemoteSpanInfo
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.hivemind_compat import MSGPackSerializer
 from bloombee.utils.misc import DUMMY, is_dummy
-from bloombee.utils.packaging import pack_args_kwargs
 
 logger = get_logger(__name__)
 
@@ -68,11 +67,11 @@ async def sequential_forward(
                 span = sequences.popleft()
 
                 stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, span.peer_id)
-                flat_tensors, args_structure = pack_args_kwargs(inputs, prompts[span.start : span.end])
+                flat_tensors = (inputs, prompts[span.start : span.end])
 
                 span_uids = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
                 metadata = sequence_manager.get_request_metadata(
-                    "rpc_forward", args_structure, span_uids, *flat_tensors
+                    "rpc_forward", span_uids, *flat_tensors
                 )
                 (outputs,) = await run_remote_forward(
                     span_uids,
@@ -153,14 +152,16 @@ async def sequential_backward(
                     span = forward_sequences.pop()
 
                 grad_outputs_cpu = [grad.cpu() for grad in grad_outputs]
-                flat_tensors, args_structure = pack_args_kwargs(
-                    inputs, *grad_outputs_cpu, prompts[span.start : span.end]
+                flat_tensors = (
+                    inputs,
+                    *grad_outputs_cpu,
+                    prompts[span.start : span.end],
                 )
 
                 span_uids = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
                 stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, span.peer_id)
                 metadata = sequence_manager.get_request_metadata(
-                    "rpc_backward", args_structure, span_uids, *flat_tensors, peer_id=span.peer_id
+                    "rpc_backward", span_uids, *flat_tensors, peer_id=span.peer_id
                 )
                 grad_outputs, *span_grad_prompts = await run_remote_backward(
                     span_uids,

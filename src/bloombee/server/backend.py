@@ -224,14 +224,52 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         with self._peft_module.using_adapter(active_adapter):
             # Before forward, ensure model is on correct device
             self._ensure_model_on_device()
-            return super().forward(*inputs)
+            outputs = super().forward(*inputs)
+            if isinstance(outputs, tuple):
+                if len(outputs) == 1:
+                    return outputs
+                if outputs and torch.is_tensor(outputs[0]):
+                    return (outputs[0],)
+            if torch.is_tensor(outputs):
+                return (outputs,)
+            return outputs
 
     def backward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
         *inputs, active_adapter = inputs
         with self._peft_module.using_adapter(active_adapter):
             # Before backward, ensure model is on correct device
             self._ensure_model_on_device()
-            return super().backward(*inputs)
+            if len(inputs) != 2:
+                return super().backward(*inputs)
+
+            hidden_states, grad_outputs = inputs
+            with torch.enable_grad():
+                hidden_states = (
+                    hidden_states.detach().requires_grad_(True)
+                    if hidden_states.is_floating_point()
+                    else hidden_states.detach()
+                )
+                outputs = self.module(hidden_states)
+                if isinstance(outputs, tuple):
+                    output_hidden_states = outputs[0]
+                else:
+                    output_hidden_states = outputs
+
+                grad_outputs = grad_outputs.to(
+                    device=output_hidden_states.device,
+                    dtype=output_hidden_states.dtype,
+                    non_blocking=True,
+                )
+                torch.autograd.backward(
+                    (output_hidden_states,),
+                    grad_tensors=(grad_outputs,),
+                    create_graph=False,
+                    retain_graph=False,
+                )
+                self.on_backward(hidden_states.size(0))
+
+            grad_inputs = hidden_states.grad if isinstance(hidden_states.grad, torch.Tensor) else torch.zeros_like(hidden_states)
+            return (grad_inputs,)
 
     def _ensure_model_on_device(self):
         """Ensure model is on correct device, load from CPU to GPU if needed"""
