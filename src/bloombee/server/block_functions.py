@@ -542,6 +542,17 @@ def _optional_output_tensor(value: Any, empty_tensor: torch.Tensor) -> torch.Ten
         return empty_tensor
     return value
 
+
+def _select_inference_output_schema(
+    requested_backends: Sequence[TransformerBackend],
+    *,
+    is_spec_dec: bool,
+):
+    outputs_schema = tuple(nested_flatten(requested_backends[-1].outputs_schema))
+    if is_spec_dec:
+        return outputs_schema[:6]
+    return outputs_schema[:3]
+
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
     requested_backends: Sequence[TransformerBackend],
@@ -1606,6 +1617,10 @@ async def iterate_rpc_inference(
                     "prefill" if merged_hidden_states.ndim >= 2 and int(merged_hidden_states.shape[1]) > 1 else "decode"
                 )
                 output_debug_names = ("hidden_states", "keep_indices", "need_pruning_next")
+                output_schema = _select_inference_output_schema(
+                    requested_backends,
+                    is_spec_dec=False,
+                )
                 with transport_profile_scope() as merge_transport_profile:
                     output_tensors = [
                         serialize_torch_tensor(
@@ -1623,7 +1638,7 @@ async def iterate_rpc_inference(
                         )
                         for idx, (result, proto) in enumerate(zip(
                             (merged_hidden_states, merged_keep_indices, need_pruning_next),
-                            nested_flatten(requested_backends[-1].outputs_schema)
+                            output_schema,
                         ))
                     ]
                 merge_transport_summary = summarize_transport_profile(merge_transport_profile)
@@ -2594,22 +2609,34 @@ async def iterate_rpc_inference(
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)
         transport_phase = "prefill" if hidden_states.ndim >= 2 and int(hidden_states.shape[1]) > 1 else "decode"
-        output_debug_names = (
-            "hidden_states",
-            "keep_indices",
-            "need_pruning_next",
-            "tree_attention_mask",
-            "kv_cache_position_ids",
-            "draft_tokens",
+        output_schema = _select_inference_output_schema(
+            requested_backends,
+            is_spec_dec=is_spec_dec,
         )
-        flat_tensors = ensure_tensors(
-            (
-                hidden_states,
-                keep_indices,
-                need_pruning_next,
-                _optional_output_tensor(tree_attention_mask, torch.empty(0, dtype=torch.bool)),
-                _optional_output_tensor(kv_cache_position_ids, DUMMY_INT64),
-                _optional_output_tensor(draft_tokens, DUMMY),
+        flat_tensors = (
+            ensure_tensors((hidden_states, keep_indices, need_pruning_next))
+            if not is_spec_dec
+            else ensure_tensors(
+                (
+                    hidden_states,
+                    keep_indices,
+                    need_pruning_next,
+                    _optional_output_tensor(tree_attention_mask, torch.empty(0, dtype=torch.bool)),
+                    _optional_output_tensor(kv_cache_position_ids, DUMMY_INT64),
+                    _optional_output_tensor(draft_tokens, DUMMY),
+                )
+            )
+        )
+        output_debug_names = (
+            ("hidden_states", "keep_indices", "need_pruning_next")
+            if not is_spec_dec
+            else (
+                "hidden_states",
+                "keep_indices",
+                "need_pruning_next",
+                "tree_attention_mask",
+                "kv_cache_position_ids",
+                "draft_tokens",
             )
         )
         with transport_profile_scope() as full_serialize_profile:
@@ -2628,7 +2655,7 @@ async def iterate_rpc_inference(
                     },
                 )
                 for idx, (result, proto) in enumerate(
-                    zip(flat_tensors, nested_flatten(requested_backends[-1].outputs_schema))
+                    zip(flat_tensors, output_schema)
                 )
             ]
         full_serialize_summary = summarize_transport_profile(full_serialize_profile)

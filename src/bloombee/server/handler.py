@@ -2298,13 +2298,22 @@ class TransformerConnectionHandler(ConnectionHandler):
                     f"[CROSS_GPU_TRANSFER_START] FromBlocks={sender_blocks} ToBlocks={next_start}:{next_end} ToPeer={next_peer_id}"
                 )
 
-            # `serialized_outputs` now carries the updated routing tensors for
-            # indices 0..5: hidden_states, keep_indices, need_pruning,
-            # tree_attention_mask, kv_cache_position_ids, draft_tokens.
-            # Preserve only the remaining request tensors starting from
-            # prefill_length so the downstream layout stays aligned.
+            # `serialized_outputs` carries the updated routing tensors for the
+            # next stage. Regular decode emits a compact 3-tensor prefix
+            # (hidden_states, keep_indices, need_pruning), while speculative
+            # decoding still emits the full 6-tensor routing prefix that also
+            # includes tree_attention_mask, kv_cache_position_ids and
+            # draft_tokens. Preserve the untouched tail of the original request
+            # so the downstream rpc_inference layout remains aligned.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
-            next_tensors = normalized_outputs + list(request.tensors[6:])
+            if len(normalized_outputs) == 3:
+                next_tensors = normalized_outputs + list(request.tensors[3:])
+            elif len(normalized_outputs) == 6:
+                next_tensors = normalized_outputs + list(request.tensors[6:])
+            else:
+                raise ValueError(
+                    f"Unexpected routing tensor count from upstream stage: {len(normalized_outputs)}"
+                )
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
             next_metadata["sender_blocks"] = sender_blocks
