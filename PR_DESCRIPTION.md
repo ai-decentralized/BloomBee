@@ -2,7 +2,7 @@
 
 This PR improves the stage-to-stage inference path and cleans up several runtime hot-path and shutdown issues.
 
-It combines eight changesets:
+It combines nine changesets:
 
 1. `Optimize downstream decode push path`
 2. `Clean inference metadata and runtime cleanup`
@@ -12,6 +12,7 @@ It combines eight changesets:
 6. `Use empty optional tensors for decode outputs`
 7. `Split decode inference output schema`
 8. `Split and slim regular decode input layouts`
+9. `Move speculative control flags to metadata`
 
 The current focus is same-machine validation for a cross-machine-oriented codebase. The changes therefore avoid adding local-only fast paths and instead reduce overhead in the existing BloomBee + Hivemind transport/runtime path.
 
@@ -76,6 +77,14 @@ The current focus is same-machine validation for a cross-machine-oriented codeba
 - Server-side full-batch inference now accepts and defaults both compact/minimal regular layouts without changing speculative request handling.
 - Fix `SimpleProbabilityPruner` token indexing by casting draft-token ids to integers before indexing logits/probabilities.
 
+### 9. Remove duplicated speculative control tensors from the request path
+
+- Stop sending `need_pruning` and `is_spec_dec` as speculative request tensors.
+- Keep those control flags in request metadata instead.
+- Add `spec_compact_v1` full-batch parsing on the server side for speculative requests.
+- Update stage-to-stage forwarding so speculative `rpc_push` reconstructs the downstream request layout without reintroducing the removed control tensors.
+- Preserve `need_pruning_next` semantics by carrying the forwarded value in metadata on the downstream request path.
+
 ## Validation
 
 ### Local end-to-end inference
@@ -104,6 +113,17 @@ Representative successful result after the regular-decode input layout split:
 
 - `throughput=5.64 tokens/sec/sequence`
 - `effective_throughput=22.55 tokens/sec`
+
+Representative successful result after the speculative control-flag cleanup:
+
+- short local speculative benchmark still completes successfully
+- `Final result: speed=0.67`
+
+Representative successful result after rerunning regular inference with a longer decode window:
+
+- `seq_len=64`, `batch_size=1`
+- `throughput=7.66 tokens/sec/sequence`
+- full generated text remains coherent in the local end-to-end check
 
 ### Micro-batching
 
@@ -151,16 +171,22 @@ Representative successful result after the later regular-decode input split and 
 - speculative benchmark still completes successfully after the compact/minimal regular-decode input layouts
 - `Final result: speed=1.12`
 
+Representative successful result after moving speculative control flags to metadata:
+
+- speculative benchmark still completes successfully with `spec_compact_v1`
+- `Final result: speed=0.67`
+
 ## Notes
 
 - This PR does **not** yet replace Hivemind unary protobuf `rpc_push` with a binary streaming path.
 - The branch currently includes the active local server policy/testing settings used during validation.
 - Speculative decoding is now locally runnable again, but this PR does not yet try to optimize speculative throughput.
 - Regular decode input/output tensors are slimmer, but the regular path still carries a small routing/control prefix for downstream compatibility.
+- Speculative requests now rely on metadata for control flags, but speculative output/routing tensors are still more complex than regular decode.
 
 ## Next steps
 
-1. Continue simplifying speculative request/control state, especially fields still duplicated across tensors and metadata.
+1. Continue simplifying speculative request/control state, especially the remaining routing/output tensors that are still speculative-specific.
 2. Revisit why speculative cross-stage transfer is still taking the `rpc_push` path even when the code intends to keep full speculative context.
 3. Benchmark speculative decoding with larger `seq_len` / `batch_size` combinations and check whether 50/50 KV offload remains stable.
 4. Revisit whether the remaining regular-decode routing prefix can be reduced further without complicating downstream stage forwarding.

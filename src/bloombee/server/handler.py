@@ -2301,21 +2301,43 @@ class TransformerConnectionHandler(ConnectionHandler):
             # `serialized_outputs` carries the updated routing tensors for the
             # next stage. Regular decode emits a compact 3-tensor prefix
             # (hidden_states, keep_indices, need_pruning), while speculative
-            # decoding still emits the full 6-tensor routing prefix that also
-            # includes tree_attention_mask, kv_cache_position_ids and
-            # draft_tokens. Preserve the untouched tail of the original request
-            # so the downstream rpc_inference layout remains aligned.
+            # decoding emits a 6-tensor routing prefix that also includes
+            # tree_attention_mask, kv_cache_position_ids and draft_tokens.
+            # Reconstruct the downstream rpc_inference tensor layout according
+            # to the original request metadata and keep control flags in
+            # metadata when possible.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
             if len(normalized_outputs) == 3:
                 next_tensors = normalized_outputs + list(request.tensors[3:])
             elif len(normalized_outputs) == 6:
-                next_tensors = normalized_outputs + list(request.tensors[6:])
+                inference_layout = metadata.get("inference_layout")
+                if inference_layout == "spec_compact_v1":
+                    need_pruning_next = deserialize_torch_tensor(normalized_outputs[2])
+                    if torch.is_tensor(need_pruning_next) and need_pruning_next.numel() > 0:
+                        next_need_pruning = int(bool(need_pruning_next.bool().any().item()))
+                    else:
+                        next_need_pruning = 0
+                    next_tensors = [
+                        normalized_outputs[0],
+                        normalized_outputs[1],
+                        normalized_outputs[3],
+                        normalized_outputs[4],
+                        normalized_outputs[5],
+                        request.tensors[5],
+                        request.tensors[6],
+                        request.tensors[7],
+                    ]
+                else:
+                    next_need_pruning = None
+                    next_tensors = normalized_outputs + list(request.tensors[6:])
             else:
                 raise ValueError(
                     f"Unexpected routing tensor count from upstream stage: {len(normalized_outputs)}"
                 )
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
+            if len(normalized_outputs) == 6 and metadata.get("inference_layout") == "spec_compact_v1":
+                next_metadata["need_pruning"] = next_need_pruning
             next_metadata["sender_blocks"] = sender_blocks
             next_metadata["receiver_blocks"] = f"{next_start}:{next_end}"
             next_metadata["s2s_channel"] = "full_batch"

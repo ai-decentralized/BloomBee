@@ -243,24 +243,20 @@ class _ServerInferenceSession:
                     input_tensors = (
                         inputs,
                         normalize_arg(keep_indices),
-                        normalize_arg(torch.tensor(1 if need_pruning else 0)),
                         normalize_arg(tree_attention_mask),
                         normalize_arg(kv_cache_position_ids),
                         normalize_arg(draft_tokens),
                         normalize_arg(prefill_length),
-                        normalize_arg(torch.tensor(1 if is_spec_dec else 0)),
                         prompts,
                         hypo_ids,
                     )
                     tensor_debug_names = (
                         "hidden_states",
                         "keep_indices",
-                        "need_pruning",
                         "tree_attention_mask",
                         "kv_cache_position_ids",
                         "draft_tokens",
                         "prefill_length",
-                        "is_spec_dec",
                         "prompts",
                         "hypo_ids",
                     )
@@ -274,7 +270,7 @@ class _ServerInferenceSession:
                 request_metadata["full_batch_size"] = int(logical_full_batch_size)
                 request_metadata["micro_batch_size"] = int(inputs.shape[0]) if inputs.ndim >= 1 else 1
                 request_metadata["inference_layout"] = (
-                    regular_layout_name if use_compact_decode_layout else "spec_full_v1"
+                    regular_layout_name if use_compact_decode_layout else "spec_compact_v1"
                 )
                 if is_spec_dec:
                     request_metadata["start_from_position"] = self._position + n_input_tokens
