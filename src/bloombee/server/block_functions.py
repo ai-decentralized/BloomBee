@@ -33,7 +33,7 @@ from bloombee.utils.lossless_transport import (
     tensor_raw_nbytes,
     transport_profile_scope,
 )
-from bloombee.utils.misc import DUMMY, is_dummy
+from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
@@ -533,6 +533,14 @@ def ensure_tensors(flat_tensors):
         else:
             raise TypeError(f"flat_tensors[{i}] cant trans to tensor: type={type(t)}, value={t}")
     return tuple(result)
+
+
+def _optional_output_tensor(value: Any, empty_tensor: torch.Tensor) -> torch.Tensor:
+    if value is None:
+        return empty_tensor
+    if torch.is_tensor(value) and is_dummy(value):
+        return empty_tensor
+    return value
 
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
@@ -2595,7 +2603,14 @@ async def iterate_rpc_inference(
             "draft_tokens",
         )
         flat_tensors = ensure_tensors(
-            (hidden_states, keep_indices, need_pruning_next, tree_attention_mask, kv_cache_position_ids, draft_tokens)
+            (
+                hidden_states,
+                keep_indices,
+                need_pruning_next,
+                _optional_output_tensor(tree_attention_mask, torch.empty(0, dtype=torch.bool)),
+                _optional_output_tensor(kv_cache_position_ids, DUMMY_INT64),
+                _optional_output_tensor(draft_tokens, DUMMY),
+            )
         )
         with transport_profile_scope() as full_serialize_profile:
             output_tensors = [
