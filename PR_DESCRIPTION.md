@@ -115,12 +115,13 @@ The forward/backward path was revalidated after removing `args_structure`:
 
 ### Regular decode
 
-Representative local regular-decode results on the current tree:
+Representative local regular-decode result on the current tree:
 
+- default config: no micro-batching, no KV cache offload
 - `seq_len=64`, `batch_size=1`
-- `Final result: throughput=5.61 tokens/sec/sequence, effective_throughput=5.61 tokens/sec`
+- `Final result: throughput=5.84 tokens/sec/sequence, effective_throughput=5.84 tokens/sec`
 
-Representative local regular micro-batch result:
+Representative local regular micro-batch result from the explicit validation path:
 
 - `seq_len=16`, `batch_size=4`
 - `Final result: throughput=5.24 tokens/sec/sequence, effective_throughput=20.97 tokens/sec`
@@ -144,12 +145,12 @@ The latest local regression pass completed without new:
 
 ## Current runtime defaults and assumptions
 
-- `DEFAULT_MICRO_BATCH_SIZE` is currently back to `0`, so micro-batching is **disabled by default**
-- server policy still keeps:
+- micro-batching is **disabled by default**
+- server policy currently keeps:
   - weights on GPU
   - activations on GPU
-  - KV cache at `50/50` GPU/CPU
-- micro-batching and speculative micro-batching were validated explicitly during local tests even though the default is now off
+  - KV cache on GPU (`100% GPU / 0% CPU`)
+- micro-batching and speculative micro-batching were validated explicitly with opt-in settings even though the default is now off
 
 ## What is still not done
 
