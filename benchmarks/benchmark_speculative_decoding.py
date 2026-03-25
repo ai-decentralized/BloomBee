@@ -37,6 +37,18 @@ def main():
     parser.add_argument("--n_processes", type=str, default=1, help="Number of concurrent processes")
     parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length (reserved)")
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
+    parser.add_argument(
+        "--prompt_start_index",
+        type=int,
+        default=1,
+        help="Starting index for prompt generation; default=1 avoids the degenerate 'Number 0' case",
+    )
+    parser.add_argument(
+        "--prompt_template",
+        type=str,
+        default="Number {i}: ",
+        help="Prompt template. Must contain '{i}', e.g. 'Number {i}: ' or 'Topic {i}: '",
+    )
     args = parser.parse_args()
 
     if args.n_processes == "n_gpus":
@@ -70,28 +82,32 @@ def benchmark_inference(process_idx, args, result_pipe):
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
     batch_size = getattr(args, 'batch_size', 8)
-    dataset = load_dataset("tatsu-lab/alpaca")["train"]
-    indices = random.sample(range(len(dataset)), batch_size)
-    sampled = dataset.select(indices)
-    test_prompts = []
+    # dataset = load_dataset("tatsu-lab/alpaca")["train"]
+    # indices = random.sample(range(len(dataset)), batch_size)
+    # sampled = dataset.select(indices)
+    # test_prompts = []
     # for item in sampled:
-        # test_prompts.append(item["instruction"])
+    #     test_prompts.append(item["instruction"])
         
-    base_prompt = (
-        "Quantum mechanics explains the behavior of particles at very small scales. "
-        "Neural networks learn patterns by adjusting weights through backpropagation. "
-        "Distributed systems require robust consensus mechanisms to maintain state. "
-        "Optimization algorithms like gradient descent are fundamental to machine learning. "
-        "Transformer architectures rely on attention mechanisms to capture dependencies. "
-        "Reinforcement learning optimizes actions by maximizing cumulative rewards. "
-        "Bayesian inference updates beliefs based on observed evidence and prior knowledge. "
-        "Convex optimization problems guarantee global minima under certain conditions. "
-        "Signal processing extracts meaningful information from noisy measurements. "
-    )
-    prompts = [
-        f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
-        for i in range(batch_size)
-    ]
+    # base_prompt = (
+    #     "Quantum mechanics explains the behavior of particles at very small scales. "
+    #     "Neural networks learn patterns by adjusting weights through backpropagation. "
+    #     "Distributed systems require robust consensus mechanisms to maintain state. "
+    #     "Optimization algorithms like gradient descent are fundamental to machine learning. "
+    #     "Transformer architectures rely on attention mechanisms to capture dependencies. "
+    #     "Reinforcement learning optimizes actions by maximizing cumulative rewards. "
+    #     "Bayesian inference updates beliefs based on observed evidence and prior knowledge. "
+    #     "Convex optimization problems guarantee global minima under certain conditions. "
+    #     "Signal processing extracts meaningful information from noisy measurements. "
+    # )
+    # prompts = [
+    #     f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
+    #     for i in range(batch_size)
+    # ]
+    prompt_indices = [args.prompt_start_index + i for i in range(batch_size)]
+    if "{i}" not in args.prompt_template:
+        raise ValueError("--prompt_template must include '{i}' placeholder")
+    prompts = [args.prompt_template.format(i=i) for i in prompt_indices]
     test_prompts = prompts
 
     tokenizer.pad_token = tokenizer.eos_token
