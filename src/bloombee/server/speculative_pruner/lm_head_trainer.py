@@ -35,7 +35,7 @@ class LM_head_trainer:
         self.lm_head.load_weight("/tmp/data/llama_weights/llama-13b-np")
         self.lm_head.to(dtype=torch.bfloat16)
 
-        self.optimizer_head = torch.optim.AdamW(self.lm_head.parameters(), lr=1e-4)
+        self.optimizer_head = torch.optim.AdamW(self.lm_head.parameters(), lr=3e-5)
         self.ite = 0
 
         # ── 若本地有 checkpoint 则恢复，否则从预训练权重出发 ────
@@ -47,12 +47,12 @@ class LM_head_trainer:
             dprint(f"[INFO] No checkpoint found at '{path}', starting from pretrained weights.")
             return
 
-        dprint(f"[INFO] Checkpoint found at '{path}', resuming training...")
+        logger.info(f"[INFO] Checkpoint found at '{path}', resuming training...")
         checkpoint = torch.load(path, map_location=self.device)
         self.lm_head.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer_head.load_state_dict(checkpoint['optimizer_state_dict'])
         self.ite = checkpoint['ite']
-        dprint(f"[INFO] Resumed from iteration {self.ite}.")
+        logger.info(f"[INFO] Resumed from iteration {self.ite}.")
 
     # ────────────────────────────────────────────────────────────
     def train_step(
@@ -61,6 +61,7 @@ class LM_head_trainer:
         final_hidden_states: torch.Tensor,
     ) -> float:
         self.ite += 1
+        logger.info(f"train_step ite: {self.ite}")
 
         middle_hidden_states = middle_hidden_states.to(torch.bfloat16)
         final_hidden_states  = final_hidden_states.to(torch.bfloat16)
@@ -85,7 +86,7 @@ class LM_head_trainer:
         loss.backward()
         self.optimizer_head.step()
 
-        if self.ite % 200 == 0:
+        if self.ite % 20 == 0:
             self._save_trained_head(CHECKPOINT_PATH)
             logger.info(f"current loss: {loss}")
 

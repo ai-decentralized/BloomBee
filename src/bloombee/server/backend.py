@@ -304,7 +304,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 self._is_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
                 
                 training_mode = True
-                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.20':
+                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-13b-hf.20':
                     self.pruner_manager.middle_states = hidden_states
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
@@ -464,7 +464,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     self.pruner_manager.train_model(middle_norm_hidden_states, final_logits, full_mask, inference_info.draft_tokens)
                     
                 training_lm_head_mode = True
-                if training_mode and training_lm_head_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.39':
+                if training_mode and training_lm_head_mode and self._is_spec_decoding and inference_info.uid == 'llama-13b-hf.39':
+                    logger.info(f"prepare training_lm_head_mode")
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
                     self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
