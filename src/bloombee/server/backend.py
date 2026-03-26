@@ -369,8 +369,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     position_ids = self._position_ids_cache[cache_key] + (cache_len + offset)
                     if self._is_spec_decoding:
                         rotary_position_ids = self._create_tree_position_ids_with_invalid_cache(
-                            width=1,
-                            depth=4,
+                            width=2,
+                            depth=3,
                             prefill_length=inference_info.prefill_length - 1,
                             kv_cache_position_ids=kv_cache_position_ids,
                             batch_offset=inference_info.batch_offset,

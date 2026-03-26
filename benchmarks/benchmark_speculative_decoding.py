@@ -73,7 +73,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     drafter = MultiSSMDrafter(
         ssm_model_name="JackFram/llama-68m",
-        num_workers=1,
+        num_workers=4,
         device="cuda"
     )
     model = AutoDistributedSpeculativeModel.from_pretrained(
@@ -82,12 +82,12 @@ def benchmark_inference(process_idx, args, result_pipe):
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
     batch_size = getattr(args, 'batch_size', 8)
-    # dataset = load_dataset("tatsu-lab/alpaca")["train"]
-    # indices = random.sample(range(len(dataset)), batch_size)
-    # sampled = dataset.select(indices)
-    # test_prompts = []
-    # for item in sampled:
-    #     test_prompts.append(item["instruction"])
+    dataset = load_dataset("tatsu-lab/alpaca")["train"]
+    indices = random.sample(range(len(dataset)), batch_size)
+    sampled = dataset.select(indices)
+    test_prompts = []
+    for item in sampled:
+        test_prompts.append(item["instruction"])
         
     # base_prompt = (
     #     "Quantum mechanics explains the behavior of particles at very small scales. "
@@ -104,11 +104,11 @@ def benchmark_inference(process_idx, args, result_pipe):
     #     f"{base_prompt} Example {i + 1} discusses large-scale AI systems and scientific discovery."
     #     for i in range(batch_size)
     # ]
-    prompt_indices = [args.prompt_start_index + i for i in range(batch_size)]
-    if "{i}" not in args.prompt_template:
-        raise ValueError("--prompt_template must include '{i}' placeholder")
-    prompts = [args.prompt_template.format(i=i) for i in prompt_indices]
-    test_prompts = prompts
+    # prompt_indices = [args.prompt_start_index + i for i in range(batch_size)]
+    # if "{i}" not in args.prompt_template:
+    #     raise ValueError("--prompt_template must include '{i}' placeholder")
+    # prompts = [args.prompt_template.format(i=i) for i in prompt_indices]
+    # test_prompts = prompts
 
     tokenizer.pad_token = tokenizer.eos_token
     input_ids = tokenizer(test_prompts, return_tensors="pt", padding=True).to(device)["input_ids"]

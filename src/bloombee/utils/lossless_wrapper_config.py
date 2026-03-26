@@ -5,7 +5,7 @@ Edit values in this file before starting client/server processes.
 """
 
 # 0 = disable lossless wrapper, 1 = enable
-ENABLE_LOSSLESS_WRAPPER = 0
+ENABLE_LOSSLESS_WRAPPER = 1
 
 # "zstd" (recommended), "zlib", "none"
 LOSSLESS_ALGO = "zstd"

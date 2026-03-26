@@ -15,22 +15,26 @@ class MultiSSMDrafter:
         from transformers import AutoModelForCausalLM
         
         self.num_workers = num_workers
-        self.device = torch.device(device)
         
         self.ssms = []
         self.streams = []
-        for _ in range(num_workers):
+        self.devices = []
+
+        for i in range(num_workers):
+            device_i = torch.device(f'cuda:{i}')
+            self.devices.append(device_i)
+
             ssm = AutoModelForCausalLM.from_pretrained(
                 ssm_model_name,
                 torch_dtype=torch.float16)
-            ssm = ssm.to(self.device)
+            ssm = ssm.to(device_i)
             ssm.eval()
             self.ssms.append(ssm)
-            self.streams.append(torch.cuda.Stream(device=self.device))
+            self.streams.append(torch.cuda.Stream(device=device_i))
         
         with torch.no_grad():
-            dummy = torch.ones(1, 8, dtype=torch.long, device=self.device)
-            for ssm in self.ssms:
+            for i, ssm in enumerate(self.ssms):
+                dummy = torch.ones(1, 8, dtype=torch.long, device=self.devices[i])
                 ssm(dummy, attention_mask=torch.ones_like(dummy))
     
     def build_trees_parallel(
@@ -49,10 +53,11 @@ class MultiSSMDrafter:
         def worker_fn(worker_idx: int, batch_indices: List[int]):
             ssm = self.ssms[worker_idx]
             stream = self.streams[worker_idx]
+            device = self.devices[worker_idx]
             
             with torch.cuda.stream(stream):
                 results = self._build_trees_batched(
-                    batch_indices, input_ids, seq_lengths, ssm, beam_width, max_depth
+                    batch_indices, input_ids, seq_lengths, ssm, beam_width, max_depth, device
                 )
                 for batch_idx, tree in results:
                     all_results[batch_idx] = tree
@@ -72,8 +77,9 @@ class MultiSSMDrafter:
             t.join()
         
         # 同步所有 streams
-        for stream in self.streams:
-            stream.synchronize()
+        for i, stream in enumerate(self.streams):
+            with torch.cuda.device(self.devices[i]):
+                stream.synchronize()
         
         return all_results
 
@@ -85,9 +91,10 @@ class MultiSSMDrafter:
         ssm,
         beam_width: int,
         max_depth: int,
+        device: torch.device,
     ) -> List:
         
-        pad_token_id = getattr(ssm.config, 'pad_token_id', 0)
+        pad_token_id = getattr(ssm.config, 'pad_token_id', None) or 0
         
         trees = {}
         valid_inputs = {}
@@ -96,7 +103,7 @@ class MultiSSMDrafter:
         
         for batch_idx in batch_indices:
             actual_len = seq_lengths[batch_idx].item()
-            valid_input_ids = input_ids[batch_idx, :actual_len]
+            valid_input_ids = input_ids[batch_idx, :actual_len].to(device)
             valid_inputs[batch_idx] = valid_input_ids
             prefix_lengths[batch_idx] = max(actual_len - 1, 0)
             
@@ -118,23 +125,23 @@ class MultiSSMDrafter:
                 if pf_len > 0:
                     prefix = valid_inputs[batch_idx][:-1]
                 else:
-                    prefix = torch.tensor([], dtype=torch.long, device=self.device)
+                    prefix = torch.tensor([], dtype=torch.long, device=device)
                 
                 pad_len = max_prefix_len - pf_len
                 
                 if pf_len > 0:
                     padded_prefixes.append(torch.cat([
-                        torch.full((pad_len,), pad_token_id, dtype=torch.long, device=self.device),
+                        torch.full((pad_len,), pad_token_id, dtype=torch.long, device=device),
                         prefix
                     ]))
                 else:
                     padded_prefixes.append(
-                        torch.full((max_prefix_len,), pad_token_id, dtype=torch.long, device=self.device)
+                        torch.full((max_prefix_len,), pad_token_id, dtype=torch.long, device=device)
                     )
                 
                 prefix_masks.append(torch.cat([
-                    torch.zeros(pad_len, dtype=torch.long, device=self.device),
-                    torch.ones(pf_len, dtype=torch.long, device=self.device)
+                    torch.zeros(pad_len, dtype=torch.long, device=device),
+                    torch.ones(pf_len, dtype=torch.long, device=device)
                 ]))
             
             batch_prefixes = torch.stack(padded_prefixes)
@@ -166,7 +173,7 @@ class MultiSSMDrafter:
                 
                 for node in tree.get_nodes_at_depth(depth):
                     path = node.get_path_from_root()
-                    path_tokens = torch.tensor([root_token] + path, dtype=torch.long, device=self.device)
+                    path_tokens = torch.tensor([root_token] + path, dtype=torch.long, device=device)
                     all_paths.append(path_tokens)
                     node_mapping.append((batch_idx, node))
                     cache_indices.append(idx_map[batch_idx])
@@ -180,8 +187,8 @@ class MultiSSMDrafter:
             total_mask_len = max_pf_len + max_path_len
             
             # 预分配
-            batch_paths = torch.full((num_nodes, max_path_len), pad_token_id, dtype=torch.long, device=self.device)
-            batch_path_masks = torch.zeros((num_nodes, total_mask_len), dtype=torch.long, device=self.device)
+            batch_paths = torch.full((num_nodes, max_path_len), pad_token_id, dtype=torch.long, device=device)
+            batch_path_masks = torch.zeros((num_nodes, total_mask_len), dtype=torch.long, device=device)
             
             # 填充
             for i, path in enumerate(all_paths):
@@ -212,7 +219,7 @@ class MultiSSMDrafter:
                 all_logits = outputs.logits[:, -1, :]
             
             t_forward += time.perf_counter() - t0
-            t0 =    time.perf_counter()
+            t0 = time.perf_counter()
             # 批量 topk
             _, all_top_k_indices = torch.topk(all_logits, k=beam_width, dim=-1)
             all_probs = torch.softmax(all_logits, dim=-1)
