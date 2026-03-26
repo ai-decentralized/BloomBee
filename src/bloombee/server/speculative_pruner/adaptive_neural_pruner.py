@@ -55,7 +55,7 @@ class AdaptiveNeuralPruner:
         self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
         lm_head_weights_path = hf_hub_download(
             repo_id="xxiong59/lm-head-for-speculative-pruning",
-            filename="lm_head_llama30B-15.pt",
+            filename="lm_head_llama13B-20.pt",
             cache_dir="./cache"
         )
         lm_head_checkpoint = torch.load(lm_head_weights_path, map_location="cuda")

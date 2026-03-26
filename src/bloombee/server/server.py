@@ -324,13 +324,13 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
         
-        hidden_size = 6656
+        hidden_size = 5120
         vocab_size = 32000
         
         # Create configuration
         config = PruningConfig(
             method=PruningMethod.ADAPTIVE_NEURAL,
-            neural_threshold=0.6,
+            neural_threshold=0.5,
             simple_threshold=0.1
         )
         

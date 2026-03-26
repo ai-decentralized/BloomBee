@@ -73,7 +73,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     drafter = MultiSSMDrafter(
         ssm_model_name="JackFram/llama-68m",
-        num_workers=4,
+        num_workers=2,
         device="cuda"
     )
     model = AutoDistributedSpeculativeModel.from_pretrained(
@@ -88,6 +88,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     test_prompts = []
     for item in sampled:
         test_prompts.append(item["instruction"])
+        # test_prompts.append("Generate a list of the best places to eat in London.")
         
     # base_prompt = (
     #     "Quantum mechanics explains the behavior of particles at very small scales. "
