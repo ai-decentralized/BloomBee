@@ -26,13 +26,13 @@ class LM_head_trainer:
 
         # ── 用于推理 target 的 frozen 原始 LM head ─────────────
         self.original_lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
-        self.original_lm_head.load_weight("/tmp/data/llama_weights/llama-13b-np")
+        self.original_lm_head.load_weight("/tmp/data/llama_weights/llama-30b-np")
         self.original_lm_head.requires_grad_(False)
         self.original_lm_head.to(dtype=torch.bfloat16)
 
         # ── 待训练的 LM head ────────────────────────────────────
         self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
-        self.lm_head.load_weight("/tmp/data/llama_weights/llama-13b-np")
+        self.lm_head.load_weight("/tmp/data/llama_weights/llama-30b-np")
         self.lm_head.to(dtype=torch.bfloat16)
 
         self.optimizer_head = torch.optim.AdamW(self.lm_head.parameters(), lr=3e-5)
