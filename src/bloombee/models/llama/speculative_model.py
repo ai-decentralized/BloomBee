@@ -35,8 +35,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         streamer: Optional["BaseStreamer"] = None,
-        beam_width: int = 2,
-        max_tree_depth: int = 3,
+        beam_width: int = 1,
+        max_tree_depth: int = 5,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
         max_new_tokens: int = 128,
@@ -55,7 +55,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # Keep the argument for API compatibility, but ignore runtime overrides.
         if "session_max_length" in model_kwargs:
             model_kwargs.pop("session_max_length", None)
-        session_max_length = 624
+        session_max_length = 728
         logger.info("Speculative session_max_length=%s (hardcoded)", session_max_length)
 
         # Use inference session for proper distributed caching
@@ -134,7 +134,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         has_printed_first_reach = False # 确保只打印一次
         sample_finish_times = [None] * batch_size
         sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
-        while not finished and (seq_lengths - initial_seq_lengths).max().item() < max_new_tokens:
+        while not finished and (seq_lengths - initial_seq_lengths).min().item() < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
             spec_trees = drafter.build_trees_parallel(

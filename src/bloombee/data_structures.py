@@ -131,6 +131,7 @@ class InferenceMetadata:
     keep_indices: Optional[torch.Tensor] = None
     need_pruning: Optional[torch.Tensor] = None
     is_spec_dec: Optional[torch.Tensor] = None
+    rotary_position_ids: Optional[torch.Tensor] = None
     # Micro-batch support: batch slicing for KV cache
     batch_offset: int = 0  # Start index in the full batch for this micro-batch
     full_batch_size: int = 0  # Total batch size (0 means no micro-batch, use entire cache)

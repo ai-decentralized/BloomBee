@@ -168,6 +168,92 @@ def _slice_batch_aligned(
         return value[mb_start:mb_end].contiguous()
     return value
 
+def _create_tree_position_ids_with_invalid_cache(
+    width: int,
+    depth: int,
+    prefill_length: torch.Tensor,           # (B,)
+    kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len) 或 None, -1 是 padding
+    batch_offset,
+    device: torch.device,
+    target_seq_len: Optional[int] = None,
+) -> torch.Tensor:
+    B = prefill_length.shape[0]
+    device = torch.device(device)
+
+    # 1. 生成 Tree 模板
+    tree_position_ids_list = []
+    def dfs_generate(node_depth, current_depth):
+        tree_position_ids_list.append(node_depth)
+        if current_depth < depth:
+            for _ in range(width):
+                dfs_generate(node_depth + 1, current_depth + 1)
+    dfs_generate(0, 0)
+    tree_len = len(tree_position_ids_list)
+    tree_position_ids = torch.tensor(tree_position_ids_list, dtype=torch.long, device=device)
+    
+    # 2. 判断是否为 Prefill 阶段
+    is_prefill = kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0
+    prefill_length = prefill_length.to(device)
+
+    if is_prefill:
+        # ── Prefill 阶段 ──────────────────────────────────────────────────
+        max_prefill_len = prefill_length.max().item()
+        if target_seq_len is not None:
+            total_len = target_seq_len
+            prompt_part_len = target_seq_len - tree_len
+        else:
+            total_len = max_prefill_len + tree_len
+            prompt_part_len = max_prefill_len
+
+        full_position_ids = torch.zeros(B, total_len, dtype=torch.long, device=device)
+        
+        
+        # Prompt 部分的 position ids
+
+        # Prompt 部分的 position ids
+        if prompt_part_len > 0:
+            prefill_positions = torch.arange(prompt_part_len, dtype=torch.long, device=device)
+            full_position_ids[:, :prompt_part_len] = prefill_positions.unsqueeze(0)
+
+        tree_base = prefill_length.unsqueeze(1)  # (B, 1)
+        full_position_ids[:, prompt_part_len:] = tree_base + tree_position_ids.unsqueeze(0)
+
+        return full_position_ids
+
+    else:
+        kv_cache_position_ids = kv_cache_position_ids.to(device)
+        kv_cache_position_ids = _slice_batch_aligned(
+            kv_cache_position_ids, batch_offset, batch_offset + B, kv_cache_position_ids.shape[0]
+        )
+        valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
+
+        batch_indices = torch.arange(B, device=device)
+        has_valid = valid_mask.any(dim=1)
+        first_valid_idx = valid_mask.int().argmax(dim=1)
+        root_positions = kv_cache_position_ids[batch_indices, first_valid_idx]
+        root_positions = root_positions * has_valid
+
+        tree_valid_counts = valid_mask.sum(dim=1)
+        base_positions = root_positions + tree_valid_counts        # (B,)
+
+        # 处理 target_seq_len（不修改传入的 tensor）
+        actual_tree_ids = tree_position_ids
+        if target_seq_len is not None and target_seq_len != tree_len:
+            pad = target_seq_len - tree_len
+            if pad > 0:
+                last_val = tree_position_ids[-1].item()
+                actual_tree_ids = torch.cat([
+                    tree_position_ids,
+                    torch.full((pad,), last_val, dtype=torch.long, device=device)
+                ])
+            else:
+                actual_tree_ids = tree_position_ids[:target_seq_len]
+
+        position_ids = base_positions.unsqueeze(1) + actual_tree_ids.unsqueeze(0)
+
+        return position_ids
+        
+
 
 def _unpack_inference_submit_result(result: Any) -> Tuple[torch.Tensor, Any, Optional[Dict[str, float]]]:
     """
@@ -528,6 +614,19 @@ async def iterate_rpc_inference(
                 
         token_increment = _effective_token_increment(hidden_states, kv_cache_position_ids, is_spec_dec)
         
+        if is_spec_dec:
+            rotary_position_ids = _create_tree_position_ids_with_invalid_cache(
+                width=1,
+                depth=5,
+                prefill_length=prefill_length - 1,
+                kv_cache_position_ids=kv_cache_position_ids,
+                batch_offset=0,
+                device=hidden_states.device,
+                target_seq_len=length_increment
+            )
+        else:
+            rotary_position_ids = None
+        
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
@@ -581,7 +680,7 @@ async def iterate_rpc_inference(
                 execution_mode = "merged_fullbatch"
                 # Legacy path: process entire batch at once
                 inference_infos = tuple(
-                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec)
+                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_attention_mask, kv_cache_position_ids=kv_cache_position_ids, draft_tokens=draft_tokens, prefill_length=prefill_length, keep_indices=keep_indices, need_pruning=need_pruning, is_spec_dec=is_spec_dec, rotary_position_ids=rotary_position_ids)
                     for i, (uid, handles) in enumerate(zip(requested_uids, cache_handles))
                 )
                 submit_result = await requested_backends[0].inference_pool.submit_task(
