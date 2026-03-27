@@ -134,7 +134,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         has_printed_first_reach = False # 确保只打印一次
         sample_finish_times = [None] * batch_size
         sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
-        while not finished and (seq_lengths - initial_seq_lengths).min().item() < max_new_tokens:
+        while not finished and (seq_lengths - initial_seq_lengths).max().item() < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
             spec_trees = drafter.build_trees_parallel(

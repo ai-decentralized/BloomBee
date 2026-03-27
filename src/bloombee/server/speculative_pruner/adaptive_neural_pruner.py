@@ -55,7 +55,7 @@ class AdaptiveNeuralPruner:
         self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
         lm_head_weights_path = hf_hub_download(
             repo_id="xxiong59/lm-head-for-speculative-pruning",
-            filename="lm_head_llama13B-20.pt",
+            filename="lm_head_weights_15.pt",
             cache_dir="./cache"
         )
         lm_head_checkpoint = torch.load(lm_head_weights_path, map_location="cuda")
@@ -123,7 +123,7 @@ class AdaptiveNeuralPruner:
 
         # ── 1. parent indices for each (b, i) where i in [1, S) ────────────
         # mask slice we care about: [B, S, S]  (child × parent)
-        child_to_parent_mask = tree_attention_mask[:, :, prefix_len:].to(device)  # [B, S, S]
+        child_to_parent_mask = (tree_attention_mask[:, :, prefix_len:] == 0.0).to(device) # [B, S, S]
 
         # For each child i (rows 1..S-1), find the *last* True column j < i.
         # Strategy: multiply col indices by mask, take max over j.
@@ -215,7 +215,7 @@ class AdaptiveNeuralPruner:
         device = initial_keep.device
 
         # adj[b, i, j] = True: token i attends to token j (j is ancestor of i)
-        adj = tree_attention_mask[:, :, prefix_len:].to(device)  # [B, S, S]
+        adj = (tree_attention_mask[:, :, prefix_len:] == 0.0).to(device)  # [B, S, S]
 
         discarded = ~initial_keep  # [B, S]
 
@@ -374,7 +374,7 @@ class AdaptiveNeuralPruner:
 
         col_idx = torch.arange(S, device=device).view(1, 1, S)
         causal_mask = col_idx < torch.arange(S, device=device).view(1, S, 1)
-        child_to_parent = tree_attention_mask[:, :, prefix_len:]
+        child_to_parent = (tree_attention_mask[:, :, prefix_len:] == 0.0)
         masked_cols = (child_to_parent & causal_mask).long() * (col_idx + 1)
         parent_indices = masked_cols.max(dim=-1).values - 1
         parent_indices = parent_indices.clamp(min=0)
@@ -416,7 +416,7 @@ class AdaptiveNeuralPruner:
             if is_leaf[i]:
                 path = [i]
                 for j in range(i - 1, -1, -1):
-                    if attention_mask[0, i, j + prefix_len] == 1:
+                    if attention_mask[0, i, j + prefix_len] == 0.0:
                         is_leaf[j] = False
                         path.append(j)
                 path.reverse()

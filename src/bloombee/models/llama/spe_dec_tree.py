@@ -195,7 +195,11 @@ def prepare_incremental_tree_batch(
 ) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
     """
     准备增量 tree batch，支持不同序列长度
+    attention mask 直接输出 float score：0.0 表示可attend，-65504.0 表示被遮蔽
     """
+    MASKED = -65504.0
+    ATTEND = 0.0
+
     batch_size = len(trees)
 
     if not trees or all(tree.total_nodes <= 1 for tree in trees):
@@ -228,64 +232,71 @@ def prepare_incremental_tree_batch(
         batch_tree_tokens.append(padded_tokens)
 
         tree_len = len(tree_token_ids)  # 不包含 root
-        inputs_len = tree_len + 1  # root + tree tokens
+        inputs_len = tree_len + 1       # root + tree tokens
         
         if is_prefill:
-            # ============ Prefill 阶段（不变） ============
+            # ============ Prefill 阶段 ============
             past_len = input_ids.shape[1]
             total_len = past_len + tree_len
-            mask = torch.zeros(1, total_len, total_len, dtype=torch.bool, device=device)
+            mask = torch.full((1, total_len, total_len), MASKED, dtype=torch.float, device=device)
             
             prompt_len = curr_seq_len - 1 if curr_seq_len > 0 else 0
             root_pos = prompt_len
             
+            # Prompt 部分：causal mask
             if prompt_len > 0:
                 row_idx = torch.arange(prompt_len, device=device).view(-1, 1)
                 col_idx = torch.arange(prompt_len, device=device).view(1, -1)
-                causal_mask = row_idx >= col_idx
-                mask[0, :prompt_len, :prompt_len] = causal_mask
+                causal_mask = row_idx >= col_idx  # bool
+                mask[0, :prompt_len, :prompt_len] = torch.where(causal_mask, ATTEND, MASKED)
             
+            # Root attend to prompt + 自己
             if prompt_len > 0:
-                mask[0, root_pos, :prompt_len] = True
-            mask[0, root_pos, root_pos] = True
+                mask[0, root_pos, :prompt_len] = ATTEND
+            mask[0, root_pos, root_pos] = ATTEND
             
+            # Tree tokens attend to prompt + root
             if tree_len > 0:
                 if prompt_len > 0:
-                    mask[0, past_len:past_len + tree_len, :prompt_len] = True
-                mask[0, past_len:past_len + tree_len, root_pos] = True
+                    mask[0, past_len:past_len + tree_len, :prompt_len] = ATTEND
+                mask[0, past_len:past_len + tree_len, root_pos] = ATTEND
             
+            # Tree tokens 之间
             if tree_len > 0:
                 tree_mask = build_tree_attention_mask_with_root(tree_len, parent_indices, device)
                 mask[0, past_len:past_len + tree_len, past_len:past_len + tree_len] = tree_mask
             
+            # Padding
             if tree_len < max_tree_size:
                 total_padded_len = past_len + max_tree_size
-                padded_mask = torch.zeros(1, total_padded_len, total_padded_len, dtype=torch.bool, device=device)
+                padded_mask = torch.full(
+                    (1, total_padded_len, total_padded_len), MASKED, dtype=torch.float, device=device
+                )
                 padded_mask[0, :total_len, :total_len] = mask[0]
+                # Padding 行 attend to prompt（避免 NaN）
                 if curr_seq_len > 0:
-                    padded_mask[0, total_len:, :curr_seq_len] = True
+                    padded_mask[0, total_len:, :curr_seq_len] = ATTEND
                 mask = padded_mask
-        
+
         else:
             # ============ Generation 阶段 ============
-            # 总长度 = cache + 本轮输入
             total_len = cache_len + inputs_len
+            mask = torch.full((1, inputs_len, total_len), MASKED, dtype=torch.float, device=device)
             
-            mask = torch.zeros(1, inputs_len, total_len, dtype=torch.bool, device=device)
-            
-            # 计算 cache 中的有效位置
-            cache_valid_mask = _compute_single_cache_valid_mask(
+            # 计算 cache 中的有效位置（bool），再映射为 score
+            cache_valid_bool = _compute_single_cache_valid_mask(
                 kv_cache_position_ids[i], cache_len, device
-            )
-            
+            )  # shape: (cache_len,), dtype: bool
+            cache_scores = torch.where(cache_valid_bool, ATTEND, MASKED)  # float scores
+
             # 1. Root attend to cache + 自己
-            mask[0, 0, :cache_len] = cache_valid_mask
-            mask[0, 0, cache_len] = True  # root attend 自己
+            mask[0, 0, :cache_len] = cache_scores
+            mask[0, 0, cache_len] = ATTEND  # root attend 自己
             
             # 2. Tree tokens attend to cache + root
             if tree_len > 0:
-                mask[0, 1:inputs_len, :cache_len] = cache_valid_mask.unsqueeze(0).expand(tree_len, cache_len)
-                mask[0, 1:inputs_len, cache_len] = True  # tree tokens attend to root
+                mask[0, 1:inputs_len, :cache_len] = cache_scores.unsqueeze(0).expand(tree_len, cache_len)
+                mask[0, 1:inputs_len, cache_len] = ATTEND  # tree tokens attend to root
             
             # 3. Tree tokens 之间
             if tree_len > 0:
@@ -297,10 +308,12 @@ def prepare_incremental_tree_batch(
             if inputs_len < max_inputs_len:
                 pad_len = max_inputs_len - inputs_len
                 total_padded_len = cache_len + max_inputs_len
-                padded_mask = torch.zeros(1, max_inputs_len, total_padded_len, dtype=torch.bool, device=device)
+                padded_mask = torch.full(
+                    (1, max_inputs_len, total_padded_len), MASKED, dtype=torch.float, device=device
+                )
                 padded_mask[0, :inputs_len, :total_len] = mask[0]
                 # Padding 行 attend to cache（避免 NaN）
-                padded_mask[0, inputs_len:, :cache_len] = cache_valid_mask.unsqueeze(0).expand(pad_len, cache_len)
+                padded_mask[0, inputs_len:, :cache_len] = cache_scores.unsqueeze(0).expand(pad_len, cache_len)
                 mask = padded_mask
 
         batch_attention_masks.append(mask)
@@ -358,16 +371,17 @@ def build_tree_attention_mask_with_root(
 ) -> torch.Tensor:
     """
     构建 tree tokens 之间的 attention mask（不包含 root）
+    直接返回 float score mask：0.0 表示可attend，-65504.0 表示被遮蔽
     """
-    mask = torch.zeros(tree_len, tree_len, dtype=torch.bool, device=device)
+    mask = torch.full((tree_len, tree_len), -65504.0, dtype=torch.float, device=device)
     
     for i in range(tree_len):
-        mask[i, i] = True
+        mask[i, i] = 0.0
         current = i
         while current >= 0:
             parent = parent_indices[current]
             if parent >= 0:
-                mask[i, parent] = True
+                mask[i, parent] = 0.0
                 current = parent
             else:
                 break

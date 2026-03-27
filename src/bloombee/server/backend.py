@@ -141,7 +141,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 BatchTensorDescriptor((), dtype=self.dtype),
                 BatchTensorDescriptor((), dtype=torch.int64),
                 BatchTensorDescriptor(
-                    1, 64, 64, dtype=self.dtype
+                    1, 64, 64, dtype=torch.float
                 ), # tree_attention_mask
                 BatchTensorDescriptor(
                     128, dtype=torch.int64
@@ -284,7 +284,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             
             self._ensure_model_on_device()
             
-            # t0 = time.perf_counter()
+            t0 = time.perf_counter()
             with self.cache_manager.use_cache(
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
@@ -319,6 +319,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             f"micro_batch_size={inference_info.micro_batch_size}, "
                             f"full_batch_size={inference_info.full_batch_size}")
                 
+                t1 = time.perf_counter()
+                
                 if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
                     k_pkv, v_pkv, cache_len = self.cache_manager.select_cache_without_reorder(
                         kv_cache_position_ids, 
@@ -339,8 +341,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     )
                     cache_len = k_pkv.shape[2] if k_pkv is not None else 0
                     
-                # t2 = time.perf_counter()
-                # logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
+                t2 = time.perf_counter()
+                logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
 
                 layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
 
@@ -349,10 +351,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 if self._is_spec_decoding:
                     full_mask = inference_info.tree_attention_mask.to(device)
-                    attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                    attention_mask = full_mask
                 if full_mask == None:
                     full_mask = self._create_causal_attention_mask(batch_size, (seq_len + cache_len), cache_len, hidden_states.device)
                     attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                    
+                t3 = time.perf_counter()
+                logger.info(f"convert_mask_to_scores took {t3 - t2:.4f} seconds")
+
                     
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
@@ -378,6 +384,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             target_seq_len=seq_len)
                     else:
                         rotary_position_ids = None
+                        
+                    t4 = time.perf_counter()
+                    logger.info(f"_create_tree_position_ids_with_invalid_cache took {t4 - t3:.4f} seconds")
                     
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
@@ -391,8 +400,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             rotary_position_ids=rotary_position_ids,
                         )
                         
-                        # t5 = time.perf_counter()
-                        # logger.info(f"inference_step: module.forward call took {t5 - t4:.4f} seconds")
+                        t5 = time.perf_counter()
+                        logger.info(f"inference_step: module.forward call took {t5 - t4:.4f} seconds")
                         
                         if forward_result is None:
                             logger.info(f" ERROR: module.forward returned None!")
@@ -438,6 +447,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         batch_offset=inference_info.batch_offset,
                         full_batch_size=inference_info.full_batch_size,
                         micro_batch_size=inference_info.micro_batch_size,) 
+                
+                t6 = time.perf_counter()
+                logger.info(f"update_cache_and_async_reorder took {t6 - t5:.4f} seconds")
+                        
                     
                 keep_indices = self._normalize_keep_indices(
                     inference_info.keep_indices,
@@ -471,6 +484,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
+                    t7 = time.perf_counter()
+                    logger.info(f"prune_draft_tree took {t7 - t6:.4f} seconds")
+                      
+                    
+                
                     
                 if not training_mode and self._is_spec_decoding and self._is_last_block:
                     original_hidden_states = output_hidden_states

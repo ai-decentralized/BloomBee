@@ -324,7 +324,7 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
         
-        hidden_size = 5120
+        hidden_size = 4096
         vocab_size = 32000
         
         # Create configuration
@@ -717,7 +717,7 @@ class ModuleContainer(threading.Thread):
                             compression=compression
                         ),
                         BatchTensorDescriptor(
-                            1, 64, 64, dtype=torch.bool
+                            1, 64, 64, dtype=torch.float
                         ), # tree_attention_mask
                         BatchTensorDescriptor(
                             1, 128, dtype=torch.int64

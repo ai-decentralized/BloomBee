@@ -795,7 +795,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                                 push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
 
                                 # 模拟网络传输延时
-                                NETWORK_SPEED_BYTES_PER_SEC = 50 * 1024 * 1024  # 10 MB/s
+                                NETWORK_SPEED_BYTES_PER_SEC = 10 * 1024 * 1024  # 10 MB/s
                                 transfer_delay = push_tensor_bytes / NETWORK_SPEED_BYTES_PER_SEC
                                 await asyncio.sleep(transfer_delay)
                                 task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
