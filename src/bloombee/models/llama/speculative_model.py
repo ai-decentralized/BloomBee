@@ -390,7 +390,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 
         # Extract verification results - 现在返回 valid_lengths
         verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths = self._extract_best_verified_paths_fixed(
-            logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration
+            logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration,
+            acceptance_top_k = 3
         )
         return verified_tokens, kv_cache_position_ids, new_past_key_values, llm_generated_tokens, valid_lengths
     
@@ -582,6 +583,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         tree_len: int,
         seq_lengths: torch.LongTensor,
         is_first_iteration: bool,
+        acceptance_top_k: int = 1,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -621,9 +623,17 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     if pos >= seq_len:
                         break
                     
-                    predicted_token = torch.argmax(logits[batch_idx, pos]).item()
+                    if acceptance_top_k == 1:
+                        predicted_token = torch.argmax(logits[batch_idx, pos]).item()
+                        accepted = (predicted_token == node.token_id)
+                    else:
+                        top_k_tokens = torch.topk(
+                            logits[batch_idx, pos], 
+                            k=acceptance_top_k
+                        ).indices.tolist()
+                        accepted = (node.token_id in top_k_tokens)
                     
-                    if predicted_token == node.token_id:
+                    if accepted:
                         verified_tokens.append(node.token_id)
                         absolute_position = tree_root_position + node.position_in_sequence + 1
                         verified_positions.append(absolute_position)
