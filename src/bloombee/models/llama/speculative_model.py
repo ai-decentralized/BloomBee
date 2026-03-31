@@ -391,7 +391,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # Extract verification results - 现在返回 valid_lengths
         verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths = self._extract_best_verified_paths_fixed(
             logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration,
-            acceptance_top_k = 3
+            acceptance_top_k = 1
         )
         return verified_tokens, kv_cache_position_ids, new_past_key_values, llm_generated_tokens, valid_lengths
     
