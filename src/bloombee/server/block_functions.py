@@ -1571,8 +1571,21 @@ async def iterate_rpc_inference(
                     micro_hidden_list = [r[0] for r in results]
                     micro_keep_list = [r[1] for r in results]
                     
+
+                    padded_keep_list = []
+                    for keep_indices in micro_keep_list:
+                        current_len = keep_indices.shape[1]  # dim 1, 当前是 1
+                        pad_size = length_increment - current_len
+                        if pad_size > 0:
+                            # pad shape: [batch_size, pad_size]
+                            pad_shape = (keep_indices.shape[0], pad_size)
+                            padding = torch.full(pad_shape, -1, dtype=keep_indices.dtype, device=keep_indices.device)
+                            keep_indices = torch.cat([keep_indices, padding], dim=1)  # → [16, length_increment]
+                        padded_keep_list.append(keep_indices)
+                    
+                    
                     hidden_states = merge_microbatch_outputs(micro_hidden_list, dim=0)
-                    keep_indices = merge_microbatch_outputs(micro_keep_list, dim=0)
+                    keep_indices = merge_microbatch_outputs(padded_keep_list, dim=0)
                     
                     # Calculate overlap statistics
                     total_pipeline_time = (pipeline_end_time - pipeline_start_time) * 1000  # ms
@@ -1860,6 +1873,16 @@ async def iterate_rpc_inference(
                 dtype=torch.int64,
                 device=hidden_states.device
             ).unsqueeze(0).expand(hidden_states.shape[0], -1)
+            
+        if is_spec_dec:
+            original_hidden_states = hidden_states
+            batch_size, seq_len, hidden_size = original_hidden_states.shape
+            device = original_hidden_states.device
+            valid_mask = keep_indices >= 0
+            batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
+            valid_hidden_states = original_hidden_states[batch_idx[valid_mask], keep_indices[valid_mask], :]
+            hidden_states = valid_hidden_states.unsqueeze(0)
+            
         
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)

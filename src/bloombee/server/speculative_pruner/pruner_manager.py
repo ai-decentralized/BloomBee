@@ -42,7 +42,7 @@ class SpeculativePrunerManager:
         self.iteration = 0
         self.middle_states = None
         
-        train_lm_head_mode = True
+        train_lm_head_mode = False
         self.lm_head_trainer = LM_head_trainer(hidden_size, vocab_size, device, config) if train_lm_head_mode else None
         
     def switch_method(self, method: Union[str, PruningMethod], keep_stats: bool = False):

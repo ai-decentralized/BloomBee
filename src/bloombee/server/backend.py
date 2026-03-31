@@ -369,8 +369,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     position_ids = self._position_ids_cache[cache_key] + (cache_len + offset)
                     if self._is_spec_decoding:
                         rotary_position_ids = self._create_tree_position_ids_with_invalid_cache(
-                            width=1,
-                            depth=4,
+                            width=2,
+                            depth=3,
                             prefill_length=inference_info.prefill_length - 1,
                             kv_cache_position_ids=kv_cache_position_ids,
                             batch_offset=inference_info.batch_offset,
@@ -472,15 +472,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
                     
-                if not training_mode and self._is_spec_decoding and self._is_last_block:
-                    original_hidden_states = output_hidden_states
-                    batch_size, seq_len, hidden_size = original_hidden_states.shape
-                    device = original_hidden_states.device
-                    valid_mask = keep_indices >= 0
-                    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
-                    valid_hidden_states = original_hidden_states[batch_idx[valid_mask], keep_indices[valid_mask], :]
-                    output_hidden_states = valid_hidden_states.unsqueeze(0)
-                    
+                
                 self._last_keep_indices = keep_indices + cache_len
                 return (output_hidden_states, keep_indices) # Return output hidden states
                 

@@ -292,7 +292,7 @@ class Server:
 
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU cache allocation
-            50, 50,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # w_gpu_percent, w_cpu_percent
             100, 0,                   # cache_gpu_percent=100% (GPU cache only holds micro_batch_size slots)
             100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
@@ -324,13 +324,13 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
         
-        hidden_size = 4096
+        hidden_size = 6656
         vocab_size = 32000
         
         # Create configuration
         config = PruningConfig(
             method=PruningMethod.ADAPTIVE_NEURAL,
-            neural_threshold=0.9,
+            neural_threshold=0.5,
             simple_threshold=0.1
         )
         
