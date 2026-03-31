@@ -616,8 +616,8 @@ async def iterate_rpc_inference(
         
         if is_spec_dec:
             rotary_position_ids = _create_tree_position_ids_with_invalid_cache(
-                width=1,
-                depth=5,
+                width=2,
+                depth=3,
                 prefill_length=prefill_length - 1,
                 kv_cache_position_ids=kv_cache_position_ids,
                 batch_offset=0,
