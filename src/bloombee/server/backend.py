@@ -476,8 +476,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
                 
                 if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block:
-                    # norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    # keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
                     # t7 = time.perf_counter()
                     # logger.info(f"prune_draft_tree took {t7 - t6:.4f} seconds")
