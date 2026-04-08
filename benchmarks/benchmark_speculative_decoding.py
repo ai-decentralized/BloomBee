@@ -76,7 +76,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     drafter = MultiSSMDrafter(
         ssm_model_name="JackFram/llama-68m",
-        num_workers=2,
+        num_workers=1,
         device="cuda"
     )
     model = AutoDistributedSpeculativeModel.from_pretrained(

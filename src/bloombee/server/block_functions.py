@@ -145,7 +145,7 @@ def _effective_token_increment(
             return default_inc
     if kv_cache_position_ids.numel() == 0:
         return 0
-    return int(kv_cache_position_ids[0].numel())
+    return 1
 
 
 def _slice_batch_aligned(

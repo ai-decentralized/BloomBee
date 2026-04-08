@@ -303,6 +303,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # mode can get stuck after the first request served by this backend.
                 self._need_pruning = _flag_to_bool(inference_info.need_pruning)
                 self._is_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
+                
+                training_mode = False
+                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-30b-hf.20':
+                    self.pruner_manager.middle_states = hidden_states
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
                 # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
@@ -475,7 +479,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     middle_norm_hidden_states = self.module.rms_norm(self.pruner_manager.middle_states)
                     self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
                 
-                if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block:
+                is_prefill = kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0
+                if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block and not is_prefill:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices

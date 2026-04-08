@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from bloombee.server.speculative_pruner.mid_layer_LM_head import MidLMHead
+from bloombee.server.speculative_pruner.mid_layer_LM_head import TrainableMidLMHead, OriginalLMHead
 from bloombee.utils.debug import dprint
 
 class LM_head_trainer:
@@ -17,17 +17,14 @@ class LM_head_trainer:
         self.device = device
         self.config = config
         
-        # LM head for getting probabilities
-        self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
-        # need to modify this path to real LM head path
-        self.lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
-        self.lm_head.requires_grad_(False)
+        # 1. 中间头：使用新的 Trainable 类，不加载 30B 预训练权重
+        self.lm_head = TrainableMidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
+        self.lm_head.requires_grad_(True)
         self.lm_head.to(dtype=torch.bfloat16)
 
-        
-        self.original_lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
-        # need to modify this path to real LM head path
-        self.original_lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
+        # 2. 目标头：使用 Original 类，加载 30B 的真实 Head 权重
+        self.original_lm_head = OriginalLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
+        self.original_lm_head.load_weight("/tmp/data/llama_weights/llama-30b-np") # 确保路径正确
         self.original_lm_head.requires_grad_(False)
         self.original_lm_head.to(dtype=torch.bfloat16)
         
@@ -41,6 +38,7 @@ class LM_head_trainer:
         self,
         middle_hidden_states: torch.Tensor,
         final_hidden_states: torch.Tensor,
+        T: float = 2.5 # 引入温度系数平滑分布
     ) -> dict:
         self.ite = self.ite + 1
         
@@ -48,29 +46,32 @@ class LM_head_trainer:
         final_hidden_states = final_hidden_states.to(torch.bfloat16)
 
         self.lm_head.train()
-        self.lm_head.requires_grad_(True)
         self.optimizer_head.zero_grad()
 
+        # 获取目标的 Soft Labels
         with torch.no_grad():
             target_logits = self.original_lm_head(final_hidden_states)
             
         with torch.enable_grad():
             mid_logits = self.lm_head(middle_hidden_states) 
             b, t, v = mid_logits.shape
+            
             mid_logits_2d = mid_logits.view(-1, v)
             target_logits_2d = target_logits.view(-1, v)
 
-            log_p = F.log_softmax(mid_logits_2d.float(), dim=-1)
-            p_target = F.softmax(target_logits_2d.float(), dim=-1)
+            # 使用温度系数进行 KL 散度蒸馏
+            log_p = F.log_softmax(mid_logits_2d.float() / T, dim=-1)
+            p_target = F.softmax(target_logits_2d.float() / T, dim=-1)
 
-            loss = F.kl_div(log_p, p_target, reduction='batchmean')
-            
+            # 乘以 T 的平方，保证梯度的量级稳定
+            loss = F.kl_div(log_p, p_target, reduction='batchmean') * (T * T)
 
         loss.backward()
-        
+        # 增加梯度裁剪，防止初期梯度爆炸
+        torch.nn.utils.clip_grad_norm_(self.lm_head.parameters(), max_norm=1.0)
         self.optimizer_head.step()
         
-        if self.ite % 1000 == 0:
+        if self.ite % 100 == 0:
             self._save_trained_head()
         return loss.item()
     
