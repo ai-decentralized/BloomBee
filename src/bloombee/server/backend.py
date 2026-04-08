@@ -304,7 +304,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 self._is_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
                 
                 training_mode = True
-                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-30b-hf.15':
+                if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-30b-hf.20':
                     self.pruner_manager.middle_states = hidden_states
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
@@ -374,8 +374,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     position_ids = self._position_ids_cache[cache_key] + (cache_len + offset)
                     if self._is_spec_decoding:
                         rotary_position_ids = self._create_tree_position_ids_with_invalid_cache(
-                            width=1,
-                            depth=4,
+                            width=2,
+                            depth=3,
                             prefill_length=inference_info.prefill_length - 1,
                             kv_cache_position_ids=kv_cache_position_ids,
                             batch_offset=inference_info.batch_offset,

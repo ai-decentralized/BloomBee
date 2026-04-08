@@ -7,7 +7,7 @@ from collections import deque
 import math
 import logging
 
-from bloombee.server.speculative_pruner.mid_layer_LM_head import MidLMHead
+from bloombee.server.speculative_pruner.mid_layer_LM_head import OriginalLMHead, TrainableMidLMHead
 from bloombee.server.speculative_pruner.utils import NetworkCondition
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class AdaptiveNeuralPruner:
         self.device = device
         self.config = config
         
-        self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
+        self.lm_head = TrainableMidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
         lm_head_weights_path = hf_hub_download(
             repo_id="xxiong59/lm-head-for-speculative-pruning",
             filename="lm_head_weights_15.pt",

@@ -339,6 +339,7 @@ class Server:
             vocab_size=vocab_size,
             config=config
         )
+        # self.pruner_manager=None
         
         ##############################################################
         
