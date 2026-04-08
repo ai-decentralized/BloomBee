@@ -330,7 +330,7 @@ class Server:
         # Create configuration
         config = PruningConfig(
             method=PruningMethod.ADAPTIVE_NEURAL,
-            neural_threshold=0.5,
+            neural_threshold=0.4,
             simple_threshold=0.1
         )
         
