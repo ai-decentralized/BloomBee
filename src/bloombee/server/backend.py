@@ -263,8 +263,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         
         # Mark as already set to skip future checks
         self._device_already_set = True
-
-    @torch.inference_mode() # Enter inference mode, no gradient computation to save memory
+        
     def inference_step( # Each block will execute once
         self,
         hidden_states: torch.Tensor,  # Input hidden state tensor
@@ -426,6 +425,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
                 # Centralized KV update via KVCacheManager
                 # [MERGED] Speculative decoding batched update with micro-batch support
+                logger.info(f"kv_cache_position_ids: {kv_cache_position_ids}")
                 if self._is_spec_decoding:
                     # self.cache_manager.update_cache_batched(new_kvs, kv_valid_lengths)
                     self.cache_manager.update_cache_and_async_reorder(
@@ -458,11 +458,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # logger.info(f"inference_step: KV cache update took {t6 - t5:.4f} seconds")
                 
                 # In training mode, you need to deploy your whole model in one device and choose a specific middle layer. After saving the middle_states, you can train the MLP network by comparing the middle states and final states logits.
-                training_mode = False
+                training_mode = True
                 if training_mode and self._is_spec_decoding and inference_info.uid == 'llama-7b-hf.15':
                     self.pruner_manager.middle_states = output_hidden_states
                 
-                training_model_mode = False
+                training_model_mode = True
                 if training_mode and training_model_mode and self._is_spec_decoding and self._is_last_block:
                     norm_hidden_states = self.module.rms_norm(output_hidden_states)
                     final_logits = self.module.lm_head_forward(norm_hidden_states)
@@ -476,9 +476,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     self.pruner_manager.train_lm_head(middle_norm_hidden_states, norm_hidden_states)
                 
                 if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block:
-                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    # norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    # keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
+                    logger.info(f"keep_indices: {keep_indices}")
                     # t7 = time.perf_counter()
                     # logger.info(f"prune_draft_tree took {t7 - t6:.4f} seconds")
                       
@@ -958,7 +959,6 @@ class _MergedInferenceStep:
         delta["_valid"] = 1 if (before is not None and after is not None) else 0
         return delta
 
-    @torch.inference_mode()
     def __call__(
         self,
         hidden_states: torch.Tensor,
@@ -975,8 +975,6 @@ class _MergedInferenceStep:
         if self._call_count == 1:
             batch_size = hidden_states.shape[0] if hidden_states.ndim >= 1 else 1
             mbpipe_log_path_entry(logger, "backend._MergedInferenceStep", batch_size=batch_size)
-        
-        kv_timing_before = self._snapshot_kv_timing()
 
         # Process all blocks for this micro-batch
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
@@ -986,7 +984,4 @@ class _MergedInferenceStep:
                 hidden_states, hypo_ids, inference_info
             )
 
-        kv_timing_after = self._snapshot_kv_timing()
-        kv_timing_delta = self._compute_kv_timing_delta(kv_timing_before, kv_timing_after)
-
-        return (hidden_states, keep_indices, kv_timing_delta)
+        return (hidden_states, keep_indices)

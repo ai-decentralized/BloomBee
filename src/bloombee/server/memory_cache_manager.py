@@ -1604,6 +1604,8 @@ class KVCacheManager:
                 new_positions = new_positions.unsqueeze(0).expand(B, tree_len)
                 extended_position_ids = torch.cat([kv_cache_position_ids_copy, new_positions], dim=1)
                 
+                logger.info(f"extended_position_ids: {extended_position_ids}")
+                
                 # 计算 cache 长度
                 ext_valid_mask = extended_position_ids >= 0
                 max_ext_position = extended_position_ids[ext_valid_mask].max().item()

@@ -70,13 +70,12 @@ def main():
     logger.info(f"Final result: {speed=:.2f}")
 
 
-@torch.inference_mode()
 def benchmark_inference(process_idx, args, result_pipe):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     drafter = MultiSSMDrafter(
         ssm_model_name="JackFram/llama-68m",
-        num_workers=2,
+        num_workers=1,
         device="cuda"
     )
     model = AutoDistributedSpeculativeModel.from_pretrained(
@@ -86,74 +85,124 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     batch_size = getattr(args, 'batch_size', 32)
     group_idx = getattr(args, 'group_idx', 0)
+    num_train_iters = getattr(args, 'num_train_iters', 256)
+    save_interval = getattr(args, 'save_interval', 32)
     
-    # 加载固定的prompt组
+    # 加载数据集（只加载一次）
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
-    with open("eval_indices.json", "r") as f:
-        groups = json.load(f)
-    
-    indices = groups[group_idx]
-    sampled = dataset.select(indices)
-    test_prompts = [item["instruction"] for item in sampled]
-    
-    logger.info(f"Running group {group_idx}/{len(groups)-1}")
-    logger.info(f"Prompts: {test_prompts}")
+    all_prompts = [item["instruction"] for item in dataset if item["instruction"].strip()]
+    logger.info(f"Loaded {len(all_prompts)} prompts from dataset")
     
     tokenizer.pad_token = tokenizer.eos_token
-    input_ids = tokenizer(
-        test_prompts, 
-        return_tensors="pt", 
-        padding=True
-    ).to(device)["input_ids"]
-    
     max_new_tokens = getattr(args, 'seq_len', 128)
+    
+    def sample_batch():
+        """每次随机采样 batch_size 条 prompt 并 tokenize"""
+        sampled_prompts = random.sample(all_prompts, batch_size)
+        ids = tokenizer(
+            sampled_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        ).to(device)["input_ids"]
+        return sampled_prompts, ids
     
     # warmup
     logger.info("Warming up...")
-    _ = model.generate(
-        input_ids=input_ids, 
-        drafter=drafter, 
-        max_new_tokens=10
-    )
+    _, warmup_ids = sample_batch()
+    with torch.inference_mode():
+        _ = model.generate(
+            input_ids=warmup_ids,
+            drafter=drafter,
+            max_new_tokens=10
+        )
     
-    # 正式计时
-    logger.info("Starting benchmark...")
-    start_time = perf_counter()
-    result = model.generate(
-        input_ids=input_ids, 
-        drafter=drafter, 
-        max_new_tokens=max_new_tokens
-    )
-    elapsed_time = perf_counter() - start_time
+    # 训练循环
+    logger.info(f"Starting training loop for {num_train_iters} iterations...")
     
-    original_output_ids = result
+    total_loss = 0.0
+    total_throughput = 0.0
+    train_stats = []
     
-    total_generated = 128 * batch_size
-    throughput = total_generated / elapsed_time
+    for iteration in range(num_train_iters):
+        # 每次随机采样新的一批 prompts
+        current_prompts, input_ids = sample_batch()
+        
+        start_time = perf_counter()
+        
+        result = model.generate(
+            input_ids=input_ids,
+            drafter=drafter,
+            max_new_tokens=max_new_tokens,
+            output_hidden_states=True,
+        )
+        
+        elapsed_time = perf_counter() - start_time
+        
+        # train_step
+        if hasattr(model, 'pruner') and model.pruner is not None:
+            train_info = model.pruner.train_step(
+                middle_hidden_states=result.middle_hidden_states,
+                final_logits=result.final_logits,
+                attention_mask=result.attention_mask,
+                draft_tokens=result.draft_tokens,
+            )
+            loss = train_info['total_loss']
+            total_loss += loss
+            
+            train_stats.append({
+                "iteration": iteration,
+                "loss": loss,
+                "pos_count": train_info['pos_count'],
+                "neg_count": train_info['neg_count'],
+            })
+            
+            logger.info(
+                f"[{iteration+1}/{num_train_iters}] "
+                f"loss={loss:.4f} | "
+                f"pos={train_info['pos_count']} neg={train_info['neg_count']} | "
+                f"time={elapsed_time:.2f}s"
+            )
+        else:
+            logger.warning(f"[{iteration+1}/{num_train_iters}] model.pruner not found, skipping train_step")
+        
+        # 定期保存
+        if (iteration + 1) % save_interval == 0:
+            ckpt_path = f"pruner_ckpt_iter{iteration+1}.pt"
+            if hasattr(model, 'pruner') and model.pruner is not None:
+                model.pruner.save_model(ckpt_path)
+                logger.info(f"Checkpoint saved to {ckpt_path}")
     
-    logger.info(f"Group {group_idx} | "
-                f"Total time: {elapsed_time:.4f}s | "
-                f"Throughput: {throughput:.2f} tokens/s | "
-                f"Generated tokens per sample: {total_generated}")
+    # 训练结束统计
+    avg_loss = total_loss / num_train_iters
+    logger.info("=" * 60)
+    logger.info(f"Training complete | avg_loss={avg_loss:.4f}")
+    logger.info("=" * 60)
     
-    # 保存结果
+    # 保存最终模型
+    final_ckpt_path = f"pruner_final_group{group_idx}.pt"
+    if hasattr(model, 'pruner') and model.pruner is not None:
+        model.pruner.save_model(final_ckpt_path)
+        logger.info(f"Final model saved to {final_ckpt_path}")
+    
+    # 保存训练统计
     result_label = "pruned" if getattr(args, 'pruning', False) else "unpruned"
     output_file = f"results_{result_label}_group_{group_idx}.json"
     result_data = {
         "group_idx": group_idx,
         "pruning": getattr(args, 'pruning', False),
-        "throughput": throughput,
-        "elapsed_time": elapsed_time,
-        "total_generated": total_generated,
-        "generated_tokens_nums": total_generated,
+        "avg_loss": avg_loss,
+        "num_train_iters": num_train_iters,
         "batch_size": batch_size,
         "max_new_tokens": max_new_tokens,
+        "train_stats": train_stats,
     }
     with open(output_file, "w") as f:
         json.dump(result_data, f, indent=2)
     logger.info(f"Results saved to {output_file}")
     
-    result_pipe.send(throughput)
+    result_pipe.send(0)
 
 
 if __name__ == "__main__":

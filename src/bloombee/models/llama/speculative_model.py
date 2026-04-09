@@ -55,7 +55,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # Keep the argument for API compatibility, but ignore runtime overrides.
         if "session_max_length" in model_kwargs:
             model_kwargs.pop("session_max_length", None)
-        session_max_length = 728
+        session_max_length = 300
         logger.info("Speculative session_max_length=%s (hardcoded)", session_max_length)
 
         # Use inference session for proper distributed caching
@@ -727,5 +727,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     verified_tokens[i, :v.shape[0]] = v
         else:
             verified_tokens = None
+            
+        logger.info(f"kv_cache_position_ids: {kv_cache_position_ids}")
         
         return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths

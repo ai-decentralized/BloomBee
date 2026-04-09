@@ -3,7 +3,7 @@ import json
 from datasets import load_dataset
 
 dataset = load_dataset("tatsu-lab/alpaca")["train"]
-batch_size = 32
+batch_size = 8
 num_groups = 10
 
 random.seed(42)

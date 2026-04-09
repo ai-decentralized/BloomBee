@@ -55,7 +55,7 @@ class AdaptiveNeuralPruner:
         self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
         lm_head_weights_path = hf_hub_download(
             repo_id="xxiong59/lm-head-for-speculative-pruning",
-            filename="lm_head_llama13B-20.pt",
+            filename="lm_head_weights_15.pt",
             cache_dir="./cache"
         )
         lm_head_checkpoint = torch.load(lm_head_weights_path, map_location="cuda")
@@ -180,6 +180,8 @@ class AdaptiveNeuralPruner:
     ) -> torch.Tensor:
         """Returns labels [B, S-1]."""
         B, Sm1, V = probs.shape
+        draft_tokens = draft_tokens.to(self.device)
+        probs = probs.to(self.device)
         token_ids = draft_tokens[:, 1:].long()  # [B, S-1]
 
         # topk ranks
@@ -284,7 +286,9 @@ class AdaptiveNeuralPruner:
         quality_scores = torch.cat([torch.zeros(B, 1, device=device), quality_scores_inner], dim=1)
 
         initial_keep = (decision_probs > self.config.neural_threshold)  # [B, S]
-        initial_keep[:, 0] = True  # root always kept
+        # root + first 3 positions always kept
+        force_keep_len = min(3, S)
+        initial_keep[:, :force_keep_len] = True
 
         # ── 6. Propagate discards down the tree — fully batched ───────────────
         final_keep = self._propagate_prune_mask_batched(
@@ -452,16 +456,19 @@ class AdaptiveNeuralPruner:
         accepted_indices, best_validated = self._get_current_accepted_tokens_indices(
             final_logits, attention_mask, draft_tokens
         )
+        
+        with torch.no_grad():
+            mid_logits = self.lm_head(middle_hidden_states)  # [1, S, V]
         logger.info(f"train_step, accepted_indices: {accepted_indices}")
         prob_features, labels = self.collect_training_data(
-            middle_hidden_states, attention_mask, draft_tokens
+            mid_logits, attention_mask, draft_tokens
         )
 
         self.ite += 1
         self.decision_net.train()
         self.optimizer.zero_grad()
 
-        tree_size = draft_tokens.shape[0]
+        tree_size = labels.shape[0]
 
         with torch.enable_grad():
             predictions, quality_scores = self.decision_net(prob_features)
