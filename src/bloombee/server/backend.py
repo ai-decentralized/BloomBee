@@ -481,8 +481,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 is_prefill = kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0
                 if not training_mode and self._is_spec_decoding and self._need_pruning and self._is_last_block and not is_prefill:
-                    # norm_hidden_states = self.module.rms_norm(output_hidden_states)
-                    # keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
+                    norm_hidden_states = self.module.rms_norm(output_hidden_states)
+                    keep_indices = self.prune_draft_tree(norm_hidden_states, inference_info.draft_tokens, full_mask)
                     keep_indices = keep_indices
                     # t7 = time.perf_counter()
                     # logger.info(f"prune_draft_tree took {t7 - t6:.4f} seconds")
@@ -980,9 +980,6 @@ class _MergedInferenceStep:
         if self._call_count == 1:
             batch_size = hidden_states.shape[0] if hidden_states.ndim >= 1 else 1
             mbpipe_log_path_entry(logger, "backend._MergedInferenceStep", batch_size=batch_size)
-        
-        kv_timing_before = self._snapshot_kv_timing()
-
         # Process all blocks for this micro-batch
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
             if optional_prompt is not None:
@@ -990,8 +987,4 @@ class _MergedInferenceStep:
             (hidden_states, keep_indices) = self.backends[inference_info.uid].inference_step(
                 hidden_states, hypo_ids, inference_info
             )
-
-        kv_timing_after = self._snapshot_kv_timing()
-        kv_timing_delta = self._compute_kv_timing_delta(kv_timing_before, kv_timing_after)
-
-        return (hidden_states, keep_indices, kv_timing_delta)
+        return (hidden_states, keep_indices)

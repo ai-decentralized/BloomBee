@@ -593,8 +593,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 
                 # [MBPIPE_STREAMING] For cross-stage micro-batch streaming, use full_batch_size for KV cache allocation
                 # This is critical for decode overlap: Stage 2 must allocate cache for full batch on first MB arrival
-                is_streaming_decode = is_microbatch_queue_item(request) or metadata.get("type") == "micro_batch"
-                logger.debug(f"[MB_DEBUG] is_streaming_decode={is_streaming_decode}, is_microbatch_queue_item={is_microbatch_queue_item(request)}")
+                is_streaming_decode = False
                 
                 if is_streaming_decode:
                     streaming_full_batch_size = metadata_full_batch_size if metadata_full_batch_size is not None else batch_size
@@ -689,46 +688,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                     output_buffer: Optional[AsyncOutputBuffer] = None
                     use_buffer = False
                     
-                    # Check if we should use async buffer (based on timing data)
-                    # Server-to-server communication is determined by next_servers in metadata
-                    if is_microbatch_enabled():
-                        # Check timing data for buffer decision
-                        tracker = get_timing_tracker()
-                        use_buffer, buffer_pos = tracker.should_use_buffer()
-                        
-                        if use_buffer and buffer_pos == "producer":
-                            output_buffer = AsyncOutputBuffer(
-                                max_pending=2,  # Allow up to 2 pending sends
-                                logger=logger,
-                                name=f"server_{requested_uids[0]}"
-                            )
-                            
-                            # Define the async push function for the buffer
-                            # Must be async because _push_outputs is async
-                            async def buffered_push_fn(item):
-                                req, tensors, meta = item
-                                await self._push_outputs(req, tensors, meta)
-                            
-                            await output_buffer.start_sender(buffered_push_fn)
-                            logger.info(
-                                f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer started for cross-stage overlap"
-                            )
-                    
-                    # [MBPIPE] Cross-stage streaming push callback (for micro-batch level streaming)
-                    # This enables Server2 to start processing micro-batch N while Server1 computes N+1
-                    cross_stage_push_microbatch = None
-                    
-                    if is_microbatch_enabled():
-                        # Create the cross-stage push function that captures required context
-                        async def _cross_stage_push_wrapper(mb_hidden, mb_keep, push_metadata):
-                            """Wrapper that calls _push_microbatch with required backends."""
-                            await self._push_microbatch(
-                                mb_hidden, mb_keep, push_metadata, requested_backends
-                            )
-                        
-                        cross_stage_push_microbatch = _cross_stage_push_wrapper
-                        logger.debug(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
-                    
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
                     # offload_logger.info(" Start inference iteration")
@@ -746,7 +705,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         points=points,
                         quant_type=self.quant_type,
                         args_structure=args_structure,
-                        cross_stage_push_fn=cross_stage_push_microbatch,  # [MBPIPE] Cross-stage streaming (currently disabled)
+                        cross_stage_push_fn=None,  # [MBPIPE] Cross-stage streaming (currently disabled)
                     ):
                         handler_step_start = perf_counter()
                         step_id_for_log = (
@@ -758,49 +717,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                         # print('=================================================   server rpc_inference step ',step_) ###
                         # print_time_now('')
                         step_+=1 ###
-                        
-                        # After first step (warmup/prefill), clean up temporary shared memory
-                        # This helps reduce /dev/shm peak usage on systems with limited shared memory
-                        # For larger batch sizes, perform cleanup more aggressively
-                        if not warmup_completed and step_ > 0:
-                            warmup_completed = True
-                            self._cleanup_warmup_shared_memory()
-                        # For large batch sizes, also cleanup periodically to prevent accumulation
-                        elif step_ > 0 and step_ % 5 == 0 and batch_size >= 20:
-                            self._cleanup_warmup_shared_memory()
-                        
                         can_push_case_time=perf_counter() ###
-
-                        if can_push:
-                            # [MBPIPE] Skip _push_outputs if data was already sent via cross-stage micro-batch push
-                            cross_stage_pushed = step_metadata.get("cross_stage_pushed", False) if step_metadata else False
-                            if cross_stage_pushed:
-                                logger.debug(f"{MBPIPE_LOG_PREFIX} Skipping _push_outputs: data sent via cross-stage micro-batch push")
-                            elif output_buffer is not None and output_buffer.is_running:
-                                # Non-blocking put into buffer - actual send happens in background
-                                try:
-                                    await output_buffer.put(
-                                        (request, output_tensors, step_metadata),
-                                        clone=False  # Already serialized, no need to clone
-                                    )
-                                except Exception as e:
-                                    logger.warning(f"{MBPIPE_LOG_PREFIX} Buffer put failed, falling back to direct send: {e}")
-                                    task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
-                                    background_tasks.add(task)
-                                    task.add_done_callback(background_tasks.discard)
-                            else:
-                                # Original direct task creation
-                                normalized_outputs = self._normalize_serialized_tensors(output_tensors)
-                                next_tensors = normalized_outputs + list(request.tensors[6:])
-                                push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
-
-                                # 模拟网络传输延时
-                                NETWORK_SPEED_BYTES_PER_SEC = 15.6 * 1024 * 1024 
-                                transfer_delay = push_tensor_bytes / NETWORK_SPEED_BYTES_PER_SEC + 0.075
-                                await asyncio.sleep(transfer_delay)
-                                task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
-                                background_tasks.add(task)  # Keep reference until it is done to save it from GC
-                                task.add_done_callback(background_tasks.discard)
+                        normalized_outputs = self._normalize_serialized_tensors(output_tensors)
+                        next_tensors = normalized_outputs + list(request.tensors[6:])
+                        push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
+                        NETWORK_SPEED_BYTES_PER_SEC = 62.5 * 1024 * 1024 
+                        transfer_delay = push_tensor_bytes / NETWORK_SPEED_BYTES_PER_SEC + 0.025
+                        await asyncio.sleep(transfer_delay)
                         start_ExpertResponse_time=perf_counter() ###
                         push_schedule_ms = (start_ExpertResponse_time - can_push_case_time) * 1000.0
                         push_time.append(push_schedule_ms) ###
@@ -1085,60 +1008,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         else:
                             get_push_task = asyncio.create_task(asyncio.Event().wait())  # Dummy never-ending task
 
-                    # [MBPIPE] Check if this is a micro-batch queue item (dict with type="micro_batch")
-                    if is_microbatch_queue_item(request):
-                        # Yield micro-batch directly with type marker
-                        mb_item = request
-                        mb_metadata = mb_item.get("metadata", {}).copy()
-                        mb_step_id = mb_metadata.get("step_id")
-                        mb_idx = mb_item.get("mb_idx", 0)
-                        skip_mb_item = False
-
-                        # If this step was already processed through full-batch path, ignore late micro-batch pushes.
-                        if mb_step_id is not None and mb_step_id in processed_step_ids and mb_step_id not in microbatch_step_ids:
-                            logger.info(
-                                f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping late micro-batch "
-                                f"(step_id={mb_step_id}, mb_idx={mb_idx}) because full-batch path already processed it"
-                            )
-                            request = None
-                            skip_mb_item = True
-
-                        # Idempotency at consume side: prevent duplicate enqueue/replay from being processed twice.
-                        if not skip_mb_item:
-                            mb_dedup_key = (mb_step_id, mb_idx)
-                            if mb_dedup_key in processed_microbatch_ids:
-                                logger.info(
-                                    f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping duplicate micro-batch "
-                                    f"(step_id={mb_step_id}, mb_idx={mb_idx})"
-                                )
-                                request = None
-                                skip_mb_item = True
-                            else:
-                                processed_microbatch_ids.add(mb_dedup_key)
-                                if mb_step_id is not None:
-                                    microbatch_step_ids.add(mb_step_id)
-
-                        if not skip_mb_item:
-                            mb_metadata["type"] = "micro_batch"
-                            mb_metadata["mb_idx"] = mb_idx
-                            mb_metadata["expected_num_mb"] = mb_item.get("expected_num_mb", 1)
-                            mb_metadata["offset"] = mb_item.get("offset", 0)
-                            mb_metadata["size"] = mb_item.get("size", 1)
-                            mb_metadata["full_batch_size"] = mb_item.get("full_batch_size", 1)
-                            mb_metadata["pushed"] = True
-                            mb_metadata["_queue_wait_ms"] = float(queue_wait_ms)
-                            mb_metadata["_queue_source"] = queue_source
-                            
-                            logger.debug(
-                                f"{MBPIPE_LOG_PREFIX} iterate_steps: yielding micro-batch "
-                                f"mb_idx={mb_item.get('mb_idx')} for immediate processing"
-                            )
-                            
-                            yield mb_item.get("payload"), mb_metadata
-                            
-                            # Continue to next item from queue
-                            request = None
-                    elif hasattr(request, 'tensors') and (request.tensors or (request.metadata and not request.tensors)):
+                    if hasattr(request, 'tensors') and (request.tensors or (request.metadata and not request.tensors)):
                         # Original full-batch request path
                         start_meta_time = perf_counter()
                         metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}

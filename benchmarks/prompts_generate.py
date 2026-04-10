@@ -6,7 +6,7 @@ dataset = load_dataset("tatsu-lab/alpaca")["train"]
 batch_size = 32
 num_groups = 10
 
-random.seed(42)
+random.seed(1)
 groups = []
 for i in range(num_groups):
     indices = random.sample(range(len(dataset)), batch_size)

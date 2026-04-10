@@ -4,11 +4,13 @@ import argparse
 import multiprocessing as mp
 from time import perf_counter
 import logging
+import json
 
 import numpy as np
 import torch
 from hivemind.utils.logging import get_logger
 from transformers import AutoTokenizer
+from datasets import load_dataset
 
 from bloombee import AutoDistributedModelForCausalLM
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
