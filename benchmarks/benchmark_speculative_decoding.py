@@ -60,7 +60,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     drafter = MultiSSMDrafter(
-        ssm_model_name="JackFram/llama-68m",
+        ssm_model_name="JackFram/llama-160m",
         num_workers=1,
         device="cuda"
     )

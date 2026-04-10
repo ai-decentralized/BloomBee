@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from bloombee.server.speculative_pruner.mid_layer_LM_head import MidLMHead
+from bloombee.server.speculative_pruner.mid_layer_LM_head import TrainableMidLMHead, OriginalLMHead
 from bloombee.utils.debug import dprint
 
 class LM_head_trainer:
@@ -18,14 +18,14 @@ class LM_head_trainer:
         self.config = config
         
         # LM head for getting probabilities
-        self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
+        self.lm_head = TrainableMidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
         # need to modify this path to real LM head path
         self.lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
         self.lm_head.requires_grad_(False)
         self.lm_head.to(dtype=torch.bfloat16)
 
         
-        self.original_lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
+        self.original_lm_head = OriginalLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to(device)
         # need to modify this path to real LM head path
         self.original_lm_head.load_weight("/tmp/data/llama_weights/llama-7b-np")
         self.original_lm_head.requires_grad_(False)

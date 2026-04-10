@@ -6,7 +6,7 @@ from huggingface_hub import hf_hub_download
 
 from bloombee.server.speculative_pruner.pruner_interface import PrunerInterface
 from bloombee.server.speculative_pruner.utils import PruningConfig
-from bloombee.server.speculative_pruner.mid_layer_LM_head import MidLMHead
+from bloombee.server.speculative_pruner.mid_layer_LM_head import TrainableMidLMHead
 
 class SimpleProbabilityPruner(PrunerInterface):
     
@@ -22,7 +22,7 @@ class SimpleProbabilityPruner(PrunerInterface):
         self.device = device
         
         # LM head for getting probabilities
-        self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
+        self.lm_head = TrainableMidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
         lm_head_weights_path = hf_hub_download(
             repo_id="xxiong59/lm-head-for-speculative-pruning",
             filename="lm_head_weights_15.pt",

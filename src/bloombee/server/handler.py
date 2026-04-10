@@ -770,7 +770,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             self._cleanup_warmup_shared_memory()
                         
                         can_push_case_time=perf_counter() ###
-
+                        
                         if can_push:
                             # [MBPIPE] Skip _push_outputs if data was already sent via cross-stage micro-batch push
                             cross_stage_pushed = step_metadata.get("cross_stage_pushed", False) if step_metadata else False
@@ -790,6 +790,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                                     task.add_done_callback(background_tasks.discard)
                             else:
                                 # Original direct task creation
+                                normalized_outputs = self._normalize_serialized_tensors(output_tensors)
+                                next_tensors = normalized_outputs + list(request.tensors[6:])
+                                push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
+
+                                # 模拟网络传输延时
+                                NETWORK_SPEED_BYTES_PER_SEC = 31.25 * 1024 * 1024 
+                                transfer_delay = push_tensor_bytes / NETWORK_SPEED_BYTES_PER_SEC + 0.05
+                                await asyncio.sleep(transfer_delay)
                                 task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
                                 background_tasks.add(task)  # Keep reference until it is done to save it from GC
                                 task.add_done_callback(background_tasks.discard)

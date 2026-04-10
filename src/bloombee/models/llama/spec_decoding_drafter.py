@@ -87,7 +87,7 @@ class MultiSSMDrafter:
         max_depth: int,
     ) -> List:
         
-        pad_token_id = getattr(ssm.config, 'pad_token_id', 0)
+        pad_token_id = getattr(ssm.config, 'pad_token_id', None) or 0
         
         trees = {}
         valid_inputs = {}
