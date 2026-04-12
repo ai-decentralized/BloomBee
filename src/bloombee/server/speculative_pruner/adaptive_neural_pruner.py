@@ -55,7 +55,7 @@ class AdaptiveNeuralPruner:
         self.lm_head = MidLMHead(hidden_size=hidden_size, vocab_size=vocab_size).to("cuda")
         lm_head_weights_path = hf_hub_download(
             repo_id="xxiong59/lm-head-for-speculative-pruning",
-            filename="lm_head_llama30B-20.pt",
+            filename="lm_head_llama13B-20.pt",
             cache_dir="./cache"
         )
         lm_head_checkpoint = torch.load(lm_head_weights_path, map_location="cuda")
@@ -284,7 +284,9 @@ class AdaptiveNeuralPruner:
         quality_scores = torch.cat([torch.zeros(B, 1, device=device), quality_scores_inner], dim=1)
 
         initial_keep = (decision_probs > self.config.neural_threshold)  # [B, S]
-        initial_keep[:, 0] = True  # root always kept
+        # root + first 3 positions always kept
+        force_keep_len = min(3, S)
+        initial_keep[:, :force_keep_len] = True
 
         # ── 6. Propagate discards down the tree — fully batched ───────────────
         final_keep = self._propagate_prune_mask_batched(

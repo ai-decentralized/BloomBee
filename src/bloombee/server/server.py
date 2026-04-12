@@ -324,7 +324,7 @@ class Server:
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = os.path.join(tempfile.gettempdir(), 'data', 'llama_weights')
         
-        hidden_size = 6656
+        hidden_size = 5120
         vocab_size = 32000
         
         # Create configuration

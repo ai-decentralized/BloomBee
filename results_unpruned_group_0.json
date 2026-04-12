@@ -1,0 +1,10 @@
+{
+  "group_idx": 0,
+  "pruning": false,
+  "throughput": 89.84063335409176,
+  "elapsed_time": 45.591842433437705,
+  "total_generated": 4096,
+  "generated_tokens_nums": 4096,
+  "batch_size": 32,
+  "max_new_tokens": 128
+}
