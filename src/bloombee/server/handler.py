@@ -718,12 +718,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                         # print_time_now('')
                         step_+=1 ###
                         can_push_case_time=perf_counter() ###
-                        normalized_outputs = self._normalize_serialized_tensors(output_tensors)
-                        next_tensors = normalized_outputs + list(request.tensors[6:])
-                        push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
-                        NETWORK_SPEED_BYTES_PER_SEC = 62.5 * 1024 * 1024 
-                        transfer_delay = push_tensor_bytes / NETWORK_SPEED_BYTES_PER_SEC + 0.025
-                        await asyncio.sleep(transfer_delay)
+                        # normalized_outputs = self._normalize_serialized_tensors(output_tensors)
+                        # next_tensors = normalized_outputs + list(request.tensors[6:])
+                        # push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
+                        # NETWORK_SPEED_BYTES_PER_SEC = 62.5 * 1024 * 1024 
+                        # transfer_delay = push_tensor_bytes / NETWORK_SPEED_BYTES_PER_SEC + 0.025
+                        # await asyncio.sleep(transfer_delay)
                         start_ExpertResponse_time=perf_counter() ###
                         push_schedule_ms = (start_ExpertResponse_time - can_push_case_time) * 1000.0
                         push_time.append(push_schedule_ms) ###

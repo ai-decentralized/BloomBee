@@ -127,18 +127,36 @@ def benchmark_inference(process_idx, args, result_pipe):
     elapsed_time = perf_counter() - start_time
     
     original_output_ids = result
+
+    # 去掉输入部分，只保留生成的部分
+    input_len = input_ids.shape[1]
+
+    # padding token ids 是 0, 1, 2
+    PADDING_IDS = {0, 1, 2}
     
-    total_generated = 128 * batch_size
+    input_lengths = [
+        sum(1 for tok in sample.tolist() if tok not in PADDING_IDS)
+        for sample in input_ids
+    ]
+
+    # 统计每个 sample 实际生成的 token 数（去掉 padding）
+    per_sample_generated = [
+        sum(1 for tok in result[i, input_lengths[i]:].tolist() if tok not in PADDING_IDS)
+        for i in range(len(input_lengths))
+    ]
+
+    total_generated = sum(per_sample_generated)
     throughput = total_generated / elapsed_time
-    
+
     logger.info(f"Group {group_idx} | "
                 f"Total time: {elapsed_time:.4f}s | "
                 f"Throughput: {throughput:.2f} tokens/s | "
-                f"Generated tokens per sample: {total_generated}")
+                f"Per-sample generated: {per_sample_generated} | "
+                f"Total generated: {total_generated}")
     
-    # 保存结果
-    result_label = "pruned" if getattr(args, 'pruning', False) else "unpruned"
-    output_file = f"results_{result_label}_group_{group_idx}.json"
+    logger.info(f"input_ids: {input_ids}")
+    logger.info(f"original_output_ids: {original_output_ids}")
+
     result_data = {
         "group_idx": group_idx,
         "pruning": getattr(args, 'pruning', False),
@@ -146,12 +164,10 @@ def benchmark_inference(process_idx, args, result_pipe):
         "elapsed_time": elapsed_time,
         "total_generated": total_generated,
         "generated_tokens_nums": total_generated,
+        "per_sample_generated": per_sample_generated,
         "batch_size": batch_size,
         "max_new_tokens": max_new_tokens,
     }
-    with open(output_file, "w") as f:
-        json.dump(result_data, f, indent=2)
-    logger.info(f"Results saved to {output_file}")
     
     result_pipe.send(throughput)
 
