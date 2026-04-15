@@ -55,7 +55,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # Keep the argument for API compatibility, but ignore runtime overrides.
         if "session_max_length" in model_kwargs:
             model_kwargs.pop("session_max_length", None)
-        session_max_length = 350
+        session_max_length = 120
         logger.info("Speculative session_max_length=%s (hardcoded)", session_max_length)
 
         # Use inference session for proper distributed caching
@@ -129,12 +129,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         logger.info(f"init input_ids: {input_ids}, seq_lengths: {seq_lengths}")
         # 修改循环条件：基于最短序列的长度判断
         # t0 = time.perf_counter()
-        initial_len = input_ids.shape[1]
+        initial_seq_lengths = seq_lengths.clone()
         t0 = time.perf_counter()  # 用于记录第一个达标的时间
         has_printed_first_reach = False # 确保只打印一次
         sample_finish_times = [None] * batch_size
         sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
-        while not finished and (seq_lengths.min().item() - initial_len) < max_new_tokens:
+        while not finished and (seq_lengths - initial_seq_lengths).max().item() < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
             spec_trees = drafter.build_trees_parallel(
@@ -209,7 +209,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             finished = unfinished_sequences.max() == 0
             total_time = time.perf_counter() - t1
             logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
-            current_generations = seq_lengths - initial_len
+            current_generations = seq_lengths - initial_seq_lengths
             for i in range(batch_size):
                 if (current_generations[i] >= max_new_tokens and not sample_finished[i]):
                     finish_time = time.perf_counter() - t0

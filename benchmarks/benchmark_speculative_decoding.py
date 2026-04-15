@@ -3,6 +3,7 @@ import argparse
 import multiprocessing as mp
 import random
 import sys
+import json
 from pathlib import Path
 from time import perf_counter
 
@@ -37,6 +38,20 @@ def main():
     parser.add_argument("--n_processes", type=str, default=1, help="Number of concurrent processes")
     parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length (reserved)")
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
+    parser.add_argument(
+        "--prompt_start_index",
+        type=int,
+        default=1,
+        help="Starting index for prompt generation; default=1 avoids the degenerate 'Number 0' case",
+    )
+    parser.add_argument(
+        "--prompt_template",
+        type=str,
+        default="Number {i}: ",
+        help="Prompt template. Must contain '{i}', e.g. 'Number {i}: ' or 'Topic {i}: '",
+    )
+    parser.add_argument("--group_idx", type=int, default=0, 
+                    help="Which group to run (0-9)")
     args = parser.parse_args()
 
     if args.n_processes == "n_gpus":
@@ -69,51 +84,92 @@ def benchmark_inference(process_idx, args, result_pipe):
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
     
-    batch_size = getattr(args, 'batch_size', 8)
+    batch_size = getattr(args, 'batch_size', 32)
+    group_idx = getattr(args, 'group_idx', 0)
+    
+    # 加载固定的prompt组
     dataset = load_dataset("tatsu-lab/alpaca")["train"]
-    indices = random.sample(range(len(dataset)), batch_size)
+    with open("eval_indices.json", "r") as f:
+        groups = json.load(f)
+    
+    indices = groups[group_idx]
     sampled = dataset.select(indices)
-    test_prompts = []
-    for item in sampled:
-        test_prompts.append(item["instruction"])
+    test_prompts = [item["instruction"] for item in sampled]
     
-
+    logger.info(f"Running group {group_idx}/{len(groups)-1}")
+    logger.info(f"Prompts: {test_prompts}")
+    
     tokenizer.pad_token = tokenizer.eos_token
-    input_ids = tokenizer(test_prompts, return_tensors="pt", padding=True).to(device)["input_ids"]
-
-    result = ""
-    start_time = perf_counter()
+    input_ids = tokenizer(
+        test_prompts, 
+        return_tensors="pt", 
+        padding=True
+    ).to(device)["input_ids"]
+    
     max_new_tokens = getattr(args, 'seq_len', 128)
-    result = model.generate(input_ids=input_ids, drafter=drafter, max_new_tokens=max_new_tokens)
-    time = perf_counter() - start_time
-    generated_tokens_nums = []
-    for i in range(batch_size):
-        prompt_mask = input_ids[i].ne(tokenizer.pad_token_id)
-        prompt_length = prompt_mask.sum().item()
-        result_mask = result[i].ne(tokenizer.pad_token_id) & result[i].ne(0)
-        result_length = result_mask.sum().item()
-        generated_tokens_num = result_length - prompt_length
-        generated_tokens_nums.append(generated_tokens_num)
-        
-        logger.info(f"result: {result[i]}")
     
-    avg_generated_tokens = sum(generated_tokens_nums) / batch_size
-    speed = avg_generated_tokens / time
-
-    decoded_results = tokenizer.batch_decode(result, skip_special_tokens=True)
-
-    logger.info(f"benchmark_inference batch size: {batch_size}")
-    logger.info(f"Total time: {time:.4f}s, Average speed: {speed:.2f} tokens/s")
-    logger.info(f"Generated tokens per sample: {generated_tokens_nums}")
-
-    for i, (prompt, decoded_result) in enumerate(zip(test_prompts, decoded_results)):
-        logger.info(f"Sample {i}:")
-        logger.info(f"  Prompt: {prompt}")
-        logger.info(f"  Result: {decoded_result}")
-        logger.info(f"  Generated tokens: {generated_tokens_nums[i]}")
+    # warmup
+    logger.info("Warming up...")
+    _ = model.generate(
+        input_ids=input_ids, 
+        drafter=drafter, 
+        max_new_tokens=10
+    )
     
+    # 正式计时
+    logger.info("Starting benchmark...")
+    start_time = perf_counter()
+    result = model.generate(
+        input_ids=input_ids, 
+        drafter=drafter, 
+        max_new_tokens=max_new_tokens
+    )
+    elapsed_time = perf_counter() - start_time
     
-    result_pipe.send(speed)
+    original_output_ids = result
+
+    # 去掉输入部分，只保留生成的部分
+    input_len = input_ids.shape[1]
+
+    # padding token ids 是 0, 1, 2
+    PADDING_IDS = {0, 1, 2}
+    
+    input_lengths = [
+        sum(1 for tok in sample.tolist() if tok not in PADDING_IDS)
+        for sample in input_ids
+    ]
+
+    # 统计每个 sample 实际生成的 token 数（去掉 padding）
+    per_sample_generated = [
+        sum(1 for tok in result[i, input_lengths[i]:].tolist() if tok not in PADDING_IDS)
+        for i in range(len(input_lengths))
+    ]
+
+    total_generated = sum(per_sample_generated)
+    throughput = total_generated / elapsed_time
+
+    logger.info(f"Group {group_idx} | "
+                f"Total time: {elapsed_time:.4f}s | "
+                f"Throughput: {throughput:.2f} tokens/s | "
+                f"Per-sample generated: {per_sample_generated} | "
+                f"Total generated: {total_generated}")
+    
+    logger.info(f"input_ids: {input_ids}")
+    logger.info(f"original_output_ids: {original_output_ids}")
+
+    result_data = {
+        "group_idx": group_idx,
+        "pruning": getattr(args, 'pruning', False),
+        "throughput": throughput,
+        "elapsed_time": elapsed_time,
+        "total_generated": total_generated,
+        "generated_tokens_nums": total_generated,
+        "per_sample_generated": per_sample_generated,
+        "batch_size": batch_size,
+        "max_new_tokens": max_new_tokens,
+    }
+    
+    result_pipe.send(throughput)
 
 
 if __name__ == "__main__":
