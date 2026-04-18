@@ -1325,10 +1325,27 @@ def map_to_torch_tensor(tensor, indices):
 
 
 def copy_worker_func(queue, cuda_id):
-    """The copy worker thread."""
+    """The copy worker thread.
+
+    The pinned CPU relay buffer is only used when at least one end of a
+    copy is on CUDA. When disk-offload is disabled (Disk% = 0), no such
+    copy is ever enqueued — but the thread still starts and, pre-arch-
+    reform, eagerly allocated a full 1 * GB fp16 (2 GB) pinned buffer.
+    On boxes with a modest CUDA pinned-memory budget (e.g. V100 16GB /
+    driver-limited RMLIMIT_MEMLOCK hosts) that 2 GB registration fails
+    with a misleading "CUDA out of memory" error before the server can
+    even bind its DHT. Shrink the default to 4 MB; allow override via
+    BLOOMBEE_PIN_RELAY_MB for workloads that actually stage through here.
+    """
+    import os
+
     torch.cuda.set_device(cuda_id)
 
-    cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+    pin_mb = int(os.environ.get("BLOOMBEE_PIN_RELAY_MB", "4"))
+    pin_mb = max(pin_mb, 1)
+    # fp16 element_size is 2 bytes; buffer length in elements.
+    pin_elems = pin_mb * (1 << 20) // 2
+    cpu_buf = torch.empty((pin_elems,), dtype=torch.float16, pin_memory=True)
     copy_stream = torch.cuda.Stream()
 
     with torch.cuda.stream(copy_stream), torch.inference_mode():
@@ -1344,11 +1361,17 @@ def copy_worker_func(queue, cuda_id):
 
             if (src.device.device_type == DeviceType.CUDA or
                 dst.device.device_type == DeviceType.CUDA):
-                # Use a pinned cpu buffer as a relay
-                size = np.prod(src_data.shape)
-                tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
-                tmp_cpu_buf.copy_(src_data)
-                dst_data.copy_(tmp_cpu_buf)
+                size = int(np.prod(src_data.shape))
+                if size <= cpu_buf.numel():
+                    # Use a pinned cpu buffer as a relay
+                    tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                    tmp_cpu_buf.copy_(src_data)
+                    dst_data.copy_(tmp_cpu_buf)
+                else:
+                    # Buffer too small for this transfer — fall back to a
+                    # direct copy. Slightly less overlap-friendly, but
+                    # correct and avoids a silent OOB view.
+                    dst_data.copy_(src_data)
             else:
                 dst_data.copy_(src_data)
 
