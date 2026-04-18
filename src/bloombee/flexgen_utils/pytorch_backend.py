@@ -812,15 +812,27 @@ class TorchDevice:
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache and k_cache.device.device_type == DeviceType.COMPRESSED:
-                    # shape: (s, b * n_head, head_dim)
+                    # Compressed backing store: decompress to a new tensor first.
                     k = k_cache.device.decompress(k_cache)
                     v = v_cache.device.decompress(v_cache)
+                    cache_capacity = k.shape[0]
                 else:
-                    # shape: (s, b * n_head, head_dim)
                     k = k_cache.data
                     v = v_cache.data
-                k = torch.cat([k, k_new], dim=0)   # shape → (hist_len + tgt_s, ...)
-                v = torch.cat([v, v_new], dim=0)
+                    cache_capacity = k.shape[0]
+                # If the cache tensor is the FlexGen pre-allocated slab (capacity
+                # ≥ src_s), write the new tokens in place at the current position
+                # and take a view of the populated prefix. Otherwise (server path
+                # where the cache is a fresh-per-step tensor shaped exactly to the
+                # history length), fall back to concat.
+                if cache_capacity >= src_s:
+                    k[src_s - tgt_s:src_s] = k_new
+                    v[src_s - tgt_s:src_s] = v_new
+                    k = k[:src_s]
+                    v = v[:src_s]
+                else:
+                    k = torch.cat([k, k_new], dim=0)
+                    v = torch.cat([v, v_new], dim=0)
                 # shape: (b * n_head, head_dim, s)
                 k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
                 # shape: (b * n_head, s, head_dim)
