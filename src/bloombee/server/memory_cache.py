@@ -43,6 +43,7 @@ from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, Torch
 from bloombee.flexgen_utils.compression import TorchCompressedDevice, general_copy_compressed
 from bloombee.flexgen_utils.utils import torch_dtype_to_np_dtype
 from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
+from bloombee.server.paged_kv import BLOCK_SIZE as PAGED_BLOCK_SIZE, PagedKVTable
 import numpy as np
 
 logger = get_logger(__name__)
@@ -56,6 +57,24 @@ def _is_verbose_kv_alloc_logs() -> bool:
     """Enable detailed KV allocation logs with BLOOMBEE_VERBOSE_KV_LOGS=1."""
     return get_env_bool_with_debug_fallback(
         "BLOOMBEE_VERBOSE_KV_LOGS",
+        default=False,
+        groups=("kv_cache",),
+    )
+
+
+def _is_paged_kv_enabled() -> bool:
+    """Phase 2 paged-KV shim. OFF by default; opt in with BLOOMBEE_PAGED_KV=1.
+
+    When enabled, MemoryCache registers a PagedKVTable aliased onto each
+    allocated (k, v) slab. The attention kernel still sees the same
+    TorchTensor pair from use_cache(); the paged table is available as a
+    side channel via paged_view(handle) for the spec-decoding verify and
+    rollback paths. Writes through either channel land in the same
+    backing storage — this is the whole point of the shim being
+    byte-compatible.
+    """
+    return get_env_bool_with_debug_fallback(
+        "BLOOMBEE_PAGED_KV",
         default=False,
         groups=("kv_cache",),
     )
@@ -79,6 +98,10 @@ class MemoryCache:
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
         self._allocated_tensors: Dict[Handle, Any] = {}
         self._handle_size_bytes: Dict[Handle, int] = {}
+        # Phase 2 shim: per-handle PagedKVTable aliased onto the same slab
+        # storage as _allocated_tensors[handle]. Populated lazily at
+        # allocation time; only present when BLOOMBEE_PAGED_KV=1.
+        self._paged_tables: Dict[Handle, PagedKVTable] = {}
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
@@ -263,6 +286,37 @@ class MemoryCache:
         finally:
             self._cache_home_probe_emitted = True
 
+    def _register_paged_view(self, handle: Handle, allocated_cache: Any) -> None:
+        """Alias a PagedKVTable onto the (k, v) storage for ``handle``.
+
+        Silent no-op if the cache shape isn't what the paged substrate
+        expects. The shim is additive — registration failure must NOT
+        break allocation.
+        """
+        try:
+            k_cache, v_cache = allocated_cache
+            k_data = getattr(k_cache, "data", None)
+            v_data = getattr(v_cache, "data", None)
+            if not (torch.is_tensor(k_data) and torch.is_tensor(v_data)):
+                return
+            if k_data.ndim != 3 or k_data.shape != v_data.shape:
+                return
+            s_total = int(k_data.shape[0])
+            if s_total % PAGED_BLOCK_SIZE != 0:
+                return
+            self._paged_tables[handle] = PagedKVTable(k_data, v_data)
+        except Exception as e:  # registration must be non-fatal
+            logger.warning(f"[PAGED_KV] failed to register view for handle={handle}: {e}")
+
+    def paged_view(self, handle: Handle) -> Optional[PagedKVTable]:
+        """Return the PagedKVTable aliased onto ``handle``'s slab, if any.
+
+        Returns None when the paged shim is disabled or registration
+        skipped this handle (e.g. mixed-device slabs). Callers must
+        fall back to the legacy slab path in that case.
+        """
+        return self._paged_tables.get(handle)
+
     @contextlib.contextmanager
     def use_cache(self, *handles: Handle) -> Sequence[torch.Tensor]:
         """
@@ -375,7 +429,10 @@ class MemoryCache:
                     kv_alloc_log(f"[MBPIPE_KV_DEBUG] === KV CACHE ALLOCATION COMPLETE ===")
                     
                     self._allocated_tensors[handle] = allocated_cache
-                    
+
+                    if _is_paged_kv_enabled():
+                        self._register_paged_view(handle, allocated_cache)
+
             else:  # delete tensors by handle
                 for handle in recv_handles:
                     if handle not in self._allocated_tensors:
@@ -383,6 +440,7 @@ class MemoryCache:
                             f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
                         )
                     self._allocated_tensors.pop(handle, None)
+                    self._paged_tables.pop(handle, None)
 
         while self._pipe_recv.poll():
             _process_message(*self._pipe_recv.recv())
