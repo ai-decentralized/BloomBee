@@ -127,12 +127,62 @@ compounding, with no regressions in the code paths we didn't touch.
 - **Combined end-to-end: 5.4× at batch=16 over a 256-step decode, with
   141 MB less peak GPU memory.** See section 4.
 
+## 5. Real-server round-trip through BloomBee RPC on V100
+
+Weight-loading blockers were removed (see commit `da30b0e`):
+`flex_llama.py`'s unconditional `huggyllama/llama-7b`
+`snapshot_download`, the `llama-65b` default fallback for unknown
+geometries, and the missing local-safetensors → FlexGen numpy
+converter. Server-side round-trip is now measurable.
+
+Setup: single V100-SXM2-16GB host, 4-block llama-7b geometry
+(`hidden_size=4096`, `n_head=32`, `L=4`), FlexGen float16, zero-initialized
+weights (we are measuring the RPC/attention/KV path, not text quality),
+speculative-decoding disabled (`BLOOMBEE_DISABLE_SPEC=1`), private swarm,
+`alloc_seq_len=64` (block-aligned so the Phase 2 shim actually registers),
+`prompt_len=18`, `n_new=46`. Figures are the server's own
+`[TIMING_SUMMARY]` (3 decode steps/trial, 3 trials each).
+
+| Config | alloc_seq_len | InferenceLatency (ms) | Throughput (tok/s) | Notes |
+|---|---:|---:|---:|---|
+| `BLOOMBEE_PAGED_KV=0` — trial 1 | 64 | 36.96 | 243.50 | baseline |
+| `BLOOMBEE_PAGED_KV=0` — trial 2 | 64 | 37.22 | 241.83 | baseline |
+| `BLOOMBEE_PAGED_KV=0` — trial 3 | 64 | 37.25 | 241.63 | baseline |
+| `BLOOMBEE_PAGED_KV=1` — trial 1 | 64 | 38.93 | 231.17 | shim active |
+| `BLOOMBEE_PAGED_KV=1` — trial 2 | 64 | 37.83 | 237.92 | shim active |
+| `BLOOMBEE_PAGED_KV=1` — trial 3 | 64 | 37.33 | 241.09 | shim active |
+
+**Medians: PAGED_KV=0 → 37.22 ms/step, 241.83 tok/s. PAGED_KV=1 →
+37.83 ms/step, 237.92 tok/s.** The shim adds ≈0.6 ms per step (~1.6%
+overhead) when registration fires. This matches expectations: the
+attention kernel still reads from the FlexGen slab; the PagedKVTable
+is aliased on top and only costs the per-handle bookkeeping +
+registration. Functionally correct end-to-end round-trip: client
+connects, routes through all 4 blocks, session opens, decode steps
+execute on GPU (`decode_branch=dense_cuda`), session closes cleanly.
+
+This confirms the Phase 2 substrate is wired up through the real
+server without regressing latency. The next step is to route Phase 3
+speculative verification through the paged substrate so the shim
+becomes load-bearing — at that point the ~0.6 ms bookkeeping cost
+gets amortized against the per-step `torch.cat` alloc churn that the
+paged writes eliminate.
+
+## Summary of this session's measured wins
+
+| Optimization | Where | Measured speedup | Type |
+|---|---|---:|---|
+| Ancestor matrix (O(n³)→O(n·d)) | spec-dec tree rebuild | 4–11× per call | algorithmic |
+| Verify argmax hoist | spec-dec verify | up to 32× at B=16 CUDA | kernel-sync |
+| In-place slab (vs `torch.cat`) | FlexGen decode KV write | 93× at B=4×511 CPU; break-even at B=1 CUDA | memcpy + alloc |
+| End-to-end decode loop (3 combined) | synthesized Llama-7b decode | **5.4× at B=16**, −141 MB peak | compounded |
+| Real-server round-trip (PAGED_KV on vs off) | full BloomBee RPC pipeline | 0.6 ms shim cost (~1.6%) | overhead guard |
+
 ## Not yet measured
 
-Phase 2 MemoryCache↔PagedKVTable shim is landed behind
-`BLOOMBEE_PAGED_KV=1`. 13 unit tests (substrate byte-equivalence +
-per-handle decoupling + rollback hiding) pass on V100. End-to-end
-throughput impact via the server still requires unblocking the
-`flex_llama.py:441` hardcoded `huggyllama/llama-7b` snapshot_download
-that triggers on any model, plus FlexGen's numpy-layout weight
-conversion pipeline that safetensors-native TinyLlama doesn't satisfy.
+Routing the generate() path through `paged_view(handle)` for spec-dec
+verify + rollback is the next step — at that point the shim becomes
+load-bearing instead of aliased. Ripe for a follow-up branch that
+wires `_extract_best_verified_paths_fixed` to write through the paged
+substrate and measures real commit/rollback hiding under acceptance
+rates ≠ 1.
