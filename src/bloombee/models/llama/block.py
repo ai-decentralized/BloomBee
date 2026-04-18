@@ -327,14 +327,27 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self.init_weight(j)
 
     def init_weight(self, j):
-        # Get model name from config - HF config may use different attribute names
-        model_name = None
-        for attr in ('name', 'name_or_path', '_name_or_path'):
+        # If the HF config points at a local directory, always prefer the
+        # local-conversion path — it works for any LLaMA-arch model (including
+        # TinyLlama, Vicuna, etc.) without needing a matching huggyllama
+        # snapshot_download. Only fall back to architecture guessing +
+        # download_llama_weights when no local path is available.
+        local_src_dir = None
+        raw_path = None
+        for attr in ('name_or_path', '_name_or_path', 'name'):
             if hasattr(self.llama_config, attr):
                 val = getattr(self.llama_config, attr)
                 if val and isinstance(val, str):
-                    model_name = os.path.basename(val.rstrip('/'))
+                    raw_path = val
                     break
+
+        model_name = None
+        if raw_path:
+            if os.path.isdir(raw_path):
+                local_src_dir = raw_path
+                model_name = os.path.basename(raw_path.rstrip('/'))
+            else:
+                model_name = os.path.basename(raw_path.rstrip('/'))
 
         # Fallback: infer from architecture (hidden_size, num_hidden_layers, intermediate_size)
         if not model_name or model_name == '.':
@@ -350,19 +363,23 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             elif (h, L) == (8192, 80):
                 model_name = "llama-70b" if I == 28672 else "llama-65b"
             else:
-                model_name = "llama-65b"  # safest default for 80-layer 8192 models
+                model_name = "llama-7b"  # safe default for 32-layer-ish models
 
         # Remove -hf suffix if present, as huggyllama repos don't use it
         if model_name.endswith('-hf'):
             model_name = model_name[:-3]
-            
+
         self.llama_config.name = model_name
         expanded_path = os.path.abspath(os.path.expanduser(
             os.path.join(self.path, f"{model_name}-np")))
         check_path = os.path.join(expanded_path, "embed_tokens.weight")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
-            download_llama_weights(self.llama_config.name, self.path)
-            
+            if local_src_dir is not None:
+                from bloombee.flexgen_utils.llama_config import convert_local_llama_weights
+                convert_local_llama_weights(local_src_dir, model_name, self.path)
+            else:
+                download_llama_weights(self.llama_config.name, self.path)
+
         self.expanded_apth = expanded_path
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 

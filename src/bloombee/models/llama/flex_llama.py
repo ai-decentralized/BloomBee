@@ -438,7 +438,6 @@ class FLEX_LlamaAttention(LlamaAttention):
         
         super().__init__(config)
         self.config = config
-        self.llama_config = get_llama_config('huggyllama/llama-7b')
         self.num_heads = config.num_attention_heads
         self.env = env
         self.layer_id = layer_id
@@ -638,7 +637,6 @@ class FLEX_LlamaMLP(LlamaMLP):
     ):
         super().__init__(config)
         self.config = config
-        self.llama_config = get_llama_config('huggyllama/llama-7b')
         self.env = env
         self.layer_id = layer_id
         self.policy = policy
