@@ -137,33 +137,43 @@ def linearize_tree_with_positions(tree: SpeculativeTree) -> Tuple[List[TreeNode]
 
 
 def build_ancestor_matrix_optimized(parent_indices: List[int], device: torch.device) -> torch.Tensor:
+    """Return boolean (n, n) matrix where [i, j] == True iff j is a strict ancestor of i.
+
+    Previous implementation used iterative float matmul to compute transitive
+    closure — O(n^3) per iteration, up to n iterations. We now walk parent
+    pointers directly in O(n * depth), which is strictly block-lower-triangular
+    since DFS linearization guarantees parent_indices[i] < i. This matches the
+    SpecInfer tree-attention mask contract: each node attends to its ancestor
+    path plus itself.
+    """
     n = len(parent_indices)
     if n == 0:
         return torch.empty(0, 0, dtype=torch.bool, device=device)
 
-    A = torch.zeros(n, n, dtype=torch.bool, device=device)
+    # Build on CPU — walks are Python-level, cheap for typical tree sizes (< 64).
+    ancestor_rows: List[List[int]] = [[] for _ in range(n)]
+    for i, parent in enumerate(parent_indices):
+        j = parent
+        while j >= 0:
+            ancestor_rows[i].append(j)
+            # DFS linearization guarantees parent_indices[j] < j, so this terminates.
+            j = parent_indices[j]
 
-    rows = torch.arange(n, device=device)
-    cols = torch.as_tensor(parent_indices, device=device)
-    mask = cols >= 0
+    # Materialize directly to device in one pass.
+    if not any(ancestor_rows):
+        return torch.zeros(n, n, dtype=torch.bool, device=device)
 
-    if mask.any():
-        A[rows[mask], cols[mask]] = True
+    row_idx = []
+    col_idx = []
+    for i, ancestors in enumerate(ancestor_rows):
+        row_idx.extend([i] * len(ancestors))
+        col_idx.extend(ancestors)
 
-    ancestor_matrix = A.clone()
-
-    for _ in range(n):
-        A_float = A.float()
-        ancestor_float = ancestor_matrix.float()
-
-        power_A = torch.matmul(ancestor_float, A_float)
-        new_reachable = ancestor_matrix | (power_A > 0)
-
-        if torch.equal(new_reachable, ancestor_matrix):
-            break
-
-        ancestor_matrix = new_reachable
-
+    ancestor_matrix = torch.zeros(n, n, dtype=torch.bool, device=device)
+    if row_idx:
+        rows = torch.tensor(row_idx, dtype=torch.long, device=device)
+        cols = torch.tensor(col_idx, dtype=torch.long, device=device)
+        ancestor_matrix[rows, cols] = True
     return ancestor_matrix
 
 
