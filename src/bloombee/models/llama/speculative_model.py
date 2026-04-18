@@ -51,12 +51,29 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         generation_config.do_sample = False
         generation_config.return_dict_in_generate = False
 
-        # Roll back to fixed session max length mode.
-        # Keep the argument for API compatibility, but ignore runtime overrides.
-        if "session_max_length" in model_kwargs:
-            model_kwargs.pop("session_max_length", None)
-        session_max_length = 624
-        logger.info("Speculative session_max_length=%s (hardcoded)", session_max_length)
+        # Resolve session_max_length from (in order): kwarg > model_kwargs > config
+        # > a conservative fallback. The previous hardcoded 624 made every
+        # speculation session request a 624-token cache regardless of actual
+        # prompt + max_new_tokens, which wastes KV budget and constrains
+        # admission under continuous batching. We use ceil(prompt + budget)
+        # with a floor that matches drafter tree growth.
+        kwarg_override = session_max_length
+        session_max_length = model_kwargs.pop("session_max_length", kwarg_override)
+        if session_max_length is None:
+            prompt_len = int(input_ids.shape[1])
+            tree_budget = max_tree_depth * max(beam_width, 1)
+            session_max_length = max(
+                prompt_len + int(max_new_tokens) + tree_budget + 16,
+                256,
+            )
+        logger.info(
+            "Speculative session_max_length=%s (prompt=%s max_new_tokens=%s depth=%s width=%s)",
+            session_max_length,
+            int(input_ids.shape[1]),
+            max_new_tokens,
+            max_tree_depth,
+            beam_width,
+        )
 
         # Use inference session for proper distributed caching
         with self.transformer.h.inference_session(max_length=session_max_length) as session:
@@ -595,7 +612,19 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         total_tree_tokens = tree_len
         fallback_pos = max(0, seq_len - total_tree_tokens)
         device = logits.device
-        
+
+        # Vectorize greedy verification: compute argmax per position once for the
+        # whole batch, move to host, then walk tree paths in Python without per-
+        # node GPU syncs. For a depth-d width-w tree this removes O(B * w^d * d)
+        # .item() calls per step — the dominant CPU-GPU sync cost. Semantics are
+        # preserved for do_sample=False (argmax verify equals rejection sampling
+        # with a one-hot target). Stochastic sampling will extend this function
+        # with a `min(1, p/q)` branch; see SPEC_DECODING_SURVEY.md.
+        if logits.numel() > 0 and logits.shape[1] > 0:
+            predicted_tokens_cpu = logits.argmax(dim=-1).detach().cpu().tolist()
+        else:
+            predicted_tokens_cpu = [[] for _ in range(batch_size)]
+
         # 存储结果
         verified_tokens_list = []
         positions_list = []
@@ -627,17 +656,18 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             best_positions = []
             best_score = -1
             
+            predicted_row = predicted_tokens_cpu[batch_idx] if batch_idx < len(predicted_tokens_cpu) else []
             for node_path in node_paths:
                 verified_tokens = []
                 verified_positions = []
-                
+
                 for node in node_path:
                     pos = node.parent.position_in_sequence + 1
-                    if pos >= seq_len:
+                    if pos >= seq_len or pos >= len(predicted_row):
                         break
-                    
-                    predicted_token = torch.argmax(logits[batch_idx, pos]).item()
-                    
+
+                    predicted_token = predicted_row[pos]
+
                     if predicted_token == node.token_id:
                         verified_tokens.append(node.token_id)
                         absolute_position = tree_root_position + node.position_in_sequence + 1
