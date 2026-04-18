@@ -202,6 +202,93 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                        f"head_dim={head_dim}, max_length={max_length}, shape={(batch_size, num_heads, head_dim, max_length)}")
         return cache_tensors
     
+    # ------------------------------------------------------------------
+    # Phase 1: block-step seam
+    #
+    # inference_step() used to call select_cache + module.forward +
+    # update_cache inline. Phase 2 replaces the cache ops with paged-KV
+    # writes; Phase 3 layers tree-attention verification on top. Rather
+    # than duplicate that logic at every call site, the three hot-path
+    # primitives now live behind these helpers so they can be swapped
+    # independently.
+    # ------------------------------------------------------------------
+
+    def _run_block_forward(
+        self,
+        hidden_states_chunk: torch.Tensor,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        rotary_position_ids: Optional[torch.Tensor],
+    ) -> Optional[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]]:
+        """One transformer block forward pass on a (chunked) hidden-states slice.
+
+        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs) or None
+        on failure.
+        """
+        forward_result = self.module.forward(
+            hidden_states_chunk,
+            layer_past=layer_past,
+            attention_mask=attention_mask,
+            use_cache=True,
+            position_ids=position_ids,
+            rotary_position_ids=rotary_position_ids,
+        )
+        if forward_result is None:
+            logger.info(" ERROR: module.forward returned None!")
+            return None
+        output_hidden_states_chunk, new_kvs = forward_result
+        return output_hidden_states_chunk, new_kvs
+
+    def _finalize_cache_update(
+        self,
+        new_kvs: Tuple[torch.Tensor, ...],
+        cache_len: int,
+        inference_info: InferenceMetadata,
+        kv_cache_position_ids: Optional[torch.Tensor],
+        cache_tensors,
+    ) -> None:
+        """Write new KVs back to the cache manager.
+
+        Step-level seam (runs once after all chunks). Phase 2 swaps the body
+        with paged-KV writes; Phase 3 adds per-page rollback on rejected
+        speculative tokens without changing callers.
+        """
+        if self._is_spec_decoding:
+            self.cache_manager.update_cache_and_async_reorder(
+                new_kvs,
+                self._slice_batch_aligned(
+                    kv_cache_position_ids,
+                    inference_info.batch_offset,
+                    inference_info.batch_offset + inference_info.micro_batch_size,
+                    inference_info.full_batch_size,
+                ),
+                batch_offset=inference_info.batch_offset,
+                full_batch_size=inference_info.full_batch_size,
+                micro_batch_size=inference_info.micro_batch_size,
+                cache_tensors=cache_tensors,
+            )
+            return
+
+        if getattr(self.cache_manager, "_verbose_kv_logs", False):
+            logger.info(
+                "[MBPIPE_BACKEND_WRITE] update_cache start: uid=%s cache_len=%s "
+                "batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s",
+                inference_info.uid,
+                cache_len,
+                inference_info.batch_offset,
+                inference_info.full_batch_size,
+                inference_info.micro_batch_size,
+                type(new_kvs).__name__ if new_kvs is not None else "None",
+            )
+        self.cache_manager.update_cache(
+            new_kvs,
+            cache_len,
+            batch_offset=inference_info.batch_offset,
+            full_batch_size=inference_info.full_batch_size,
+            micro_batch_size=inference_info.micro_batch_size,
+        )
+
     def prune_draft_tree(
         self, 
         norm_hidden_states: torch.Tensor, 
@@ -466,74 +553,35 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         rotary_position_ids = None
                     
                     try:
-                        # Fixed: Properly handle forward method return values with position_ids
-                        # print(f' About to call module.forward with position_ids...')
-                        forward_result = self.module.forward(
-                            hidden_states_chunk, 
+                        step_result = self._run_block_forward(
+                            hidden_states_chunk,
                             layer_past=layer_past,
-                            attention_mask=attention_mask, 
-                            use_cache=True,
+                            attention_mask=attention_mask,
                             position_ids=position_ids,
                             rotary_position_ids=rotary_position_ids,
                         )
-                        
-                        # t5 = time.perf_counter()
-                        # logger.info(f"inference_step: module.forward call took {t5 - t4:.4f} seconds")
-                        
-                        if forward_result is None:
-                            logger.info(f" ERROR: module.forward returned None!")
+                        if step_result is None:
                             return (hidden_states, None)
-                        
-                        output_hidden_states_chunk, new_kvs = forward_result
-                        # print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
-                        
-                        # Add forward result debug information
-                        # offload_logger.info(f" module.forward completed:")
-                        # offload_logger.info(f"   - output_hidden_states_chunk shape: {output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}")
-                        # offload_logger.info(f"   - new_kvs length: {len(new_kvs) if new_kvs else 0}")
-                        # if new_kvs and len(new_kvs) > 0:
-                        #     offload_logger.info(f"   - new_kvs[0] shape: {new_kvs[0].shape}")
-                        #     offload_logger.info(f"   - new_kvs[0] device: {new_kvs[0].device}")
-                        
+                        output_hidden_states_chunk, new_kvs = step_result
                     except Exception as e:
                         print(f' ERROR in module.forward: {type(e).__name__}: {e}')
                         import traceback
                         traceback.print_exc()
                         return (hidden_states, None)
-                    
+
                     if seq_len > max_chunk_length:
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
                     else:
                         output_hidden_states = output_hidden_states_chunk
 
-                # Centralized KV update via KVCacheManager
-                # [MERGED] Speculative decoding batched update with micro-batch support
-                if self._is_spec_decoding:
-                    # self.cache_manager.update_cache_batched(new_kvs, kv_valid_lengths)
-                    self.cache_manager.update_cache_and_async_reorder(
-                        new_kvs, 
-                        self._slice_batch_aligned(kv_cache_position_ids, inference_info.batch_offset, inference_info.batch_offset + inference_info.micro_batch_size, inference_info.full_batch_size),
-                        batch_offset=inference_info.batch_offset,
-                        full_batch_size=inference_info.full_batch_size,
-                        micro_batch_size=inference_info.micro_batch_size,
-                        cache_tensors=cache_tensors,)
-                else:
-                    if getattr(self.cache_manager, "_verbose_kv_logs", False):
-                        logger.info(
-                            "[MBPIPE_BACKEND_WRITE] update_cache start: uid=%s cache_len=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s",
-                            inference_info.uid,
-                            cache_len,
-                            inference_info.batch_offset,
-                            inference_info.full_batch_size,
-                            inference_info.micro_batch_size,
-                            type(new_kvs).__name__ if new_kvs is not None else "None",
-                        )
-                    self.cache_manager.update_cache(
-                        new_kvs, 
-                        cache_len,
-                        batch_offset=inference_info.batch_offset,
-                        full_batch_size=inference_info.full_batch_size,
-                        micro_batch_size=inference_info.micro_batch_size,) 
+                # Centralized KV update via KVCacheManager (single step-level seam).
+                self._finalize_cache_update(
+                    new_kvs,
+                    cache_len=cache_len,
+                    inference_info=inference_info,
+                    kv_cache_position_ids=kv_cache_position_ids,
+                    cache_tensors=cache_tensors,
+                )
 
                 keep_indices = self._normalize_keep_indices(
                     inference_info.keep_indices,
