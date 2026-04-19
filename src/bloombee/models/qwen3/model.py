@@ -162,6 +162,19 @@ class DistributedQwen3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _B
         # Initialize weights and apply final processing
         self.post_init()
 
+    def mark_tied_weights_as_initialized(self, loading_info):
+        """Override TF 5.x's tied-weight bookkeeping.
+
+        Qwen3 has tie_word_embeddings=True, so the upstream method iterates
+        ``all_tied_weights_keys`` (which includes ``lm_head.weight``) and calls
+        ``self.get_parameter("lm_head.weight")``. BloomBee's LMHead holds
+        ``self.weight = None`` until it gets bound to ``embed_tokens.weight``
+        during state-dict loading, so ``get_parameter`` raises AttributeError.
+
+        BloomBee manages the tying manually, so we just skip the bookkeeping.
+        """
+        return
+
     def get_output_embeddings(self):
         return self.lm_head
 
