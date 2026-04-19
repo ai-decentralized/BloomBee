@@ -175,6 +175,18 @@ class DistributedQwen3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _B
         """
         return
 
+    def tie_weights(self, missing_keys=None, recompute_mapping=True):
+        """Bind LMHead.weight to embed_tokens.weight when tie_word_embeddings=True.
+
+        The upstream TF 5.x implementation also walks ``all_tied_weights_keys``
+        and calls ``get_parameter`` on each, which fails on our LMHead stub.
+        Do the minimum BloomBee needs: hand embed_tokens.weight to LMHead.
+        """
+        if getattr(self.config, "tie_word_embeddings", False):
+            embed = self.get_input_embeddings()
+            if embed is not None and getattr(embed, "weight", None) is not None:
+                self.lm_head.weight = embed.weight
+
     def get_output_embeddings(self):
         return self.lm_head
 
