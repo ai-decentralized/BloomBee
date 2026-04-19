@@ -20,8 +20,8 @@ __version__ = "2.3.0.dev2"
 
 if not os.getenv("BLOOMBEE_IGNORE_DEPENDENCY_VERSION"):
     assert (
-        version.parse("4.43.1") <= version.parse(transformers.__version__) < version.parse("4.44.0")
-    ), "Please install a proper transformers version: pip install transformers>=4.43.1,<4.44.0"
+        version.parse("5.5.0") <= version.parse(transformers.__version__)
+    ), "Please install transformers>=5.5.0: pip install -U 'transformers>=5.5.0'"
 
 
 def _override_bfloat16_mode_default():

@@ -20,7 +20,8 @@ from hivemind.utils.logging import get_logger
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import PretrainedConfig, PreTrainedModel
-from transformers.utils import get_file_from_repo
+
+from bloombee.utils.hf_compat import get_file_from_repo
 
 from bloombee.constants import DTYPE_MAP
 from bloombee.models.mixtral import WrappedMixtralBlock

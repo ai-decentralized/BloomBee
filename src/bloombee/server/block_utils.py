@@ -6,6 +6,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from bloombee.models.mixtral.block import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
+from bloombee.models.qwen3.block import WrappedQwen3Block
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import get_size_in_bytes
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -73,6 +74,10 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
     elif config.block_class == WrappedFalconBlock:
         dprint('server/block_utils.py config.block_class == WrappedFalconBlock ')
         return config.block_class(config)
+    elif config.block_class == WrappedQwen3Block:
+        dprint('server/block_utils.py config.block_class == WrappedQwen3Block ')
+        config = PreTrainedModel._autoset_attn_implementation(config)
+        return config.block_class(config, layer_idx)
     # config.block_class == WrappedLlamaBlock in distributedllamaconfig in config.py
     # print('server/block_utils.py get_model_block() : config', config)
     res = config.block_class(config, layer_idx, env, policy, weight_home, path)  # go to block.py class OptimizedLlamaDecoderLayer

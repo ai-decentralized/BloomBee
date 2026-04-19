@@ -179,8 +179,16 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values._seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                # tf 5.x removed _seen_tokens; get_seq_length() is the replacement
+                past_length = getattr(past_key_values, "_seen_tokens", None)
+                if past_length is None:
+                    past_length = cache_length
+                if hasattr(past_key_values, "get_max_length"):
+                    max_cache_length = past_key_values.get_max_length()
+                elif hasattr(past_key_values, "get_max_cache_shape"):
+                    max_cache_length = past_key_values.get_max_cache_shape()
+                else:
+                    max_cache_length = None
                 # print(f"   Cache case: cache_length={cache_length}, past_length={past_length}")
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2] if hasattr(past_key_values[0][0], 'shape') else 0
