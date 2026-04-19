@@ -102,6 +102,9 @@ class PagedKVTable:
         for page in state.pages:
             self._free.append(page)
 
+    def has_sequence(self, seq_id: int) -> bool:
+        return seq_id in self._seqs
+
     # ----- state accessors -----------------------------------------------------
 
     def l_seq(self, seq_id: int) -> int:
@@ -196,6 +199,33 @@ class PagedKVTable:
             pos += tokens_this_page
             src_offset += tokens_this_page
 
+        if end_position > state.l_seq:
+            state.l_seq = end_position
+        if commit and end_position > state.l_acc:
+            state.l_acc = end_position
+
+    def track_write(
+        self,
+        seq_id: int,
+        start_position: int,
+        s_new: int,
+        commit: bool = True,
+    ) -> None:
+        """
+        State-only mirror of ``write``: ensure pages are allocated and advance
+        ``l_seq`` / ``l_acc``, but do NOT touch the backing tensors. Use when
+        the caller has already landed the bytes via a separate path (e.g.
+        legacy ``_write_kvs``) and only needs the shim's state machine to
+        reflect that write — this is what makes the shim load-bearing for
+        rollback without double-copying every decode step.
+        """
+        if s_new <= 0:
+            return
+        if seq_id not in self._seqs:
+            self.register_sequence(seq_id)
+        end_position = start_position + int(s_new)
+        self._ensure_capacity(seq_id, end_position)
+        state = self._seqs[seq_id]
         if end_position > state.l_seq:
             state.l_seq = end_position
         if commit and end_position > state.l_acc:
