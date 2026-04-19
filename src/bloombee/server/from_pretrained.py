@@ -26,6 +26,7 @@ from bloombee.utils.hf_compat import get_file_from_repo
 from bloombee.constants import DTYPE_MAP
 from bloombee.models.mixtral import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
+from bloombee.models.qwen3.block import WrappedQwen3Block
 from bloombee.server.block_utils import get_model_block, resolve_block_dtype
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.disk_cache import DEFAULT_CACHE_DIR, allow_cache_reads, allow_cache_writes, free_disk_space_for
@@ -82,8 +83,8 @@ def load_pretrained_block(
         and len(tensor_parallel_devices) > 1
     )
 
-    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral)
-    _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock)
+    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral, Qwen3)
+    _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock, WrappedQwen3Block)
 
     if use_native_flexgen_llama_tp:
         with init_empty_weights():
