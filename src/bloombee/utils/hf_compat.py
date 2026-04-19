@@ -5,6 +5,7 @@ The huggingface_hub ``hf_hub_download`` + ``try_to_load_from_cache`` pair
 provides the equivalent semantics (return path or None, with local-only mode).
 """
 
+import os
 from typing import Optional, Union
 
 from huggingface_hub import hf_hub_download, try_to_load_from_cache
@@ -26,8 +27,13 @@ def get_file_from_repo(
 
     Returns the local filesystem path of a cached/downloaded file, or None
     when the file is absent. Matches the old contract used throughout the
-    BloomBee codebase.
+    BloomBee codebase — including treating path_or_repo_id as a local
+    directory when it exists on disk (the TF 4.x behavior).
     """
+    if os.path.isdir(path_or_repo_id):
+        local = os.path.join(path_or_repo_id, filename)
+        return local if os.path.isfile(local) else None
+
     effective_token = token if token is not None else use_auth_token
 
     if local_files_only:
