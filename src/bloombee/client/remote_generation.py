@@ -21,7 +21,15 @@ class RemotePastKeyValues(Cache):
     """only keeps the number of seen tokens. pretends to be a legit cache"""
 
     def __init__(self) -> None:
-        super().__init__()
+        # TF 5.x's Cache.__init__ requires exactly one of `layers` or
+        # `layer_class_to_replicate`. BloomBee doesn't actually store layers
+        # here (the real cache lives on the remote server), so hand it an
+        # empty list. TF 4.x's Cache.__init__ takes no args — in that case we
+        # skip super() entirely to stay compatible.
+        try:
+            super().__init__(layers=[])
+        except TypeError:
+            super().__init__()
         self._seen_tokens: Optional[torch.Tensor] = None
         self.hypo_ids: Optional[torch.LongTensor] = None
         self.kv_cache_position_ids: Optional[torch.LongTensor] = None
