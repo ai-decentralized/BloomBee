@@ -469,7 +469,8 @@ class TorchDevice:
         num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, hidden_size // num_attention_heads)
+        head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -1117,7 +1118,8 @@ class TorchDisk:
         num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, hidden_size // num_attention_heads)
+        head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
@@ -1188,7 +1190,8 @@ class TorchMixedDevice:
         num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, hidden_size // num_attention_heads)
+        head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
 
         # We have to round to a multiple of `num_head`
         if policy.cache_disk_percent == 0:

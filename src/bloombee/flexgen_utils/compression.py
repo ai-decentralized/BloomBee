@@ -54,7 +54,8 @@ class TorchCompressedDevice:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        head_dim = getattr(config, "head_dim", None) or (hidden_size // num_head)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, head_dim)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16,
@@ -69,7 +70,7 @@ class TorchCompressedDevice:
 
         b = policy.gpu_batch_size
         n_head = config.num_attention_heads
-        head_dim = config.hidden_size // n_head
+        head_dim = getattr(config, "head_dim", None) or (config.hidden_size // n_head)
         max_seq_len = task.prompt_len + task.gen_len - 1
         shape = (max_seq_len, b * n_head, head_dim)
 

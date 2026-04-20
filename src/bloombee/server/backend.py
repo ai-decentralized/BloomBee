@@ -186,7 +186,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        # Qwen3 / Gemma3 / some Llama variants expose an explicit head_dim that does NOT equal
+        # hidden_size // num_attention_heads (Qwen3-0.6B: hidden=1024, heads=16, head_dim=128).
+        # Prefer the explicit value when set.
+        head_dim = getattr(self.config, "head_dim", None) or (
+            self.config.hidden_size // self.config.num_attention_heads
+        )
         cache_tensors = []
         for device, num_heads in zip(self.module.devices, self.shard_num_heads):
             # IMPORTANT:
