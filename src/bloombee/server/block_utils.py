@@ -4,6 +4,7 @@ import torch
 from accelerate import init_empty_weights
 from transformers import PretrainedConfig, PreTrainedModel
 
+from bloombee.models.bloom.block import WrappedBloomBlock
 from bloombee.models.mixtral.block import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.qwen3.block import WrappedQwen3Block
@@ -85,10 +86,14 @@ def _autoset_attn_impl(config):
 def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
     """
     The function to create a model block based on the block class.
+    - Bloom:   takes (config) only, no layer_idx, no FlexGen args
     - Mixtral: takes (config, layer_idx), no FlexGen args
     - Falcon:  takes (config) only, no layer_idx, no FlexGen args
     - Llama:   takes (config, layer_idx, env, policy, weight_home, path) — FlexGen-based
     """
+    if config.block_class == WrappedBloomBlock:
+        dprint('server/block_utils.py config.block_class == WrappedBloomBlock ')
+        return config.block_class(config, layer_idx)
     if config.block_class == WrappedMixtralBlock:
         dprint('server/block_utils.py config.block_class == WrappedMixtralBlock ')
         config = _autoset_attn_impl(config)

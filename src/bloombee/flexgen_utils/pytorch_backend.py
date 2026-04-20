@@ -108,13 +108,15 @@ def precompute_freqs_cis(
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
-def rms_norm(hidden_states, weight, variance_epsilon=1e-6):  # 改 eps=1e-6 from 1e-5
+def rms_norm(hidden_states, weight, variance_epsilon=1e-5):
+    # Default matches LLaMA/LLaMA2/LLaMA3's config.rms_norm_eps. Call sites that
+    # know their model's exact value (e.g. from config) should pass it explicitly.
     input_dtype = hidden_states.dtype
     x = hidden_states.to(torch.float32)
     w = weight.to(torch.float32)
     var = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(var + variance_epsilon)
-    return (x * w).to(input_dtype)  # 乘法在 fp32，最后再 cast
+    return (x * w).to(input_dtype)
 
 def sample_top_p(probs, p):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)

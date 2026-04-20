@@ -33,7 +33,11 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         assert len(self.layers) == 0
         config.num_hidden_layers = n_layer
 
-        self.layers = RemoteSequential(config, dht=dht) # create RemoteSequential instance to manage distributed layers
+        # Force CPU context: transformers from_pretrained wraps __init__ in torch.device('cuda'),
+        # which hijacks torch.empty() in hivemind's DHT/MPFuture to create CUDA tensors.
+        # share_memory_() only works on CPU tensors, so we must reset device context here.
+        with torch.device('cpu'):
+            self.layers = RemoteSequential(config, dht=dht) # create RemoteSequential instance to manage distributed layers
 
         self.requires_grad_(False)  # Forbid accumulate grads for embeddings and layernorm
         self.init_prompts(config)
@@ -241,6 +245,15 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
 
     def get_output_embeddings(self):
         return self.lm_head
+
+    def mark_tied_weights_as_initialized(self, loading_info):
+        return
+
+    def tie_weights(self, missing_keys=None, recompute_mapping=True):
+        if getattr(self.config, "tie_word_embeddings", False):
+            embed = self.get_input_embeddings()
+            if embed is not None and getattr(embed, "weight", None) is not None:
+                self.lm_head.weight = embed.weight
 
     @property
     def transformer(self) -> DistributedLlamaModel:  # For compatibility with RemoteGenerationMixin

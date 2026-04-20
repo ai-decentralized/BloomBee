@@ -24,6 +24,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from bloombee.utils.hf_compat import get_file_from_repo
 
 from bloombee.constants import DTYPE_MAP
+from bloombee.models.bloom.block import WrappedBloomBlock
 from bloombee.models.mixtral import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.qwen3.block import WrappedQwen3Block
@@ -83,8 +84,8 @@ def load_pretrained_block(
         and len(tensor_parallel_devices) > 1
     )
 
-    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral, Qwen3)
-    _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock, WrappedQwen3Block)
+    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Bloom, Falcon, Mixtral, Qwen3)
+    _is_hf_model = config.block_class in (WrappedBloomBlock, WrappedFalconBlock, WrappedMixtralBlock, WrappedQwen3Block)
 
     if use_native_flexgen_llama_tp:
         with init_empty_weights():
@@ -110,7 +111,17 @@ def load_pretrained_block(
             token=token, cache_dir=cache_dir, max_disk_space=max_disk_space, torch_dtype=torch_dtype,
         )
     else:
-        # For FlexGen-based models (Llama): weights are managed by FlexGen at runtime
+        # For FlexGen-based models (Llama): weights are managed by FlexGen at runtime.
+        # FlexGen's OptimizedLlamaDecoderLayer.init_weight() reads _name_or_path off
+        # the config to decide between local conversion and the huggyllama download
+        # fallback. HF's PretrainedConfig.from_pretrained clears _name_or_path when
+        # loading from a local directory, so we thread the original model_name back
+        # in here before block construction.
+        if not getattr(config, "_name_or_path", "") and model_name:
+            try:
+                config._name_or_path = model_name
+            except Exception:
+                pass
         with init_empty_weights():
             logger.debug('load_pretrained_block: init_empty_weights()')
             block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)

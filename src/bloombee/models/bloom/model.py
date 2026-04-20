@@ -31,7 +31,10 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
         assert len(self.h) == 0
         config.num_hidden_layers = n_layer
 
-        self.h = RemoteSequential(config, dht=dht)
+        # Force CPU context: TF 5.x from_pretrained may wrap __init__ in a cuda device context,
+        # which hijacks hivemind's torch.empty() calls and breaks share_memory_().
+        with torch.device('cpu'):
+            self.h = RemoteSequential(config, dht=dht)
 
         self.requires_grad_(False)  # Forbid accumulate grads for embeddings and layernorm
         self.init_prompts(config)
@@ -181,6 +184,15 @@ class DistributedBloomForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Bl
 
     def _temporary_reorder_cache(self, past_key_values, beam_idx):
         return past_key_values
+
+    def mark_tied_weights_as_initialized(self, loading_info):
+        return
+
+    def tie_weights(self, missing_keys=None, recompute_mapping=True):
+        if getattr(self.config, "tie_word_embeddings", False):
+            embed = self.get_input_embeddings()
+            if embed is not None and getattr(embed, "weight", None) is not None:
+                self.lm_head.weight = embed.weight
 
     def get_output_embeddings(self):
         return self.lm_head
