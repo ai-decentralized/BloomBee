@@ -11,6 +11,8 @@
     <a href="https://github.com/ai-decentralized/bloombee"><img src="https://img.shields.io/github/stars/ai-decentralized/bloombee?style=social"></a>
 </p>
 
+> **📘 Working on the `arch-reform-qwen3-4b` branch?** See the bilingual handoff summary for the architecture reform + transformers 5.x migration: [English](ARCH_REFORM_TF5_SUMMARY.md) · [中文](ARCH_REFORM_TF5_SUMMARY_zh.md). Covers design rationale, per-model verification matrix on V100, the `BLOOMBEE_PIN_RELAY_MB` knob, and a checklist for scaling to larger GPUs.
+
 The rapid rise of generative AI has boosted demand for large language model (LLM) inference and fine-tuning services. While proprietary models are still favored, advancements in open-source LLMs have made them competitive. However, high costs and limited GPU resources hinder deployment. BloomBee is a decentralized offline serving system that leverages idle GPU resources to provide cost-effective access to LLMs.
 
 Instead of requiring a single powerful machine, BloomBee splits a model's transformer blocks across multiple peers in a P2P network. If your GPU can only hold a small portion of a large model like LLaMA 3.1 (405B), you can join a network of servers each hosting different layers and collaboratively serve inference or fine-tuning requests.
@@ -55,6 +57,7 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
 - [Acknowledgements](#acknowledgements)
+- **Branch-specific handoff**: [ARCH_REFORM_TF5_SUMMARY.md](ARCH_REFORM_TF5_SUMMARY.md) (EN) / [ARCH_REFORM_TF5_SUMMARY_zh.md](ARCH_REFORM_TF5_SUMMARY_zh.md) (中文)
 
 ---
 
