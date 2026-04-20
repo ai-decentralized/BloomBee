@@ -30,6 +30,21 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         if not hasattr(self.self_attn, "num_key_value_heads"):
             self.self_attn.num_key_value_heads = config.num_key_value_heads
 
+    def _apply(self, fn, recurse=True):
+        # Keep rotary inv_freq buffers in fp32 across .to(dtype=fp16/bf16) calls.
+        # HF's full model achieves this via _keep_in_fp32_modules, but BloomBee
+        # loads a bare block and calls .to(dtype=fp16). Without this override the
+        # buffer rounds to fp16 and rotary positions accumulate quantization
+        # error, corrupting generation (symptom: repeated tokens in groups).
+        out = super()._apply(fn, recurse=recurse)
+        rot = getattr(self, "_rotary_emb", None)
+        if rot is not None:
+            for name in ("inv_freq", "original_inv_freq"):
+                buf = getattr(rot, name, None)
+                if buf is not None and buf.is_floating_point() and buf.dtype != torch.float32:
+                    rot.register_buffer(name, buf.float(), persistent=False)
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -65,10 +80,22 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations (SDPA, flash_attention_2, eager) handle
-        # causal masking internally when attention_mask=None. No need for the deprecated
-        # _prepare_4d_causal_attention_mask* helpers.
-        attention_mask = None
+        # tf 5.x eager/SDPA attention does NOT add an implicit causal mask when
+        # attention_mask=None — eager_attention_forward only masks what you pass in.
+        # BloomBee wraps a bare DecoderLayer (no Qwen3Model in front to build the mask),
+        # so build the additive causal mask here.
+        if attention_mask is None:
+            total_len = past_key_values_length + seq_length
+            neg_inf = torch.finfo(hidden_states.dtype).min
+            causal = torch.full(
+                (seq_length, total_len),
+                neg_inf,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            if total_len > 0:
+                causal = torch.triu(causal, diagonal=past_key_values_length + 1)
+            attention_mask = causal.unsqueeze(0).unsqueeze(0)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:

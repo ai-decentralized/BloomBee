@@ -125,3 +125,60 @@ def test_unspecified_mask_is_handled():
     h = torch.randn(1, 4, cfg.hidden_size)
     out, _ = block(h, attention_mask=None, use_cache=True)
     assert out.shape == h.shape
+
+
+def test_rotary_inv_freq_stays_fp32_under_fp16_cast():
+    """Regression: `.to(torch.float16)` used to downcast rotary `inv_freq`,
+    which caused fp16 rounding of RoPE positions and catastrophic generation
+    quality loss on real checkpoints (token collapse into repeated groups).
+    """
+    cfg = _make_config()
+    block = WrappedQwen3Block(cfg, layer_idx=0).eval()
+    block.to(torch.float16)
+    assert block._rotary_emb.inv_freq.dtype == torch.float32
+    assert block._rotary_emb.original_inv_freq.dtype == torch.float32
+
+
+def test_fp16_block_matches_hf_layer_with_causal_mask():
+    """End-to-end parity against HF's native Qwen3DecoderLayer in fp16,
+    forcing the wrapper through the rotary buffer cast (block.to(fp16)).
+    Covers the inv_freq fp16-downcast bug that survived the unit tests."""
+    from transformers.models.qwen3.modeling_qwen3 import (
+        Qwen3DecoderLayer as _HFDecoderLayer,
+        Qwen3RotaryEmbedding as _HFRotary,
+    )
+
+    torch.manual_seed(0)
+    cfg = _make_config()
+    B, S = 1, 8
+
+    hf = _HFDecoderLayer(cfg, layer_idx=0).eval()
+    wrapped = WrappedQwen3Block(cfg, layer_idx=0).eval()
+    wrapped.load_state_dict(hf.state_dict(), strict=False)
+
+    hf.to(torch.float16)
+    wrapped.to(torch.float16)
+
+    h = torch.randn(B, S, cfg.hidden_size, dtype=torch.float16)
+    causal = torch.triu(
+        torch.full((S, S), float("-inf"), dtype=torch.float16), diagonal=1
+    ).unsqueeze(0).unsqueeze(0)
+    pos_ids = torch.arange(S).unsqueeze(0)
+    rot = _HFRotary(cfg)
+    pos_emb = rot(h, pos_ids)
+
+    with torch.no_grad():
+        hf_out = hf(
+            h,
+            attention_mask=causal,
+            position_ids=pos_ids,
+            position_embeddings=pos_emb,
+            past_key_values=None,
+            use_cache=False,
+            cache_position=pos_ids[0],
+        )
+        hf_out = hf_out[0] if isinstance(hf_out, tuple) else hf_out
+
+        wr_out, _ = wrapped(h, attention_mask=causal, layer_past=None, use_cache=True)
+
+    torch.testing.assert_close(hf_out, wr_out, atol=5e-3, rtol=5e-3)
