@@ -440,3 +440,84 @@ doesn't hash them but the decoded text reads identically.
 - arch-reform **adds** sampling spec-dec capability that mainline does
   not implement.
 - No token-level regression vs mainline greedy.
+
+---
+
+## §P3 — Sequoia dynamic tree shape (2026-04-21)
+
+Added Sequoia (arXiv 2402.12374) as a third tree-shape policy in
+`spec_decoding_drafter.py` alongside the existing fixed-grid (default)
+and EAGLE-2 budgeted (`tree_budget` / `tree_min_log_prob`) paths. Sequoia
+is **static per-depth**: the drafter follows a precomputed
+`List[int]` width plan mechanically, no per-step ranking cost.
+
+**Plan computation**: greedy-by-marginal-ratio DP over a total-node
+budget, driven by an `AcceptanceHistogram` collected online during
+verify. Bump cost at depth d accounts for *all descendant nodes* added
+when widening (not just immediate siblings), which is what made my
+first pass wrong (treated budget as sum(widths) rather than product
+subtree size — widths [5,5,5,5] would actually be 780 nodes, not 20).
+See `src/bloombee/models/llama/spec_decoding_tree_shape.py:sequoia_optimize_widths`.
+
+**A/B on 2×A100 llama-7b + JackFram/llama-68m drafter (seq_len=128,
+greedy, --spec_decoding, 64 tokens target)**:
+
+| variant             | plan       | tokens | time (s) | tok/s  | accepted/step |
+|---------------------|------------|--------|----------|--------|---------------|
+| fixed-grid baseline | depth×w=4  | 130    | 5.38     | 24.16  | **2.41**      |
+| Sequoia (budget=24) | [3,2,1,1]  | 146    | 5.49     | **26.60** | **4.56**   |
+
+**+10.1 % throughput**, **1.89× accepted-tokens-per-step**. Step time
+grew 71 % (larger drafter tree, [3,2,1,1] expanding to more frontier
+than depth-4 uniform-2-wide), but tokens per step grew 89 %, so net
+throughput up.
+
+Budget=24 comes from the baseline's empirical histogram:
+```
+hist.seen     = [52, 30, 23, 21, 0, 0]
+hist.accepted = [30, 23, 21, 20, 0, 0]
+rates         = [0.463, 0.68, 1.0, 1.0, 0.02, 0.02]   (floor 0.02)
+```
+High acceptance floor at depths 1–3 (>0.68) tells the DP to invest
+early; depth 4+ had zero reach under fixed-grid so the floor kicks in.
+
+**Ceiling caveat**: for the single-prompt "The capital of France is 1"
+the `rates[2]=rates[3]=1.0` are optimistic (only 21 reaches counted).
+On more varied prompts the histogram should settle lower; the gain
+will be smaller. The DP converges fast so online recalibration every
+N steps is cheap.
+
+**Why not EAGLE-3 (arXiv 2503.01840)?** EAGLE-3 is a *feature-level*
+drafter that requires training a target-specific hidden-state adapter.
+Out of scope for this branch — it's a model, not a tree-shape policy.
+
+### Qwen3-14B slow-path investigation (2026-04-21)
+
+**Problem**: client-observed step latency ~881 ms/step on 2×A100 while
+per-server `InferenceLatency` was only ~47 ms × 2 ≈ 94 ms — 787 ms of
+unexplained client overhead.
+
+**Fix landed**: `DistributedQwen3ForCausalLM.prepare_inputs_for_generation`
+was missing (Llama had it); TF 5.x's default implementation re-does
+prefill-shaped work every step. Ported llama's version verbatim. See
+`src/bloombee/models/qwen3/model.py:166`.
+
+**Result after fix**: ~874 ms/step — **the fix is correct but not the
+dominant cost**. Probe revealed:
+
+```
+vocab=151936, hidden=5120, fp16 CPU chunked-forward lm_head
+  mean = 565 ms / step
+```
+
+The CPU LMHead matmul at Qwen3-14B's 4.75× larger vocab vs llama-7B
+(32000) dominates. Llama-7B on the same stack is 212 ms/step because
+its LMHead is only ~120 ms. Moving LMHead to GPU is the next fix but
+requires plumbing input-tensor device handling through BloomBee's
+`RemoteGenerationMixin` — **deferred to a separate commit** since
+it's orthogonal to this branch's arch-reform focus.
+
+**So the `prepare_inputs_for_generation` fix is landed + correct**
+(prevents a latent pessimization that would bite once LMHead moves to
+GPU or under larger `max_new_tokens`), even though it doesn't move the
+top-line number today.

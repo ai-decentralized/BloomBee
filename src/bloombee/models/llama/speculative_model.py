@@ -72,16 +72,21 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             prompt_len = int(input_ids.shape[1])
             # Sequoia plan: total tree budget is sum of products of widths.
             if isinstance(beam_width, (list, tuple)):
-                tree_budget = 0
+                tree_nodes = 0
                 running = 1
                 for w in beam_width:
                     running *= max(int(w), 1)
-                    tree_budget += running
+                    tree_nodes += running
             else:
-                tree_budget = max_tree_depth * max(int(beam_width), 1)
+                tree_nodes = max_tree_depth * max(int(beam_width), 1)
+            # Each decode step pushes the full tree into the server cache
+            # (only the verified prefix is retained in the rollback below, but
+            # the server must have room to store the candidates first). Size
+            # for max_new_tokens worth of steps with one verified token each,
+            # plus one full tree-sized spike per step.
             session_max_length = max(
-                prompt_len + int(max_new_tokens) + tree_budget + 16,
-                256,
+                prompt_len + int(max_new_tokens) * (tree_nodes + 1) + 32,
+                prompt_len + 256,
             )
         logger.info(
             "Speculative session_max_length=%s (prompt=%s max_new_tokens=%s depth=%s width=%s)",
