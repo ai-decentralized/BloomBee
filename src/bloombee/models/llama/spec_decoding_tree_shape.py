@@ -1,5 +1,10 @@
 """Dynamic tree-shape policies for speculative decoding (EAGLE-2-style).
 
+Implements the global-budget + confidence-threshold expansion rule from:
+
+- Li, Y. et al. "EAGLE-2: Faster Inference of Language Models with
+  Dynamic Draft Trees." https://arxiv.org/abs/2406.16858
+
 The default BloomBee drafter expands a fixed (depth, width) grid: at every
 layer every frontier node gets ``beam_width`` children regardless of how
 confident the path already is. For long-tail distributions this wastes
@@ -12,8 +17,10 @@ low-confidence branches are pruned early. This module provides the pure
 primitive so callers can swap the fixed expansion for a budgeted one
 without touching the rest of the drafter orchestration.
 
-Not yet wired into MultiSSMDrafter; lives here as a drop-in that tests
-can exercise and future drafter code can import.
+Wired into ``MultiSSMDrafter._build_trees_batched`` via the optional
+``tree_budget`` / ``tree_min_log_prob`` args. When neither is set the drafter
+falls back to the original full-grid (depth × width) expansion, which keeps
+pre-existing tests token-identical.
 """
 
 from __future__ import annotations

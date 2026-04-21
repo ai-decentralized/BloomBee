@@ -1,8 +1,18 @@
 """Stochastic rejection sampling for tree speculative decoding.
 
-SpecInfer / Sequoia per-edge rejection sampling: accept draft token `t`
-with probability ``min(1, p_target(t) / p_draft(t))``. On reject, resample
-from the residual distribution ``(p_target - p_draft)+`` (normalized).
+Implements the per-edge rejection sampling rule from:
+
+- Miao, X. et al. "SpecInfer: Accelerating Large Language Model Serving
+  with Tree-based Speculative Inference and Verification."
+  https://arxiv.org/abs/2305.09781
+- Chen, Z. et al. "Sequoia: Scalable, Robust, and Hardware-aware
+  Speculative Decoding." https://arxiv.org/abs/2402.12374
+
+Rule: accept draft token ``t`` with probability
+``min(1, p_target(t) / p_draft(t))``. On reject, resample from the residual
+distribution ``(p_target - p_draft)+`` (normalized). When every edge on a
+path is accepted, emit one bonus token sampled from the final target
+distribution.
 
 This module stays pure — no batching glue, no tree traversal — so it can be
 unit-tested against known distributions independent of the rest of the
@@ -10,8 +20,10 @@ speculative generate loop. The caller is responsible for walking paths
 and stitching the results back into KV cache position ids.
 
 The existing argmax path (``speculative_model._extract_best_verified_paths_fixed``)
-remains the default when ``do_sample=False``. This primitive activates only
-on the stochastic branch.
+remains the default when ``do_sample=False`` and is token-identical to greedy
+decoding on the target model. This primitive activates only on the stochastic
+branch (``do_sample=True``) and is provably distribution-equivalent to
+sampling directly from the target model (see SpecInfer §3.2 / Sequoia §3.1).
 """
 
 from __future__ import annotations

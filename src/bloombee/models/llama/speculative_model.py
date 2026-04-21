@@ -1,5 +1,6 @@
 from typing import Optional, Union, List, Tuple, Any
 
+import math
 import torch
 import time
 import numpy as np
@@ -13,6 +14,7 @@ from transformers.generation.streamers import BaseStreamer
 from bloombee.models.llama.config import DistributedLlamaConfig
 from bloombee.models.llama.model import DistributedLlamaForCausalLM
 from bloombee.models.llama.spec_decoding_drafter import MultiSSMDrafter
+from bloombee.models.llama.spec_decoding_verify import verify_path
 
 
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree, TreeNode, prepare_incremental_tree_batch
@@ -48,7 +50,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         logits_processor = logits_processor or LogitsProcessorList()
         stopping_criteria = stopping_criteria or StoppingCriteriaList()
 
-        generation_config.do_sample = False
+        # Do not override do_sample here. When do_sample=False the verify loop
+        # takes the argmax path (token-identical to greedy decoding on the
+        # target model, same as before). When do_sample=True the verify loop
+        # uses SpecInfer rejection sampling (arXiv 2305.09781) which is
+        # provably distribution-equivalent to sampling directly from the
+        # target model.
         generation_config.return_dict_in_generate = False
 
         # Resolve session_max_length from (in order): kwarg > model_kwargs > config
@@ -172,6 +179,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 use_kv_cache=use_kv_cache,
                 kv_cache_window=kv_cache_window,
                 seq_lengths=seq_lengths,
+                do_sample=bool(getattr(generation_config, "do_sample", False)),
+                temperature=float(getattr(generation_config, "temperature", 1.0) or 1.0),
             )
             
             t3 = time.perf_counter()
@@ -311,6 +320,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         use_kv_cache: bool,
         kv_cache_window: int,
         seq_lengths: torch.LongTensor,
+        do_sample: bool = False,
+        temperature: float = 1.0,
     ) -> Tuple[torch.LongTensor, torch.Tensor, RemotePastKeyValues, torch.Tensor, torch.Tensor]:
         """
         Verify speculative trees using standard forward() call within the active session context
@@ -407,7 +418,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 
         # Extract verification results - 现在返回 valid_lengths
         verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths = self._extract_best_verified_paths_fixed(
-            logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration
+            logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration,
+            do_sample=do_sample, temperature=temperature,
         )
         return verified_tokens, kv_cache_position_ids, new_past_key_values, llm_generated_tokens, valid_lengths
     
@@ -590,6 +602,142 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         
         return trees
     
+    def _extract_sampling_paths_specinfer(
+        self,
+        logits: torch.Tensor,
+        batch_node_paths: List[List[List[TreeNode]]],
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        tree_len: int,
+        seq_lengths: torch.LongTensor,
+        is_first_iteration: bool,
+        temperature: float,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        # SpecInfer (arXiv 2305.09781) rejection-sampling verification for the
+        # do_sample=True branch. For each batch we pick the highest-path-log-prob
+        # candidate path from the tree, build sparse p_draft vectors from the
+        # siblings' stored drafter probabilities, compute p_target with the
+        # requested temperature, and call spec_decoding_verify.verify_path. The
+        # result is (accepted prefix, resampled/bonus token), which matches the
+        # shape of the greedy return tuple so the outer loop is untouched.
+        batch_size = logits.shape[0]
+        seq_len = logits.shape[1]
+        device = logits.device
+        vocab_size = logits.shape[-1]
+        fallback_pos = max(0, seq_len - tree_len)
+        temp = float(temperature) if temperature and temperature > 0 else 1.0
+
+        verified_tokens_list: List[torch.Tensor] = []
+        positions_list: List[torch.Tensor] = []
+        llm_tokens_list: List[torch.Tensor] = []
+        valid_lengths_list: List[int] = []
+
+        for batch_idx in range(batch_size):
+            actual_len = seq_lengths[batch_idx].item()
+            real_fallback_pos = actual_len if is_first_iteration else fallback_pos
+            tree_root_position = actual_len - 1
+
+            node_paths = batch_node_paths[batch_idx] if batch_idx < len(batch_node_paths) else []
+
+            # Rank candidate paths by cumulative draft log-prob, pick the top one.
+            best_path: List[TreeNode] = []
+            best_log = float("-inf")
+            for node_path in node_paths:
+                if not node_path:
+                    continue
+                log_p = 0.0
+                ok = True
+                for node in node_path:
+                    if node.probability <= 0:
+                        ok = False
+                        break
+                    log_p += math.log(node.probability)
+                if not ok:
+                    continue
+                # Skip paths whose positions exceed the logits window.
+                last_pos = node_path[-1].parent.position_in_sequence + 1
+                if last_pos >= seq_len:
+                    continue
+                if log_p > best_log:
+                    best_log = log_p
+                    best_path = node_path
+
+            if not best_path:
+                # No usable path — resample one token from the fallback logits.
+                final_logits = logits[batch_idx, max(0, real_fallback_pos - 1):real_fallback_pos]
+                if final_logits.numel() == 0 or final_logits.shape[0] == 0:
+                    final_logits = logits[batch_idx, max(0, seq_len - 1):seq_len]
+                processed_logits = final_logits.clone()
+                for processor in logits_processor:
+                    processed_logits = processor(input_ids[batch_idx:batch_idx + 1], processed_logits)
+                probs = torch.softmax(processed_logits[0] / temp, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).item()
+                verified_tokens_list.append(torch.empty(0, dtype=torch.long, device=device))
+                positions_list.append(torch.tensor([tree_root_position], device=device))
+                llm_tokens_list.append(torch.tensor([next_token], device=device))
+                valid_lengths_list.append(0)
+                continue
+
+            path_len = len(best_path)
+            target_probs = torch.zeros(path_len, vocab_size, device=device, dtype=torch.float32)
+            draft_probs = torch.zeros(path_len, vocab_size, device=device, dtype=torch.float32)
+            draft_tokens_t = torch.zeros(path_len, dtype=torch.long, device=device)
+            path_positions: List[int] = []
+
+            for i, node in enumerate(best_path):
+                pos = node.parent.position_in_sequence + 1
+                path_positions.append(tree_root_position + node.position_in_sequence + 1)
+                row_logits = logits[batch_idx, pos].to(torch.float32)
+                processed = row_logits.unsqueeze(0).clone()
+                for processor in logits_processor:
+                    processed = processor(input_ids[batch_idx:batch_idx + 1], processed)
+                target_probs[i] = torch.softmax(processed[0] / temp, dim=-1)
+
+                # Sparse draft distribution: siblings share the same parent, so
+                # p_draft[sib.token] = sib.probability; other tokens get 0 (the
+                # residual handles the rest of the vocabulary).
+                siblings = node.parent.children if node.parent is not None else [node]
+                for sib in siblings:
+                    tok = int(sib.token_id)
+                    if 0 <= tok < vocab_size:
+                        draft_probs[i, tok] = max(float(sib.probability), draft_probs[i, tok].item())
+                draft_tokens_t[i] = int(node.token_id)
+
+            committed, accepted_len = verify_path(target_probs, draft_probs, draft_tokens_t)
+
+            if accepted_len > 0:
+                best_verified = committed[:accepted_len]
+                best_positions = path_positions[:accepted_len]
+            else:
+                best_verified = []
+                best_positions = []
+            llm_token_val = int(committed[accepted_len]) if accepted_len < len(committed) else int(committed[-1])
+
+            all_positions = [tree_root_position] + best_positions
+            verified_tokens_list.append(
+                torch.tensor(best_verified, dtype=torch.long, device=device) if best_verified
+                else torch.empty(0, dtype=torch.long, device=device)
+            )
+            positions_list.append(torch.tensor(all_positions, dtype=torch.long, device=device))
+            llm_tokens_list.append(torch.tensor([llm_token_val], dtype=torch.long, device=device))
+            valid_lengths_list.append(len(best_verified))
+
+        llm_generated_tokens = torch.stack(llm_tokens_list, dim=0)
+        valid_lengths = torch.tensor(valid_lengths_list, dtype=torch.long, device=device)
+        max_pos_len = max(pos.shape[0] for pos in positions_list)
+        kv_cache_position_ids = torch.full((batch_size, max_pos_len), -1, dtype=torch.long, device=device)
+        for i, pos in enumerate(positions_list):
+            kv_cache_position_ids[i, :pos.shape[0]] = pos
+        max_verified_len = max((v.shape[0] for v in verified_tokens_list), default=0)
+        if max_verified_len > 0:
+            verified_tokens = torch.full((batch_size, max_verified_len), -1, dtype=torch.long, device=device)
+            for i, v in enumerate(verified_tokens_list):
+                if v.shape[0] > 0:
+                    verified_tokens[i, :v.shape[0]] = v
+        else:
+            verified_tokens = None
+        return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths
+
     def _extract_best_verified_paths_fixed(
         self,
         logits: torch.Tensor,
@@ -599,6 +747,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         tree_len: int,
         seq_lengths: torch.LongTensor,
         is_first_iteration: bool,
+        do_sample: bool = False,
+        temperature: float = 1.0,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -618,8 +768,20 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # node GPU syncs. For a depth-d width-w tree this removes O(B * w^d * d)
         # .item() calls per step — the dominant CPU-GPU sync cost. Semantics are
         # preserved for do_sample=False (argmax verify equals rejection sampling
-        # with a one-hot target). Stochastic sampling will extend this function
-        # with a `min(1, p/q)` branch; see SPEC_DECODING_SURVEY.md.
+        # with a one-hot target). When do_sample=True we route through
+        # spec_decoding_verify.verify_path (SpecInfer arXiv 2305.09781) below.
+        if do_sample:
+            return self._extract_sampling_paths_specinfer(
+                logits=logits,
+                batch_node_paths=batch_node_paths,
+                input_ids=input_ids,
+                logits_processor=logits_processor,
+                tree_len=tree_len,
+                seq_lengths=seq_lengths,
+                is_first_iteration=is_first_iteration,
+                temperature=temperature,
+            )
+
         if logits.numel() > 0 and logits.shape[1] > 0:
             predicted_tokens_cpu = logits.argmax(dim=-1).detach().cpu().tolist()
         else:

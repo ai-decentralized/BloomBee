@@ -1,6 +1,11 @@
+import math
 import torch
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree
-from typing import List
+from bloombee.models.llama.spec_decoding_tree_shape import (
+    FrontierNode,
+    budgeted_expand_plan,
+)
+from typing import List, Optional
 import threading
 from transformers.cache_utils import DynamicCache
 import time
@@ -8,6 +13,19 @@ import time
 from hivemind.utils.logging import get_logger
 
 logger = get_logger()
+
+
+def _node_path_log_prob(node) -> float:
+    # Walk root→node (root has prob 1.0 so log=0). Used by EAGLE-2 ranking.
+    total = 0.0
+    cur = node
+    while cur is not None and cur.parent is not None:
+        if cur.probability > 0:
+            total += math.log(cur.probability)
+        else:
+            return float("-inf")
+        cur = cur.parent
+    return total
 
 class MultiSSMDrafter:
     
@@ -39,20 +57,30 @@ class MultiSSMDrafter:
         seq_lengths: torch.LongTensor,
         beam_width: int,
         max_depth: int,
+        *,
+        tree_budget: Optional[int] = None,
+        tree_min_log_prob: Optional[float] = None,
     ) -> List:
-        
+        # EAGLE-2 (https://arxiv.org/abs/2406.16858) opt-in tree shaping.
+        # - tree_budget: keep at most this many frontier nodes across the whole
+        #   tree before expanding the next depth (global top-K by path log-prob).
+        # - tree_min_log_prob: drop any frontier whose running path log-prob is
+        #   below this threshold before ranking.
+        # When both are None the drafter expands the full (depth × beam_width)
+        # grid, which is byte-identical to the pre-EAGLE-2 behavior.
         batch_size = input_ids.shape[0]
         chunk_size = (batch_size + self.num_workers - 1) // self.num_workers
-        
+
         all_results = [None] * batch_size
-        
+
         def worker_fn(worker_idx: int, batch_indices: List[int]):
             ssm = self.ssms[worker_idx]
             stream = self.streams[worker_idx]
-            
+
             with torch.cuda.stream(stream):
                 results = self._build_trees_batched(
-                    batch_indices, input_ids, seq_lengths, ssm, beam_width, max_depth
+                    batch_indices, input_ids, seq_lengths, ssm, beam_width, max_depth,
+                    tree_budget=tree_budget, tree_min_log_prob=tree_min_log_prob,
                 )
                 for batch_idx, tree in results:
                     all_results[batch_idx] = tree
@@ -85,6 +113,9 @@ class MultiSSMDrafter:
         ssm,
         beam_width: int,
         max_depth: int,
+        *,
+        tree_budget: Optional[int] = None,
+        tree_min_log_prob: Optional[float] = None,
     ) -> List:
         
         pad_token_id = getattr(ssm.config, 'pad_token_id', 0)
@@ -198,9 +229,15 @@ class MultiSSMDrafter:
             # cache
             if prefix_cache is not None:
                 node_cache = DynamicCache()
-                for layer_idx in range(len(prefix_cache)):
-                    key, value = prefix_cache[layer_idx]
-                    node_cache.update(key[cache_indices], value[cache_indices], layer_idx)
+                # transformers 5.x renamed tuple indexing into layers[i].keys/values.
+                # Fall back to the legacy subscript API when present.
+                if hasattr(prefix_cache, "layers"):
+                    for layer_idx, layer in enumerate(prefix_cache.layers):
+                        node_cache.update(layer.keys[cache_indices], layer.values[cache_indices], layer_idx)
+                else:
+                    for layer_idx in range(len(prefix_cache)):
+                        key, value = prefix_cache[layer_idx]
+                        node_cache.update(key[cache_indices], value[cache_indices], layer_idx)
             else:
                 node_cache = None
             
@@ -223,12 +260,50 @@ class MultiSSMDrafter:
             
             batch_node_results = {}
             for i, (batch_idx, node) in enumerate(node_mapping):
-                candidates = [(int(all_top_k_indices_np[i, j]), float(all_top_k_probs_np[i, j])) 
+                candidates = [(int(all_top_k_indices_np[i, j]), float(all_top_k_probs_np[i, j]))
                             for j in range(beam_width)]
                 if batch_idx not in batch_node_results:
                     batch_node_results[batch_idx] = []
                 batch_node_results[batch_idx].append((node, candidates))
-            
+
+            # EAGLE-2 (arXiv 2406.16858) tree shaping, applied per-batch so one
+            # sample's overly greedy expansion can't starve another sample in
+            # the same drafter call. When both tree_budget and
+            # tree_min_log_prob are None this loop is a no-op that rewrites
+            # the candidate lists back to their original form.
+            if tree_budget is not None or tree_min_log_prob is not None:
+                for batch_idx, per_node in batch_node_results.items():
+                    frontier: List[FrontierNode] = []
+                    for node, candidates in per_node:
+                        parent_log = _node_path_log_prob(node)
+                        for cand_token, cand_prob in candidates:
+                            cand_log = parent_log + (math.log(cand_prob) if cand_prob > 0 else float("-inf"))
+                            # Identity key uniquely identifies one candidate edge.
+                            handle = (id(node), int(cand_token), float(cand_prob))
+                            frontier.append(
+                                FrontierNode(
+                                    node_handle=handle,
+                                    path_log_prob=cand_log,
+                                    depth=depth + 1,
+                                )
+                            )
+                    survivors = budgeted_expand_plan(
+                        frontier,
+                        budget=tree_budget if tree_budget is not None else len(frontier),
+                        min_log_prob=tree_min_log_prob,
+                    )
+                    kept_handles = {fn.node_handle for fn in survivors}
+                    filtered_per_node = []
+                    for node, candidates in per_node:
+                        kept = [
+                            (t, p)
+                            for t, p in candidates
+                            if (id(node), int(t), float(p)) in kept_handles
+                        ]
+                        if kept:
+                            filtered_per_node.append((node, kept))
+                    batch_node_results[batch_idx] = filtered_per_node
+
             any_new = False
             for batch_idx in batch_indices:
                 if batch_idx not in batch_node_results:

@@ -43,6 +43,17 @@ if TYPE_CHECKING:
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
 
+
+def _flag_to_bool(value) -> bool:
+    # Hoisted from inference_step: the closure redefinition was ~1 alloc/step.
+    if value is None:
+        return False
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return False
+        return bool(value.bool().any().item())
+    return bool(value)
+
 class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Module
     """A wrapper for a transformer block that can process requests for forward, backward and inference"""
 
@@ -148,9 +159,32 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.cache_bytes_per_token: Dict[torch.device, int] = Counter()
         for descr in self.get_inference_cache_descriptors(batch_size=1, max_length=1):
             self.cache_bytes_per_token[descr.device] += descr.numel() * get_size_in_bytes(descr.dtype)
-        
+
         # 🚀 Performance optimization: Pre-allocate position_ids cache
         self._position_ids_cache = {}
+        # Compute-once hoist (②): per-step work that depended only on static
+        # backend state. Each of these used to run on every inference_step.
+        self._max_shard_num_heads = max(self.shard_num_heads)
+        # Static portion of the "can we reuse server-side KV cache?" gate —
+        # depends only on the offloading policy decided at server init.
+        policy = cache_manager.offloading_policy
+        self._static_reuse_blocker = (
+            policy.cache_gpu_percent < 100
+            or policy.cache_cpu_percent > 0
+            or policy.cache_disk_percent > 0
+            or policy.compress_cache
+            or policy.cpu_cache_compute
+        )
+        self._policy_gpu_batch_size = int(getattr(policy, "gpu_batch_size", 0))
+        self._has_set_remote_cache_reuse = hasattr(self.module, "set_remote_cache_reuse_enabled")
+        # Per (device, dtype) cached no-op attention score tensor for the
+        # fast decode path (seq_len == 1, non-spec). Causal mask with one
+        # query attending to everything in cache + itself is equivalent to
+        # attention_mask=None at the block level. We pass None instead of
+        # allocating (B, 1+cache_len) bool + (B, 1+cache_len) float32 every
+        # step. The cached tensor stays as a sentinel for callers that
+        # insist on a non-None mask; it's unused on the hot path.
+        self._decode_noop_mask = None
 
         # Decide device placement policy for module based on offloading policy
         offload_policy = cache_manager.offloading_policy
@@ -412,15 +446,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             with self.cache_manager.use_cache(
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
-                def _flag_to_bool(value) -> bool:
-                    if value is None:
-                        return False
-                    if torch.is_tensor(value):
-                        if value.numel() == 0:
-                            return False
-                        return bool(value.bool().any().item())
-                    return bool(value)
-
                 # Parse flags per request (not just first-ever call), otherwise spec/non-spec
                 # mode can get stuck after the first request served by this backend.
                 self._need_pruning = _flag_to_bool(inference_info.need_pruning)
@@ -474,22 +499,24 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
 
                 layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
-                if hasattr(self.module, "set_remote_cache_reuse_enabled"):
-                    policy = self.cache_manager.offloading_policy
+                if self._has_set_remote_cache_reuse:
+                    # Compute-once hoist (②): _static_reuse_blocker folds in
+                    # the 5 policy fields that are frozen at server init.
+                    # Only the per-request terms (spec-dec, non-identity
+                    # hypo_ids, kv_cache_position_ids, gpu_batch underflow)
+                    # need to be re-evaluated each step.
+                    gpu_bs = self._policy_gpu_batch_size
+                    underflow = (
+                        inference_info.full_batch_size > 0
+                        and gpu_bs > 0
+                        and gpu_bs < int(inference_info.full_batch_size)
+                    )
                     reuse_allowed = not (
-                        self._is_spec_decoding
+                        self._static_reuse_blocker
+                        or self._is_spec_decoding
                         or (kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0)
                         or not self._is_identity_hypo_ids(hypo_ids)
-                        or policy.cache_gpu_percent < 100
-                        or policy.cache_cpu_percent > 0
-                        or policy.cache_disk_percent > 0
-                        or policy.compress_cache
-                        or policy.cpu_cache_compute
-                        or (
-                            inference_info.full_batch_size > 0
-                            and int(getattr(policy, "gpu_batch_size", inference_info.full_batch_size))
-                            < int(inference_info.full_batch_size)
-                        )
+                        or underflow
                     )
                     self.module.set_remote_cache_reuse_enabled(reuse_allowed)
 
@@ -679,7 +706,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # the model uses multi-query attention
         batch_size, seq_length, hidden_size = hidden_states.shape
         worst_case_length = inference_info.prefix_length + seq_length
-        attn_bytes_per_token = max(self.shard_num_heads) * batch_size * self.dtype_bytes * worst_case_length
+        attn_bytes_per_token = self._max_shard_num_heads * batch_size * self.dtype_bytes * worst_case_length
         return max(1, self.max_chunk_size_bytes // attn_bytes_per_token)
 
     def _reorder_cache_inplace(self, cache_tensors: torch.Tensor, hypo_ids: torch.Tensor):
