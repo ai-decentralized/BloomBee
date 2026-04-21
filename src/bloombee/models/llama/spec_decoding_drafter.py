@@ -5,7 +5,7 @@ from bloombee.models.llama.spec_decoding_tree_shape import (
     FrontierNode,
     budgeted_expand_plan,
 )
-from typing import List, Optional
+from typing import List, Optional, Sequence, Union
 import threading
 from transformers.cache_utils import DynamicCache
 import time
@@ -55,19 +55,23 @@ class MultiSSMDrafter:
         self,
         input_ids: torch.LongTensor,
         seq_lengths: torch.LongTensor,
-        beam_width: int,
+        beam_width: Union[int, Sequence[int]],
         max_depth: int,
         *,
         tree_budget: Optional[int] = None,
         tree_min_log_prob: Optional[float] = None,
     ) -> List:
-        # EAGLE-2 (https://arxiv.org/abs/2406.16858) opt-in tree shaping.
-        # - tree_budget: keep at most this many frontier nodes across the whole
-        #   tree before expanding the next depth (global top-K by path log-prob).
-        # - tree_min_log_prob: drop any frontier whose running path log-prob is
-        #   below this threshold before ranking.
-        # When both are None the drafter expands the full (depth × beam_width)
-        # grid, which is byte-identical to the pre-EAGLE-2 behavior.
+        # Tree-shape policies, in precedence order:
+        #
+        # 1. Sequoia (https://arxiv.org/abs/2402.12374): if ``beam_width`` is a
+        #    list/tuple, it's interpreted as the Sequoia static per-depth
+        #    widths plan. Depth ``d`` expands each frontier node to
+        #    ``beam_width[d]`` children. No per-step ranking cost.
+        # 2. EAGLE-2 (https://arxiv.org/abs/2406.16858): if ``tree_budget`` or
+        #    ``tree_min_log_prob`` is set, expand a uniform (depth × beam_width)
+        #    grid and then prune via ``budgeted_expand_plan``.
+        # 3. Default: full (depth × beam_width) grid — byte-identical to the
+        #    pre-EAGLE-2 behavior.
         batch_size = input_ids.shape[0]
         chunk_size = (batch_size + self.num_workers - 1) // self.num_workers
 
@@ -111,13 +115,21 @@ class MultiSSMDrafter:
         input_ids: torch.LongTensor,
         seq_lengths: torch.LongTensor,
         ssm,
-        beam_width: int,
+        beam_width: Union[int, Sequence[int]],
         max_depth: int,
         *,
         tree_budget: Optional[int] = None,
         tree_min_log_prob: Optional[float] = None,
     ) -> List:
-        
+
+        # Sequoia per-depth plan: list/tuple overrides scalar beam_width and
+        # caps tree depth. Each depth expands to ``width_plan[depth]`` children.
+        if isinstance(beam_width, (list, tuple)):
+            width_plan: Optional[List[int]] = [int(w) for w in beam_width]
+            max_depth = min(max_depth, len(width_plan))
+        else:
+            width_plan = None
+
         pad_token_id = getattr(ssm.config, 'pad_token_id', 0)
         
         trees = {}
@@ -250,18 +262,25 @@ class MultiSSMDrafter:
             
             t_forward += time.perf_counter() - t0
             t0 =    time.perf_counter()
+            # Per-depth width: Sequoia plan overrides scalar beam_width.
+            if width_plan is not None:
+                depth_width = width_plan[depth] if depth < len(width_plan) else 0
+            else:
+                depth_width = int(beam_width)
+            if depth_width <= 0:
+                break
             # 批量 topk
-            _, all_top_k_indices = torch.topk(all_logits, k=beam_width, dim=-1)
+            _, all_top_k_indices = torch.topk(all_logits, k=depth_width, dim=-1)
             all_probs = torch.softmax(all_logits, dim=-1)
             all_top_k_probs = torch.gather(all_probs, 1, all_top_k_indices)
-            
+
             all_top_k_indices_np = all_top_k_indices.cpu().numpy()
             all_top_k_probs_np = all_top_k_probs.cpu().numpy()
-            
+
             batch_node_results = {}
             for i, (batch_idx, node) in enumerate(node_mapping):
                 candidates = [(int(all_top_k_indices_np[i, j]), float(all_top_k_probs_np[i, j]))
-                            for j in range(beam_width)]
+                            for j in range(depth_width)]
                 if batch_idx not in batch_node_results:
                     batch_node_results[batch_idx] = []
                 batch_node_results[batch_idx].append((node, candidates))

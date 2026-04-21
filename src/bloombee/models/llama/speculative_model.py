@@ -15,6 +15,7 @@ from bloombee.models.llama.config import DistributedLlamaConfig
 from bloombee.models.llama.model import DistributedLlamaForCausalLM
 from bloombee.models.llama.spec_decoding_drafter import MultiSSMDrafter
 from bloombee.models.llama.spec_decoding_verify import verify_path
+from bloombee.models.llama.spec_decoding_tree_shape import AcceptanceHistogram
 
 
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree, TreeNode, prepare_incremental_tree_batch
@@ -37,12 +38,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         streamer: Optional["BaseStreamer"] = None,
-        beam_width: int = 1,
+        beam_width: Union[int, List[int]] = 1,
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
         max_new_tokens: int = 128,
         session_max_length: Optional[int] = None,
+        acceptance_histogram: Optional[AcceptanceHistogram] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
         
@@ -68,7 +70,15 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         session_max_length = model_kwargs.pop("session_max_length", kwarg_override)
         if session_max_length is None:
             prompt_len = int(input_ids.shape[1])
-            tree_budget = max_tree_depth * max(beam_width, 1)
+            # Sequoia plan: total tree budget is sum of products of widths.
+            if isinstance(beam_width, (list, tuple)):
+                tree_budget = 0
+                running = 1
+                for w in beam_width:
+                    running *= max(int(w), 1)
+                    tree_budget += running
+            else:
+                tree_budget = max_tree_depth * max(int(beam_width), 1)
             session_max_length = max(
                 prompt_len + int(max_new_tokens) + tree_budget + 16,
                 256,
@@ -97,6 +107,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 use_kv_cache=use_kv_cache,
                 kv_cache_window=kv_cache_window,
                 max_new_tokens=max_new_tokens,
+                acceptance_histogram=acceptance_histogram,
                 **model_kwargs,
             )
         
@@ -109,11 +120,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         generation_config: GenerationConfig,
         session: InferenceSession,
         streamer: Optional["BaseStreamer"],
-        beam_width: int = 2,
+        beam_width: Union[int, List[int]] = 2,
         max_tree_depth: int = 3,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
         max_new_tokens: int = 128,
+        acceptance_histogram: Optional[AcceptanceHistogram] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
         logger.info("Starting speculative decoding with distributed inference session!")
@@ -181,6 +193,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 seq_lengths=seq_lengths,
                 do_sample=bool(getattr(generation_config, "do_sample", False)),
                 temperature=float(getattr(generation_config, "temperature", 1.0) or 1.0),
+                acceptance_histogram=acceptance_histogram,
             )
             
             t3 = time.perf_counter()
@@ -322,6 +335,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         seq_lengths: torch.LongTensor,
         do_sample: bool = False,
         temperature: float = 1.0,
+        acceptance_histogram: Optional[AcceptanceHistogram] = None,
     ) -> Tuple[torch.LongTensor, torch.Tensor, RemotePastKeyValues, torch.Tensor, torch.Tensor]:
         """
         Verify speculative trees using standard forward() call within the active session context
@@ -420,6 +434,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths = self._extract_best_verified_paths_fixed(
             logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration,
             do_sample=do_sample, temperature=temperature,
+            acceptance_histogram=acceptance_histogram,
         )
         return verified_tokens, kv_cache_position_ids, new_past_key_values, llm_generated_tokens, valid_lengths
     
@@ -749,6 +764,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         is_first_iteration: bool,
         do_sample: bool = False,
         temperature: float = 1.0,
+        acceptance_histogram: Optional[AcceptanceHistogram] = None,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -819,11 +835,19 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             best_score = -1
             
             predicted_row = predicted_tokens_cpu[batch_idx] if batch_idx < len(predicted_tokens_cpu) else []
+            # Track the longest path's depth-of-rejection so we can feed the
+            # Sequoia acceptance histogram: every prefix depth before that
+            # counts as an accept at that depth, the first mismatching depth
+            # counts as a reject (unless the path ran out). This matches
+            # Sequoia §4.1's per-depth-Bernoulli approximation.
+            best_path_depth_accepts = 0
+            best_path_rejected_at: Optional[int] = None
             for node_path in node_paths:
                 verified_tokens = []
                 verified_positions = []
 
-                for node in node_path:
+                rejected_at_depth: Optional[int] = None
+                for depth_idx, node in enumerate(node_path):
                     pos = node.parent.position_in_sequence + 1
                     if pos >= seq_len or pos >= len(predicted_row):
                         break
@@ -835,12 +859,21 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                         absolute_position = tree_root_position + node.position_in_sequence + 1
                         verified_positions.append(absolute_position)
                     else:
+                        rejected_at_depth = depth_idx
                         break
-                
+
                 if len(verified_tokens) > best_score:
                     best_score = len(verified_tokens)
                     best_verified = verified_tokens
                     best_positions = verified_positions
+                    best_path_depth_accepts = len(verified_tokens)
+                    best_path_rejected_at = rejected_at_depth
+
+            if acceptance_histogram is not None:
+                for d in range(best_path_depth_accepts):
+                    acceptance_histogram.record(d, True)
+                if best_path_rejected_at is not None:
+                    acceptance_histogram.record(best_path_rejected_at, False)
             
             # 确定取 llm_token 的位置
             if len(best_verified) > 0:

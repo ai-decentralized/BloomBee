@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from hivemind import DHT
 from hivemind.utils.logging import get_logger
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 try:
     from transformers.models.qwen3 import (
@@ -161,6 +162,64 @@ class DistributedQwen3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _B
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ) -> dict:
+        # Ported from DistributedLlamaForCausalLM. Without this override,
+        # TF 5.x's default prepare_inputs_for_generation re-does prefill-shaped
+        # work every step (seen on A100 as 881 ms/step on Qwen3-14B while
+        # per-server compute was only ~94 ms). Llama had this override so it
+        # decoded at 212 ms/step; Qwen3 was missing it.
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = getattr(past_key_values, "_seen_tokens", None)
+                if past_length is None:
+                    past_length = cache_length
+                if hasattr(past_key_values, "get_max_length"):
+                    max_cache_length = past_key_values.get_max_length()
+                elif hasattr(past_key_values, "get_max_cache_shape"):
+                    max_cache_length = past_key_values.get_max_cache_shape()
+                else:
+                    max_cache_length = None
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1]:]
+
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
 
     def mark_tied_weights_as_initialized(self, loading_info):
         """Override TF 5.x's tied-weight bookkeeping.
