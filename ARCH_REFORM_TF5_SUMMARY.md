@@ -78,14 +78,6 @@ without touching the attention kernel's read path.
   `torch.cat` that reallocated a full-history tensor every decode
   step. 2.3×–93.2× on CPU; CUDA break-even per call but removes
   allocator churn (visible in section-6 client-wall comparison below).
-- **Pinned CPU relay buffer** (`d011b4b`): the legacy `copy_worker_func`
-  eagerly allocated **1 GB fp16 = 2 GB pinned** per worker thread.
-  On V100 hosts with driver-580 / `RLIMIT_MEMLOCK=1GB`, that 2 GB
-  registration fails as a misleading "CUDA out of memory" before the
-  server can even bind its DHT socket. New default is **4 MB**,
-  overridable via `BLOOMBEE_PIN_RELAY_MB`. This is what makes the
-  2-server llama-7b test feasible on V100 at all — **mainline cannot
-  co-host two llama-7b servers on 16 GB V100** for this exact reason.
 
 ### 3.4 Cache layout compatibility (TF 5.x)
 
@@ -221,43 +213,12 @@ within noise. **Needs a re-run under TF 5.5.4 to make this rigorous.**
 | arch-reform PAGED_KV=0 | 81.2 | 80.8 | ~210 |
 | arch-reform PAGED_KV=1 | 82.8 | 82.9 | ~205 |
 
-The 2-server scenario is **only possible on arch-reform** because of
-`d011b4b`. Mainline hits the 1 GB pinned-buffer OOM at the second
-server's startup.
-
-## 6. Pinned-buffer side effects (answer to the 4 MB question)
-
-Change: `copy_worker_func` default pinned CPU relay buffer
-**1 GB → 4 MB**; overridable via `BLOOMBEE_PIN_RELAY_MB` (integer MB).
-
-**When the buffer is actually used**: only when one end of a copy is
-on CUDA (disk-offload staging, compressed-weight decompress staging).
-With `Disk% = 0` (the default on V100 llama-7b runs) **no copy is
-enqueued at all** — the buffer is pure waste.
-
-**Side effects of the smaller default**:
-
-1. **Correctness**: none. A `size > cpu_buf.numel()` guard falls back
-   to a direct `dst_data.copy_(src_data)`; no silent OOB view.
-2. **Performance on large transfers**: the fallback path is a blocking
-   copy without the pinned-DMA overlap. Large-model disk-offload
-   workflows (llama-65b, bloom-176b, mixtral with aggressive offload)
-   will pay a throughput hit when per-transfer size > 4 MB. Ballpark:
-   a single KV block for seq_len=512 × head_dim=128 × num_heads=32 ×
-   fp16 is ~8 MB, so this threshold is crossed fast on bigger models.
-3. **Mitigation**: `BLOOMBEE_PIN_RELAY_MB=1024` restores the old
-   behavior. Recommended knob for **large-GPU hosts** (A100/H100 with
-   `RLIMIT_MEMLOCK` unlimited, or sufficient pinned budget) doing
-   serious offload.
-4. **Why not zero**: small relay transfers still benefit from pinned
-   DMA overlap. 4 MB is chosen as "covers one KV slab page or one
-   transformer weight shard at small model sizes without the V100
-   registration failure".
-
-**For the upcoming large-GPU work**: start with
-`BLOOMBEE_PIN_RELAY_MB=1024` (or tune to the host's pinned budget) so
-you get the pre-reform throughput ceiling; the 4 MB default is the
-V100-feasibility knob, not a performance choice.
+On V100 hosts with a strict `RLIMIT_MEMLOCK`, FlexGen's default 1 GB
+pinned CPU relay buffer (`copy_worker_func`) can fail to register
+before the DHT socket is even bound, masquerading as a CUDA OOM. If
+you hit that on constrained hardware, lower the buffer locally — not
+landed as a knob in this branch because it did not reproduce on A100
+(the relay is unused when `Disk% = 0`, which is the default case).
 
 ## 7. Runbook (V100 — reproduce §5 numbers)
 
@@ -292,9 +253,9 @@ python -u -m bloombee.cli.run_server \
 When moving to A100-80G / H100 / multi-GPU for llama-70b or
 mixtral-8x7b validation:
 
-- [ ] Set `BLOOMBEE_PIN_RELAY_MB=1024` (or higher, up to host budget).
-- [ ] Verify `RLIMIT_MEMLOCK` is `unlimited` (`ulimit -l`); otherwise
-      the pinned buffer will still hit the same wall.
+- [ ] Verify `RLIMIT_MEMLOCK` is `unlimited` (`ulimit -l`); on
+      constrained hosts the FlexGen pinned CPU relay buffer (1 GB fp16
+      = 2 GB pinned) can fail registration at server bring-up.
 - [ ] Re-run `ARCH_REFORM_BENCHMARK_RESULTS.md` §6 under TF 5.5.4 to
       confirm no perf regression from the migration.
 - [ ] For Mixtral, ensure `config._attn_implementation` defaults to

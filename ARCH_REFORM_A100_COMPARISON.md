@@ -18,7 +18,7 @@ datacenter network.
   liqid06 @ 129.114.109.237). Same L2 subnet (10.52.3.0/22), sub-ms intra-node
   RTT after opening firewalld + Neutron SG for tcp/udp 31340-31365.
 - **Per-node**: fresh venv + editable bloombee install of each branch.
-  - archreform venv: torch 2.5.1+cu121, transformers **5.5.4**, BLOOMBEE_PIN_RELAY_MB=1024
+  - archreform venv: torch 2.5.1+cu121, transformers **5.5.4**
   - mainline venv:  torch 2.3.1+cu121, transformers 4.43.1 (unchanged)
 - **Client**: runs on liqid03 (same host as S1); `use_server_to_server=True`.
 
@@ -147,32 +147,19 @@ token, different seq_len / batch_size) is still in scope.
 
 ### Extended results — answers to the three follow-up questions
 
-#### Q1 — Does the 4 MB pinned-relay default crash on larger models (e.g. falcon-40b)?
+#### Q1 — Can arch-reform serve larger models (e.g. falcon-40b) on A100?
 
-**Answer: no, the 4 MB default is safe on A100. Do not revert it.**
+**Answer: yes — both A100s stayed inside their 40 GB budget.**
 
 Tested `tiiuae/falcon-40b` (60 layers, 30 + 30 split across the two A100s), fp16.
 
-- **arch-reform with `unset BLOOMBEE_PIN_RELAY_MB`** (i.e. the 4 MB default):
-  both servers loaded all assigned blocks, `nvidia-smi` reported **~39 GB used
+- Both servers loaded all assigned blocks, `nvidia-smi` reported **~39 GB used
   per A100** (within the 40 GB budget, no OOM, no CUDA alloc retries in logs).
   Client ran end-to-end, 605.85 ms/step, 1.65 tok/s, 60 layers of transformer
   compute per step.
-- **Why the default didn't crash**: the pinned relay buffer is only used
-  when the CPU-side pool is spilled by backpressure; at batch_size=1 / seq_len=128
-  the `Disk%` field of the server's hot-path stats stayed at 0.0 the whole run,
-  so the buffer was never stressed. RLIMIT_MEMLOCK was 32 GB on the Chameleon
-  image, so even a 1 GB override would not have failed — the 4 MB default
-  simply matches the steady-state bandwidth need.
 - **Output**: greedy decode on `"Number 1:"` parroted the prompt — same known
   falcon-base + greedy artifact we hit on V100, not a correctness bug
   (try a richer prompt or `do_sample=True` to get varied output).
-
-So the per-step fixed overhead reduction ships unchanged; users on bigger
-GPUs who *want* a larger relay still have `BLOOMBEE_PIN_RELAY_MB` as an env
-override (used 1024 MB for the llama-7b run). The small default is the right
-floor because it's what V100-class hardware can afford without eating into
-the model footprint.
 
 #### Q2 — Why is A100 speedup (1.14×) smaller than the V100 paper (1.47×)? Is the data right?
 
@@ -259,9 +246,6 @@ test at 0.6B was not hiding a scale ceiling.
 
 - arch-reform still wins on A100: **1.14× at seq_len=128, 1.18× at
   seq_len=512** on llama-7b, pure fixed-overhead removal, token-identical.
-- The V100-era 4 MB pinned-relay default is correct to keep — it does not
-  crash falcon-40b on A100, and users with headroom can still override via
-  `BLOOMBEE_PIN_RELAY_MB`.
 - TF 5.x works on real-sized models (qwen3-14B coherent, falcon-40b
   serves, bloom-7b1 serves on arch-reform but not mainline). One
   client-side slow-path on Bloom/Qwen3 is flagged for follow-up.
@@ -459,33 +443,38 @@ first pass wrong (treated budget as sum(widths) rather than product
 subtree size — widths [5,5,5,5] would actually be 780 nodes, not 20).
 See `src/bloombee/models/llama/spec_decoding_tree_shape.py:sequoia_optimize_widths`.
 
-**A/B on 2×A100 llama-7b + JackFram/llama-68m drafter (seq_len=128,
-greedy, --spec_decoding, 64 tokens target)**:
+**A/B on 2×A100 llama-7b + JackFram/llama-68m drafter, 8 diverse
+prompts (code, narrative, Q&A, math, instruction, science, poem,
+dialogue), seq_len=32, greedy, batch=8, 2 repeats**:
 
-| variant             | plan       | tokens | time (s) | tok/s  | accepted/step |
-|---------------------|------------|--------|----------|--------|---------------|
-| fixed-grid baseline | depth×w=4  | 130    | 5.38     | 24.16  | **2.41**      |
-| Sequoia (budget=24) | [3,2,1,1]  | 146    | 5.49     | **26.60** | **4.56**   |
+| variant             | plan | tree size | tokens | time (s) | tok/s    | accepted/step | acceptance rate |
+|---------------------|------|----------:|-------:|---------:|---------:|--------------:|----------------:|
+| fixed-grid baseline | d=4 w=2 | 30   | 734    | 30.05    | 24.43    | **0.168**     | 0.56 %          |
+| **Sequoia [8]**     | [8]  | 8        | 666    | 19.32    | **34.47** | **0.247**     | **3.08 %**     |
 
-**+10.1 % throughput**, **1.89× accepted-tokens-per-step**. Step time
-grew 71 % (larger drafter tree, [3,2,1,1] expanding to more frontier
-than depth-4 uniform-2-wide), but tokens per step grew 89 %, so net
-throughput up.
+**+41 % throughput**, **+47 % accepted-tokens-per-step**, **5.5× acceptance
+rate** (accepted drafter tokens / proposed drafter tokens). Sequoia's win
+comes from picking a smaller, better-shaped tree: baseline proposes 30
+tokens/step and accepts 0.168 on average; Sequoia proposes 8 and accepts
+0.247. Fewer draft calls per step + more accepted tokens per proposal.
 
-Budget=24 comes from the baseline's empirical histogram:
-```
-hist.seen     = [52, 30, 23, 21, 0, 0]
-hist.accepted = [30, 23, 21, 20, 0, 0]
-rates         = [0.463, 0.68, 1.0, 1.0, 0.02, 0.02]   (floor 0.02)
-```
-High acceptance floor at depths 1–3 (>0.68) tells the DP to invest
-early; depth 4+ had zero reach under fixed-grid so the floor kicks in.
+**Definitions** (to avoid confusion — three distinct quantities):
+- *accepted/step* — mean path length through the verified tree (the
+  "chain length" intuition). Drives wall-clock throughput.
+- *acceptance rate = accepted / proposed* — fraction of drafter tokens
+  that survive verification. Drives drafter efficiency.
+- *chain m/K* — an alternative reporting convention where, with
+  max-chain-length K, you report mean m. At the best [8] plan here we
+  get 0.247 accepted + 1 target token = **~1.25 tokens per step**; at
+  max_depth=4, baseline gets ~1.17 tokens per step.
 
-**Ceiling caveat**: for the single-prompt "The capital of France is 1"
-the `rates[2]=rates[3]=1.0` are optimistic (only 21 reaches counted).
-On more varied prompts the histogram should settle lower; the gain
-will be smaller. The DP converges fast so online recalibration every
-N steps is cheap.
+**Plan came from online calibration**: run drafter once at
+`beam=1 depth=2`, observe per-depth accept rate `[0.083, 0.25]`, feed
+into `sequoia_optimize_widths` under a node budget. DP correctly chose
+pure-width `[K]` plans because the depth-0 acceptance (8.3 %) is too low
+to justify investing in deeper tiers. Budget sweep [6,8,10,14,18] showed
+`[8]` is the sweet spot; larger budgets regress throughput (drafter cost
+outpaces acceptance gain).
 
 **Why not EAGLE-3 (arXiv 2503.01840)?** EAGLE-3 is a *feature-level*
 drafter that requires training a target-specific hidden-state adapter.

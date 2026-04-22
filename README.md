@@ -11,7 +11,7 @@
     <a href="https://github.com/ai-decentralized/bloombee"><img src="https://img.shields.io/github/stars/ai-decentralized/bloombee?style=social"></a>
 </p>
 
-> **📘 Working on the `arch-reform-qwen3-4b` branch?** See the bilingual handoff summary for the architecture reform + transformers 5.x migration: [English](ARCH_REFORM_TF5_SUMMARY.md) · [中文](ARCH_REFORM_TF5_SUMMARY_zh.md). Covers design rationale, per-model verification matrix on V100, the `BLOOMBEE_PIN_RELAY_MB` knob, and a checklist for scaling to larger GPUs.
+> **📘 Working on the `arch-reform-qwen3-4b` branch?** See the bilingual handoff summary for the architecture reform + transformers 5.x migration: [English](ARCH_REFORM_TF5_SUMMARY.md) · [中文](ARCH_REFORM_TF5_SUMMARY_zh.md). Covers design rationale, per-model verification matrix, and a checklist for scaling to larger GPUs.
 
 The rapid rise of generative AI has boosted demand for large language model (LLM) inference and fine-tuning services. While proprietary models are still favored, advancements in open-source LLMs have made them competitive. However, high costs and limited GPU resources hinder deployment. BloomBee is a decentralized offline serving system that leverages idle GPU resources to provide cost-effective access to LLMs.
 
@@ -94,8 +94,30 @@ A **DHT (Distributed Hash Table)** keeps track of which server hosts which layer
 | **BLOOM** | `bigscience/bloom-7b1`, `bigscience/bloom` |
 | **Falcon** | `tiiuae/falcon-7b`, `tiiuae/falcon-40b` |
 | **Mixtral** | `mistralai/Mixtral-8x7B-v0.1` |
+| **Qwen3** *(new)* | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-14B` |
 
 Any HuggingFace model with a matching architecture can be served. Use `AutoDistributedModelForCausalLM` to load a model automatically.
+
+### Qwen3 and Transformers 5.x
+
+The `arch-reform-qwen3-4b` branch migrates BloomBee onto
+`transformers>=5.5,<5.6` and adds Qwen3 as a first-class model family.
+
+The migration covers the API breakages that separate Transformers 4.x
+from 5.x: the new `Cache` objects passed to attention layers, the
+strict `_tied_weights_keys` walk inside `tie_weights`, the
+`torch.device('cuda')` wrapper around `from_pretrained`'s `__init__`,
+and the stricter expectations inside `prepare_inputs_for_generation`.
+Each gap is closed with a small per-model override so BloomBee's
+distributed `MemoryCache` + remote `LMHead` placeholder still work;
+nothing in HuggingFace itself is forked. Verified end-to-end on V100
+(llama-7b, qwen3-0.6B, bloom-560m, falcon-rw-1b) and A100
+(llama-7b, qwen3-14B, falcon-40b, bloom-7b1).
+
+See [`ARCH_REFORM_TF5_SUMMARY.md`](ARCH_REFORM_TF5_SUMMARY.md)
+(English) or [`ARCH_REFORM_TF5_SUMMARY_zh.md`](ARCH_REFORM_TF5_SUMMARY_zh.md)
+(中文) for the full migration notes, and [`PR_NOTE.md`](PR_NOTE.md)
+for A100 benchmark numbers.
 
 ---
 
@@ -345,9 +367,13 @@ Jupyter notebook examples are in the `examples/` directory:
 - Use a smaller `--max_batch_size`.
 
 **`transformers` version mismatch**
-- BloomBee requires `transformers>=4.43.1,<4.44.0`. Install the pinned version:
+- On `main`, BloomBee requires `transformers>=4.43.1,<4.44.0`:
   ```bash
   pip install "transformers>=4.43.1,<4.44.0"
+  ```
+- On `arch-reform-qwen3-4b` (Transformers 5.x + Qwen3), use:
+  ```bash
+  pip install "transformers>=5.5,<5.6"
   ```
 
 **Slow inference / high latency**
