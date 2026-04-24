@@ -24,14 +24,20 @@ logger = get_logger()
 # pick drafters whose tokenizer matches the target's family (same
 # vocab → draft tokens are meaningful at the target).
 #
-# Each entry is (drafter_hf_id, "why this was picked"). Order matters:
-# first entry is the recommended default; callers can override via
-# MultiSSMDrafter(ssm_model_name=...) or the BLOOMBEE_DRAFTER env var.
-_DEFAULT_DRAFTER = "JackFram/llama-68m"
+# Each entry is the list of drafter HF ids (order matters: first entry
+# is the default). Callers override via MultiSSMDrafter(ssm_model_name=)
+# or the BLOOMBEE_DRAFTER env var.
+#
+# Note on llama-68m: its HF repo only ships pytorch_model.bin (no
+# safetensors). transformers 5.x on torch<2.6 refuses to load .bin
+# files per CVE-2025-32434, so we default to llama-160m which has
+# safetensors. llama-68m is still selectable via BLOOMBEE_DRAFTER
+# when the environment supports it.
+_DEFAULT_DRAFTER = "JackFram/llama-160m"
 
 _DRAFTER_REGISTRY: Dict[str, Tuple[str, ...]] = {
     # Llama / Llama-2 / Vicuna / TinyLlama — all use the Llama tokenizer.
-    "llama": ("JackFram/llama-68m", "JackFram/llama-160m"),
+    "llama": ("JackFram/llama-160m", "JackFram/llama-68m"),
     # Llama-3 uses a different BPE vocab (tiktoken-based), so Llama-2
     # drafters won't be aligned. Use Meta's own 1B/3B instruct drafters.
     "llama3": ("meta-llama/Llama-3.2-1B-Instruct", "meta-llama/Llama-3.2-1B"),

@@ -15,7 +15,7 @@ from bloombee.models.llama.spec_decoding_drafter import (
 @pytest.mark.parametrize(
     "model_type,name,expected_prefix",
     [
-        ("llama", "huggyllama/llama-7b", "JackFram/llama-68m"),
+        ("llama", "huggyllama/llama-7b", "JackFram/llama-160m"),
         ("llama", "meta-llama/Llama-3.2-8B-Instruct", "meta-llama/Llama-3.2-1B-Instruct"),
         ("llama", "meta-llama/Meta-Llama-3-8B", "meta-llama/Llama-3.2-1B-Instruct"),
         ("qwen3", "Qwen/Qwen3-14B", "Qwen/Qwen3-0.6B"),
@@ -53,8 +53,9 @@ def test_env_override_wins_over_registry(monkeypatch):
 
 
 def test_llama3_disambiguation_by_path():
-    drafter_id_l2, _ = select_drafter_for_target("llama", "huggyllama/llama-7b")
+    drafter_id_l2, src_l2 = select_drafter_for_target("llama", "huggyllama/llama-7b")
     drafter_id_l3, src_l3 = select_drafter_for_target("llama", "meta-llama/Llama-3.2-70B")
     assert drafter_id_l2.startswith("JackFram/llama")
+    assert src_l2 == "registry:llama"
     assert drafter_id_l3.startswith("meta-llama/Llama-3")
     assert src_l3 == "registry:llama3"
