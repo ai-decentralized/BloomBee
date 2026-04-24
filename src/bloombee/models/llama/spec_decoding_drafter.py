@@ -1,11 +1,12 @@
 import math
+import os
 import torch
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree
 from bloombee.models.llama.spec_decoding_tree_shape import (
     FrontierNode,
     budgeted_expand_plan,
 )
-from typing import List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 import threading
 from transformers.cache_utils import DynamicCache
 import time
@@ -13,6 +14,72 @@ import time
 from hivemind.utils.logging import get_logger
 
 logger = get_logger()
+
+
+# Family-specific drafter registry. A drafter's acceptance rate depends
+# on how well it models the target's output distribution — a Llama-68m
+# drafter for a Qwen3 target wastes most proposals because the vocab
+# and training distribution don't line up. We only route by target
+# model_type, which is what HF gives us from AutoConfig, and we only
+# pick drafters whose tokenizer matches the target's family (same
+# vocab → draft tokens are meaningful at the target).
+#
+# Each entry is (drafter_hf_id, "why this was picked"). Order matters:
+# first entry is the recommended default; callers can override via
+# MultiSSMDrafter(ssm_model_name=...) or the BLOOMBEE_DRAFTER env var.
+_DEFAULT_DRAFTER = "JackFram/llama-68m"
+
+_DRAFTER_REGISTRY: Dict[str, Tuple[str, ...]] = {
+    # Llama / Llama-2 / Vicuna / TinyLlama — all use the Llama tokenizer.
+    "llama": ("JackFram/llama-68m", "JackFram/llama-160m"),
+    # Llama-3 uses a different BPE vocab (tiktoken-based), so Llama-2
+    # drafters won't be aligned. Use Meta's own 1B/3B instruct drafters.
+    "llama3": ("meta-llama/Llama-3.2-1B-Instruct", "meta-llama/Llama-3.2-1B"),
+    # Qwen3 dense (0.6B, 1.7B, 4B) share the Qwen3 tokenizer with
+    # Qwen3-14B/32B targets, so acceptance is well-defined.
+    "qwen3": ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B"),
+    # Qwen3-MoE targets — no small MoE sibling, fall back to dense Qwen3
+    # drafters which share the tokenizer.
+    "qwen3_moe": ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B"),
+    # Bloom has genuine small siblings in its own tokenizer family.
+    "bloom": ("bigscience/bloom-560m", "bigscience/bloom-1b1"),
+    # Falcon — prefer Falcon3 1B/3B for speculator alignment.
+    "falcon": ("tiiuae/Falcon3-1B-Instruct", "tiiuae/falcon-rw-1b"),
+    # Mixtral: no small Mixtral; use Mistral dense as an approximate
+    # family sibling (same tokenizer).
+    "mixtral": ("mistralai/Mistral-7B-v0.3",),
+}
+
+
+def select_drafter_for_target(
+    target_model_type: Optional[str] = None,
+    target_name_or_path: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Pick a drafter HF id for a given target.
+
+    Returns (drafter_id, source) where ``source`` is one of
+    ``"env"`` / ``"registry:{model_type}"`` / ``"default"`` so the
+    caller can log why a specific drafter was chosen.
+
+    Env override: ``BLOOMBEE_DRAFTER`` short-circuits the registry.
+    """
+    env_override = os.environ.get("BLOOMBEE_DRAFTER")
+    if env_override:
+        return env_override, "env"
+
+    mt = (target_model_type or "").lower()
+    # Llama-3 vs Llama-2 share model_type="llama" in HF; disambiguate on
+    # the name string. Paths like "meta-llama/Meta-Llama-3-*" or
+    # "meta-llama/Llama-3.2-*" pick the Llama-3 tokenizer family.
+    if mt == "llama" and target_name_or_path:
+        lower_path = target_name_or_path.lower()
+        if "llama-3" in lower_path or "llama3" in lower_path:
+            return _DRAFTER_REGISTRY["llama3"][0], "registry:llama3"
+
+    if mt in _DRAFTER_REGISTRY:
+        return _DRAFTER_REGISTRY[mt][0], f"registry:{mt}"
+
+    return _DEFAULT_DRAFTER, "default"
 
 
 def _node_path_log_prob(node) -> float:
@@ -28,13 +95,14 @@ def _node_path_log_prob(node) -> float:
     return total
 
 class MultiSSMDrafter:
-    
+
     def __init__(self, ssm_model_name: str, num_workers: int = 2, device: str = 'cuda'):
         from transformers import AutoModelForCausalLM
-        
+
         self.num_workers = num_workers
         self.device = torch.device(device)
-        
+        self.ssm_model_name = ssm_model_name
+
         self.ssms = []
         self.streams = []
         for _ in range(num_workers):
@@ -45,11 +113,55 @@ class MultiSSMDrafter:
             ssm.eval()
             self.ssms.append(ssm)
             self.streams.append(torch.cuda.Stream(device=self.device))
-        
+
         with torch.no_grad():
             dummy = torch.ones(1, 8, dtype=torch.long, device=self.device)
             for ssm in self.ssms:
                 ssm(dummy, attention_mask=torch.ones_like(dummy))
+
+    @classmethod
+    def for_target(
+        cls,
+        target: Union[str, "object"],
+        *,
+        num_workers: int = 2,
+        device: str = 'cuda',
+    ) -> "MultiSSMDrafter":
+        """Construct a drafter matched to ``target``'s model family.
+
+        ``target`` can be an HF model-id string / local path, a loaded
+        `PretrainedConfig`, or a loaded model. We resolve ``model_type``
+        via AutoConfig if the input is a string. Falls back to
+        ``JackFram/llama-68m`` when the family is unknown.
+        """
+        model_type = None
+        name_or_path = None
+        if isinstance(target, str):
+            name_or_path = target
+            try:
+                from transformers import AutoConfig
+                cfg = AutoConfig.from_pretrained(target, trust_remote_code=True)
+                model_type = getattr(cfg, "model_type", None)
+            except Exception as e:
+                logger.warning(
+                    f"[DRAFTER_SELECT] could not read config for target={target!r}: {e}; "
+                    f"falling back to default drafter"
+                )
+        elif hasattr(target, "model_type"):
+            model_type = target.model_type
+            name_or_path = getattr(target, "name_or_path", None) or getattr(target, "_name_or_path", None)
+        elif hasattr(target, "config"):
+            model_type = getattr(target.config, "model_type", None)
+            name_or_path = getattr(target.config, "name_or_path", None) or getattr(target.config, "_name_or_path", None)
+
+        drafter_id, source = select_drafter_for_target(
+            target_model_type=model_type, target_name_or_path=name_or_path,
+        )
+        logger.info(
+            f"[DRAFTER_SELECT] target_model_type={model_type!r} "
+            f"→ drafter={drafter_id!r} (source={source})"
+        )
+        return cls(ssm_model_name=drafter_id, num_workers=num_workers, device=device)
     
     def build_trees_parallel(
         self,

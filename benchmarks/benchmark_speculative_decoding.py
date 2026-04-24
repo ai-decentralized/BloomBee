@@ -58,11 +58,11 @@ def main():
 def benchmark_inference(process_idx, args, result_pipe):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    drafter = MultiSSMDrafter(
-        ssm_model_name="JackFram/llama-68m",
-        num_workers=1,
-        device="cuda"
-    )
+    # Family-aware drafter: pick a drafter whose tokenizer and training
+    # distribution matches ``args.model``. Falls back to JackFram/llama-68m
+    # when the family is unknown or no registry entry exists. Override with
+    # BLOOMBEE_DRAFTER=<hf_id>.
+    drafter = MultiSSMDrafter.for_target(args.model, num_workers=1, device="cuda")
     model = AutoDistributedSpeculativeModel.from_pretrained(
         args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype]
     ).to(device)
