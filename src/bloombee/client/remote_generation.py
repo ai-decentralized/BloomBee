@@ -17,14 +17,27 @@ from bloombee.utils.misc import DUMMY, docstring_from
 
 logger = get_logger(__name__)
 
-# Fast-path mode: on by default. When eligible (plain greedy, no custom
-# logits/stopping hooks, no beam search), bypasses HF generate() and runs a
-# minimal embed → remote-forward → ln_f → lm_head → argmax loop. This
-# eliminates the per-step Python overhead of transformers 5.x's DynamicCache
-# update + prepare_inputs_for_generation + _update_model_kwargs_for_generation,
-# which at B=32 on 2× remote servers measurably dominates the client step.
-# Set BLOOMBEE_FAST_GENERATE=0 to force the legacy HF path for any reason.
-_FAST_GENERATE_ENABLED = os.environ.get("BLOOMBEE_FAST_GENERATE", "1") == "1"
+# Fast-path mode: opt-in via BLOOMBEE_FAST_GENERATE=1.
+#
+# When eligible (plain greedy, no custom logits/stopping hooks, no beam
+# search), bypasses HF generate() and runs a minimal embed → remote-forward
+# → ln_f → lm_head → argmax loop. The intent is to eliminate the per-step
+# Python overhead of transformers 5.x's DynamicCache update + the expanded
+# prepare_inputs_for_generation + _update_model_kwargs_for_generation.
+#
+# Empirically (full 3×3×3 sweep on 2×A100 llama-7b/13b + falcon-7b at
+# B=1/4/32, 3 trials per cell), the fast-path median ratio vs legacy HF
+# generate is 0.97× — i.e. slightly slower on most cells, with occasional
+# wins on specific (model, batch) combinations. The TF 5.x DynamicCache
+# overhead is theoretically real but does NOT measurably dominate in
+# BloomBee's distributed setup at these batch sizes; server-side compute
+# and network RTT are already the bulk of step time.
+#
+# Left in the codebase as an opt-in experimental knob for future work
+# (e.g. large-batch serving, single-GPU deployments, or if someone later
+# builds a StaticCache-equivalent for distributed KV). See BENCH_COMPARISON.md
+# for the measurement data.
+_FAST_GENERATE_ENABLED = os.environ.get("BLOOMBEE_FAST_GENERATE", "0") == "1"
 
 
 class RemotePastKeyValues(Cache):

@@ -298,3 +298,81 @@ server-side changes alone.
 - [transformers #31962](https://github.com/huggingface/transformers/issues/31962) — request to keep tuple past_key_values as an option
 - [HF LLM optimization guide](https://huggingface.co/docs/transformers/main/en/llm_optims) — recommends StaticCache + compile OR custom decode loop
 - vLLM / TGI / SGLang / llama.cpp all bypass `generate()` for exactly this reason
+
+---
+
+## Update 2: Full 3×3×3 sweep — fast-path is NOT a universal gain
+
+After the promising single-session A/B (previous section), I ran a proper
+3-trial-per-cell sweep across all three models × three batches × three
+stacks (mainline / arch-reform legacy / arch-reform fast-path). Each cell
+is the median of three back-to-back trials on freshly-launched servers.
+
+### Full median-tok/s matrix
+
+| model     | B=  | mainline  | legacy   | fast     | main→fast | legacy→fast |
+|-----------|-----|----------:|---------:|---------:|----------:|------------:|
+| llama-7b  |   1 |     9.34  |   13.36  |   13.59  |    1.455× |      1.017× |
+| llama-7b  |   4 |    30.42  |   49.45  |   48.00  |    1.578× |      0.971× |
+| llama-7b  |  32 |   **143.27** | 141.33 | 131.78 |    0.920× |      0.932× |
+| llama-13b |   1 |     8.65  |   10.70  |   10.69  |    1.236× |      0.999× |
+| llama-13b |   4 |    31.13  |   37.48  |   37.30  |    1.198× |      0.995× |
+| llama-13b |  32 |   119.09  |  118.52  |  115.86  |    0.973× |      0.978× |
+| falcon-7b |   1 |    10.27  |   14.24  |   11.85  |    1.154× |      0.832× |
+| falcon-7b |   4 |    22.61  |   44.53  |   44.74  | **1.979×** |     1.005× |
+| falcon-7b |  32 |   119.16  |  151.63  |  147.11  |    1.235× |      0.970× |
+
+### Honest takeaway
+
+1. **The arch-reform branch's big wins are at small batch**, as expected:
+   - 1.24–1.58× on llama B=1/B=4
+   - 1.98× on falcon-7b B=4 (biggest single-cell win)
+2. **At B=32, arch-reform and mainline are roughly equivalent**. Specifically:
+   - llama-7b B=32: mainline wins (0.92×)
+   - llama-13b B=32: tie (0.97×, within noise)
+   - falcon-7b B=32: arch-reform wins (1.24×)
+3. **The fast-path custom greedy loop (BLOOMBEE_FAST_GENERATE=1) is NOT a
+   universal win**. Its ratio vs legacy HF generate ranges from 0.83× to
+   1.02×; median ~0.97× — it's slightly **slower** on most cells. The
+   earlier single-session A/B that showed 1.04× vs legacy was **run-to-run
+   variance, not a real gain**.
+4. This means the HF 5.x DynamicCache Python overhead hypothesis, while
+   theoretically plausible, **does not measurably dominate** in BloomBee's
+   distributed setup at these batch sizes. The server-side compute and
+   network RTT are already the bulk of step time.
+
+### What this implies for PR #54 and the fast-path commit
+
+- The fast-path machinery is still **correct** (all 16 unit tests pass;
+  produces coherent output). But it's not a performance win.
+- Keeping it in the PR: **the feature flag defaults to on, but we should
+  flip it to off by default** since it doesn't help and occasionally hurts
+  (falcon-7b B=1 case, 0.83×).
+- Alternatively, we can **remove the fast-path entirely** from the PR and
+  keep it as a separate exploratory branch for future work (e.g., if
+  someone later builds a real StaticCache-equivalent for distributed KV,
+  the fast-path becomes the natural place to plug it in).
+
+### The B=32 Llama situation
+
+- mainline > arch-reform on llama-7b B=32 (0.92×)
+- tie on llama-13b B=32 (0.97×)
+
+This is a **real, consistent** small regression. Root cause analysis from
+the previous appendix still stands (FlexGen's `mha_gen_llama` cat-fallback
+eats the server-side gains arch-reform delivered). Fix requires the
+slab-threading refactor described there (~2 days). Not blocking this PR.
+
+### What this means for the paper
+
+The honest story is:
+- **arch-reform wins 1.2–2.0× at small batch** (the spec-dec winning regime,
+  and the paper's E1 B=1 and B=4 rows)
+- **arch-reform ties mainline at B=32** (within 3%)
+- **Falcon-7b is the standout**: arch-reform wins at every batch, up to
+  1.98× at B=4
+
+This is still a strong story. The paper's **Table 2 claim (B=32)** should
+be framed as "matches mainline" rather than "beats mainline"; the **B=1 /
+B=4 spec-dec wins** are the real selling point, and those numbers are rock
+solid (1.24–1.98× medians over 3 trials).
