@@ -4,8 +4,7 @@ Paged KV cache primitive for Phase 2 of the BloomBee arch reform.
 Pure data structure: a fixed-size page pool indexing along the sequence dim,
 plus a per-sequence page table. No torch kernel code lives here — reads and
 writes are done with plain index_select / slice-assign against the underlying
-storage tensor. See PHASE2_PAGED_KV_INVARIANTS.md for the state model this
-implements.
+storage tensor.
 
 Design notes
 ------------

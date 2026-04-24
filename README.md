@@ -95,9 +95,8 @@ A **DHT (Distributed Hash Table)** keeps track of which server hosts which layer
 
 Any HuggingFace model with a matching architecture can be served. Use `AutoDistributedModelForCausalLM` to load a model automatically.
 
-The `arch-reform-qwen3-4b` branch pins `transformers>=5.5,<5.6` and adds
-Qwen3 as a first-class family. See [`PR_NOTE.md`](PR_NOTE.md) for the
-migration notes and A100 benchmark numbers.
+Qwen3 support requires `transformers>=5.5,<5.6`; other families continue to
+work on either 4.43.x (mainline) or 5.5.x (this branch).
 
 ---
 

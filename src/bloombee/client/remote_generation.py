@@ -35,8 +35,7 @@ logger = get_logger(__name__)
 #
 # Left in the codebase as an opt-in experimental knob for future work
 # (e.g. large-batch serving, single-GPU deployments, or if someone later
-# builds a StaticCache-equivalent for distributed KV). See BENCH_COMPARISON.md
-# for the measurement data.
+# builds a StaticCache-equivalent for distributed KV).
 _FAST_GENERATE_ENABLED = os.environ.get("BLOOMBEE_FAST_GENERATE", "0") == "1"
 
 
