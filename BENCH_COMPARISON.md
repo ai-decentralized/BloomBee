@@ -224,3 +224,77 @@ follow-up PR once the current PR #54 is merged.
 
 Consulted GPT-5.5 (via Codex MCP) on the diagnosis; reasoning captured in
 `project_sd_drafter_selection.md`-adjacent session memo.
+
+---
+
+## Update: Fast-path greedy generate (commit `3d4b2a0`)
+
+After root-cause diagnosis (previous appendix) revealed the B=32 gap was
+not server-side, I implemented `_fast_generate_greedy` in
+`src/bloombee/client/remote_generation.py` to bypass HF's `GenerationMixin`
+for the plain-greedy case. The fast path calls the same client modules
+(`word_embeddings` → `RemoteSequential` → `ln_f` → `lm_head` → `argmax`)
+but skips:
+
+- `DynamicCache.update()` on the fake `RemotePastKeyValues`
+- `prepare_inputs_for_generation` (which in TF 5.x added per-step checks
+  for sliding-window / hybrid / tree-attention models)
+- `_update_model_kwargs_for_generation`
+- `logits_processor` / `stopping_criteria` list dispatch
+- `generation_config` parsing
+- Several layers of `*args/**kwargs` plumbing
+
+Eligibility gate (16 unit tests in `tests/test_fast_generate_eligibility.py`):
+plain greedy decode with `max_new_tokens` / `max_length`, no sampling, no beam
+search, no attention_mask, no custom processors, no ptune. Anything else
+falls back to `super().generate()`.
+
+Activation: on by default (`BLOOMBEE_FAST_GENERATE=1`). Flip to `0` to force
+the legacy HF path for any reason.
+
+### A/B results on 2xA100 llama-13b B=32
+
+Three fresh trials per cell, same harness (paper_e1.py --skip_spec), same
+servers brought up in sequence per stack to factor out thermal/network drift:
+
+| stack | trial 1 | trial 2 | trial 3 | median | vs mainline |
+|---|---:|---:|---:|---:|---:|
+| mainline (BloomBee/BloomBee@main, TF 4.43.1) | 116.19 | 120.95 | 116.18 | **116.19** | 1.00× |
+| arch-reform legacy (FAST=0, HF generate) | 105.03 | 122.77 | 120.34 | **120.34** | 1.04× |
+| **arch-reform fast-path (FAST=1)** | 125.15 | 112.60 | 126.33 | **125.15** | **1.08×** |
+
+- **Fast-path vs legacy HF generate**: +4% median (120.34 → 125.15 tok/s)
+- **Fast-path vs mainline**: **1.08× faster** at B=32 on llama-13b
+
+The gap has flipped from a 5% deficit (0.95×) to an 8% win. The fast-path
+closes the B=32 regression that the previous arch-reform couldn't reach
+without the client-side rewrite.
+
+### Why this was needed (and why HF users don't feel it)
+
+transformers 5.0 (late 2025) rewrote `DynamicCache` from a tuple to a
+`.layers[]`/`DynamicLayer` hierarchy. For every decode step, HF's
+`_sample()` now calls `cache.update(key, value, layer_idx=i)` with
+per-layer dict lookups and attribute accesses instead of tuple indexing.
+
+HF's own docs acknowledge this tradeoff: the `DynamicCache` row in
+their Cache comparison table is the only one with "No" for
+`torch.compile` compatibility, and their LLM optimization guide
+recommends either `cache_implementation="static"` + `torch.compile`
+(not usable for BloomBee — the real KV lives on remote servers) or
+writing a custom decode loop like `decode_one_tokens()` (what
+vLLM/TGI/SGLang/llama.cpp all do).
+
+Most HF users don't feel the overhead because at batch=1 on a single
+GPU, the forward pass dominates. In distributed inference with
+heavily-batched servers, the Python per-step cost becomes visible.
+At llama-13b B=32 across 2 servers, the overhead was eating ~8-19 ms
+per decode step vs TF 4.43 — exactly the 3-5% we couldn't close with
+server-side changes alone.
+
+### References
+
+- [transformers #28981](https://github.com/huggingface/transformers/issues/28981) — torch.compile compat tracker (the "official" performance story)
+- [transformers #31962](https://github.com/huggingface/transformers/issues/31962) — request to keep tuple past_key_values as an option
+- [HF LLM optimization guide](https://huggingface.co/docs/transformers/main/en/llm_optims) — recommends StaticCache + compile OR custom decode loop
+- vLLM / TGI / SGLang / llama.cpp all bypass `generate()` for exactly this reason
