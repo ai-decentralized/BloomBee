@@ -9,7 +9,7 @@ import time
 from typing import Optional, Tuple, AsyncContextManager, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
-from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata
+from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata, _is_paged_kv_enabled
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import DeviceType, TorchDisk, TorchMixedDevice, TorchTensor, general_copy
@@ -47,6 +47,13 @@ class KVCacheManager:
         # without access to the contextmanager) resolve the matching
         # PagedKVTable via MemoryCache.paged_view(handle).
         self._cache_tensors_to_handles = {}
+        # Gate all paged-KV side-channel bookkeeping on the env flag once at
+        # init time. When the shim is off (default), the per-step track/
+        # rollback/commit hooks early-return and use_cache skips the
+        # handle-lookup dict, so the hot path carries zero extra work vs
+        # mainline. The legacy _write_kvs slab write remains the source of
+        # truth in both modes.
+        self._paged_kv_enabled = _is_paged_kv_enabled()
         self._reorder_executor = ThreadPoolExecutor(max_workers=1)
         
         # [KVCACHE_OFFLOAD] Micro-batch level memory reuse state
@@ -518,6 +525,8 @@ class KVCacheManager:
         No-op when the shim is off. Called AFTER the legacy physical write
         lands — the shim is a bookkeeping layer, not a second data path.
         """
+        if not self._paged_kv_enabled:
+            return
         if cache_tensors is None:
             if not self._active_cache_tensors_stack:
                 return
@@ -549,6 +558,8 @@ class KVCacheManager:
         step's uncommitted speculated bytes before the new tree lands. Pages
         holding only rolled-back bytes return to the free list.
         """
+        if not self._paged_kv_enabled:
+            return
         if cache_tensors is None:
             if not self._active_cache_tensors_stack:
                 return
@@ -577,6 +588,8 @@ class KVCacheManager:
         cache_tensors=None,
     ) -> None:
         """Promote speculative writes up to ``l_acc_target`` to accepted."""
+        if not self._paged_kv_enabled:
+            return
         if cache_tensors is None:
             if not self._active_cache_tensors_stack:
                 return
@@ -899,21 +912,25 @@ class KVCacheManager:
             # but yield clones to callers to prevent accidental in-place edits
             # logger.info(f"use cache, cache_tensors: {cache_tensors}, len={len(cache_tensors)}")
             self._active_cache_tensors_stack.append(cache_tensors)
-            # Phase 3: remember the handle(s) behind this cache_tensors so the
-            # async reorder task can look up the per-handle PagedKVTable.
-            # cache_tensors is keyed by id() because the same TorchTensor pair
-            # instance threads through _do_reorder_task unchanged.
-            key = id(cache_tensors)
-            prev = self._cache_tensors_to_handles.get(key)
-            self._cache_tensors_to_handles[key] = tuple(handles)
+            # Phase 3: when BLOOMBEE_PAGED_KV is on, remember the handle(s)
+            # behind this cache_tensors so the async reorder task can look
+            # up the per-handle PagedKVTable. When off, skip the dict ops —
+            # the track/rollback/commit hooks all early-return anyway.
+            key = None
+            prev = None
+            if self._paged_kv_enabled:
+                key = id(cache_tensors)
+                prev = self._cache_tensors_to_handles.get(key)
+                self._cache_tensors_to_handles[key] = tuple(handles)
             try:
                 yield cache_tensors
             finally:
                 self._active_cache_tensors_stack.pop()
-                if prev is None:
-                    self._cache_tensors_to_handles.pop(key, None)
-                else:
-                    self._cache_tensors_to_handles[key] = prev
+                if key is not None:
+                    if prev is None:
+                        self._cache_tensors_to_handles.pop(key, None)
+                    else:
+                        self._cache_tensors_to_handles[key] = prev
 
     def delete_cache(self, *handles: Handle):
         """Explicitly delete cache handles to free space early."""

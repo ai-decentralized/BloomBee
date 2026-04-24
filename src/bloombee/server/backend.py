@@ -5,6 +5,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
 from time import perf_counter
 
+import os
 import torch
 import traceback
 import numpy as np
@@ -53,6 +54,10 @@ def _flag_to_bool(value) -> bool:
             return False
         return bool(value.bool().any().item())
     return bool(value)
+
+
+_STEP_PROFILE_ENABLED = os.environ.get("BLOOMBEE_STEP_PROFILE", "0") == "1"
+_STEP_PROFILE_INTERVAL = int(os.environ.get("BLOOMBEE_STEP_PROFILE_INTERVAL", "32"))
 
 class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Module
     """A wrapper for a transformer block that can process requests for forward, backward and inference"""
@@ -177,14 +182,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         )
         self._policy_gpu_batch_size = int(getattr(policy, "gpu_batch_size", 0))
         self._has_set_remote_cache_reuse = hasattr(self.module, "set_remote_cache_reuse_enabled")
-        # Per (device, dtype) cached no-op attention score tensor for the
-        # fast decode path (seq_len == 1, non-spec). Causal mask with one
-        # query attending to everything in cache + itself is equivalent to
-        # attention_mask=None at the block level. We pass None instead of
-        # allocating (B, 1+cache_len) bool + (B, 1+cache_len) float32 every
-        # step. The cached tensor stays as a sentinel for callers that
-        # insist on a non-None mask; it's unused on the hot path.
-        self._decode_noop_mask = None
+        # Decode-path mask scores cache, keyed by (batch_size, src_len, device).
+        # AR decode has seq_len=1 and current_token_count=1, so the causal
+        # mask is "query attends to all cache + self" — a constant all-zeros
+        # scores tensor of shape (B, 1, src_len). We pay the allocation once
+        # per distinct (B, src_len, device) triple instead of every step.
+        # At B=32 × 40 layers × 128 decode steps this removes ~160k
+        # per-step allocs of a float32 tensor that's otherwise constant.
+        self._decode_mask_scores_cache: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
 
         # Decide device placement policy for module based on offloading policy
         offload_policy = cache_manager.offloading_policy
@@ -209,6 +214,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if is_last_block:
             self.module.load_lm_head()
         self._last_keep_indices = None
+
+        # Opt-in per-step wall-clock profile. Off by default. When enabled,
+        # records select_cache / module.forward / update_cache / other for
+        # each step and logs a mean/p50/p95 roll-up every N steps. Uses
+        # torch.cuda.synchronize() to make the numbers comparable between
+        # mainline (TF 4.x) and arch-reform (TF 5.x).
+        self._step_profile_enabled = _STEP_PROFILE_ENABLED
+        if self._step_profile_enabled:
+            self._step_profile_counter = 0
+            self._step_profile_buf = {"select": [], "forward": [], "update": [], "total": []}
 
     def _is_identity_hypo_ids(self, hypo_ids: Optional[torch.Tensor]) -> bool:
         if hypo_ids is None:
@@ -475,6 +490,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             f"micro_batch_size={inference_info.micro_batch_size}, "
                             f"full_batch_size={inference_info.full_batch_size}")
                 
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_t0 = perf_counter()
                 if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
                     k_pkv, v_pkv, cache_len = self.cache_manager.select_cache_without_reorder(
                         kv_cache_position_ids,
@@ -494,6 +513,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         micro_batch_size=inference_info.micro_batch_size,
                     )
                     cache_len = k_pkv.shape[2] if k_pkv is not None else 0
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_select = perf_counter() - _prof_t0
 
                 # t2 = time.perf_counter()
                 # logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
@@ -555,10 +578,34 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         attention_mask = self.convert_mask_to_scores(full_mask)
                     else:
                         attention_mask = None
-                if full_mask == None:
-                    full_mask = self._create_causal_attention_mask(batch_size, (seq_len + cache_len), cache_len, hidden_states.device)
-                    attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                if full_mask is None:
+                    # Fast path: AR decode step (seq_len == 1, non-spec) — the
+                    # causal mask with a single query attending to all prior
+                    # cache + itself is an all-zero scores tensor of shape
+                    # (B, 1, cache_len+1). Cache it per (B, src_len, device)
+                    # so the common decode loop avoids a per-step alloc of
+                    # both the bool mask and the -inf scores tensor.
+                    if seq_len == 1 and cache_len >= 0 and not self._is_spec_decoding:
+                        src_len = cache_len + 1
+                        cache_key = (batch_size, src_len, hidden_states.device)
+                        attention_mask = self._decode_mask_scores_cache.get(cache_key)
+                        if attention_mask is None:
+                            attention_mask = torch.zeros(
+                                batch_size, seq_len, src_len,
+                                dtype=torch.float, device=hidden_states.device,
+                            )
+                            self._decode_mask_scores_cache[cache_key] = attention_mask
+                        full_mask = None
+                    else:
+                        full_mask = self._create_causal_attention_mask(
+                            batch_size, (seq_len + cache_len), cache_len, hidden_states.device
+                        )
+                        attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
                     
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_fwd_t0 = perf_counter()
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
                     # print('transformer backend inference step() offset ', offset )
@@ -606,6 +653,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     else:
                         output_hidden_states = output_hidden_states_chunk
 
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_forward = perf_counter() - _prof_fwd_t0
+                    _prof_upd_t0 = perf_counter()
+
                 # Centralized KV update via KVCacheManager (single step-level seam).
                 self._finalize_cache_update(
                     new_kvs,
@@ -614,6 +667,39 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     kv_cache_position_ids=kv_cache_position_ids,
                     cache_tensors=cache_tensors,
                 )
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_update = perf_counter() - _prof_upd_t0
+                    _prof_total = perf_counter() - _prof_t0
+                    buf = self._step_profile_buf
+                    buf["select"].append(_prof_select)
+                    buf["forward"].append(_prof_forward)
+                    buf["update"].append(_prof_update)
+                    buf["total"].append(_prof_total)
+                    self._step_profile_counter += 1
+                    if self._step_profile_counter % _STEP_PROFILE_INTERVAL == 0:
+                        import statistics as _stats
+                        def _summary(key):
+                            xs = buf[key]
+                            if not xs:
+                                return "n=0"
+                            xs_sorted = sorted(xs)
+                            p50 = xs_sorted[len(xs_sorted) // 2]
+                            p95 = xs_sorted[int(len(xs_sorted) * 0.95)]
+                            return (
+                                f"n={len(xs)} mean={1000*_stats.mean(xs):.2f}ms "
+                                f"p50={1000*p50:.2f}ms p95={1000*p95:.2f}ms"
+                            )
+                        logger.info(
+                            "[STEP_PROFILE] %s B=%s seq=%s cache=%s | "
+                            "select: %s | forward: %s | update: %s | total: %s",
+                            self.name, batch_size, seq_len, cache_len,
+                            _summary("select"), _summary("forward"),
+                            _summary("update"), _summary("total"),
+                        )
+                        for k in buf:
+                            buf[k].clear()
 
                 keep_indices = self._normalize_keep_indices(
                     inference_info.keep_indices,
@@ -1022,20 +1108,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         if current_token_count <= 0:
             return None
-        
+
         if past_key_values_length == 0:
-            full_mask = torch.zeros(B, src_len, src_len, dtype=torch.bool, device=device)
-            causal_indices = torch.tril_indices(src_len, src_len, device=device)
-            full_mask[:, causal_indices[0], causal_indices[1]] = True
-            return full_mask
+            row = torch.arange(src_len, device=device)
+            base = (row.unsqueeze(1) >= row.unsqueeze(0)).unsqueeze(0)
+            return base.expand(B, src_len, src_len).contiguous()
 
-        current_mask = torch.zeros(B, current_token_count, src_len, dtype=torch.bool, device=device)
-        start_pos = past_key_values_length
-
-        for i in range(current_token_count):
-            current_mask[:, i, :start_pos + i + 1] = True
-
-        return current_mask
+        rows = torch.arange(current_token_count, device=device) + past_key_values_length
+        cols = torch.arange(src_len, device=device)
+        base = (cols.unsqueeze(0) <= rows.unsqueeze(1)).unsqueeze(0)
+        return base.expand(B, current_token_count, src_len).contiguous()
 
     
     def convert_mask_to_scores(self, mask: torch.Tensor) -> torch.Tensor:
