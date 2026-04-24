@@ -248,7 +248,19 @@ class MultiSSMDrafter:
         else:
             width_plan = None
 
-        pad_token_id = getattr(ssm.config, 'pad_token_id', 0)
+        # Some drafter repos (e.g. JackFram/llama-160m) don't set
+        # pad_token_id in their config, leaving it None. Fall back to
+        # eos_token_id, then bos_token_id, then 0 so downstream
+        # torch.full() calls don't trip on a None fill_value.
+        pad_token_id = (
+            getattr(ssm.config, 'pad_token_id', None)
+            or getattr(ssm.config, 'eos_token_id', None)
+            or getattr(ssm.config, 'bos_token_id', None)
+            or 0
+        )
+        if isinstance(pad_token_id, (list, tuple)):
+            pad_token_id = int(pad_token_id[0])
+        pad_token_id = int(pad_token_id)
         
         trees = {}
         valid_inputs = {}
