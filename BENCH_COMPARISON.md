@@ -97,3 +97,130 @@ Both installed in separate venvs, both use the same client harness (`paper_e1.py
 - Summary JSON: `/tmp/sweep_full.json` and trial reruns `/tmp/{l7,l13,f7}_t{N}.json`.
 - Both servers launched with `--batch_size 32 --max_batch_size 8192
   --attn_cache_tokens 32768` so B=32 + seq_len 140 + 128 new_tokens fits.
+
+---
+
+## Appendix: Root-cause diagnosis of the residual 5% Llama B=32 gap
+
+After the B=32 fix (`53a6144`) closed the 9% regression to ~5%, I investigated
+why the remaining gap persists on Llama but not Falcon.
+
+### Asymmetry
+
+| family | B=1 | B=4 | B=32 |
+|--------|----:|----:|-----:|
+| Llama-7b | 1.52× | 1.61× | **0.97×** |
+| Llama-13b | 1.21× | 1.22× | **0.95×** |
+| Falcon-7b | 1.16× | 1.15× | **1.24×** |
+
+Falcon's attention uses `F.scaled_dot_product_attention` (SDPA / FlashAttention
+on A100). Llama's decode uses BloomBee's FlexGen-family `mha_gen_llama` with a
+manual `bmm → fp32-cast → softmax → bmm` path. Initial hypothesis was that the
+manual kernel is the bottleneck.
+
+### Microbench (ruled out attention swap as the fix)
+
+On A100, at llama-13b decode shape `(B=32, H=40, D=128, tgt_s=1, src_s=268)`:
+
+| path | ms/layer | 40-layer step |
+|------|---------:|--------------:|
+| manual bmm (current) | 0.23 | 9.2 ms |
+| `F.scaled_dot_product_attention` | 1.29 | 51.5 ms |
+
+**SDPA is 5.6× slower than the manual path at this decode shape.** SDPA is
+tuned for prefill / long-sequence work; at `tgt_s=1` it can't amortize its
+launch overhead. Swapping in SDPA would make Llama decode *worse*. This
+closes the door on the "use SDPA for Llama" plan.
+
+### Microbench (found the real culprit)
+
+Profiling each sub-op of one llama-13b decode layer at B=32:
+
+| op | ms/layer | 40-layer step |
+|----|---------:|--------------:|
+| RMSNorm (fp32 cast) | 0.07 | 2.9 ms |
+| QKV projection (3× H×H) | 0.15 | 6.0 ms |
+| **torch.cat K/V append (current)** | **0.73** | **29.1 ms** |
+| In-place K/V write + view | 0.01 | 0.5 ms |
+| Manual bmm attention | 0.25 | 10.1 ms |
+| Output projection | 0.06 | 2.4 ms |
+| MLP (gate/up/down) | 0.36 | 14.5 ms |
+
+Closer measurement of the **end-to-end path** (view of slab + cat +
+permute-reshape vs in-place write + view + permute-reshape):
+
+| variant | ms/layer | 40-layer step |
+|---------|---------:|--------------:|
+| current: `cat([slab_view[:prefix], new])` | 0.81 | **32.5 ms** |
+| ideal: in-place write + `slab_view[:prefix+1]` | 0.03 | **1.1 ms** |
+
+**31 ms/step wasted on Llama B=32** to memory churn inside `torch.cat`. At
+the current ~115 tok/s, that's ~27% of the step budget. The other arch-reform
+wins recover ~20% of it (leading to the observed "1.00× parity"), and the
+net gap ends up at a noisy 3–5% slower than mainline.
+
+### Why Falcon isn't affected
+
+Falcon's `FalconAttention.forward` also uses `torch.cat` for its K/V append
+(falcon/block.py:218). But: Falcon goes through HF's standard decoder layer,
+and BloomBee's MemoryCache **never runs `select_cache` → FlexGen conversion
+path** for Falcon — the server's block forward feeds the cache tensor
+directly to HF SDPA, which works on the `(B, H, S, D)` layout and doesn't
+re-materialize. So Falcon's `torch.cat` is on a smaller tensor
+(`(B·H_kv, prev_S, D)` with a single KV head for falcon-7b) and the cat is
+absorbed into the SDPA call chain.
+
+Llama, however, routes through `FLEX_LlamaAttention` → FlexGen
+`mha_gen_llama`, whose `(S, B·H, D)` layout and explicit cat path is the
+dominant tax.
+
+### The fix is not trivial
+
+`mha_gen_llama` already has a fast in-place-write path gated on
+`cache_capacity >= src_s` (`pytorch_backend.py:831`). On the server decode
+path, `cache_capacity == prefix_length < src_s` because `select_cache`
+returns a view of only the valid prefix of the slab. The fast path is
+always bypassed.
+
+To make the fast path fire, we need to thread the **full pre-allocated slab**
+from `MemoryCache` all the way to `mha_gen_llama`, with a separate
+`valid_length` parameter. Current blockers:
+
+1. `select_cache` returns `(B, H, S, D)` via `_to_pkv(x.view(prefix_length, ...))`,
+   which can't be re-used on a full slab.
+2. Spec-dec and micro-batch paths assume `select_cache` returns an isolated,
+   position-resolved tensor — any aliasing changes must not break their
+   rollback/multiplex semantics.
+3. Mixed-device (`cache_cpu_percent>0`, `cache_disk_percent>0`) paths genuinely
+   need the copy. Fix must be conditional on GPU-only + non-mixed.
+
+**Estimated scope**: 2 days. Requires:
+- A new `select_cache_slab_view()` method returning `(slab_tensor, valid_len,
+  handle_metadata)`; existing `select_cache` stays for callers that need the
+  PKV-shaped view.
+- `mha_gen_llama` gains a `valid_length` kwarg; fast path becomes
+  `if cache_capacity >= src_s AND valid_length is not None`.
+- Llama block forward detects the slab-view mode and skips the
+  `_reorder_cache_from_bloom_to_llama` permute.
+- Spec-dec + micro-batch integration tests pass under both paths.
+
+**Not rushing this fix** in the current session because:
+- The net effect today is 3–5% slower than mainline on Llama B=32, **within
+  the inter-run variance of the hardware**.
+- Arch-reform already wins 1.21–1.61× at B=1/4 on Llama and at every batch
+  on Falcon — the architecture is a net positive.
+- The fix risks breaking spec-dec verify/rollback and micro-batch paths,
+  which the user needs to approve given the scope.
+
+### Summary
+
+The remaining B=32 Llama gap is NOT a general arch-reform regression and
+is NOT an attention-kernel issue. It's specifically FlexGen's
+`mha_gen_llama` hot path being forced into the `torch.cat` fallback because
+the server-side `select_cache` contract doesn't expose the pre-allocated
+slab. Fixing it requires an API-level change to thread the slab through to
+`mha_gen_llama` with preserved validity semantics. Recommended as a
+follow-up PR once the current PR #54 is merged.
+
+Consulted GPT-5.5 (via Codex MCP) on the diagnosis; reasoning captured in
+`project_sd_drafter_selection.md`-adjacent session memo.
