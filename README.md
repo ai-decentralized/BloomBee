@@ -91,12 +91,9 @@ A **DHT (Distributed Hash Table)** keeps track of which server hosts which layer
 | **BLOOM** | `bigscience/bloom-7b1`, `bigscience/bloom` |
 | **Falcon** | `tiiuae/falcon-7b`, `tiiuae/falcon-40b` |
 | **Mixtral** | `mistralai/Mixtral-8x7B-v0.1` |
-| **Qwen3** *(new)* | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-14B` |
+| **Qwen3** | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-14B` |
 
 Any HuggingFace model with a matching architecture can be served. Use `AutoDistributedModelForCausalLM` to load a model automatically.
-
-Qwen3 support requires `transformers>=5.5,<5.6`; other families continue to
-work on either 4.43.x (mainline) or 5.5.x (this branch).
 
 ---
 
