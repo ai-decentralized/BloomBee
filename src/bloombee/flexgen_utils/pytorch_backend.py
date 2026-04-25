@@ -467,12 +467,24 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, descriptor=None):
         num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
+        # A per-block TensorDescriptor, when supplied, is the source of truth
+        # for (num_heads, head_dim). BloomBee's heterogeneous-layer families
+        # (Gemma-4: sliding head_dim=256 vs full head_dim=512) need this
+        # because `config.head_dim` is only the *default* layer type; reading
+        # it globally collapses full layers onto the sliding D and the KV
+        # write path later asserts D mismatch. For uniform families (Llama,
+        # Qwen3, Mixtral, Bloom, Falcon) no descriptor is passed and we fall
+        # back to the legacy config-driven shape.
+        if descriptor is not None:
+            _, desc_num_heads, desc_head_dim, _ = descriptor.shape
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
+        else:
+            head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -1116,12 +1128,16 @@ class TorchDisk:
         if os.path.exists(tensor.data) and tensor.delete_file:
             os.remove(tensor.data)
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, descriptor=None):
         num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
+        if descriptor is not None:
+            _, desc_num_heads, desc_head_dim, _ = descriptor.shape
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
+        else:
+            head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
@@ -1188,21 +1204,27 @@ class TorchMixedDevice:
             if x:
                 x.delete()
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, descriptor=None):
         num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
+        if descriptor is not None:
+            _, desc_num_heads, desc_head_dim, _ = descriptor.shape
+            num_heads_for_shape = desc_num_heads
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
+        else:
+            head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
+            num_heads_for_shape = num_attention_heads
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
 
         # We have to round to a multiple of `num_head`
         if policy.cache_disk_percent == 0:
-            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_attention_heads * num_attention_heads
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_heads_for_shape * num_heads_for_shape
             len_cpu = shape[SEG_DIM]  - len_gpu
             len_disk = 0
         else:
-            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_attention_heads * num_attention_heads
-            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_attention_heads * num_attention_heads
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_heads_for_shape * num_heads_for_shape
+            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_heads_for_shape * num_heads_for_shape
             len_disk = shape[SEG_DIM] - len_gpu - len_cpu
         lens = [len_gpu, len_cpu, len_disk]
 

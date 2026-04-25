@@ -376,8 +376,14 @@ class MemoryCache:
                         except Exception as e:
                             logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
                     
+                    # Pass the per-block descriptor through so the device
+                    # backend can honor heterogeneous-layer shapes (Gemma-4's
+                    # sliding head_dim=256 vs full head_dim=512). For uniform
+                    # families the descriptor still matches config.head_dim
+                    # so this is a no-op.
                     allocated_cache = self.device.init_cache_one_gpu_batch(
-                        self.block_config, self.mocked_task, override_policy
+                        self.block_config, self.mocked_task, override_policy,
+                        descriptor=descr,
                     )
                     self._emit_cache_home_probe(
                         allocated_cache,

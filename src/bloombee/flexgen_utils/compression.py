@@ -50,12 +50,16 @@ class TorchCompressedDevice:
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            (data, scale, comp_config), self, name=name)
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, descriptor=None):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", None) or (hidden_size // num_head)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, head_dim)
+        if descriptor is not None:
+            _, desc_num_heads, desc_head_dim, _ = descriptor.shape
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
+        else:
+            head_dim = getattr(config, "head_dim", None) or (hidden_size // num_head)
+            shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, head_dim)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16,
