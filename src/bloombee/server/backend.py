@@ -74,6 +74,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
         inference_outputs_schema: Optional[Tuple[BatchTensorDescriptor, ...]] = None,
+        block_index: Optional[int] = None,
         **kwargs,
     ):
         import bloombee.utils.peft as _peft_module
@@ -82,12 +83,18 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         super().__init__(*args, **kwargs)
         # Accept both TensorParallel and our PipelineParallelWrapper
-        assert (isinstance(self.module, TensorParallel) or 
+        assert (isinstance(self.module, TensorParallel) or
                 hasattr(self.module, 'devices') and hasattr(self.module, 'module_shards'))
         self.config = config
         self.cache_manager = cache_manager
         self.pruner_manager = pruner_manager
         self.max_chunk_size_bytes = max_chunk_size_bytes
+        # Gemma-4 and other heterogeneous-layer families need to know which
+        # transformer layer this backend owns so its KV descriptor can
+        # reflect the per-layer (head_count, head_dim) shape. For uniform
+        # families (Llama, Qwen3, Bloom, Falcon, Mixtral) block_index is
+        # unused and left as None by older call sites.
+        self.block_index = block_index
         if inference_outputs_schema is None:
             inference_outputs_schema = tuple(nested_flatten(self.outputs_schema))
         else:
@@ -234,27 +241,69 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         return torch.equal(hypo_ids, expected)
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
-        """Create tensor descriptors for attention cache tensors used during inference_step"""
-        # Qwen3 / Gemma3 / some Llama variants expose an explicit head_dim that does NOT equal
-        # hidden_size // num_attention_heads (Qwen3-0.6B: hidden=1024, heads=16, head_dim=128).
-        # Prefer the explicit value when set.
-        head_dim = getattr(self.config, "head_dim", None) or (
-            self.config.hidden_size // self.config.num_attention_heads
-        )
+        """Create tensor descriptors for attention cache tensors used during inference_step.
+
+        For uniform-attention families (Llama, Qwen3, Bloom, Falcon, Mixtral)
+        this returns a single descriptor per device with
+        ``(B, num_attention_heads, head_dim, max_length)``.
+
+        For families with heterogeneous layer types — currently Gemma-4,
+        whose full-attention layers use ``global_head_dim`` (512) instead
+        of the sliding-attention ``head_dim`` (256) — the descriptor uses
+        the head_dim that matches THIS backend's specific layer. That
+        requires ``self.block_index`` to have been threaded in at
+        construction time so we can index into ``config.layer_types``.
+
+        GQA head-count note: we keep the descriptor at
+        ``num_attention_heads`` even though attention only writes into
+        the first ``num_kv_heads`` slots. The FlexGen decode path
+        (``mha_gen_llama``) assumes BH = batch * num_attention_heads for
+        its K/V update shapes. Downscaling to num_kv_heads would break
+        that contract. Memory waste here is the GQA ratio (Qwen3: 5x).
+        """
+        head_dim = self._head_dim_for_this_block()
         cache_tensors = []
         for device, num_heads in zip(self.module.devices, self.shard_num_heads):
-            # IMPORTANT:
-            # Flex decode path (`mha_gen_llama`) uses attention head count when building
-            # K/V updates (BH = batch * num_attention_heads). KV cache descriptors must
-            # match that contract, otherwise we hit BH mismatches (e.g. 32 vs 128).
-            # So keep shard attention heads here; do NOT downscale by key-value groups.
-            keys = TensorDescriptor((batch_size, num_heads, head_dim, max_length), dtype=self.dtype, device=device)
-            # values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
+            keys = TensorDescriptor(
+                (batch_size, num_heads, head_dim, max_length),
+                dtype=self.dtype, device=device,
+            )
             cache_tensors.append(keys)
-            # [DEBUG] Log descriptor shape
-            logger.debug(f"[MB_DEBUG] get_inference_cache_descriptors: batch_size={batch_size}, num_heads={num_heads}, "
-                       f"head_dim={head_dim}, max_length={max_length}, shape={(batch_size, num_heads, head_dim, max_length)}")
+            logger.debug(
+                f"[MB_DEBUG] get_inference_cache_descriptors: batch_size={batch_size}, "
+                f"num_heads={num_heads}, head_dim={head_dim}, max_length={max_length}, "
+                f"block_index={self.block_index}, "
+                f"layer_type={self._layer_type_for_this_block()}, "
+                f"shape={(batch_size, num_heads, head_dim, max_length)}"
+            )
         return cache_tensors
+
+    def _layer_type_for_this_block(self) -> Optional[str]:
+        """Return ``config.layer_types[block_index]`` if available, else None."""
+        lt = getattr(self.config, "layer_types", None)
+        bi = self.block_index
+        if lt is None or bi is None:
+            return None
+        if not (0 <= bi < len(lt)):
+            return None
+        return lt[bi]
+
+    def _head_dim_for_this_block(self) -> int:
+        """Pick the right head_dim for this backend's layer.
+
+        Defaults to ``config.head_dim`` (or ``hidden_size // num_attention_heads``).
+        For Gemma-4 full_attention layers we must use ``global_head_dim``
+        instead; sliding layers stay on ``head_dim``.
+        """
+        default_hd = getattr(self.config, "head_dim", None) or (
+            self.config.hidden_size // self.config.num_attention_heads
+        )
+        layer_type = self._layer_type_for_this_block()
+        if layer_type == "full_attention":
+            global_hd = getattr(self.config, "global_head_dim", None)
+            if global_hd:
+                return int(global_hd)
+        return int(default_hd)
     
     # ------------------------------------------------------------------
     # Phase 1: block-step seam
