@@ -35,6 +35,49 @@ from transformers.models.gemma4.modeling_gemma4 import (
 )
 
 
+def _build_layer_type_mask(
+    *,
+    layer_type: str,
+    sliding_window: Optional[int],
+    query_length: int,
+    past_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Additive attention mask shaped `(1, 1, query_length, past+query)`.
+
+    For `full_attention`: strict upper-triangular -inf above the diagonal,
+    anchored on the last-valid-query position `past_length + q_idx`.
+
+    For `sliding_attention`: same causal mask, AND -inf on keys older than
+    `sliding_window - 1` positions behind the query. HF defines the window
+    as inclusive of the query itself, so a sliding_window of 1024 means
+    each query can attend to at most 1024 keys total (itself + 1023 earlier).
+    """
+    total_len = past_length + query_length
+    neg_inf = torch.finfo(dtype).min
+    if total_len == 0:
+        return torch.zeros((1, 1, query_length, 0), dtype=dtype, device=device)
+
+    # Absolute position of each query within the full sequence.
+    q_pos = torch.arange(past_length, past_length + query_length, device=device)
+    k_pos = torch.arange(total_len, device=device)
+    # Causal: mask keys that come strictly after the query.
+    causal = k_pos.unsqueeze(0) > q_pos.unsqueeze(1)  # (q, k)
+    mask = causal
+    if layer_type == "sliding_attention" and sliding_window is not None and sliding_window > 0:
+        # Sliding: also mask keys older than (sliding_window - 1) back.
+        too_old = k_pos.unsqueeze(0) < (q_pos.unsqueeze(1) - (sliding_window - 1))
+        mask = mask | too_old
+
+    additive = torch.where(
+        mask,
+        torch.tensor(neg_inf, dtype=dtype, device=device),
+        torch.tensor(0.0, dtype=dtype, device=device),
+    )
+    return additive.unsqueeze(0).unsqueeze(0)
+
+
 class WrappedGemma4Block(_BaseDecoderLayer):
     def __init__(self, config: _BaseBlockConfig, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -114,25 +157,23 @@ class WrappedGemma4Block(_BaseDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # Causal mask: Gemma-4 full_attention uses a plain causal triangular
-        # mask; sliding_attention additionally zeros entries outside the
-        # sliding window. For Phase 1 we only implement the full path (the
-        # simple mask) and let sliding layers attend over whatever's in cache
-        # — that's functionally equivalent when the cumulative context
-        # already fits inside the window, which is true for short prompts.
-        # Longer-context serving needs per-layer masks and is Phase 3.
+        # Causal mask:
+        #   - full_attention layers get the plain causal triangular mask
+        #     (every query attends over all earlier keys + itself).
+        #   - sliding_attention layers additionally zero keys older than
+        #     `sliding_window - 1` tokens behind the query. The HF model
+        #     builds this as a dict `{full: ..., sliding: ...}` at the
+        #     model level; BloomBee wraps bare layers so we do it here
+        #     per-block, keyed on `self.layer_type`.
         if attention_mask is None:
-            total_len = past_key_values_length + seq_length
-            neg_inf = torch.finfo(hidden_states.dtype).min
-            causal = torch.full(
-                (seq_length, total_len),
-                neg_inf,
+            attention_mask = _build_layer_type_mask(
+                layer_type=self.layer_type,
+                sliding_window=self.sliding_window,
+                query_length=seq_length,
+                past_length=past_key_values_length,
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            if total_len > 0:
-                causal = torch.triu(causal, diagonal=past_key_values_length + 1)
-            attention_mask = causal.unsqueeze(0).unsqueeze(0)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
