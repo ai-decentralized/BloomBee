@@ -54,6 +54,13 @@ _DRAFTER_REGISTRY: Dict[str, Tuple[str, ...]] = {
     # Mixtral: no small Mixtral; use Mistral dense as an approximate
     # family sibling (same tokenizer).
     "mixtral": ("mistralai/Mistral-7B-v0.3",),
+    # Gemma-4: the smallest in-family variants (E2B/E4B) are Matformer +
+    # multimodal, not a clean drop-in drafter. No tokenizer-compatible
+    # small sibling exists today, so default to the system-wide default
+    # (llama-160m) via absence from the registry. This entry is a stub
+    # meant to make the cross-family intent explicit; it still resolves
+    # to the default unless the user pins BLOOMBEE_DRAFTER.
+    "gemma4": (_DEFAULT_DRAFTER,),
 }
 
 

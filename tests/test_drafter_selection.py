@@ -23,6 +23,9 @@ from bloombee.models.llama.spec_decoding_drafter import (
         ("bloom", "bigscience/bloom-7b1", "bigscience/bloom-560m"),
         ("falcon", "tiiuae/falcon-7b", "tiiuae/Falcon3-1B-Instruct"),
         ("mixtral", "mistralai/Mixtral-8x7B-v0.1", "mistralai/Mistral-7B-v0.3"),
+        # Gemma-4 intentionally maps to the default drafter — no small
+        # in-family sibling without Matformer multimodal baggage.
+        ("gemma4", "google/gemma-4-31B-it", _DEFAULT_DRAFTER),
     ],
 )
 def test_registry_picks_expected_default(model_type, name, expected_prefix):
