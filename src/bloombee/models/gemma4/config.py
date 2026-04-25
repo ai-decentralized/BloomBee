@@ -51,20 +51,35 @@ class DistributedGemma4Config(_Gemma4TextConfig, ClientConfig, PTuneConfig, LMHe
             dht_prefix = str(model_name_or_path).replace(".", "-")
             logger.info(f"Using DHT prefix: {dht_prefix}")
 
-        # The published Gemma-4 checkpoints carry a multimodal top-level
-        # config; `Gemma4TextConfig.from_pretrained` already knows how to
-        # reach into `text_config` and pull out just the text sub-dict,
-        # so we can delegate to the parent and it does the right thing.
-        result = super().from_pretrained(
-            model_name_or_path, *args, dht_prefix=dht_prefix, **kwargs
-        )
-        config = result[0] if isinstance(result, tuple) else result
+        # Why we can't just call `super().from_pretrained(...)`:
+        # We set `model_type = "gemma4"` on this class so BloomBee's
+        # dispatcher matches the top-level gemma-4 checkpoint. But that
+        # causes HF's loader to parse the TOP-LEVEL config dict (which
+        # has model_type="gemma4" but no `num_hidden_layers` — those
+        # live under `text_config`). HF then silently falls back to the
+        # `Gemma4TextConfig` defaults (30 layers, etc.), which is wrong.
+        #
+        # Fix: call `Gemma4TextConfig.from_pretrained` explicitly (it
+        # knows how to reach into `text_config`), then rebuild our
+        # subclass from that loaded instance's dict.
+        return_unused_kwargs = kwargs.pop("return_unused_kwargs", False)
 
-        # The parent load may have re-stamped `model_type` to `gemma4_text`
-        # (because we inherit from Gemma4TextConfig). Force it back to the
-        # top-level key the dispatcher expects.
-        config.model_type = cls.model_type
+        parent_result = _Gemma4TextConfig.from_pretrained(
+            model_name_or_path, *args, return_unused_kwargs=True, **kwargs,
+        )
+        parent_cfg, unused = parent_result if isinstance(parent_result, tuple) else (parent_result, {})
+
+        # Rebuild as our subclass so BloomBee-specific fields are populated
+        # (ClientConfig / PTuneConfig / LMHeadConfig defaults). Pass
+        # parent_cfg's fields directly via to_dict + our dht_prefix.
+        src = parent_cfg.to_dict()
+        src["model_type"] = cls.model_type  # "gemma4", matches dispatcher
+        src["dht_prefix"] = dht_prefix
+        config = cls.from_dict(src, **unused)
 
         if config.pad_token_id is None:
             config.pad_token_id = 0
-        return result
+
+        if return_unused_kwargs:
+            return config, unused
+        return config
