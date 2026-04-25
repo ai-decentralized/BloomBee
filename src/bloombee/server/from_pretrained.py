@@ -27,6 +27,7 @@ from bloombee.constants import DTYPE_MAP
 from bloombee.models.bloom.block import WrappedBloomBlock
 from bloombee.models.mixtral import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
+from bloombee.models.gemma4.block import WrappedGemma4Block
 from bloombee.models.qwen3.block import WrappedQwen3Block
 from bloombee.server.block_utils import get_model_block, resolve_block_dtype
 from bloombee.utils.auto_config import AutoDistributedConfig
@@ -84,8 +85,14 @@ def load_pretrained_block(
         and len(tensor_parallel_devices) > 1
     )
 
-    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Bloom, Falcon, Mixtral, Qwen3)
-    _is_hf_model = config.block_class in (WrappedBloomBlock, WrappedFalconBlock, WrappedMixtralBlock, WrappedQwen3Block)
+    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Bloom, Falcon, Mixtral, Qwen3, Gemma4)
+    _is_hf_model = config.block_class in (
+        WrappedBloomBlock,
+        WrappedFalconBlock,
+        WrappedMixtralBlock,
+        WrappedQwen3Block,
+        WrappedGemma4Block,
+    )
 
     if use_native_flexgen_llama_tp:
         with init_empty_weights():
