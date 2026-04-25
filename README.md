@@ -92,8 +92,11 @@ A **DHT (Distributed Hash Table)** keeps track of which server hosts which layer
 | **Falcon** | `tiiuae/falcon-7b`, `tiiuae/falcon-40b` |
 | **Mixtral** | `mistralai/Mixtral-8x7B-v0.1` |
 | **Qwen3** | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-14B` |
+| **Gemma-4** | `google/gemma-4-31B-it` |
 
 Any HuggingFace model with a matching architecture can be served. Use `AutoDistributedModelForCausalLM` to load a model automatically.
+
+> **Note:** Qwen3 (152k vocab) and Gemma-4 (262k vocab) have large vocabularies, so the client-side LM head matmul dominates decode latency on CPU. Use a GPU client for these families (`model.to("cuda")`, or `--client_device cuda` in `benchmarks/benchmark_inference.py`).
 
 ---
 
