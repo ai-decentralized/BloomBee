@@ -34,7 +34,13 @@ class DistributedGemma4Config(_Gemma4TextConfig, ClientConfig, PTuneConfig, LMHe
 
     block_class = WrappedGemma4Block
     attn_class = _BaseAttention
-    block_prefix = "model.layers"
+    # Published Gemma-4-31B-it checkpoints are saved by the multimodal
+    # `Gemma4ForConditionalGeneration`, which wraps the text tower as
+    # `self.model.language_model`. That makes every parameter name start
+    # with `model.language_model.` (including per-layer weights). BloomBee's
+    # server uses `block_prefix` to slice individual decoder blocks out of
+    # the sharded checkpoint index, so we have to match that exact nesting.
+    block_prefix = "model.language_model.layers"
 
     num_key_value_groups = 1
 

@@ -2,8 +2,10 @@
 
 Targets the text tower of the multimodal `Gemma4ForConditionalGeneration`
 checkpoints. The checkpoint ships vision-tower weights in the same
-state_dict under `model.vision_*` / `model.embed_vision.*`; those must
-be ignored at load time.
+state_dict under `model.vision_*` / `model.embed_vision.*` / `model.audio_tower.*`
+and the text tower under `model.language_model.*` — we have to ignore the
+vision/audio keys and remap `model.language_model.X` onto our
+`Gemma4ForCausalLM`-shaped `model.X` slots at load time.
 
 HF has no `Gemma4ForSequenceClassification`, so we don't ship one.
 """
@@ -40,18 +42,60 @@ logger = get_logger(__name__)
 _VISION_IGNORE_KEYS = [
     r"^model\.vision_.*",
     r"^model\.embed_vision\..*",
+    r"^model\.audio_.*",
+    r"^model\.embed_audio\..*",
+    r"^model\.vision_tower\..*",
     r"^vision_.*",
     r"^embed_vision\..*",
 ]
+
+
+# Rename map for the published multimodal checkpoint.
+#
+# The 31B-it release is saved by `Gemma4ForConditionalGeneration`, which
+# wraps `Gemma4TextModel` at `self.model.language_model`. So every text
+# weight in the state_dict begins with `model.language_model.` (e.g.
+# `model.language_model.embed_tokens.weight`, `model.language_model.norm.weight`,
+# `model.language_model.layers.0.self_attn.q_proj.weight`, ...).
+#
+# Our adapter inherits from `Gemma4ForCausalLM`, whose text tower lives
+# at `self.model` — so we want `model.X` not `model.language_model.X`.
+# The per-layer weights are loaded by the server (see
+# `server/from_pretrained.py`, which now reads from
+# `config.block_prefix = "model.language_model.layers"`). The client
+# still needs to load `embed_tokens` + `norm`, so we strip the
+# `language_model.` segment on the way in.
+#
+# Passed to HF's `from_pretrained(..., key_mapping=...)`, which applies
+# the rename as a regex replace across every key in the checkpoint.
+_GEMMA4_KEY_MAPPING = {
+    # Strip `language_model.` out of the `model.` namespace.
+    # HF's key_mapping treats this as a regex where the source pattern is
+    # searched and the target replaces it in-place.
+    r"^model\.language_model\.": "model.",
+    # `Gemma4ForConditionalGeneration` has `lm_head` directly under root,
+    # just like us, so nothing to remap for the head.
+}
 
 
 class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, _BaseTextModel):
     """Gemma4TextModel with remote transformer layers."""
 
     _keys_to_ignore_on_load_missing = PTuneMixin._keys_to_ignore_on_load_missing
+    # After `key_mapping` flattens `model.language_model.*` to `model.*`,
+    # per-layer keys look like `model.layers.<i>.*` — ignored here so the
+    # embed/norm-only client doesn't complain about them.
     _keys_to_ignore_on_load_unexpected = [r"^model\.layers\."] + _VISION_IGNORE_KEYS
 
     config_class = DistributedGemma4Config
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # Checkpoint is saved by the multimodal Gemma4ForConditionalGeneration
+        # under `model.language_model.*`. Flatten onto our text-only namespace
+        # (`model.*`) before HF matches it against our parameter names.
+        kwargs.setdefault("key_mapping", dict(_GEMMA4_KEY_MAPPING))
+        return super().from_pretrained(*args, **kwargs)
 
     def __init__(self, config: DistributedGemma4Config, *, dht: Optional[DHT] = None):
         # Prevent the base class from instantiating the 60 full layers;
@@ -169,6 +213,13 @@ class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
     _supports_cache_class = True
     config_class = DistributedGemma4Config
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # Same remap as the text-only class, since the top-level checkpoint
+        # still nests the text weights at `model.language_model.*`.
+        kwargs.setdefault("key_mapping", dict(_GEMMA4_KEY_MAPPING))
+        return super().from_pretrained(*args, **kwargs)
 
     def __init__(self, config: DistributedGemma4Config):
         _BasePreTrained.__init__(self, config)
