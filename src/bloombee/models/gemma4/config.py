@@ -56,12 +56,32 @@ class DistributedGemma4Config(_Gemma4TextConfig, ClientConfig, PTuneConfig, LMHe
         # dispatcher matches the top-level gemma-4 checkpoint. But that
         # causes HF's loader to parse the TOP-LEVEL config dict (which
         # has model_type="gemma4" but no `num_hidden_layers` — those
-        # live under `text_config`). HF then silently falls back to the
+        # live under `text_config`). HF then silently falls back to
         # `Gemma4TextConfig` defaults (30 layers, etc.), which is wrong.
         #
         # Fix: call `Gemma4TextConfig.from_pretrained` explicitly (it
         # knows how to reach into `text_config`), then rebuild our
         # subclass from that loaded instance's dict.
+        #
+        # A secondary wrinkle: BloomBee's ClientConfig / PTuneConfig /
+        # LMHeadConfig dataclasses carry fields like `initial_peers`,
+        # `active_adapter`, `use_chunked_forward`, etc. that callers
+        # pass as kwargs. Normally the inherited from_pretrained walks
+        # the MRO and has each mixin consume its own fields, leaving
+        # kwargs empty. Calling `_Gemma4TextConfig.from_pretrained`
+        # directly bypasses that walk, so those kwargs leak through to
+        # `cls(config, **kwargs)` and crash with "unexpected keyword
+        # argument 'initial_peers'". We pop them here before delegating.
+        import dataclasses as _dc
+        own_field_names = set()
+        for base in cls.__mro__:
+            if _dc.is_dataclass(base):
+                for f in _dc.fields(base):
+                    own_field_names.add(f.name)
+        popped = {name: kwargs.pop(name) for name in list(kwargs) if name in own_field_names}
+        if dht_prefix is not None:
+            popped["dht_prefix"] = dht_prefix
+
         return_unused_kwargs = kwargs.pop("return_unused_kwargs", False)
 
         parent_result = _Gemma4TextConfig.from_pretrained(
@@ -70,11 +90,11 @@ class DistributedGemma4Config(_Gemma4TextConfig, ClientConfig, PTuneConfig, LMHe
         parent_cfg, unused = parent_result if isinstance(parent_result, tuple) else (parent_result, {})
 
         # Rebuild as our subclass so BloomBee-specific fields are populated
-        # (ClientConfig / PTuneConfig / LMHeadConfig defaults). Pass
-        # parent_cfg's fields directly via to_dict + our dht_prefix.
+        # (ClientConfig / PTuneConfig / LMHeadConfig defaults). Layer in the
+        # popped BloomBee kwargs so `initial_peers`, etc. land on the config.
         src = parent_cfg.to_dict()
         src["model_type"] = cls.model_type  # "gemma4", matches dispatcher
-        src["dht_prefix"] = dht_prefix
+        src.update(popped)
         config = cls.from_dict(src, **unused)
 
         if config.pad_token_id is None:
