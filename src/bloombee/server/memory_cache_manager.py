@@ -9,7 +9,7 @@ import time
 from typing import Optional, Tuple, AsyncContextManager, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
-from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata
+from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata, _is_paged_kv_enabled
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import DeviceType, TorchDisk, TorchMixedDevice, TorchTensor, general_copy
@@ -42,6 +42,18 @@ class KVCacheManager:
         self.block_config = block_config
         self.max_alloc_timeout = max_alloc_timeout
         self._active_cache_tensors_stack = []
+        # Phase 3: id(cache_tensors) -> tuple of handle ids currently aliased
+        # onto those TorchTensors. Lets async reorder tasks (run on a thread
+        # without access to the contextmanager) resolve the matching
+        # PagedKVTable via MemoryCache.paged_view(handle).
+        self._cache_tensors_to_handles = {}
+        # Gate all paged-KV side-channel bookkeeping on the env flag once at
+        # init time. When the shim is off (default), the per-step track/
+        # rollback/commit hooks early-return and use_cache skips the
+        # handle-lookup dict, so the hot path carries zero extra work vs
+        # mainline. The legacy _write_kvs slab write remains the source of
+        # truth in both modes.
+        self._paged_kv_enabled = _is_paged_kv_enabled()
         self._reorder_executor = ThreadPoolExecutor(max_workers=1)
         
         # [KVCACHE_OFFLOAD] Micro-batch level memory reuse state
@@ -418,14 +430,15 @@ class KVCacheManager:
     
     def add_cache(self, kvs: AdaptedKVCache, start_position: int):
         self._write_kvs(kvs, start_position)
-                
+        self._track_paged_write(kvs, start_position, commit=True)
+
     def update_cache(
         self, new_kvs: AdaptedKVCache, start_position: int,
         batch_offset: int = 0, full_batch_size: int = 0, micro_batch_size: int = 0
     ):
         """
         Update KV cache with new values.
-        
+
         Args:
             new_kvs: New KV tensors to write
             start_position: Start position along sequence dimension
@@ -444,6 +457,157 @@ class KVCacheManager:
                 len(self._active_cache_tensors_stack),
             )
         self._write_kvs(new_kvs, start_position, batch_offset, full_batch_size, micro_batch_size)
+        # Non-spec-dec: every written token is accepted, so commit immediately.
+        self._track_paged_write(new_kvs, start_position, commit=True)
+
+    # ---------------- Phase 3: PagedKVTable load-bearing hooks ----------------
+    #
+    # Strategy: the legacy slab write in _write_kvs remains the source of
+    # truth for the attention kernel (byte-identical to mainline). The
+    # PagedKVTable mirrors the write as state-only (track_write) so that
+    # rollback of rejected speculated tokens can return pages to the free
+    # list and gather_prefix only exposes committed bytes. This keeps the
+    # byte-equivalence invariant proven in Phase 2 intact while making the
+    # shim load-bearing for correctness of rollback.
+
+    def _paged_tables_for_active(self, cache_tensors) -> list:
+        """Return the list of PagedKVTable instances aliased onto ``cache_tensors``.
+
+        Empty when the paged shim is disabled or no handle resolved. Every
+        caller must treat the empty case as "fall back to legacy slab
+        semantics" — the shim is additive.
+        """
+        try:
+            handles = self._cache_tensors_to_handles.get(id(cache_tensors))
+            if not handles:
+                return []
+            tables = []
+            for handle in handles:
+                table = self.cache.paged_view(handle)
+                if table is not None:
+                    tables.append(table)
+            return tables
+        except Exception as e:  # never let shim bookkeeping break a real write
+            logger.debug(f"[PAGED_KV] failed to resolve paged tables: {e}")
+            return []
+
+    def _infer_seq_ids_and_tokens(self, new_kvs) -> Tuple[list, int]:
+        """
+        Derive per-sequence ids and the per-sequence token count from
+        ``new_kvs`` (key shape ``(BH, D, s_new)``). Sequence ids are the
+        batch indices 0..B-1 — stable across decode steps of one handle.
+        """
+        try:
+            kvs_data = new_kvs.kvs if hasattr(new_kvs, "kvs") else new_kvs
+            key, _ = kvs_data
+            key_data = key.data if hasattr(key, "data") else key
+            if key_data.ndim != 3:
+                return [], 0
+            BH, _D, s_new = key_data.shape
+            H = getattr(self.block_config, "num_attention_heads", 32) or 32
+            if H <= 0 or BH % H != 0:
+                return [], 0
+            B = BH // H
+            return list(range(B)), int(s_new)
+        except Exception as e:
+            logger.debug(f"[PAGED_KV] failed to infer seq ids: {e}")
+            return [], 0
+
+    def _track_paged_write(
+        self,
+        new_kvs,
+        start_position: int,
+        commit: bool,
+        cache_tensors=None,
+    ) -> None:
+        """State-only mirror of ``_write_kvs`` into the paged tables.
+
+        No-op when the shim is off. Called AFTER the legacy physical write
+        lands — the shim is a bookkeeping layer, not a second data path.
+        """
+        if not self._paged_kv_enabled:
+            return
+        if cache_tensors is None:
+            if not self._active_cache_tensors_stack:
+                return
+            cache_tensors = self._active_cache_tensors_stack[-1]
+        tables = self._paged_tables_for_active(cache_tensors)
+        if not tables:
+            return
+        seq_ids, s_new = self._infer_seq_ids_and_tokens(new_kvs)
+        if s_new <= 0 or not seq_ids:
+            return
+        for table in tables:
+            for seq_id in seq_ids:
+                try:
+                    table.track_write(seq_id, int(start_position), s_new, commit=commit)
+                except Exception as e:
+                    logger.warning(
+                        f"[PAGED_KV] track_write failed for seq_id={seq_id} "
+                        f"start={start_position} s_new={s_new}: {e}"
+                    )
+
+    def _rollback_paged_to(
+        self,
+        l_acc_target: int,
+        cache_tensors=None,
+    ) -> None:
+        """Roll back all sequences on the active handle(s) to ``l_acc_target``.
+
+        Called at the start of each spec-dec step to invalidate the prior
+        step's uncommitted speculated bytes before the new tree lands. Pages
+        holding only rolled-back bytes return to the free list.
+        """
+        if not self._paged_kv_enabled:
+            return
+        if cache_tensors is None:
+            if not self._active_cache_tensors_stack:
+                return
+            cache_tensors = self._active_cache_tensors_stack[-1]
+        tables = self._paged_tables_for_active(cache_tensors)
+        if not tables:
+            return
+        for table in tables:
+            # Copy keys to avoid mutation during iteration if rollback alters state.
+            for seq_id in list(table._seqs.keys()):
+                try:
+                    current_acc = table.l_acc(seq_id)
+                    target = min(int(l_acc_target), current_acc)
+                    if target < 0:
+                        target = 0
+                    table.rollback(seq_id, target)
+                except Exception as e:
+                    logger.warning(
+                        f"[PAGED_KV] rollback failed for seq_id={seq_id} "
+                        f"target={l_acc_target}: {e}"
+                    )
+
+    def _commit_paged_to(
+        self,
+        l_acc_target: int,
+        cache_tensors=None,
+    ) -> None:
+        """Promote speculative writes up to ``l_acc_target`` to accepted."""
+        if not self._paged_kv_enabled:
+            return
+        if cache_tensors is None:
+            if not self._active_cache_tensors_stack:
+                return
+            cache_tensors = self._active_cache_tensors_stack[-1]
+        tables = self._paged_tables_for_active(cache_tensors)
+        if not tables:
+            return
+        for table in tables:
+            for seq_id in list(table._seqs.keys()):
+                try:
+                    current_seq = table.l_seq(seq_id)
+                    target = min(int(l_acc_target), current_seq)
+                    table.commit(seq_id, up_to=target)
+                except Exception as e:
+                    logger.warning(
+                        f"[PAGED_KV] commit failed for seq_id={seq_id} "
+                        f"target={l_acc_target}: {e}"
+                    )
     
     def tokens_left(self) -> int:
         return self.cache.tokens_left
@@ -748,11 +912,25 @@ class KVCacheManager:
             # but yield clones to callers to prevent accidental in-place edits
             # logger.info(f"use cache, cache_tensors: {cache_tensors}, len={len(cache_tensors)}")
             self._active_cache_tensors_stack.append(cache_tensors)
+            # Phase 3: when BLOOMBEE_PAGED_KV is on, remember the handle(s)
+            # behind this cache_tensors so the async reorder task can look
+            # up the per-handle PagedKVTable. When off, skip the dict ops —
+            # the track/rollback/commit hooks all early-return anyway.
+            key = None
+            prev = None
+            if self._paged_kv_enabled:
+                key = id(cache_tensors)
+                prev = self._cache_tensors_to_handles.get(key)
+                self._cache_tensors_to_handles[key] = tuple(handles)
             try:
-                # safe_views = tuple(t.detach().clone() for t in cache_tensors)
                 yield cache_tensors
             finally:
                 self._active_cache_tensors_stack.pop()
+                if key is not None:
+                    if prev is None:
+                        self._cache_tensors_to_handles.pop(key, None)
+                    else:
+                        self._cache_tensors_to_handles[key] = prev
 
     def delete_cache(self, *handles: Handle):
         """Explicitly delete cache handles to free space early."""
@@ -1866,63 +2044,86 @@ class KVCacheManager:
             with torch.inference_mode():
                 if kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0:
                     self._write_kvs(
-                        new_kvs, 
-                        start_position=0, 
-                        batch_offset=batch_offset,
-                        full_batch_size=full_batch_size,
-                        micro_batch_size=micro_batch_size,
-                        cache_tensors=cache_tensors
-                    )
-                    return
-                
-                # ============ Generation 阶段 ============
-                valid_mask = kv_cache_position_ids >= 0
-                
-                if not valid_mask.any():
-                    self._write_kvs(
-                        new_kvs, 
+                        new_kvs,
                         start_position=0,
                         batch_offset=batch_offset,
                         full_batch_size=full_batch_size,
                         micro_batch_size=micro_batch_size,
                         cache_tensors=cache_tensors
                     )
+                    # Prefill-style path: no prior commit point, track as accepted.
+                    cache_manager._track_paged_write(
+                        new_kvs, start_position=0, commit=True, cache_tensors=cache_tensors,
+                    )
                     return
-                
+
+                # ============ Generation 阶段 ============
+                valid_mask = kv_cache_position_ids >= 0
+
+                if not valid_mask.any():
+                    self._write_kvs(
+                        new_kvs,
+                        start_position=0,
+                        batch_offset=batch_offset,
+                        full_batch_size=full_batch_size,
+                        micro_batch_size=micro_batch_size,
+                        cache_tensors=cache_tensors
+                    )
+                    cache_manager._track_paged_write(
+                        new_kvs, start_position=0, commit=True, cache_tensors=cache_tensors,
+                    )
+                    return
+
                 max_position = kv_cache_position_ids[valid_mask].max().item()
                 write_position = int(max_position) + 1
-                
+
+                # Phase 3: before the new tree lands, invalidate any speculated
+                # bytes left from the prior step past the committed prefix.
+                # write_position is the start of the new tree, i.e. the length
+                # of the accepted prefix — everything at or beyond this offset
+                # was speculative and must be dropped to free pages.
+                cache_manager._rollback_paged_to(
+                    l_acc_target=write_position, cache_tensors=cache_tensors,
+                )
+
                 # 1. 同步写入新 KV
                 self._write_kvs(
-                    new_kvs, 
+                    new_kvs,
                     write_position,
                     batch_offset=batch_offset,
                     full_batch_size=full_batch_size,
                     micro_batch_size=micro_batch_size,
                     cache_tensors=cache_tensors
                 )
-                
+                # Tree write is speculative — only raises l_seq, not l_acc.
+                cache_manager._track_paged_write(
+                    new_kvs,
+                    start_position=write_position,
+                    commit=False,
+                    cache_tensors=cache_tensors,
+                )
+
                 # 2. 准备异步重排所需的参数
                 new_kvs_data = new_kvs.kvs if hasattr(new_kvs, "kvs") else new_kvs
                 key, _ = new_kvs_data
                 key_data = key.data if hasattr(key, 'data') else key
                 tree_len = key_data.shape[-1]
-                
+
                 device = kv_cache_position_ids.device
                 B = kv_cache_position_ids.shape[0]
-                
+
                 kv_cache_position_ids_copy = kv_cache_position_ids.clone()
-                
+
                 # 构建 extended_position_ids
                 new_positions = torch.arange(write_position, write_position + tree_len, device=device)
                 new_positions = new_positions.unsqueeze(0).expand(B, tree_len)
                 extended_position_ids = torch.cat([kv_cache_position_ids_copy, new_positions], dim=1)
-                
+
                 # 计算 cache 长度
                 ext_valid_mask = extended_position_ids >= 0
                 max_ext_position = extended_position_ids[ext_valid_mask].max().item()
                 cache_len = int(max_ext_position) + 1
-                
+
                 # 直接调用现有的 select_cache
                 k_pkv, v_pkv, _ = cache_manager.select_cache(
                     prefix_length=cache_len,
@@ -1933,10 +2134,10 @@ class KVCacheManager:
                     micro_batch_size=micro_batch_size,
                     cache_tensors=cache_tensors,
                 )
-                
+
                 if k_pkv is None:
                     return
-                
+
                 # 重排并写回
                 cache_manager.reorder_and_write_cache(
                     k_pkv=k_pkv,
@@ -1947,7 +2148,13 @@ class KVCacheManager:
                     full_batch_size=full_batch_size,
                     micro_batch_size=micro_batch_size,
                 )
-                    
+                # After reorder compacts the accepted prefix into [0, cache_len),
+                # promote those bytes to committed so rollback next step drops
+                # only the next tree's speculation.
+                cache_manager._commit_paged_to(
+                    l_acc_target=cache_len, cache_tensors=cache_tensors,
+                )
+
         except Exception as e:
             import logging
             logging.error(f"Async cache reorder failed: {e}")

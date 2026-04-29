@@ -5,6 +5,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
 from time import perf_counter
 
+import os
 import torch
 import traceback
 import numpy as np
@@ -43,6 +44,21 @@ if TYPE_CHECKING:
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
 
+
+def _flag_to_bool(value) -> bool:
+    # Hoisted from inference_step: the closure redefinition was ~1 alloc/step.
+    if value is None:
+        return False
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return False
+        return bool(value.bool().any().item())
+    return bool(value)
+
+
+_STEP_PROFILE_ENABLED = os.environ.get("BLOOMBEE_STEP_PROFILE", "0") == "1"
+_STEP_PROFILE_INTERVAL = int(os.environ.get("BLOOMBEE_STEP_PROFILE_INTERVAL", "32"))
+
 class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Module
     """A wrapper for a transformer block that can process requests for forward, backward and inference"""
 
@@ -58,6 +74,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
         inference_outputs_schema: Optional[Tuple[BatchTensorDescriptor, ...]] = None,
+        block_index: Optional[int] = None,
         **kwargs,
     ):
         import bloombee.utils.peft as _peft_module
@@ -66,12 +83,18 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         super().__init__(*args, **kwargs)
         # Accept both TensorParallel and our PipelineParallelWrapper
-        assert (isinstance(self.module, TensorParallel) or 
+        assert (isinstance(self.module, TensorParallel) or
                 hasattr(self.module, 'devices') and hasattr(self.module, 'module_shards'))
         self.config = config
         self.cache_manager = cache_manager
         self.pruner_manager = pruner_manager
         self.max_chunk_size_bytes = max_chunk_size_bytes
+        # Gemma-4 and other heterogeneous-layer families need to know which
+        # transformer layer this backend owns so its KV descriptor can
+        # reflect the per-layer (head_count, head_dim) shape. For uniform
+        # families (Llama, Qwen3, Bloom, Falcon, Mixtral) block_index is
+        # unused and left as None by older call sites.
+        self.block_index = block_index
         if inference_outputs_schema is None:
             inference_outputs_schema = tuple(nested_flatten(self.outputs_schema))
         else:
@@ -148,9 +171,32 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.cache_bytes_per_token: Dict[torch.device, int] = Counter()
         for descr in self.get_inference_cache_descriptors(batch_size=1, max_length=1):
             self.cache_bytes_per_token[descr.device] += descr.numel() * get_size_in_bytes(descr.dtype)
-        
+
         # 🚀 Performance optimization: Pre-allocate position_ids cache
         self._position_ids_cache = {}
+        # Compute-once hoist (②): per-step work that depended only on static
+        # backend state. Each of these used to run on every inference_step.
+        self._max_shard_num_heads = max(self.shard_num_heads)
+        # Static portion of the "can we reuse server-side KV cache?" gate —
+        # depends only on the offloading policy decided at server init.
+        policy = cache_manager.offloading_policy
+        self._static_reuse_blocker = (
+            policy.cache_gpu_percent < 100
+            or policy.cache_cpu_percent > 0
+            or policy.cache_disk_percent > 0
+            or policy.compress_cache
+            or policy.cpu_cache_compute
+        )
+        self._policy_gpu_batch_size = int(getattr(policy, "gpu_batch_size", 0))
+        self._has_set_remote_cache_reuse = hasattr(self.module, "set_remote_cache_reuse_enabled")
+        # Decode-path mask scores cache, keyed by (batch_size, src_len, device).
+        # AR decode has seq_len=1 and current_token_count=1, so the causal
+        # mask is "query attends to all cache + self" — a constant all-zeros
+        # scores tensor of shape (B, 1, src_len). We pay the allocation once
+        # per distinct (B, src_len, device) triple instead of every step.
+        # At B=32 × 40 layers × 128 decode steps this removes ~160k
+        # per-step allocs of a float32 tensor that's otherwise constant.
+        self._decode_mask_scores_cache: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
 
         # Decide device placement policy for module based on offloading policy
         offload_policy = cache_manager.offloading_policy
@@ -176,6 +222,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             self.module.load_lm_head()
         self._last_keep_indices = None
 
+        # Opt-in per-step wall-clock profile. Off by default. When enabled,
+        # records select_cache / module.forward / update_cache / other for
+        # each step and logs a mean/p50/p95 roll-up every N steps. Uses
+        # torch.cuda.synchronize() to make the numbers comparable between
+        # mainline (TF 4.x) and arch-reform (TF 5.x).
+        self._step_profile_enabled = _STEP_PROFILE_ENABLED
+        if self._step_profile_enabled:
+            self._step_profile_counter = 0
+            self._step_profile_buf = {"select": [], "forward": [], "update": [], "total": []}
+
     def _is_identity_hypo_ids(self, hypo_ids: Optional[torch.Tensor]) -> bool:
         if hypo_ids is None:
             return True
@@ -185,23 +241,157 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         return torch.equal(hypo_ids, expected)
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
-        """Create tensor descriptors for attention cache tensors used during inference_step"""
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        """Create tensor descriptors for attention cache tensors used during inference_step.
+
+        For uniform-attention families (Llama, Qwen3, Bloom, Falcon, Mixtral)
+        this returns a single descriptor per device with
+        ``(B, num_attention_heads, head_dim, max_length)``.
+
+        For families with heterogeneous layer types — currently Gemma-4,
+        whose full-attention layers use ``global_head_dim`` (512) instead
+        of the sliding-attention ``head_dim`` (256) — the descriptor uses
+        the head_dim that matches THIS backend's specific layer. That
+        requires ``self.block_index`` to have been threaded in at
+        construction time so we can index into ``config.layer_types``.
+
+        GQA head-count note: we keep the descriptor at
+        ``num_attention_heads`` even though attention only writes into
+        the first ``num_kv_heads`` slots. The FlexGen decode path
+        (``mha_gen_llama``) assumes BH = batch * num_attention_heads for
+        its K/V update shapes. Downscaling to num_kv_heads would break
+        that contract. Memory waste here is the GQA ratio (Qwen3: 5x).
+        """
+        head_dim = self._head_dim_for_this_block()
         cache_tensors = []
         for device, num_heads in zip(self.module.devices, self.shard_num_heads):
-            # IMPORTANT:
-            # Flex decode path (`mha_gen_llama`) uses attention head count when building
-            # K/V updates (BH = batch * num_attention_heads). KV cache descriptors must
-            # match that contract, otherwise we hit BH mismatches (e.g. 32 vs 128).
-            # So keep shard attention heads here; do NOT downscale by key-value groups.
-            keys = TensorDescriptor((batch_size, num_heads, head_dim, max_length), dtype=self.dtype, device=device)
-            # values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
+            keys = TensorDescriptor(
+                (batch_size, num_heads, head_dim, max_length),
+                dtype=self.dtype, device=device,
+            )
             cache_tensors.append(keys)
-            # [DEBUG] Log descriptor shape
-            logger.debug(f"[MB_DEBUG] get_inference_cache_descriptors: batch_size={batch_size}, num_heads={num_heads}, "
-                       f"head_dim={head_dim}, max_length={max_length}, shape={(batch_size, num_heads, head_dim, max_length)}")
+            logger.debug(
+                f"[MB_DEBUG] get_inference_cache_descriptors: batch_size={batch_size}, "
+                f"num_heads={num_heads}, head_dim={head_dim}, max_length={max_length}, "
+                f"block_index={self.block_index}, "
+                f"layer_type={self._layer_type_for_this_block()}, "
+                f"shape={(batch_size, num_heads, head_dim, max_length)}"
+            )
         return cache_tensors
+
+    def _layer_type_for_this_block(self) -> Optional[str]:
+        """Return ``config.layer_types[block_index]`` if available, else None."""
+        lt = getattr(self.config, "layer_types", None)
+        bi = self.block_index
+        if lt is None or bi is None:
+            return None
+        if not (0 <= bi < len(lt)):
+            return None
+        return lt[bi]
+
+    def _head_dim_for_this_block(self) -> int:
+        """Pick the right head_dim for this backend's layer.
+
+        Defaults to ``config.head_dim`` (or ``hidden_size // num_attention_heads``).
+        For Gemma-4 full_attention layers we must use ``global_head_dim``
+        instead; sliding layers stay on ``head_dim``.
+        """
+        default_hd = getattr(self.config, "head_dim", None) or (
+            self.config.hidden_size // self.config.num_attention_heads
+        )
+        layer_type = self._layer_type_for_this_block()
+        if layer_type == "full_attention":
+            global_hd = getattr(self.config, "global_head_dim", None)
+            if global_hd:
+                return int(global_hd)
+        return int(default_hd)
     
+    # ------------------------------------------------------------------
+    # Phase 1: block-step seam
+    #
+    # inference_step() used to call select_cache + module.forward +
+    # update_cache inline. Phase 2 replaces the cache ops with paged-KV
+    # writes; Phase 3 layers tree-attention verification on top. Rather
+    # than duplicate that logic at every call site, the three hot-path
+    # primitives now live behind these helpers so they can be swapped
+    # independently.
+    # ------------------------------------------------------------------
+
+    def _run_block_forward(
+        self,
+        hidden_states_chunk: torch.Tensor,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        rotary_position_ids: Optional[torch.Tensor],
+    ) -> Optional[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]]:
+        """One transformer block forward pass on a (chunked) hidden-states slice.
+
+        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs) or None
+        on failure.
+        """
+        forward_result = self.module.forward(
+            hidden_states_chunk,
+            layer_past=layer_past,
+            attention_mask=attention_mask,
+            use_cache=True,
+            position_ids=position_ids,
+            rotary_position_ids=rotary_position_ids,
+        )
+        if forward_result is None:
+            logger.info(" ERROR: module.forward returned None!")
+            return None
+        output_hidden_states_chunk, new_kvs = forward_result
+        return output_hidden_states_chunk, new_kvs
+
+    def _finalize_cache_update(
+        self,
+        new_kvs: Tuple[torch.Tensor, ...],
+        cache_len: int,
+        inference_info: InferenceMetadata,
+        kv_cache_position_ids: Optional[torch.Tensor],
+        cache_tensors,
+    ) -> None:
+        """Write new KVs back to the cache manager.
+
+        Step-level seam (runs once after all chunks). Phase 2 swaps the body
+        with paged-KV writes; Phase 3 adds per-page rollback on rejected
+        speculative tokens without changing callers.
+        """
+        if self._is_spec_decoding:
+            self.cache_manager.update_cache_and_async_reorder(
+                new_kvs,
+                self._slice_batch_aligned(
+                    kv_cache_position_ids,
+                    inference_info.batch_offset,
+                    inference_info.batch_offset + inference_info.micro_batch_size,
+                    inference_info.full_batch_size,
+                ),
+                batch_offset=inference_info.batch_offset,
+                full_batch_size=inference_info.full_batch_size,
+                micro_batch_size=inference_info.micro_batch_size,
+                cache_tensors=cache_tensors,
+            )
+            return
+
+        if getattr(self.cache_manager, "_verbose_kv_logs", False):
+            logger.info(
+                "[MBPIPE_BACKEND_WRITE] update_cache start: uid=%s cache_len=%s "
+                "batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s",
+                inference_info.uid,
+                cache_len,
+                inference_info.batch_offset,
+                inference_info.full_batch_size,
+                inference_info.micro_batch_size,
+                type(new_kvs).__name__ if new_kvs is not None else "None",
+            )
+        self.cache_manager.update_cache(
+            new_kvs,
+            cache_len,
+            batch_offset=inference_info.batch_offset,
+            full_batch_size=inference_info.full_batch_size,
+            micro_batch_size=inference_info.micro_batch_size,
+        )
+
     def prune_draft_tree(
         self, 
         norm_hidden_states: torch.Tensor, 
@@ -320,15 +510,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             with self.cache_manager.use_cache(
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
-                def _flag_to_bool(value) -> bool:
-                    if value is None:
-                        return False
-                    if torch.is_tensor(value):
-                        if value.numel() == 0:
-                            return False
-                        return bool(value.bool().any().item())
-                    return bool(value)
-
                 # Parse flags per request (not just first-ever call), otherwise spec/non-spec
                 # mode can get stuck after the first request served by this backend.
                 self._need_pruning = _flag_to_bool(inference_info.need_pruning)
@@ -358,6 +539,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             f"micro_batch_size={inference_info.micro_batch_size}, "
                             f"full_batch_size={inference_info.full_batch_size}")
                 
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_t0 = perf_counter()
                 if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
                     k_pkv, v_pkv, cache_len = self.cache_manager.select_cache_without_reorder(
                         kv_cache_position_ids,
@@ -377,27 +562,33 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         micro_batch_size=inference_info.micro_batch_size,
                     )
                     cache_len = k_pkv.shape[2] if k_pkv is not None else 0
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_select = perf_counter() - _prof_t0
 
                 # t2 = time.perf_counter()
                 # logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
 
                 layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
-                if hasattr(self.module, "set_remote_cache_reuse_enabled"):
-                    policy = self.cache_manager.offloading_policy
+                if self._has_set_remote_cache_reuse:
+                    # Compute-once hoist (②): _static_reuse_blocker folds in
+                    # the 5 policy fields that are frozen at server init.
+                    # Only the per-request terms (spec-dec, non-identity
+                    # hypo_ids, kv_cache_position_ids, gpu_batch underflow)
+                    # need to be re-evaluated each step.
+                    gpu_bs = self._policy_gpu_batch_size
+                    underflow = (
+                        inference_info.full_batch_size > 0
+                        and gpu_bs > 0
+                        and gpu_bs < int(inference_info.full_batch_size)
+                    )
                     reuse_allowed = not (
-                        self._is_spec_decoding
+                        self._static_reuse_blocker
+                        or self._is_spec_decoding
                         or (kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0)
                         or not self._is_identity_hypo_ids(hypo_ids)
-                        or policy.cache_gpu_percent < 100
-                        or policy.cache_cpu_percent > 0
-                        or policy.cache_disk_percent > 0
-                        or policy.compress_cache
-                        or policy.cpu_cache_compute
-                        or (
-                            inference_info.full_batch_size > 0
-                            and int(getattr(policy, "gpu_batch_size", inference_info.full_batch_size))
-                            < int(inference_info.full_batch_size)
-                        )
+                        or underflow
                     )
                     self.module.set_remote_cache_reuse_enabled(reuse_allowed)
 
@@ -436,10 +627,34 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         attention_mask = self.convert_mask_to_scores(full_mask)
                     else:
                         attention_mask = None
-                if full_mask == None:
-                    full_mask = self._create_causal_attention_mask(batch_size, (seq_len + cache_len), cache_len, hidden_states.device)
-                    attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
+                if full_mask is None:
+                    # Fast path: AR decode step (seq_len == 1, non-spec) — the
+                    # causal mask with a single query attending to all prior
+                    # cache + itself is an all-zero scores tensor of shape
+                    # (B, 1, cache_len+1). Cache it per (B, src_len, device)
+                    # so the common decode loop avoids a per-step alloc of
+                    # both the bool mask and the -inf scores tensor.
+                    if seq_len == 1 and cache_len >= 0 and not self._is_spec_decoding:
+                        src_len = cache_len + 1
+                        cache_key = (batch_size, src_len, hidden_states.device)
+                        attention_mask = self._decode_mask_scores_cache.get(cache_key)
+                        if attention_mask is None:
+                            attention_mask = torch.zeros(
+                                batch_size, seq_len, src_len,
+                                dtype=torch.float, device=hidden_states.device,
+                            )
+                            self._decode_mask_scores_cache[cache_key] = attention_mask
+                        full_mask = None
+                    else:
+                        full_mask = self._create_causal_attention_mask(
+                            batch_size, (seq_len + cache_len), cache_len, hidden_states.device
+                        )
+                        attention_mask = self.convert_mask_to_scores(full_mask) if full_mask is not None else None
                     
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_fwd_t0 = perf_counter()
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
                     # print('transformer backend inference step() offset ', offset )
@@ -466,74 +681,74 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         rotary_position_ids = None
                     
                     try:
-                        # Fixed: Properly handle forward method return values with position_ids
-                        # print(f' About to call module.forward with position_ids...')
-                        forward_result = self.module.forward(
-                            hidden_states_chunk, 
+                        step_result = self._run_block_forward(
+                            hidden_states_chunk,
                             layer_past=layer_past,
-                            attention_mask=attention_mask, 
-                            use_cache=True,
+                            attention_mask=attention_mask,
                             position_ids=position_ids,
                             rotary_position_ids=rotary_position_ids,
                         )
-                        
-                        # t5 = time.perf_counter()
-                        # logger.info(f"inference_step: module.forward call took {t5 - t4:.4f} seconds")
-                        
-                        if forward_result is None:
-                            logger.info(f" ERROR: module.forward returned None!")
+                        if step_result is None:
                             return (hidden_states, None)
-                        
-                        output_hidden_states_chunk, new_kvs = forward_result
-                        # print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
-                        
-                        # Add forward result debug information
-                        # offload_logger.info(f" module.forward completed:")
-                        # offload_logger.info(f"   - output_hidden_states_chunk shape: {output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}")
-                        # offload_logger.info(f"   - new_kvs length: {len(new_kvs) if new_kvs else 0}")
-                        # if new_kvs and len(new_kvs) > 0:
-                        #     offload_logger.info(f"   - new_kvs[0] shape: {new_kvs[0].shape}")
-                        #     offload_logger.info(f"   - new_kvs[0] device: {new_kvs[0].device}")
-                        
+                        output_hidden_states_chunk, new_kvs = step_result
                     except Exception as e:
                         print(f' ERROR in module.forward: {type(e).__name__}: {e}')
                         import traceback
                         traceback.print_exc()
                         return (hidden_states, None)
-                    
+
                     if seq_len > max_chunk_length:
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
                     else:
                         output_hidden_states = output_hidden_states_chunk
 
-                # Centralized KV update via KVCacheManager
-                # [MERGED] Speculative decoding batched update with micro-batch support
-                if self._is_spec_decoding:
-                    # self.cache_manager.update_cache_batched(new_kvs, kv_valid_lengths)
-                    self.cache_manager.update_cache_and_async_reorder(
-                        new_kvs, 
-                        self._slice_batch_aligned(kv_cache_position_ids, inference_info.batch_offset, inference_info.batch_offset + inference_info.micro_batch_size, inference_info.full_batch_size),
-                        batch_offset=inference_info.batch_offset,
-                        full_batch_size=inference_info.full_batch_size,
-                        micro_batch_size=inference_info.micro_batch_size,
-                        cache_tensors=cache_tensors,)
-                else:
-                    if getattr(self.cache_manager, "_verbose_kv_logs", False):
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_forward = perf_counter() - _prof_fwd_t0
+                    _prof_upd_t0 = perf_counter()
+
+                # Centralized KV update via KVCacheManager (single step-level seam).
+                self._finalize_cache_update(
+                    new_kvs,
+                    cache_len=cache_len,
+                    inference_info=inference_info,
+                    kv_cache_position_ids=kv_cache_position_ids,
+                    cache_tensors=cache_tensors,
+                )
+                if self._step_profile_enabled:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _prof_update = perf_counter() - _prof_upd_t0
+                    _prof_total = perf_counter() - _prof_t0
+                    buf = self._step_profile_buf
+                    buf["select"].append(_prof_select)
+                    buf["forward"].append(_prof_forward)
+                    buf["update"].append(_prof_update)
+                    buf["total"].append(_prof_total)
+                    self._step_profile_counter += 1
+                    if self._step_profile_counter % _STEP_PROFILE_INTERVAL == 0:
+                        import statistics as _stats
+                        def _summary(key):
+                            xs = buf[key]
+                            if not xs:
+                                return "n=0"
+                            xs_sorted = sorted(xs)
+                            p50 = xs_sorted[len(xs_sorted) // 2]
+                            p95 = xs_sorted[int(len(xs_sorted) * 0.95)]
+                            return (
+                                f"n={len(xs)} mean={1000*_stats.mean(xs):.2f}ms "
+                                f"p50={1000*p50:.2f}ms p95={1000*p95:.2f}ms"
+                            )
                         logger.info(
-                            "[MBPIPE_BACKEND_WRITE] update_cache start: uid=%s cache_len=%s batch_offset=%s full_batch=%s micro_batch=%s new_kvs_type=%s",
-                            inference_info.uid,
-                            cache_len,
-                            inference_info.batch_offset,
-                            inference_info.full_batch_size,
-                            inference_info.micro_batch_size,
-                            type(new_kvs).__name__ if new_kvs is not None else "None",
+                            "[STEP_PROFILE] %s B=%s seq=%s cache=%s | "
+                            "select: %s | forward: %s | update: %s | total: %s",
+                            self.name, batch_size, seq_len, cache_len,
+                            _summary("select"), _summary("forward"),
+                            _summary("update"), _summary("total"),
                         )
-                    self.cache_manager.update_cache(
-                        new_kvs, 
-                        cache_len,
-                        batch_offset=inference_info.batch_offset,
-                        full_batch_size=inference_info.full_batch_size,
-                        micro_batch_size=inference_info.micro_batch_size,) 
+                        for k in buf:
+                            buf[k].clear()
 
                 keep_indices = self._normalize_keep_indices(
                     inference_info.keep_indices,
@@ -626,7 +841,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # the model uses multi-query attention
         batch_size, seq_length, hidden_size = hidden_states.shape
         worst_case_length = inference_info.prefix_length + seq_length
-        attn_bytes_per_token = max(self.shard_num_heads) * batch_size * self.dtype_bytes * worst_case_length
+        attn_bytes_per_token = self._max_shard_num_heads * batch_size * self.dtype_bytes * worst_case_length
         return max(1, self.max_chunk_size_bytes // attn_bytes_per_token)
 
     def _reorder_cache_inplace(self, cache_tensors: torch.Tensor, hypo_ids: torch.Tensor):
@@ -942,20 +1157,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         if current_token_count <= 0:
             return None
-        
+
         if past_key_values_length == 0:
-            full_mask = torch.zeros(B, src_len, src_len, dtype=torch.bool, device=device)
-            causal_indices = torch.tril_indices(src_len, src_len, device=device)
-            full_mask[:, causal_indices[0], causal_indices[1]] = True
-            return full_mask
+            row = torch.arange(src_len, device=device)
+            base = (row.unsqueeze(1) >= row.unsqueeze(0)).unsqueeze(0)
+            return base.expand(B, src_len, src_len).contiguous()
 
-        current_mask = torch.zeros(B, current_token_count, src_len, dtype=torch.bool, device=device)
-        start_pos = past_key_values_length
-
-        for i in range(current_token_count):
-            current_mask[:, i, :start_pos + i + 1] = True
-
-        return current_mask
+        rows = torch.arange(current_token_count, device=device) + past_key_values_length
+        cols = torch.arange(src_len, device=device)
+        base = (cols.unsqueeze(0) <= rows.unsqueeze(1)).unsqueeze(0)
+        return base.expand(B, current_token_count, src_len).contiguous()
 
     
     def convert_mask_to_scores(self, mask: torch.Tensor) -> torch.Tensor:

@@ -141,6 +141,63 @@ def disable_hf_llama_init():
             "_init_weights", lambda *args, **kwargs: None)
 
 
+def convert_local_llama_weights(src_model_dir, model_name, path):
+    """Convert local HF llama weights (safetensors or .bin) to FlexGen
+    numpy-layout cache at ``{path}/{model_name}-np/``.
+
+    FlexGen reads weights as one ``.weight`` file per parameter via
+    ``np.load``. Target layout:
+        {path}/{model_name}-np/layers.{i}.self_attn.q_proj.weight
+        {path}/{model_name}-np/embed_tokens.weight
+        ...
+
+    This is the non-downloading analog of ``download_llama_weights``,
+    letting the server bootstrap from a model the user has already
+    downloaded without making HF calls.
+    """
+    import torch
+
+    out_dir = os.path.join(path, f"{model_name}-np")
+    out_dir = os.path.abspath(os.path.expanduser(out_dir))
+    sentinel = os.path.join(out_dir, ".bloombee_np_converted")
+    if os.path.exists(sentinel):
+        dprint(f"FlexGen numpy cache already present at {out_dir}; skipping conversion.")
+        return
+    os.makedirs(out_dir, exist_ok=True)
+
+    dprint(f"Converting {src_model_dir} → FlexGen numpy layout at {out_dir}")
+
+    # Load state dict: prefer safetensors, fall back to .bin.
+    state: dict = {}
+    safetensor_files = sorted(glob.glob(os.path.join(src_model_dir, "*.safetensors")))
+    if safetensor_files:
+        from safetensors import safe_open
+        for sf in tqdm(safetensor_files, desc="Read safetensors"):
+            with safe_open(sf, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    state[k] = f.get_tensor(k)
+    else:
+        bin_files = sorted(glob.glob(os.path.join(src_model_dir, "*.bin")))
+        if not bin_files:
+            raise FileNotFoundError(
+                f"No *.safetensors or *.bin found in {src_model_dir}"
+            )
+        for bf in tqdm(bin_files, desc="Read .bin"):
+            state.update(torch.load(bf, map_location="cpu"))
+
+    for name, param in tqdm(list(state.items()), desc="Convert → np"):
+        stripped = name.replace("model.", "")
+        stripped = stripped.replace("final_layer_norm", "layer_norm")
+        param_path = os.path.join(out_dir, stripped)
+        os.makedirs(os.path.dirname(param_path), exist_ok=True)
+        arr = param.detach().to(torch.float16).cpu().numpy()
+        with open(param_path, "wb") as f:
+            np.save(f, arr)
+
+    with open(sentinel, "w") as f:
+        f.write("ok\n")
+
+
 def download_llama_weights(model_name, path):
     from huggingface_hub import snapshot_download
     import torch
@@ -149,7 +206,7 @@ def download_llama_weights(model_name, path):
           f"The downloading and cpu loading can take dozens of minutes. "
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
-    if "llama" in model_name:
+    if "llama" in model_name.lower():
         # Remove -hf suffix if present, as huggyllama repos don't use it
         clean_name = model_name.replace("-hf", "")
         hf_model_name = "huggyllama/" + clean_name

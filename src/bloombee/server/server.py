@@ -722,6 +722,7 @@ class ModuleContainer(threading.Thread):
                     is_last_block=is_last_block,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
+                    block_index=block_index,
                     args_schema=(
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression

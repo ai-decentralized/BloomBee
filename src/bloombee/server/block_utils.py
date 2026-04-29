@@ -4,8 +4,11 @@ import torch
 from accelerate import init_empty_weights
 from transformers import PretrainedConfig, PreTrainedModel
 
-from bloombee.models.mixtral.block import WrappedMixtralBlock
+from bloombee.models.bloom.block import WrappedBloomBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
+from bloombee.models.gemma4.block import WrappedGemma4Block
+from bloombee.models.mixtral.block import WrappedMixtralBlock
+from bloombee.models.qwen3.block import WrappedQwen3Block
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import get_size_in_bytes
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -59,20 +62,54 @@ def get_block_size(
     return round(n_params * bytes_per_value * (1 + eps))
 
 
+def _autoset_attn_impl(config):
+    """Set ``config._attn_implementation`` in a way that works on TF 4.x and 5.x.
+
+    TF 4.x exposed ``PreTrainedModel._autoset_attn_implementation(config)`` which
+    picked sdpa/flash/eager based on availability and wrote it to the config.
+    TF 5.x removed that classmethod; its replacement (``set_attn_implementation``)
+    is an instance method on an already-built model, which is backwards for us —
+    we need the decision *before* instantiation.
+
+    For BloomBee's single-block use case, "eager" is always a safe choice:
+    flash-attn isn't on our V100 stack, and sdpa requires a batched mask path
+    we don't always provide. We only write eager if the caller hasn't pinned
+    something else on the config already.
+    """
+    legacy = getattr(PreTrainedModel, "_autoset_attn_implementation", None)
+    if legacy is not None:
+        return legacy(config)
+    if getattr(config, "_attn_implementation", None) in (None, "", "auto"):
+        config._attn_implementation = "eager"
+    return config
+
+
 def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
     """
     The function to create a model block based on the block class.
+    - Bloom:   takes (config) only, no layer_idx, no FlexGen args
     - Mixtral: takes (config, layer_idx), no FlexGen args
     - Falcon:  takes (config) only, no layer_idx, no FlexGen args
     - Llama:   takes (config, layer_idx, env, policy, weight_home, path) — FlexGen-based
     """
+    if config.block_class == WrappedBloomBlock:
+        dprint('server/block_utils.py config.block_class == WrappedBloomBlock ')
+        return config.block_class(config, layer_idx)
     if config.block_class == WrappedMixtralBlock:
         dprint('server/block_utils.py config.block_class == WrappedMixtralBlock ')
-        config = PreTrainedModel._autoset_attn_implementation(config)
+        config = _autoset_attn_impl(config)
         return config.block_class(config, layer_idx)
     elif config.block_class == WrappedFalconBlock:
         dprint('server/block_utils.py config.block_class == WrappedFalconBlock ')
         return config.block_class(config)
+    elif config.block_class == WrappedQwen3Block:
+        dprint('server/block_utils.py config.block_class == WrappedQwen3Block ')
+        config = _autoset_attn_impl(config)
+        return config.block_class(config, layer_idx)
+    elif config.block_class == WrappedGemma4Block:
+        dprint('server/block_utils.py config.block_class == WrappedGemma4Block ')
+        config = _autoset_attn_impl(config)
+        return config.block_class(config, layer_idx)
     # config.block_class == WrappedLlamaBlock in distributedllamaconfig in config.py
     # print('server/block_utils.py get_model_block() : config', config)
     res = config.block_class(config, layer_idx, env, policy, weight_home, path)  # go to block.py class OptimizedLlamaDecoderLayer

@@ -20,11 +20,15 @@ from hivemind.utils.logging import get_logger
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import PretrainedConfig, PreTrainedModel
-from transformers.utils import get_file_from_repo
+
+from bloombee.utils.hf_compat import get_file_from_repo
 
 from bloombee.constants import DTYPE_MAP
+from bloombee.models.bloom.block import WrappedBloomBlock
 from bloombee.models.mixtral import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
+from bloombee.models.gemma4.block import WrappedGemma4Block
+from bloombee.models.qwen3.block import WrappedQwen3Block
 from bloombee.server.block_utils import get_model_block, resolve_block_dtype
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.disk_cache import DEFAULT_CACHE_DIR, allow_cache_reads, allow_cache_writes, free_disk_space_for
@@ -81,8 +85,14 @@ def load_pretrained_block(
         and len(tensor_parallel_devices) > 1
     )
 
-    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral)
-    _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock)
+    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Bloom, Falcon, Mixtral, Qwen3, Gemma4)
+    _is_hf_model = config.block_class in (
+        WrappedBloomBlock,
+        WrappedFalconBlock,
+        WrappedMixtralBlock,
+        WrappedQwen3Block,
+        WrappedGemma4Block,
+    )
 
     if use_native_flexgen_llama_tp:
         with init_empty_weights():
@@ -108,7 +118,17 @@ def load_pretrained_block(
             token=token, cache_dir=cache_dir, max_disk_space=max_disk_space, torch_dtype=torch_dtype,
         )
     else:
-        # For FlexGen-based models (Llama): weights are managed by FlexGen at runtime
+        # For FlexGen-based models (Llama): weights are managed by FlexGen at runtime.
+        # FlexGen's OptimizedLlamaDecoderLayer.init_weight() reads _name_or_path off
+        # the config to decide between local conversion and the huggyllama download
+        # fallback. HF's PretrainedConfig.from_pretrained clears _name_or_path when
+        # loading from a local directory, so we thread the original model_name back
+        # in here before block construction.
+        if not getattr(config, "_name_or_path", "") and model_name:
+            try:
+                config._name_or_path = model_name
+            except Exception:
+                pass
         with init_empty_weights():
             logger.debug('load_pretrained_block: init_empty_weights()')
             block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)

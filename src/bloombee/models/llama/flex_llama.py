@@ -435,10 +435,12 @@ class FLEX_LlamaAttention(LlamaAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: LlamaConfig, env: ExecutionEnv, policy: Policy, layer_id: int):
-        
-        super().__init__(config)
+
+        try:
+            super().__init__(config, layer_idx=layer_id)
+        except TypeError:
+            super().__init__(config)
         self.config = config
-        self.llama_config = get_llama_config('huggyllama/llama-7b')
         self.num_heads = config.num_attention_heads
         self.env = env
         self.layer_id = layer_id
@@ -638,7 +640,6 @@ class FLEX_LlamaMLP(LlamaMLP):
     ):
         super().__init__(config)
         self.config = config
-        self.llama_config = get_llama_config('huggyllama/llama-7b')
         self.env = env
         self.layer_id = layer_id
         self.policy = policy

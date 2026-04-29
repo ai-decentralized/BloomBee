@@ -33,7 +33,11 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         assert len(self.layers) == 0
         config.num_hidden_layers = n_layer
 
-        self.layers = RemoteSequential(config, dht=dht) # create RemoteSequential instance to manage distributed layers
+        # Force CPU context: transformers from_pretrained wraps __init__ in torch.device('cuda'),
+        # which hijacks torch.empty() in hivemind's DHT/MPFuture to create CUDA tensors.
+        # share_memory_() only works on CPU tensors, so we must reset device context here.
+        with torch.device('cpu'):
+            self.layers = RemoteSequential(config, dht=dht) # create RemoteSequential instance to manage distributed layers
 
         self.requires_grad_(False)  # Forbid accumulate grads for embeddings and layernorm
         self.init_prompts(config)
@@ -179,8 +183,16 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values._seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                # tf 5.x removed _seen_tokens; get_seq_length() is the replacement
+                past_length = getattr(past_key_values, "_seen_tokens", None)
+                if past_length is None:
+                    past_length = cache_length
+                if hasattr(past_key_values, "get_max_length"):
+                    max_cache_length = past_key_values.get_max_length()
+                elif hasattr(past_key_values, "get_max_cache_shape"):
+                    max_cache_length = past_key_values.get_max_cache_shape()
+                else:
+                    max_cache_length = None
                 # print(f"   Cache case: cache_length={cache_length}, past_length={past_length}")
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2] if hasattr(past_key_values[0][0], 'shape') else 0
@@ -233,6 +245,15 @@ class DistributedLlamaForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Ll
 
     def get_output_embeddings(self):
         return self.lm_head
+
+    def mark_tied_weights_as_initialized(self, loading_info):
+        return
+
+    def tie_weights(self, missing_keys=None, recompute_mapping=True):
+        if getattr(self.config, "tie_word_embeddings", False):
+            embed = self.get_input_embeddings()
+            if embed is not None and getattr(embed, "weight", None) is not None:
+                self.lm_head.weight = embed.weight
 
     @property
     def transformer(self) -> DistributedLlamaModel:  # For compatibility with RemoteGenerationMixin

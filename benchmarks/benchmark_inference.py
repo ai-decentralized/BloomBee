@@ -27,7 +27,16 @@ def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--model", type=str, required=True, help="Model")
     parser.add_argument("--initial_peers", type=str, nargs="+", default=PUBLIC_INITIAL_PEERS, help="Initial peers")
+    parser.add_argument("--dht_prefix", type=str, default=None, help="DHT prefix (required for private swarms with custom dht_prefix, e.g. 'gemma4')")
     parser.add_argument("--torch_dtype", type=str, default="float32", help="Torch dtype")
+    parser.add_argument(
+        "--client_device",
+        type=str,
+        default="cpu",
+        help="Device to host the CLIENT side (embed + LMHead). Set to 'cuda' or 'cuda:N' for "
+             "large-vocab families (Qwen3/Gemma-4) where the CPU LMHead matmul dominates decode latency. "
+             "See README.client-placement.md",
+    )
     parser.add_argument("--n_processes", type=str, default=1, help="Number of concurrent processes")
     parser.add_argument("--seq_len", type=int, default=2048, help="Number of tokens to generate (generation length)")
     parser.add_argument("--prompt_len", type=int, default=None, help="Desired prompt/prefill length in tokens (optional)")
@@ -94,11 +103,17 @@ def benchmark_inference(process_idx, args, result_pipe):
         tokenizer.pad_token = tokenizer.eos_token
         logger.info(f"Set pad_token to eos_token: {tokenizer.pad_token}")
 
-    model = AutoDistributedModelForCausalLM.from_pretrained(
-        args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype],
-        use_server_to_server=True  # Explicitly enable server-to-server communication
-    ) 
-    logger.info(f"Created model: {process_idx=} {model.device=}")
+    model_kwargs = dict(
+        initial_peers=args.initial_peers,
+        torch_dtype=DTYPE_MAP[args.torch_dtype],
+        use_server_to_server=True,  # Explicitly enable server-to-server communication
+    )
+    if args.dht_prefix is not None:
+        model_kwargs["dht_prefix"] = args.dht_prefix
+    model = AutoDistributedModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+    if args.client_device != "cpu":
+        model = model.to(args.client_device)
+    logger.info(f"Created model: {process_idx=} {model.device=} (requested client_device={args.client_device})")
 
     # Prepare batch of prompts for benchmarking
     batch_size = getattr(args, 'batch_size', 1)
@@ -139,7 +154,9 @@ def benchmark_inference(process_idx, args, result_pipe):
             processed.append(full_tokens)
         input_ids = torch.tensor(processed, dtype=torch.long)
     
-    logger.info(f"{process_idx=} Client batch_size={batch_size}, input_ids.shape={input_ids.shape}")
+    if args.client_device != "cpu":
+        input_ids = input_ids.to(args.client_device)
+    logger.info(f"{process_idx=} Client batch_size={batch_size}, input_ids.shape={input_ids.shape}, device={input_ids.device}")
     for i, prompt in enumerate(prompts):
         logger.info(
             f"{process_idx=} batch[{i}] prompt: '{prompt}' "

@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.models.falcon import (
     FalconForCausalLM,
@@ -36,7 +37,10 @@ class DistributedFalconModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         assert len(self.h) == 0
         config.num_hidden_layers = n_layer
 
-        self.h = RemoteSequential(config, dht=dht)
+        # Force CPU context: TF 5.x from_pretrained may wrap __init__ in a cuda device context,
+        # which hijacks hivemind's torch.empty() calls and breaks share_memory_().
+        with torch.device('cpu'):
+            self.h = RemoteSequential(config, dht=dht)
 
         self.requires_grad_(False)  # Forbid accumulate grads for embeddings and layernorm
         self.init_prompts(config)
@@ -119,6 +123,7 @@ class DistributedFalconModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
 class DistributedFalconForCausalLM(DefaultRevisionMixin, FromPretrainedMixin, RemoteGenerationMixin, FalconForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedFalconModel._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedFalconModel._keys_to_ignore_on_load_unexpected
+    _supports_cache_class = True
 
     config_class = DistributedFalconConfig
 
@@ -129,6 +134,80 @@ class DistributedFalconForCausalLM(DefaultRevisionMixin, FromPretrainedMixin, Re
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ) -> dict:
+        # BloomBee's RemotePastKeyValues is a Cache subclass whose __getitem__ returns a
+        # sentinel tensor, so TF's default Falcon prepare_inputs_for_generation crashes at
+        # past_key_values[0][0].shape[2]. We reimplement the same logic but Cache-aware.
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = getattr(past_key_values, "_seen_tokens", None)
+                if past_length is None:
+                    past_length = cache_length
+                if hasattr(past_key_values, "get_max_length"):
+                    max_cache_length = past_key_values.get_max_length()
+                elif hasattr(past_key_values, "get_max_cache_shape"):
+                    max_cache_length = past_key_values.get_max_cache_shape()
+                else:
+                    max_cache_length = None
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                remove_prefix_length = input_ids.shape[1] - 1
+
+            input_ids = input_ids[:, remove_prefix_length:]
+
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        # Falcon with RoPE (not alibi) wants position_ids; alibi variants ignore them.
+        position_ids = kwargs.get("position_ids", None)
+        if not self.transformer.use_alibi and attention_mask is not None and position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    def _temporary_reorder_cache(self, past_key_values, beam_idx):
+        return past_key_values
+
+    def mark_tied_weights_as_initialized(self, loading_info):
+        # TF 5.x walks all_tied_weights_keys (includes lm_head.weight) via get_parameter.
+        # BloomBee's LMHead stores weight as None until bind-time, so skip the bookkeeping
+        # — BloomBee handles tying manually in tie_weights below.
+        return
+
+    def tie_weights(self, missing_keys=None, recompute_mapping=True):
+        if getattr(self.config, "tie_word_embeddings", False):
+            embed = self.get_input_embeddings()
+            if embed is not None and getattr(embed, "weight", None) is not None:
+                self.lm_head.weight = embed.weight
 
     def get_output_embeddings(self):
         return self.lm_head
