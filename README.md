@@ -125,17 +125,29 @@ cd BloomBee
 pip install .
 ```
 
-#### P100 / CUDA 12 Chameleon Hosts
+#### Heterogeneous NVIDIA / Chameleon Hosts
 
-Pascal GPUs such as Tesla P100 need a PyTorch wheel that still supports SM 6.0 and matches the host driver. If `nvidia-smi` sees the GPU but `torch.cuda.is_available()` is `False`, install the P100-compatible wheel before installing BloomBee:
+BloomBee is intended to run across heterogeneous GPU fleets, so avoid relying on `pip install torch` to pick a CUDA wheel. If `nvidia-smi` sees the GPU but `torch.cuda.is_available()` is `False`, or before installing BloomBee on a fresh host, let BloomBee choose a PyTorch wheel from the local NVIDIA driver CUDA version and GPU compute capability:
 
 ```bash
 conda activate bb
-bash scripts/install_p100_torch.sh
+python scripts/install_compatible_torch.py
 pip install -e .
 ```
 
-This avoids accidentally installing CUDA 13 PyTorch wheels on Chameleon images whose drivers support CUDA 12.x.
+For example, Tesla P100 / Pascal hosts are kept on a CUDA 12.1 PyTorch wheel that supports SM 6.0, while newer GPUs with newer drivers can use newer CUDA wheels. You can preview the decision with:
+
+```bash
+python scripts/install_compatible_torch.py --dry-run
+```
+
+Manual overrides are available for unusual clusters:
+
+```bash
+BLOOMBEE_TORCH_SPEC='torch==2.4.1+cu121' \
+BLOOMBEE_TORCH_INDEX_URL='https://download.pytorch.org/whl/cu121' \
+python scripts/install_compatible_torch.py
+```
 
 ---
 

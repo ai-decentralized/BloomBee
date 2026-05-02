@@ -75,6 +75,6 @@ def get_cuda_unavailable_diagnostic() -> Optional[str]:
 
     return (
         detail
-        + " For Pascal/P100 or CUDA-12 Chameleon hosts, reinstall a CUDA 12.1 PyTorch wheel with "
-        + "`bash scripts/install_p100_torch.sh`, then rerun `pip install -e .`."
+        + " Reinstall a compatible PyTorch wheel with "
+        + "`python scripts/install_compatible_torch.py`, then rerun `pip install -e .`."
     )
