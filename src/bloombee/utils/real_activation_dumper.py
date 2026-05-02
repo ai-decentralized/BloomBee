@@ -29,6 +29,7 @@ import json
 import time
 import torch
 import threading
+import fcntl
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -58,6 +59,16 @@ class ActivationMetadata:
     batch_size: int
     seq_len: int
     phase: str
+    source: str = ""
+    channel: str = ""
+    direction: str = ""
+    model: str = ""
+    prompt_len: int = 0
+    blocks: str = ""
+    compute_dtype: str = ""
+    schema_dtype: str = ""
+    wire_dtype: str = ""
+    tensor_name: str = "hidden_states"
 
 
 class RealActivationDumper:
@@ -84,7 +95,9 @@ class RealActivationDumper:
             return
             
         self._initialized = True
-        self.enabled = os.environ.get("BLOOMBEE_DUMP_ACTIVATIONS", "0") == "1"
+        self.capture_backend = os.environ.get("BLOOMBEE_DUMP_ACTIVATIONS", "0") == "1"
+        self.capture_wire = os.environ.get("BLOOMBEE_DUMP_WIRE_ACTIVATIONS", "0") == "1"
+        self.enabled = self.capture_backend or self.capture_wire
         self.output_dir = Path(os.environ.get("BLOOMBEE_ACTIVATION_DIR", "/tmp/real_activations"))
         self.max_samples = int(os.environ.get("BLOOMBEE_ACTIVATION_SAMPLES", "20"))
         raw_phases = os.environ.get("BLOOMBEE_ACTIVATION_PHASES", "prefill,decode")
@@ -127,6 +140,7 @@ class RealActivationDumper:
         block_uid: str = "unknown",
         layer_idx: int = 0,
         inference_info: Optional[Any] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
         Capture a real activation tensor from inference.
@@ -142,8 +156,15 @@ class RealActivationDumper:
         Returns:
             Path to saved file, or None if not captured
         """
+        context = dict(context or {})
+        is_wire_capture = bool(context.pop("wire_capture", False))
+        if is_wire_capture and not self.capture_wire:
+            return None
+        if not is_wire_capture and not self.capture_backend:
+            return None
+
         seq_len = hidden_states.shape[1] if hidden_states.ndim >= 2 else 1
-        phase = self.infer_phase(seq_len)
+        phase = str(context.get("phase") or self.infer_phase(seq_len)).lower()
         if not self.should_capture(phase):
             return None
         
@@ -168,8 +189,19 @@ class RealActivationDumper:
             prefix_length = 0
             if inference_info is not None:
                 prefix_length = getattr(inference_info, 'prefix_length', 0)
+            prompt_len = context.get("prompt_len", prefix_length)
+            try:
+                prompt_len = int(prompt_len)
+            except Exception:
+                prompt_len = 0
             
-            batch_size = tensor.shape[0] if tensor.ndim >= 1 else 1
+            context_batch_size = context.get("batch_size")
+            try:
+                batch_size = int(context_batch_size) if context_batch_size is not None else (
+                    tensor.shape[0] if tensor.ndim >= 1 else 1
+                )
+            except Exception:
+                batch_size = tensor.shape[0] if tensor.ndim >= 1 else 1
             seq_len = tensor.shape[1] if tensor.ndim >= 2 else 1
             
             # Record metadata
@@ -191,6 +223,16 @@ class RealActivationDumper:
                 batch_size=batch_size,
                 seq_len=seq_len,
                 phase=phase,
+                source=str(context.get("source", "")),
+                channel=str(context.get("channel", "")),
+                direction=str(context.get("direction", "")),
+                model=str(context.get("model", "")),
+                prompt_len=prompt_len,
+                blocks=str(context.get("blocks", "")),
+                compute_dtype=str(context.get("compute_dtype", "")),
+                schema_dtype=str(context.get("schema_dtype", "")),
+                wire_dtype=str(context.get("wire_dtype", str(tensor.dtype).replace("torch.", ""))),
+                tensor_name=str(context.get("tensor_name", "hidden_states")),
             )
             
             self.metadata_list.append(asdict(metadata))
@@ -211,17 +253,43 @@ class RealActivationDumper:
     def _save_metadata(self):
         """Save metadata to JSON file."""
         metadata_file = self.output_dir / "metadata.json"
-        
-        summary = {
-            "total_samples": self.saved_count,
-            "total_steps": self.step_count,
-            "max_samples": self.max_samples,
-            "created_at": datetime.now().isoformat(),
-            "samples": self.metadata_list,
-        }
-        
-        with open(metadata_file, "w") as f:
-            json.dump(summary, f, indent=2)
+        lock_file = self.output_dir / "metadata.lock"
+        current_samples = [dict(item) for item in self.metadata_list]
+
+        with open(lock_file, "a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            existing_samples: List[Dict] = []
+            if metadata_file.exists():
+                try:
+                    existing = json.loads(metadata_file.read_text())
+                    if isinstance(existing, dict):
+                        existing_samples = [
+                            dict(item)
+                            for item in existing.get("samples", [])
+                            if isinstance(item, dict)
+                        ]
+                except Exception:
+                    existing_samples = []
+
+            merged_by_filename: Dict[str, Dict] = {}
+            for item in existing_samples + current_samples:
+                filename = str(item.get("filename", ""))
+                if not filename:
+                    continue
+                merged_by_filename[filename] = item
+            merged_samples = list(merged_by_filename.values())
+
+            summary = {
+                "total_samples": len(merged_samples),
+                "total_steps": self.step_count,
+                "max_samples": self.max_samples,
+                "created_at": datetime.now().isoformat(),
+                "samples": merged_samples,
+            }
+
+            with open(metadata_file, "w") as f:
+                json.dump(summary, f, indent=2)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     
     def get_summary(self) -> Dict:
         """Get summary of captured activations."""
@@ -279,6 +347,48 @@ def capture_activation(
     """
     dumper = get_activation_dumper()
     return dumper.capture(hidden_states, block_uid, layer_idx, inference_info)
+
+
+def capture_wire_activation(
+    hidden_states: torch.Tensor,
+    *,
+    source: str,
+    channel: str,
+    direction: str,
+    phase: str,
+    blocks: str = "",
+    tensor_name: str = "hidden_states",
+    compute_dtype: str = "",
+    schema_dtype: str = "",
+    wire_dtype: str = "",
+    batch_size: Optional[int] = None,
+    prompt_len: int = 0,
+    model: str = "",
+) -> Optional[str]:
+    """
+    Capture a tensor exactly at a wire serialization point for codec benchmarks.
+
+    Disabled unless BLOOMBEE_DUMP_WIRE_ACTIVATIONS=1.
+    """
+    if os.environ.get("BLOOMBEE_DUMP_WIRE_ACTIVATIONS", "0") != "1":
+        return None
+    context = {
+        "wire_capture": True,
+        "source": source,
+        "channel": channel,
+        "direction": direction,
+        "phase": phase,
+        "blocks": blocks,
+        "tensor_name": tensor_name,
+        "compute_dtype": compute_dtype,
+        "schema_dtype": schema_dtype,
+        "wire_dtype": wire_dtype,
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
+        "model": model,
+    }
+    dumper = get_activation_dumper()
+    return dumper.capture(hidden_states, block_uid=blocks or channel, layer_idx=0, context=context)
 
 
 # ============================================================

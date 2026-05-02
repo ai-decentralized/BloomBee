@@ -442,6 +442,10 @@ class FLEX_LlamaAttention(LlamaAttention):
             super().__init__(config)
         self.config = config
         self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = int(getattr(config, "num_key_value_heads", self.num_heads))
+        self.num_key_value_groups = int(
+            getattr(config, "num_key_value_groups", max(1, self.num_heads // self.num_key_value_heads))
+        )
         self.env = env
         self.layer_id = layer_id
         self.policy = policy

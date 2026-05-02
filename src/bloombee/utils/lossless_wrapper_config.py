@@ -17,9 +17,13 @@ LOSSLESS_ALGO = "zstd"
 LOSSLESS_LEVEL = 3
 
 # "plain" = compress the original serialized buffer as one stream
-# "byte_split" = also try splitting float16/float32 high-byte lanes into a second zstd stream
+# "byte_split" = split float16/float32 high-byte lanes into separate zstd streams
 # Ignored when LOSSLESS_ALGO == "zipnn"
 LOSSLESS_LAYOUT = "byte_split"
+
+# 1 = choose one layout up front, avoiding plain+byte_split double compression
+# 0 = legacy mode: try plain and byte_split candidates, then pick the smallest
+LOSSLESS_SINGLE_PATH = 1
 
 # source:channel:tensor_name selectors; "*" is allowed per field
 # Used only when LOSSLESS_LAYOUT == "byte_split"
