@@ -26,6 +26,7 @@ from bloombee.utils.lossless_transport import (
 )
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import normalize_arg
+from bloombee.utils.real_activation_dumper import capture_wire_activation
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -36,6 +37,69 @@ from bloombee.utils.microbatch_config import (
 )
 
 logger = get_logger(__name__)
+
+
+_FLOATING_WIRE_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+
+
+def _dtype_name(dtype: Optional[torch.dtype]) -> str:
+    return "" if dtype is None else str(dtype).replace("torch.", "")
+
+
+def _is_floating_wire_dtype(dtype: Optional[torch.dtype]) -> bool:
+    return dtype in _FLOATING_WIRE_DTYPES
+
+
+def _server_hidden_states_wire_dtype(server_side_inference_schema) -> Optional[torch.dtype]:
+    try:
+        dtype = server_side_inference_schema[0].dtype
+    except Exception:
+        return None
+    return dtype if _is_floating_wire_dtype(dtype) else None
+
+
+def _prepare_rpc_inference_tensor_for_wire(
+    tensor: torch.Tensor,
+    tensor_name: str,
+    compression: runtime_pb2.CompressionType,
+    server_hidden_states_dtype: Optional[torch.dtype],
+) -> Tuple[torch.Tensor, BatchTensorDescriptor, dict]:
+    original_dtype = tensor.dtype if torch.is_tensor(tensor) else None
+    schema_dtype = server_hidden_states_dtype if tensor_name == "hidden_states" else None
+    target_dtype = original_dtype
+    dtype_guard_applied = 0
+
+    if (
+        tensor_name == "hidden_states"
+        and torch.is_tensor(tensor)
+        and torch.is_floating_point(tensor)
+        and _is_floating_wire_dtype(schema_dtype)
+    ):
+        target_dtype = schema_dtype
+        dtype_guard_applied = int(original_dtype != target_dtype)
+
+    wire_tensor = tensor
+    if torch.is_tensor(wire_tensor):
+        if target_dtype is not None and wire_tensor.dtype != target_dtype:
+            wire_tensor = wire_tensor.to(target_dtype)
+        if not wire_tensor.is_contiguous():
+            wire_tensor = wire_tensor.contiguous()
+
+    proto = BatchTensorDescriptor.from_tensor(wire_tensor, compression)
+    debug_fields = {
+        "compute_dtype": _dtype_name(original_dtype),
+        "schema_dtype": _dtype_name(schema_dtype),
+        "wire_dtype": _dtype_name(wire_tensor.dtype if torch.is_tensor(wire_tensor) else None),
+        "dtype_guard_applied": dtype_guard_applied,
+        "upcast_suspect": int(
+            tensor_name == "hidden_states"
+            and original_dtype == torch.float32
+            and schema_dtype in (torch.float16, torch.bfloat16)
+        ),
+    }
+    if dtype_guard_applied:
+        debug_fields["wire_cast"] = f"{_dtype_name(original_dtype)}_to_{_dtype_name(target_dtype)}_server_schema"
+    return wire_tensor, proto, debug_fields
 
 
 class _ServerInferenceSession:
@@ -284,15 +348,38 @@ class _ServerInferenceSession:
                 # TODO: make possible to use different compression method for different tensors
                 server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
                 compression = server_side_inference_schema[0].compression
-                inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
+                server_hidden_states_dtype = _server_hidden_states_wire_dtype(server_side_inference_schema)
+                prepared_inputs = [
+                    _prepare_rpc_inference_tensor_for_wire(
+                        tensor,
+                        tensor_debug_names[idx] if idx < len(tensor_debug_names) else f"arg_{idx}",
+                        compression,
+                        server_hidden_states_dtype,
+                    )
+                    for idx, tensor in enumerate(input_tensors)
+                ]
+                hidden_wire_tensor, _, hidden_dtype_debug = prepared_inputs[0]
+                capture_wire_activation(
+                    hidden_wire_tensor,
+                    source="client",
+                    channel="rpc_inference",
+                    direction="client_to_server",
+                    phase=transport_phase,
+                    blocks=f"{self.span.start}:{self.span.end}",
+                    compute_dtype=str(hidden_dtype_debug.get("compute_dtype", "")),
+                    schema_dtype=str(hidden_dtype_debug.get("schema_dtype", "")),
+                    wire_dtype=str(hidden_dtype_debug.get("wire_dtype", "")),
+                    batch_size=int(logical_full_batch_size),
+                    prompt_len=int(hidden_wire_tensor.shape[1]) if hidden_wire_tensor.ndim >= 2 else 1,
+                )
                 # [NETWORK_TIMING] Measure serialization time
                 serialize_start = time.perf_counter()
 
                 # Serialize and send data (debug output removed for performance)
-                # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
+                # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization.
                 serialized_tensors = [
                     serialize_torch_tensor(
-                        tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
+                        wire_tensor,
                         proto.compression,
                         debug_context={
                             "phase": transport_phase,
@@ -301,9 +388,10 @@ class _ServerInferenceSession:
                             "channel": "rpc_inference",
                             "blocks": f"{self.span.start}:{self.span.end}",
                             "batch": int(logical_full_batch_size),
+                            **dtype_debug,
                         },
                     )
-                    for idx, (tensor, proto) in enumerate(zip(input_tensors, inference_schema))
+                    for idx, (wire_tensor, proto, dtype_debug) in enumerate(prepared_inputs)
                 ]
                 serialized_metadata = MSGPackSerializer.dumps(request_metadata)
 

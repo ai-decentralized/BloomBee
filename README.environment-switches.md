@@ -52,6 +52,7 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_LOSSLESS_ALGO` | `zstd` | Lossless wrapper algorithm: `zstd`, `zlib`, `zipnn`, or `none`. |
 | `BLOOMBEE_LOSSLESS_LEVEL` | `3` | Compression level for the selected lossless wrapper. |
 | `BLOOMBEE_LOSSLESS_LAYOUT` | `byte_split` | Wrapper layout: `plain` or `byte_split`. |
+| `BLOOMBEE_LOSSLESS_SINGLE_PATH` | `1` | Choose one lossless layout up front instead of compressing both plain and byte-split candidates. |
 | `BLOOMBEE_LOSSLESS_LAYOUT_TARGETS` | `*:*:hidden_states` | `source:channel:tensor_name` selectors for `byte_split` layout. |
 | `BLOOMBEE_LOSSLESS_MIN_BYTES` | `49152` | Minimum serialized tensor size before the wrapper even tries to compress. |
 | `BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES` | `2048` | Minimum required byte savings, otherwise BloomBee keeps the original buffer. |
@@ -74,6 +75,7 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | Variable | Default | What it does |
 |---|---|---|
 | `BLOOMBEE_DUMP_ACTIVATIONS` | `0` | Enables server-side dumping of real intermediate activations. |
+| `BLOOMBEE_DUMP_WIRE_ACTIVATIONS` | `0` | Enables hidden_states dumps at wire serialization points for lossless codec benchmarks. |
 | `BLOOMBEE_ACTIVATION_DIR` | `/tmp/real_activations` | Output directory for activation dumps. |
 | `BLOOMBEE_ACTIVATION_SAMPLES` | `20` | Maximum number of captured activation samples. |
 | `BLOOMBEE_ACTIVATION_PHASES` | `prefill,decode` | Comma-separated phases to capture. |

@@ -79,6 +79,40 @@ def test_serialize_torch_tensor_byte_split_roundtrip(monkeypatch):
     assert torch.equal(restored, tensor)
 
 
+def test_byte_split_single_path_skips_plain_candidate(monkeypatch):
+    tensor = _make_split_friendly_fp16().contiguous()
+    debug_context = {
+        "phase": "decode",
+        "tensor_name": "hidden_states",
+        "source": "client",
+        "channel": "rpc_inference",
+    }
+
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "zstd")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "byte_split")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_SINGLE_PATH", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT_TARGETS", "*:*:hidden_states")
+    _clear_transport_caches()
+
+    def fail_plain(_raw):
+        raise AssertionError("plain zstd candidate should not run in single-path byte_split mode")
+
+    monkeypatch.setattr(lt, "_build_plain_wrapper", fail_plain)
+
+    serialized = lt.serialize_torch_tensor(
+        tensor,
+        runtime_pb2.CompressionType.NONE,
+        debug_context=debug_context,
+    )
+    parsed = lt._parse_wrapper(serialized.buffer)
+    assert parsed is not None
+    assert parsed[0] == lt._ALGO_ZSTD_BYTE_SPLIT
+    assert torch.equal(lt.deserialize_torch_tensor(serialized), tensor)
+
+
 def test_zipnn_compare_candidate_fp16(monkeypatch):
     tensor = _make_split_friendly_fp16().contiguous()
     debug_context = {

@@ -67,6 +67,7 @@ _WIRE_TRUNCATE_FP16_ENV = "BLOOMBEE_WIRE_TRUNCATE_FP16"
 _WIRE_TRUNCATE_TARGETS_ENV = "BLOOMBEE_WIRE_TRUNCATE_TARGETS"
 _WIRE_TRUNCATE_PHASES_ENV = "BLOOMBEE_WIRE_TRUNCATE_PHASES"
 _LOSSLESS_LAYOUT_ENV = "BLOOMBEE_LOSSLESS_LAYOUT"
+_LOSSLESS_SINGLE_PATH_ENV = "BLOOMBEE_LOSSLESS_SINGLE_PATH"
 _LOSSLESS_LAYOUT_TARGETS_ENV = "BLOOMBEE_LOSSLESS_LAYOUT_TARGETS"
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
@@ -162,6 +163,16 @@ def _lossless_layout() -> str:
     if _allow_env_override():
         cfg_val = os.environ.get(_LOSSLESS_LAYOUT_ENV, cfg_val)
     return str(cfg_val).strip().lower()
+
+
+def _lossless_single_path_enabled() -> bool:
+    cfg_val = _get_cfg("LOSSLESS_SINGLE_PATH", 1)
+    if _allow_env_override() and _LOSSLESS_SINGLE_PATH_ENV in os.environ:
+        return _get_env_bool(_LOSSLESS_SINGLE_PATH_ENV, "1")
+    try:
+        return bool(int(cfg_val))
+    except Exception:
+        return bool(cfg_val)
 
 
 def _lossless_min_bytes() -> int:
@@ -853,6 +864,9 @@ def _sample_fp_bit_profile(tensor: Optional[torch.Tensor], max_values: int = 409
         "fp_exp_zero_ratio": 0.0,
         "fp_exp_all_ones_ratio": 0.0,
         "fp_mantissa_zero_ratio": 0.0,
+        "fp_sign_entropy_bits": 0.0,
+        "fp_mantissa_low8_entropy_bits": 0.0,
+        "fp_mantissa_high_entropy_bits": 0.0,
         "fp_exp_topk": "",
     }
     if tensor is None or not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
@@ -885,12 +899,25 @@ def _sample_fp_bit_profile(tensor: Optional[torch.Tensor], max_values: int = 409
             exp_cardinality = 32
             exp_all_ones = 0x1F
             fp_bits = 16
+        elif sample.dtype == torch.bfloat16:
+            bits = sample.view(torch.int16).to(torch.int64) & 0xFFFF
+            sign = (bits >> 15) & 0x1
+            exponent = (bits >> 7) & 0xFF
+            mantissa = bits & 0x7F
+            exp_cardinality = 256
+            exp_all_ones = 0xFF
+            fp_bits = 16
         else:
-            # We only do exact bit-lane attribution for FP16/FP32.
+            # We only do exact bit-lane attribution for FP16/BF16/FP32.
             return profile
 
         exp_counts = torch.bincount(exponent.to(torch.int64), minlength=exp_cardinality)
         exp_total = int(exp_counts.sum().item())
+        sign_counts = torch.bincount(sign.to(torch.int64), minlength=2)
+        mantissa_low8 = mantissa & 0xFF
+        mantissa_high = mantissa >> 8
+        mantissa_low8_counts = torch.bincount(mantissa_low8.to(torch.int64), minlength=256)
+        mantissa_high_counts = torch.bincount(mantissa_high.to(torch.int64))
         exp_top_k = min(4, exp_cardinality)
         exp_top_vals, exp_top_idx = torch.topk(exp_counts, k=exp_top_k)
         exp_top_parts: List[str] = []
@@ -914,6 +941,9 @@ def _sample_fp_bit_profile(tensor: Optional[torch.Tensor], max_values: int = 409
                 "fp_exp_zero_ratio": float((exponent == 0).float().mean().item()),
                 "fp_exp_all_ones_ratio": float((exponent == exp_all_ones).float().mean().item()),
                 "fp_mantissa_zero_ratio": float((mantissa == 0).float().mean().item()),
+                "fp_sign_entropy_bits": _entropy_from_counts(sign_counts.tolist(), sample_n),
+                "fp_mantissa_low8_entropy_bits": _entropy_from_counts(mantissa_low8_counts.tolist(), sample_n),
+                "fp_mantissa_high_entropy_bits": _entropy_from_counts(mantissa_high_counts.tolist(), sample_n),
                 "fp_exp_topk": ",".join(exp_top_parts),
             }
         )
@@ -935,6 +965,11 @@ def _fp_layout_description(dtype: Optional[torch.dtype]) -> str:
         # lane0=b0 (mantissa bits 0..7)
         # lane1=b1 (mantissa bits 8..9 + exponent bits 0..4 + sign bit)
         return "fp16_le lanes:0=m[0:8],1=m[8:10]+e[0:5]+s"
+    if dtype == torch.bfloat16:
+        # For little-endian BF16 values:
+        # lane0=b0 (mantissa bits 0..6 + exponent bit 0)
+        # lane1=b1 (exponent bits 1..7 + sign bit)
+        return "bf16_le lanes:0=m[0:7]+e0,1=e[1:8]+s"
     return ""
 
 
@@ -1144,6 +1179,9 @@ def _log_comp_bit_event(
         f"fp_exp_zero_ratio={float(fp.get('fp_exp_zero_ratio', 0.0)):.6f} "
         f"fp_exp_all_ones_ratio={float(fp.get('fp_exp_all_ones_ratio', 0.0)):.6f} "
         f"fp_mantissa_zero_ratio={float(fp.get('fp_mantissa_zero_ratio', 0.0)):.6f} "
+        f"fp_sign_entropy_bits={float(fp.get('fp_sign_entropy_bits', 0.0)):.6f} "
+        f"fp_mantissa_low8_entropy_bits={float(fp.get('fp_mantissa_low8_entropy_bits', 0.0)):.6f} "
+        f"fp_mantissa_high_entropy_bits={float(fp.get('fp_mantissa_high_entropy_bits', 0.0)):.6f} "
         f"fp_exp_topk={fp.get('fp_exp_topk', '')}"
     )
     if debug_context:
@@ -1163,6 +1201,7 @@ def _log_comp_config_once() -> None:
         f"lossless_enabled={int(_lossless_send_enabled())} "
         f"algo={_lossless_algo()} "
         f"layout={_lossless_layout()} "
+        f"single_path={int(_lossless_single_path_enabled())} "
         f"detail={int(comp_detail_profile_enabled())} "
         f"bit={int(comp_bit_profile_enabled())} "
         f"stride={int(comp_stride_profile_enabled())} "
@@ -1203,6 +1242,77 @@ def _zipnn_dtype_name(tensor: Optional[torch.Tensor]) -> Optional[str]:
     if tensor.dtype == torch.float32:
         return "float32"
     return None
+
+
+def _zipnn_dtype_name_from_dtype(dtype: torch.dtype) -> Optional[str]:
+    if dtype == torch.float16:
+        return "float16"
+    if dtype == torch.bfloat16:
+        return "bfloat16"
+    if dtype == torch.float32:
+        return "float32"
+    return None
+
+
+def zipnn_oracle_roundtrip(
+    raw: bytes,
+    dtype: torch.dtype,
+    *,
+    level: Optional[int] = None,
+) -> Dict[str, object]:
+    """
+    Benchmark-only ZipNN oracle. This does not affect online wire selection.
+    """
+    info: Dict[str, object] = {
+        "available": int(_ZipNN is not None),
+        "supported": 0,
+        "roundtrip_ok": 0,
+        "reason": "zipnn_unavailable" if _ZipNN is None else "unsupported_dtype",
+        "dtype": str(dtype).replace("torch.", ""),
+        "raw_bytes": int(len(raw)),
+        "payload_bytes": 0,
+        "wire_bytes": 0,
+        "compress_ms": 0.0,
+        "decompress_ms": 0.0,
+        "payload": b"",
+        "restored": b"",
+    }
+    dtype_name = _zipnn_dtype_name_from_dtype(dtype)
+    if _ZipNN is None or dtype_name is None:
+        return info
+    if not _zipnn_lossless_dtype_supported(dtype_name):
+        info["reason"] = "lossless_verification_failed"
+        return info
+
+    compressor = _get_zipnn_compressor(dtype_name, int(level if level is not None else _lossless_level()))
+    decompressor = _get_zipnn_decompressor()
+    if compressor is None or decompressor is None:
+        info["reason"] = "zipnn_unavailable"
+        return info
+
+    info["supported"] = 1
+    try:
+        t0 = time.perf_counter()
+        payload = bytes(compressor.compress(raw))
+        info["compress_ms"] = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
+        restored = bytes(decompressor.decompress(payload))
+        info["decompress_ms"] = (time.perf_counter() - t0) * 1000.0
+    except Exception:
+        info["reason"] = "zipnn_failed"
+        return info
+
+    info.update(
+        {
+            "reason": "ok",
+            "roundtrip_ok": int(restored == raw),
+            "payload_bytes": int(len(payload)),
+            "wire_bytes": int(_HEADER_SIZE + len(payload)),
+            "payload": payload,
+            "restored": restored,
+        }
+    )
+    return info
 
 
 @lru_cache(maxsize=8)
@@ -1541,6 +1651,7 @@ def _log_comp_detail_event(
             f"lossless_reason={wrap_info.get('reason', 'unknown')} "
             f"lossless_algo={wrap_info.get('algo_name', _lossless_algo())} "
             f"lossless_layout={wrap_info.get('layout', 'plain')} "
+            f"lossless_single_path={int(wrap_info.get('single_path', int(_lossless_single_path_enabled())))} "
             f"lossless_raw_bytes={raw_len} "
             f"lossless_wire_bytes={wire_len} "
             f"lossless_saved_bytes={saved_bytes} "
@@ -1849,6 +1960,7 @@ def _wrap_serialized_tensor_impl(
         "plain_wrapped_bytes": 0,
         "byte_split_wrapped_bytes": 0,
         "zipnn_wrapped_bytes": 0,
+        "single_path": int(_lossless_single_path_enabled()),
     }
     wrap_t0 = time.perf_counter()
     try:
@@ -1883,18 +1995,31 @@ def _wrap_serialized_tensor_impl(
                 info["reason"] = _zipnn_skip_reason(tensor, compression_type, len(raw), debug_context)
                 return serialized_tensor, info
         else:
-            plain_algo_id, plain_wrapped = _build_plain_wrapper(raw)
-            if plain_algo_id != 0:
-                candidates.append(("plain", plain_algo_id, plain_wrapped))
-                info["plain_wrapped_bytes"] = int(len(plain_wrapped))
-
-            if _supports_byte_split_layout(tensor, compression_type, len(raw), debug_context):
+            supports_byte_split = _supports_byte_split_layout(tensor, compression_type, len(raw), debug_context)
+            if _lossless_single_path_enabled() and selected_algo == "zstd" and supports_byte_split:
                 try:
                     split_wrapped = _build_zstd_byte_split_wrapper(raw, elem_size=int(tensor.element_size()))
                     candidates.append(("byte_split", _ALGO_ZSTD_BYTE_SPLIT, split_wrapped))
                     info["byte_split_wrapped_bytes"] = int(len(split_wrapped))
                 except Exception:
                     info["byte_split_wrapped_bytes"] = 0
+                    plain_algo_id, plain_wrapped = _build_plain_wrapper(raw)
+                    if plain_algo_id != 0:
+                        candidates.append(("plain", plain_algo_id, plain_wrapped))
+                        info["plain_wrapped_bytes"] = int(len(plain_wrapped))
+            else:
+                plain_algo_id, plain_wrapped = _build_plain_wrapper(raw)
+                if plain_algo_id != 0:
+                    candidates.append(("plain", plain_algo_id, plain_wrapped))
+                    info["plain_wrapped_bytes"] = int(len(plain_wrapped))
+
+                if supports_byte_split:
+                    try:
+                        split_wrapped = _build_zstd_byte_split_wrapper(raw, elem_size=int(tensor.element_size()))
+                        candidates.append(("byte_split", _ALGO_ZSTD_BYTE_SPLIT, split_wrapped))
+                        info["byte_split_wrapped_bytes"] = int(len(split_wrapped))
+                    except Exception:
+                        info["byte_split_wrapped_bytes"] = 0
 
         info["compress_elapsed_ms"] = (time.perf_counter() - compress_t0) * 1000.0
         if not candidates:

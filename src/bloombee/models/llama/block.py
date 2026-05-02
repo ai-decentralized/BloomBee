@@ -966,7 +966,9 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
                 val_bhsd = value_states.permute(0, 2, 1)
 
             # Reshape into [B, H, S, D]
-            h = self.self_attn.num_key_value_heads
+            h = self._num_key_value_heads()
+            if batch_size > 0 and bh != batch_size * h and bh % batch_size == 0:
+                h = bh // batch_size
             d = self.self_attn.head_dim
             key_out = key_bhsd.view(batch_size, h, seq_length, d)
             val_out = val_bhsd.view(batch_size, h, seq_length, d)
@@ -974,12 +976,31 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         # Unexpected shapes; return as-is to avoid crashes
         return key_states, value_states
 
+    def _num_key_value_heads(self) -> int:
+        attn = self.self_attn
+        explicit = getattr(attn, "num_key_value_heads", None)
+        if explicit is not None:
+            return int(explicit)
+
+        config = getattr(attn, "config", None)
+        explicit = getattr(config, "num_key_value_heads", None)
+        if explicit is not None:
+            return int(explicit)
+
+        num_heads = getattr(attn, "num_heads", getattr(config, "num_attention_heads", None))
+        groups = getattr(attn, "num_key_value_groups", getattr(config, "num_key_value_groups", None))
+        if num_heads is not None and groups is not None:
+            return int(num_heads) // int(groups)
+        if num_heads is not None:
+            return int(num_heads)
+        raise AttributeError("Cannot infer LLaMA num_key_value_heads from self_attn")
+
     def _reorder_cache_from_llama_to_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
         key_states, value_states = key_value
         value_states = value_states.view(
-            batch_size * self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
+            batch_size * self._num_key_value_heads(), seq_length, self.self_attn.head_dim
         )
         key_states = key_states.view(*value_states.shape)
         key_states = key_states.permute(0, 2, 1)
