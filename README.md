@@ -125,6 +125,18 @@ cd BloomBee
 pip install .
 ```
 
+#### P100 / CUDA 12 Chameleon Hosts
+
+Pascal GPUs such as Tesla P100 need a PyTorch wheel that still supports SM 6.0 and matches the host driver. If `nvidia-smi` sees the GPU but `torch.cuda.is_available()` is `False`, install the P100-compatible wheel before installing BloomBee:
+
+```bash
+conda activate bb
+bash scripts/install_p100_torch.sh
+pip install -e .
+```
+
+This avoids accidentally installing CUDA 13 PyTorch wheels on Chameleon images whose drivers support CUDA 12.x.
+
 ---
 
 ## Quick Start

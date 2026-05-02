@@ -49,6 +49,7 @@ from bloombee.server.throughput import get_dtype_name, get_server_throughput
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.server.speculative_pruner.utils import PruningConfig, PruningMethod
 from bloombee.utils.auto_config import AutoDistributedConfig
+from bloombee.utils.cuda_compat import get_cuda_unavailable_diagnostic
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
 from bloombee.utils.misc import get_size_in_bytes
@@ -215,6 +216,9 @@ class Server:
             elif torch.backends.mps.is_available():
                 device = "mps"
             else:
+                cuda_diagnostic = get_cuda_unavailable_diagnostic()
+                if cuda_diagnostic:
+                    logger.warning(cuda_diagnostic)
                 device = "cpu"
         device = torch.device(device)
         if device.type == "cuda" and device.index is None:
@@ -425,9 +429,11 @@ class Server:
         mbpipe_log_config(logger, context="Server.__init__")
 
     def _choose_num_blocks(self) -> int:
+        cuda_diagnostic = get_cuda_unavailable_diagnostic() or ""
         assert self.device.type in ("cuda", "mps"), (
             "GPU is not available. If you want to run a CPU-only server, please specify --num_blocks. "
             "CPU-only servers in the public swarm are discouraged since they are much slower"
+            + (f"\n\n{cuda_diagnostic}" if cuda_diagnostic else "")
         )
         num_devices = len(self.tensor_parallel_devices) if self.tensor_parallel_devices else 1
 
