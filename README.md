@@ -8,6 +8,7 @@
     <a href="https://github.com/ai-decentralized/bloombee/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ai-decentralized/bloombee?color=blue"></a>
     <a href="https://pypi.org/project/bloombee/"><img src="https://img.shields.io/pypi/pyversions/bloombee"></a>
     <a href="https://pypi.org/project/bloombee/"><img src="https://img.shields.io/pypi/dm/bloombee?label=Downloads"></a>
+    <a href="https://arxiv.org/abs/2604.21072"><img src="https://img.shields.io/badge/arXiv-2604.21072-b31b1b.svg"></a>
     <a href="https://github.com/ai-decentralized/bloombee"><img src="https://img.shields.io/github/stars/ai-decentralized/bloombee?style=social"></a>
 </p>
 
@@ -55,6 +56,7 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 - [Benchmarking](#benchmarking)
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
+- [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
 
 ---
@@ -387,6 +389,23 @@ Jupyter notebook examples are in the `examples/` directory:
 ---
 ## Contribution
 Bloombee is mainly developed by [PASA Lab](https://www.pasalabs.org/) at University of California Merced with significant supports from [Yotta Labs](https://www.yottalabs.ai/) and College of William&Mary. We welcome and appreciate any contribution to this open-source project.
+
+
+## Citation
+
+If you find BloomBee useful in your research, please cite our paper:
+
+```bibtex
+@misc{bloombee2026,
+      title={Distributed Generative Inference of LLM at Internet Scales with Multi-Dimensional Communication Optimization}, 
+      author={Jiu Chen and Shuangyan Yang and Xu Xiong and Hexiao Duan and Xinran Zhang and Jie Ren and Dong Li},
+      year={2026},
+      eprint={2604.21072},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2604.21072}, 
+}
+```
 
 
 ## Acknowledgements
