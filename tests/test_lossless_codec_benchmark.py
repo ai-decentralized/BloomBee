@@ -57,6 +57,44 @@ def test_phase2c_fp16_candidates_roundtrip_dump_shapes(shape):
         assert result.wire_bytes > 0
 
 
+@pytest.mark.parametrize("shape", [(1, 1, 32), (1, 6, 32), (2, 7, 33)])
+def test_phase2e_axis_and_selective_candidates_roundtrip(shape):
+    bench = _load_benchmark_module()
+    tensor = torch.randn(*shape, dtype=torch.float16)
+    raw = bench.tensor_to_raw_bytes(tensor)
+    for codec in (
+        "sample_guided_selective_byte_split_zstd",
+        "axis_transpose_byte_split_zstd",
+        "blocked_axis_byte_split_zstd_32",
+        "blocked_axis_byte_split_zstd_64",
+        "blocked_axis_byte_split_zstd_128",
+    ):
+        result = bench.CODEC_FUNCS[codec](raw, repeat=1, level=1, dtype=torch.float16, shape=shape)
+        assert result.available == 1
+        assert result.roundtrip_ok == 1
+        assert result.raw_bytes == len(raw)
+        assert result.wire_bytes > 0
+
+
+def test_phase2e_zstd_dict_candidate_roundtrip(tmp_path):
+    bench = _load_benchmark_module()
+    samples = []
+    metadata = []
+    for idx in range(8):
+        tensor = torch.randn(1, 16, 512, dtype=torch.float16)
+        path = tmp_path / f"sample_{idx}.pt"
+        torch.save(tensor, path)
+        samples.append(path)
+        metadata.append({"filename": path.name, "phase": "prefill", "direction": "client_to_server"})
+    (tmp_path / "metadata.json").write_text(json.dumps({"samples": metadata}))
+
+    rows = bench.run_benchmark(tmp_path, ["zstd_dict_byte_split_zstd"], repeat=1, level=1)
+
+    assert len(rows) == len(samples)
+    assert all(int(row["available"]) == 1 for row in rows)
+    assert all(int(row["roundtrip_ok"]) == 1 for row in rows)
+
+
 def test_phase2c_candidates_roundtrip_real_dump_if_available():
     bench = _load_benchmark_module()
     dump_dir = Path("/home/cc/bloombee-runs/phase2b_llama13b_wire_20260502_052021/wire_activations")
@@ -77,6 +115,9 @@ def test_phase2c_candidates_roundtrip_real_dump_if_available():
         for codec in (
             "byte_split_zstd_high_raw_low",
             "byte_split_selective_zstd",
+            "sample_guided_selective_byte_split_zstd",
+            "axis_transpose_byte_split_zstd",
+            "blocked_axis_byte_split_zstd_64",
             "token_xor_byte_split_zstd",
             "token_xor_zstd_high_raw_low",
         ):

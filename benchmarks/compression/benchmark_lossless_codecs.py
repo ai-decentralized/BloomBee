@@ -35,6 +35,12 @@ DEFAULT_CODECS = (
     "bit_group_zstd",
     "byte_split_zstd_high_raw_low",
     "byte_split_selective_zstd",
+    "sample_guided_selective_byte_split_zstd",
+    "axis_transpose_byte_split_zstd",
+    "blocked_axis_byte_split_zstd_32",
+    "blocked_axis_byte_split_zstd_64",
+    "blocked_axis_byte_split_zstd_128",
+    "zstd_dict_byte_split_zstd",
     "token_xor_byte_split_zstd",
     "token_xor_zstd_high_raw_low",
     "adaptive_selector",
@@ -159,6 +165,13 @@ def zstd_decompress(payload: bytes, repeat: int) -> tuple[bytes, float]:
 
 SELECTIVE_MODE_HEADER_BYTES = 1
 TOKEN_XOR_PAYLOAD_HEADER_BYTES = 8
+AXIS_LAYOUT_HEADER_BYTES = 8
+ZSTD_DICT_ID_HEADER_BYTES = 4
+SAMPLE_GUIDED_LOW_SAMPLE_BYTES = 64 * 1024
+SAMPLE_GUIDED_LOW_RATIO_THRESHOLD = 0.98
+ZSTD_DICT_SIZE_BYTES = 64 * 1024
+ZSTD_DICT_CHUNK_BYTES = 16 * 1024
+_ZSTD_DICT = None
 
 
 def codec_raw(
@@ -385,6 +398,232 @@ def codec_byte_split_selective_zstd(
         dtype,
         compress_remaining=False,
         probe_remaining=True,
+    )
+
+
+def _shape3(shape: Optional[Sequence[int]]) -> Optional[tuple[int, int, int]]:
+    if not shape or len(shape) != 3:
+        return None
+    b, t, h = (int(dim) for dim in shape)
+    if b <= 0 or t <= 0 or h <= 0:
+        return None
+    return b, t, h
+
+
+def _axis_transpose_lane(lane: bytes, shape: tuple[int, int, int]) -> bytes:
+    b, t, h = shape
+    arr = np.frombuffer(lane, dtype=np.uint8).reshape(b, t, h)
+    return np.ascontiguousarray(arr.transpose(0, 2, 1)).tobytes()
+
+
+def _axis_untranspose_lane(lane: bytes, shape: tuple[int, int, int]) -> bytes:
+    b, t, h = shape
+    arr = np.frombuffer(lane, dtype=np.uint8).reshape(b, h, t)
+    return np.ascontiguousarray(arr.transpose(0, 2, 1)).tobytes()
+
+
+def _blocked_axis_transpose_lane(lane: bytes, shape: tuple[int, int, int], block: int) -> bytes:
+    b, t, h = shape
+    arr = np.frombuffer(lane, dtype=np.uint8).reshape(b, t, h)
+    chunks = [
+        np.ascontiguousarray(arr[:, :, start : min(start + block, h)].transpose(0, 2, 1)).reshape(-1)
+        for start in range(0, h, block)
+    ]
+    return np.concatenate(chunks).tobytes() if chunks else b""
+
+
+def _blocked_axis_untranspose_lane(lane: bytes, shape: tuple[int, int, int], block: int) -> bytes:
+    b, t, h = shape
+    out = np.empty((b, t, h), dtype=np.uint8)
+    offset = 0
+    for start in range(0, h, block):
+        width = min(block, h - start)
+        size = b * width * t
+        chunk = np.frombuffer(lane, dtype=np.uint8, count=size, offset=offset).reshape(b, width, t)
+        out[:, :, start : start + width] = chunk.transpose(0, 2, 1)
+        offset += size
+    return np.ascontiguousarray(out).tobytes()
+
+
+def _axis_layout_byte_split_result(
+    codec_name: str,
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]],
+    *,
+    block: Optional[int] = None,
+) -> CodecResult:
+    shape3 = _shape3(shape)
+    if dtype != torch.float16:
+        return CodecResult(codec_name, 0, "unsupported_dtype", 0, len(raw), len(raw), 0.0, 0.0, str(level))
+    if shape3 is None:
+        return CodecResult(codec_name, 0, "unsupported_shape", 0, len(raw), len(raw), 0.0, 0.0, str(level))
+    if zstd is None:
+        return CodecResult(codec_name, 0, "zstd_unavailable", 0, len(raw), len(raw), 0.0, 0.0, str(level))
+
+    def transform_lane(lane: bytes) -> bytes:
+        if block is None:
+            return _axis_transpose_lane(lane, shape3)
+        return _blocked_axis_transpose_lane(lane, shape3, block)
+
+    def inverse_lane(lane: bytes) -> bytes:
+        if block is None:
+            return _axis_untranspose_lane(lane, shape3)
+        return _blocked_axis_untranspose_lane(lane, shape3, block)
+
+    def compress_once():
+        high_raw, low_raw = lt._split_high_byte_lane(raw, 2)
+        compressor = zstd.ZstdCompressor(level=level)
+        high_payload = bytes(compressor.compress(transform_lane(high_raw)))
+        low_payload = bytes(compressor.compress(transform_lane(low_raw)))
+        return high_payload, low_payload
+
+    (high_payload, low_payload), compress_ms = timed_median(compress_once, repeat)
+
+    def decompress_once():
+        lane_size = len(raw) // 2
+        decompressor = zstd.ZstdDecompressor()
+        high_axis = decompressor.decompress(high_payload, max_output_size=lane_size)
+        low_axis = decompressor.decompress(low_payload, max_output_size=lane_size)
+        high_raw = inverse_lane(bytes(high_axis))
+        low_raw = inverse_lane(bytes(low_axis))
+        return lt._reconstruct_high_byte_lane(high_raw, low_raw, 2, len(raw))
+
+    restored, decompress_ms = timed_median(decompress_once, repeat)
+    return CodecResult(
+        codec_name,
+        1,
+        "ok",
+        int(restored == raw),
+        len(raw),
+        BBLC_HEADER_BYTES + BYTE_SPLIT_PAYLOAD_HEADER_BYTES + AXIS_LAYOUT_HEADER_BYTES + len(high_payload) + len(low_payload),
+        compress_ms,
+        decompress_ms,
+        str(level),
+    )
+
+
+def codec_axis_transpose_byte_split_zstd(
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]] = None,
+) -> CodecResult:
+    return _axis_layout_byte_split_result("axis_transpose_byte_split_zstd", raw, repeat, level, dtype, shape)
+
+
+def _blocked_axis_codec(
+    codec_name: str,
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]],
+    block: int,
+) -> CodecResult:
+    return _axis_layout_byte_split_result(codec_name, raw, repeat, level, dtype, shape, block=block)
+
+
+def codec_blocked_axis_byte_split_zstd(
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]] = None,
+) -> CodecResult:
+    return _blocked_axis_codec("blocked_axis_byte_split_zstd", raw, repeat, level, dtype, shape, 64)
+
+
+def codec_blocked_axis_byte_split_zstd_32(
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]] = None,
+) -> CodecResult:
+    return _blocked_axis_codec("blocked_axis_byte_split_zstd_32", raw, repeat, level, dtype, shape, 32)
+
+
+def codec_blocked_axis_byte_split_zstd_64(
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]] = None,
+) -> CodecResult:
+    return _blocked_axis_codec("blocked_axis_byte_split_zstd_64", raw, repeat, level, dtype, shape, 64)
+
+
+def codec_blocked_axis_byte_split_zstd_128(
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]] = None,
+) -> CodecResult:
+    return _blocked_axis_codec("blocked_axis_byte_split_zstd_128", raw, repeat, level, dtype, shape, 128)
+
+
+def codec_sample_guided_selective_byte_split_zstd(
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]] = None,
+) -> CodecResult:
+    if dtype not in (torch.float16, torch.float32):
+        return CodecResult("sample_guided_selective_byte_split_zstd", 0, "unsupported_dtype", 0, len(raw), len(raw), 0.0, 0.0, str(level))
+    if zstd is None:
+        return CodecResult("sample_guided_selective_byte_split_zstd", 0, "zstd_unavailable", 0, len(raw), len(raw), 0.0, 0.0, str(level))
+    elem_size = torch.empty((), dtype=dtype).element_size()
+
+    def compress_once():
+        high_raw, low_raw = lt._split_high_byte_lane(raw, elem_size)
+        compressor = zstd.ZstdCompressor(level=level)
+        high_payload = bytes(compressor.compress(high_raw))
+        sample = low_raw[: min(SAMPLE_GUIDED_LOW_SAMPLE_BYTES, len(low_raw))]
+        sample_payload = bytes(compressor.compress(sample))
+        use_low_zstd = len(sample_payload) < int(len(sample) * SAMPLE_GUIDED_LOW_RATIO_THRESHOLD)
+        if use_low_zstd:
+            low_payload = sample_payload if len(sample) == len(low_raw) else bytes(compressor.compress(low_raw))
+        else:
+            low_payload = low_raw
+        return high_payload, low_payload, use_low_zstd
+
+    (high_payload, low_payload, low_is_zstd), compress_ms = timed_median(compress_once, repeat)
+
+    def decompress_once():
+        high_raw_size = len(raw) // elem_size
+        decompressor = zstd.ZstdDecompressor()
+        high_raw = decompressor.decompress(high_payload, max_output_size=high_raw_size)
+        if low_is_zstd:
+            low_raw_size = len(raw) - high_raw_size
+            low_raw = decompressor.decompress(low_payload, max_output_size=low_raw_size)
+        else:
+            low_raw = low_payload
+        return lt._reconstruct_high_byte_lane(bytes(high_raw), bytes(low_raw), elem_size, len(raw))
+
+    restored, decompress_ms = timed_median(decompress_once, repeat)
+    wire_bytes = (
+        BBLC_HEADER_BYTES
+        + BYTE_SPLIT_PAYLOAD_HEADER_BYTES
+        + SELECTIVE_MODE_HEADER_BYTES
+        + len(high_payload)
+        + len(low_payload)
+    )
+    return CodecResult(
+        "sample_guided_selective_byte_split_zstd",
+        1,
+        "ok",
+        int(restored == raw),
+        len(raw),
+        wire_bytes,
+        compress_ms,
+        decompress_ms,
+        str(level),
     )
 
 
@@ -678,6 +917,93 @@ def codec_zipnn(
     )
 
 
+def _iter_zstd_dict_chunks(samples: Sequence[TensorSample]) -> List[bytes]:
+    chunks: List[bytes] = []
+    for sample in samples:
+        dtype = sample.tensor.dtype
+        if dtype not in (torch.float16, torch.float32):
+            continue
+        raw = tensor_to_raw_bytes(sample.tensor)
+        elem_size = torch.empty((), dtype=dtype).element_size()
+        try:
+            lanes = lt._split_high_byte_lane(raw, elem_size)
+        except Exception:
+            continue
+        for lane in lanes:
+            for offset in range(0, len(lane), ZSTD_DICT_CHUNK_BYTES):
+                chunk = lane[offset : offset + ZSTD_DICT_CHUNK_BYTES]
+                if len(chunk) >= 1024:
+                    chunks.append(chunk)
+    return chunks
+
+
+def configure_zstd_dict_from_samples(samples: Sequence[TensorSample]) -> bool:
+    global _ZSTD_DICT
+    _ZSTD_DICT = None
+    if zstd is None:
+        return False
+    chunks = _iter_zstd_dict_chunks(samples)
+    total = sum(len(chunk) for chunk in chunks)
+    if len(chunks) < 8 or total < 8192:
+        return False
+    dict_size = min(ZSTD_DICT_SIZE_BYTES, max(1024, total // 8))
+    try:
+        _ZSTD_DICT = zstd.train_dictionary(dict_size, chunks)
+    except Exception:
+        _ZSTD_DICT = None
+    return _ZSTD_DICT is not None
+
+
+def codec_zstd_dict_byte_split_zstd(
+    raw: bytes,
+    repeat: int,
+    level: int,
+    dtype: torch.dtype,
+    shape: Optional[Sequence[int]] = None,
+) -> CodecResult:
+    if dtype not in (torch.float16, torch.float32):
+        return CodecResult("zstd_dict_byte_split_zstd", 0, "unsupported_dtype", 0, len(raw), len(raw), 0.0, 0.0, str(level))
+    if zstd is None:
+        return CodecResult("zstd_dict_byte_split_zstd", 0, "zstd_unavailable", 0, len(raw), len(raw), 0.0, 0.0, str(level))
+    if _ZSTD_DICT is None:
+        return CodecResult("zstd_dict_byte_split_zstd", 0, "dict_unavailable", 0, len(raw), len(raw), 0.0, 0.0, str(level))
+    elem_size = torch.empty((), dtype=dtype).element_size()
+
+    def compress_once():
+        high_raw, low_raw = lt._split_high_byte_lane(raw, elem_size)
+        compressor = zstd.ZstdCompressor(level=level, dict_data=_ZSTD_DICT)
+        high_payload = bytes(compressor.compress(high_raw))
+        low_payload = bytes(compressor.compress(low_raw))
+        return high_payload, low_payload
+
+    (high_payload, low_payload), compress_ms = timed_median(compress_once, repeat)
+
+    def decompress_once():
+        high_raw_size = len(raw) // elem_size
+        low_raw_size = len(raw) - high_raw_size
+        decompressor = zstd.ZstdDecompressor(dict_data=_ZSTD_DICT)
+        high_raw = decompressor.decompress(high_payload, max_output_size=high_raw_size)
+        low_raw = decompressor.decompress(low_payload, max_output_size=low_raw_size)
+        return lt._reconstruct_high_byte_lane(bytes(high_raw), bytes(low_raw), elem_size, len(raw))
+
+    restored, decompress_ms = timed_median(decompress_once, repeat)
+    return CodecResult(
+        "zstd_dict_byte_split_zstd",
+        1,
+        "ok",
+        int(restored == raw),
+        len(raw),
+        BBLC_HEADER_BYTES
+        + BYTE_SPLIT_PAYLOAD_HEADER_BYTES
+        + ZSTD_DICT_ID_HEADER_BYTES
+        + len(high_payload)
+        + len(low_payload),
+        compress_ms,
+        decompress_ms,
+        str(level),
+    )
+
+
 CODEC_FUNCS = {
     "raw": codec_raw,
     "plain_zstd": codec_plain_zstd,
@@ -687,6 +1013,13 @@ CODEC_FUNCS = {
     "bit_group_zstd": codec_bit_group_zstd,
     "byte_split_zstd_high_raw_low": codec_byte_split_zstd_high_raw_low,
     "byte_split_selective_zstd": codec_byte_split_selective_zstd,
+    "sample_guided_selective_byte_split_zstd": codec_sample_guided_selective_byte_split_zstd,
+    "axis_transpose_byte_split_zstd": codec_axis_transpose_byte_split_zstd,
+    "blocked_axis_byte_split_zstd": codec_blocked_axis_byte_split_zstd,
+    "blocked_axis_byte_split_zstd_32": codec_blocked_axis_byte_split_zstd_32,
+    "blocked_axis_byte_split_zstd_64": codec_blocked_axis_byte_split_zstd_64,
+    "blocked_axis_byte_split_zstd_128": codec_blocked_axis_byte_split_zstd_128,
+    "zstd_dict_byte_split_zstd": codec_zstd_dict_byte_split_zstd,
     "token_xor_byte_split_zstd": codec_token_xor_byte_split_zstd,
     "token_xor_zstd_high_raw_low": codec_token_xor_zstd_high_raw_low,
 }
@@ -822,7 +1155,10 @@ def run_benchmark(
     shapes: Optional[set[str]] = None,
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
-    for sample in iter_samples(input_dir, phases=phases, directions=directions, channels=channels, shapes=shapes):
+    samples = list(iter_samples(input_dir, phases=phases, directions=directions, channels=channels, shapes=shapes))
+    if "zstd_dict_byte_split_zstd" in codecs:
+        configure_zstd_dict_from_samples(samples)
+    for sample in samples:
         for result in benchmark_sample(sample, codecs, repeat, level):
             rows.append(row_from_result(sample, result))
     return rows

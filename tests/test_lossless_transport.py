@@ -13,6 +13,9 @@ def _clear_transport_caches() -> None:
     lt._get_zipnn_compressor.cache_clear()
     lt._get_zipnn_decompressor.cache_clear()
     lt._zipnn_lossless_dtype_supported.cache_clear()
+    lt._get_zstd_dict.cache_clear()
+    lt._get_zstd_dict_compressor_cached.cache_clear()
+    lt._get_zstd_dict_decompressor_cached.cache_clear()
 
 
 def _make_split_friendly_fp16(shape=(64, 1, 1024)) -> torch.Tensor:
@@ -178,3 +181,56 @@ def test_serialize_torch_tensor_zipnn_roundtrip(monkeypatch):
 
     restored = lt.deserialize_torch_tensor(serialized)
     assert torch.equal(restored, tensor)
+
+
+def test_adaptive_hybrid_routes_dict_only_for_first_prefill_stage(monkeypatch):
+    tensor = _make_split_friendly_fp16().contiguous()
+
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "adaptive_hybrid")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "byte_split")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT_TARGETS", "*:*:hidden_states")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS", "0:20")
+    _clear_transport_caches()
+
+    raw_size = tensor.numel() * tensor.element_size()
+
+    def fake_dict_wrapper(_raw, *, elem_size):
+        assert elem_size == tensor.element_size()
+        return lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZSTD_DICT_BYTE_SPLIT, raw_size) + b"d"
+
+    def fake_zipnn_wrapper(_raw, *, tensor):
+        return lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZIPNN, raw_size) + b"z"
+
+    monkeypatch.setattr(lt, "_build_zstd_dict_byte_split_wrapper", fake_dict_wrapper)
+    monkeypatch.setattr(lt, "_build_zipnn_wrapper", fake_zipnn_wrapper)
+    monkeypatch.setattr(lt, "_supports_zipnn_transport", lambda *args, **kwargs: True)
+
+    first_stage = {
+        "phase": "prefill",
+        "tensor_name": "hidden_states",
+        "source": "client",
+        "channel": "rpc_inference",
+        "blocks": "0:20",
+    }
+    serialized = lt.serialize_torch_tensor(
+        tensor,
+        runtime_pb2.CompressionType.NONE,
+        debug_context=first_stage,
+    )
+    parsed = lt._parse_wrapper(serialized.buffer)
+    assert parsed is not None
+    assert parsed[0] == lt._ALGO_ZSTD_DICT_BYTE_SPLIT
+
+    later_stage = dict(first_stage)
+    later_stage["blocks"] = "20:40"
+    serialized = lt.serialize_torch_tensor(
+        tensor,
+        runtime_pb2.CompressionType.NONE,
+        debug_context=later_stage,
+    )
+    parsed = lt._parse_wrapper(serialized.buffer)
+    assert parsed is not None
+    assert parsed[0] == lt._ALGO_ZIPNN
