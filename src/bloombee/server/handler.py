@@ -416,6 +416,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._mb_received: Dict[tuple, int] = {}
         # Key: (session_id, step_id) -> set of (mb_idx) already processed (idempotency)
         self._mb_processed: Dict[tuple, set] = {}
+        self._mb_processed_timestamps: Dict[tuple, float] = {}
+        self._MB_PROCESSED_TTL = 120  # seconds
         # Feature flag for immediate queuing - ENABLED for cross-stage pipeline overlap
         self._enable_immediate_mb_queue = os.environ.get(
             "BLOOMBEE_ENABLE_IMMEDIATE_MB_QUEUE", "1"
@@ -1948,6 +1950,14 @@ class TransformerConnectionHandler(ConnectionHandler):
         # [MBPIPE] Idempotency check - skip if already processed
         if mb_key not in self._mb_processed:
             self._mb_processed[mb_key] = set()
+            self._mb_processed_timestamps[mb_key] = time.monotonic()
+            # TTL cleanup: remove stale entries
+            now = time.monotonic()
+            stale_keys = [k for k, t in self._mb_processed_timestamps.items()
+                          if now - t > self._MB_PROCESSED_TTL]
+            for k in stale_keys:
+                self._mb_processed.pop(k, None)
+                self._mb_processed_timestamps.pop(k, None)
         
         if mb_idx in self._mb_processed[mb_key]:
             logger.info(
@@ -2124,6 +2134,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 self._mb_expected.pop(mb_key, None)
                 self._mb_received.pop(mb_key, None)
                 self._mb_processed.pop(mb_key, None)
+                self._mb_processed_timestamps.pop(mb_key, None)
         else:
             # ========== LEGACY PATH (wait-all-then-assemble) ==========
             logger.info(
@@ -2148,6 +2159,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     self._mb_expected.pop(mb_key, None)
                     self._mb_received.pop(mb_key, None)
                     self._mb_processed.pop(mb_key, None)
+                    self._mb_processed_timestamps.pop(mb_key, None)
         
         return runtime_pb2.ExpertResponse()
 

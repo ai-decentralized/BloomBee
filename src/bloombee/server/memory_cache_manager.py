@@ -55,6 +55,9 @@ class KVCacheManager:
         # truth in both modes.
         self._paged_kv_enabled = _is_paged_kv_enabled()
         self._reorder_executor = ThreadPoolExecutor(max_workers=1)
+        self._reorder_futures = []
+        self._reorder_lock = threading.Lock()
+        self._reorder_worker_state = threading.local()
         
         # [KVCACHE_OFFLOAD] Micro-batch level memory reuse state
         # Since all blocks share one KVCacheManager, staging must be keyed by:
@@ -136,6 +139,28 @@ class KVCacheManager:
             "staging_peak_bytes": 0,
         }
         self._staging_bytes = {}  # {(cache_id, mb_index): bytes}
+
+    def _drain_reorder_tasks(self):
+        """Wait for pending async reorder tasks before external cache reads."""
+        if getattr(self._reorder_worker_state, "in_reorder", False):
+            return
+
+        while True:
+            with self._reorder_lock:
+                futures = self._reorder_futures
+                self._reorder_futures = []
+            if not futures:
+                return
+            for future in futures:
+                future.result()
+
+    def _run_reorder_task(self, start_event: threading.Event, *args):
+        start_event.wait()
+        self._reorder_worker_state.in_reorder = True
+        try:
+            return self._do_reorder_task(*args)
+        finally:
+            self._reorder_worker_state.in_reorder = False
         
     def _get_active_cache_slot_id(self) -> Optional[int]:
         """Return a stable identifier for currently active cache tensors."""
@@ -650,6 +675,7 @@ class KVCacheManager:
             full_batch_size: Total batch size (0 = no micro-batch, read entire cache)
             micro_batch_size: Actual size of this micro-batch (0 = use full_batch_size - batch_offset)
         """
+        self._drain_reorder_tasks()
         if cache_tensors is None:
             assert self._active_cache_tensors_stack, "write_pkv_cache called outside of use_cache context"
             cache_tensors = self._active_cache_tensors_stack[-1]  # TorchTensor
@@ -1829,6 +1855,7 @@ class KVCacheManager:
         """
         为 reorder 准备：取出所有 batch 需要的 positions 的并集
         """
+        self._drain_reorder_tasks()
         assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
         
         cache_tensors = self._active_cache_tensors_stack[-1]
@@ -1888,6 +1915,7 @@ class KVCacheManager:
             v_pkv: (B, H, cache_len, D)
             cache_len: 取出的 cache 长度
         """
+        self._drain_reorder_tasks()
         if cache_tensors is None:
             assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
             cache_tensors = self._active_cache_tensors_stack[-1]
@@ -2018,9 +2046,11 @@ class KVCacheManager:
         micro_batch_size: int = 0,
     ) -> None:
         cache_manager = self
+        start_event = threading.Event()
         
-        self._reorder_executor.submit(
-            self._do_reorder_task,
+        future = self._reorder_executor.submit(
+            self._run_reorder_task,
+            start_event,
             new_kvs,
             kv_cache_position_ids,
             cache_tensors,
@@ -2029,6 +2059,9 @@ class KVCacheManager:
             micro_batch_size,
             cache_manager,
         )
+        with self._reorder_lock:
+            self._reorder_futures.append(future)
+        start_event.set()
         
     def _do_reorder_task(
         self,
@@ -2155,6 +2188,6 @@ class KVCacheManager:
                     l_acc_target=cache_len, cache_tensors=cache_tensors,
                 )
 
-        except Exception as e:
-            import logging
-            logging.error(f"Async cache reorder failed: {e}")
+        except Exception:
+            logger.exception("Async cache reorder failed")
+            raise

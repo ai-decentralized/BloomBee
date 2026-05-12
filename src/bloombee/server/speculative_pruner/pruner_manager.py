@@ -159,8 +159,7 @@ class SpeculativePrunerManager:
         self.pruned_tokens += len(results['prune_indices'])
         
         # Calculate speedup
-        if self.total_tokens > 0:
-            keep_rate = 1.0 - (self.pruned_tokens / self.total_tokens)
+        keep_rate = 1.0 - (self.pruned_tokens / self.total_tokens) if self.total_tokens > 0 else 1.0
         
         # Add manager-level metrics
         results['manager_metrics'] = {

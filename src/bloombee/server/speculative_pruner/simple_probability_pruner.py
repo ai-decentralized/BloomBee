@@ -216,6 +216,10 @@ class SimpleProbabilityPruner(PrunerInterface):
         # 计算有效长度
         valid_lengths = (padded_keep_indices >= 0).sum(dim=1)  # [B]
         
+        # Update statistics
+        self.total_branches += seq_len * batch_size
+        self.pruned_branches += sum(len(indices) for indices in batch_prune_indices)
+
         return {
             'keep_indices': padded_keep_indices,  # [B, max_keep_len]，padding 为 -1
             'prune_indices': padded_prune_indices,  # [B, max_prune_len]，padding 为 -1

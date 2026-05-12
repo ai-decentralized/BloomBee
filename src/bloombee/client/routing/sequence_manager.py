@@ -403,7 +403,7 @@ class RemoteSequenceManager:
             last_servers = [span.peer_id for span in self.state.sequence_info.spans_containing_block[-1]]
 
         pinged_servers = set(sample_up_to(first_servers, self.config.max_pinged))
-        pinged_servers = set(sample_up_to(middle_servers, self.config.max_pinged))
+        pinged_servers |= set(sample_up_to(middle_servers, self.config.max_pinged))
         pinged_servers |= set(sample_up_to(last_servers, self.config.max_pinged))
         self.ping_aggregator.ping(list(pinged_servers), wait_timeout=self.config.ping_timeout)
 
@@ -431,9 +431,8 @@ class RemoteSequenceManager:
     def __len__(self):
         return len(self.block_uids)
 
-    @property
     def is_alive(self):
-        return self._thread.is_alive
+        return self._thread.is_alive()
 
     @property
     def ready(self) -> threading.Event:
