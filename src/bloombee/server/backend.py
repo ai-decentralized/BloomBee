@@ -533,6 +533,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # Centralized select: aggregate + reorder + slice
                 # [MERGED] Speculative decoding flow with micro-batch support
                 kv_cache_position_ids = inference_info.kv_cache_position_ids
+                self.cache_manager.wait_for_pending_reorder()
                 
                 logger.debug(f"[MB_DEBUG] backend.inference_step: uid={inference_info.uid}, "
                             f"batch_offset={inference_info.batch_offset}, "
@@ -1019,17 +1020,21 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 )
             valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
 
-            # kv_cache_position_ids stores the positions that are already present in
-            # cache after the previous speculative verification step. The next tree
-            # should therefore start right after the largest valid cached position.
-            # Using root_position + valid_count underestimates the base when previous
-            # accepted positions are sparse after pruning.
-            max_positions = torch.where(
-                valid_mask,
-                kv_cache_position_ids,
-                torch.full_like(kv_cache_position_ids, -1),
-            ).max(dim=1).values
-            base_positions = max_positions + 1
+            has_valid = valid_mask.any(dim=1)
+            first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+            batch_idx = torch.arange(B, device=device)
+            root_positions = torch.where(
+                has_valid,
+                kv_cache_position_ids[batch_idx, first_valid_idx],
+                prefill_length.to(device),
+            )
+            accepted_counts = valid_mask.to(torch.long).sum(dim=1)
+            # The cache ids are physical slots in the sparse tree layout, because
+            # attention must read the accepted draft nodes from their original
+            # locations. RoPE positions are logical sequence positions, so the
+            # next root starts after root + accepted draft tokens, not after the
+            # largest sparse slot.
+            base_positions = root_positions + accepted_counts
 
             if tree_attention_mask is not None and cache_len is not None and target_seq_len is not None:
                 tree_attention_mask = tree_attention_mask.to(device)

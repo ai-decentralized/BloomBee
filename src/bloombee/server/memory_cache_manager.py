@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from typing import Optional, Tuple, AsyncContextManager, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata, _is_paged_kv_enabled
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -55,6 +55,8 @@ class KVCacheManager:
         # truth in both modes.
         self._paged_kv_enabled = _is_paged_kv_enabled()
         self._reorder_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_reorder: Optional[Future] = None
+        self._pending_reorder_lock = threading.Lock()
         
         # [KVCACHE_OFFLOAD] Micro-batch level memory reuse state
         # Since all blocks share one KVCacheManager, staging must be keyed by:
@@ -2018,8 +2020,9 @@ class KVCacheManager:
         micro_batch_size: int = 0,
     ) -> None:
         cache_manager = self
-        
-        self._reorder_executor.submit(
+
+        self.wait_for_pending_reorder()
+        future = self._reorder_executor.submit(
             self._do_reorder_task,
             new_kvs,
             kv_cache_position_ids,
@@ -2029,6 +2032,19 @@ class KVCacheManager:
             micro_batch_size,
             cache_manager,
         )
+        with self._pending_reorder_lock:
+            self._pending_reorder = future
+
+    def wait_for_pending_reorder(self) -> None:
+        """Ensure the previous speculative KV compaction is visible before reuse."""
+        with self._pending_reorder_lock:
+            future = self._pending_reorder
+        if future is None:
+            return
+        future.result()
+        with self._pending_reorder_lock:
+            if self._pending_reorder is future:
+                self._pending_reorder = None
         
     def _do_reorder_task(
         self,
