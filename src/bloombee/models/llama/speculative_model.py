@@ -15,9 +15,6 @@ from bloombee.models.llama.config import DistributedLlamaConfig
 from bloombee.models.llama.model import DistributedLlamaForCausalLM
 from bloombee.models.llama.spec_decoding_drafter import MultiSSMDrafter
 from bloombee.models.llama.spec_decoding_verify import verify_path
-from bloombee.models.llama.spec_decoding_tree_shape import AcceptanceHistogram
-
-
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree, TreeNode, prepare_incremental_tree_batch
 
 from bloombee.client.remote_generation import RemotePastKeyValues
@@ -44,10 +41,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         kv_cache_window: int = 2048,
         max_new_tokens: int = 128,
         session_max_length: Optional[int] = None,
-        acceptance_histogram: Optional[AcceptanceHistogram] = None,
+        tree_budget: Optional[int] = None,
+        tree_min_log_prob: Optional[float] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
-        
+
         generation_config = generation_config or getattr(self, "generation_config", GenerationConfig())
         logits_processor = logits_processor or LogitsProcessorList()
         stopping_criteria = stopping_criteria or StoppingCriteriaList()
@@ -112,10 +110,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 use_kv_cache=use_kv_cache,
                 kv_cache_window=kv_cache_window,
                 max_new_tokens=max_new_tokens,
-                acceptance_histogram=acceptance_histogram,
+                tree_budget=tree_budget,
+                tree_min_log_prob=tree_min_log_prob,
                 **model_kwargs,
             )
-        
+
     def _sample_with_session(
         self,
         input_ids: torch.LongTensor,
@@ -130,7 +129,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
         max_new_tokens: int = 128,
-        acceptance_histogram: Optional[AcceptanceHistogram] = None,
+        tree_budget: Optional[int] = None,
+        tree_min_log_prob: Optional[float] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
         logger.info("Starting speculative decoding with distributed inference session!")
@@ -154,7 +154,16 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         step_idx = 0
         current_input_ids = input_ids
         llm_generated_token = None
-        
+        # EAGLE drafter conditioning state — populated after the first verify.
+        # None on the very first iteration; SSM drafters ignore both kwargs.
+        prev_last_hidden: Optional[torch.Tensor] = None
+        prev_last_token: Optional[torch.Tensor] = None
+        # Target hidden states for committed tokens before the current root.
+        # EAGLE's official drafter consumes the whole shifted prefix, not just
+        # the endpoint hidden. We maintain a padded [B, L, H] buffer where
+        # L == seq_lengths[b] - 1 for each active row.
+        eagle_prefix_hidden_states: Optional[torch.Tensor] = None
+
         # 新增：维护每个序列的真实长度
         seq_lengths = torch.full((batch_size,), input_ids.shape[1], dtype=torch.long, device=input_ids.device)
         ignore_token_ids: list = [0, 2]
@@ -178,15 +187,44 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         while not finished and (seq_lengths.min().item() - initial_len) < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
-            spec_trees = drafter.build_trees_parallel(
-                current_input_ids, seq_lengths, beam_width, max_tree_depth, 
-            )
+            # Pass EAGLE-2-style tree-budget kwargs through to the drafter.
+            # MultiSSMDrafter consumes them to do post-expansion budget pruning;
+            # EAGLEDrafter uses them to drive its dynamic tree-growth loop.
+            # ``prev_last_hidden`` / ``prev_last_token`` give the drafter the
+            # target's last committed hidden + token id (EAGLE conditioning).
+            drafter_kwargs = {
+                'tree_budget': tree_budget,
+                'tree_min_log_prob': tree_min_log_prob,
+            }
+            if prev_last_hidden is not None:
+                drafter_kwargs['prev_last_hidden'] = prev_last_hidden
+                drafter_kwargs['prev_last_token'] = prev_last_token
+            if eagle_prefix_hidden_states is not None:
+                drafter_kwargs['prefix_hidden_states'] = eagle_prefix_hidden_states
+            try:
+                spec_trees = drafter.build_trees_parallel(
+                    current_input_ids, seq_lengths, beam_width, max_tree_depth,
+                    **{k: v for k, v in drafter_kwargs.items() if v is not None},
+                )
+            except TypeError:
+                # Older drafters don't take EAGLE kwargs; retry plain.
+                spec_trees = drafter.build_trees_parallel(
+                    current_input_ids, seq_lengths, beam_width, max_tree_depth,
+                )
             t2 = time.perf_counter()
             logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
             # logger.info(f"spec_trees, {spec_trees}")
             
             # 2. Verify trees using distributed inference
-            verified_tokens, verified_tokens_positions, past_key_values, llm_generated_token, valid_lengths = self._verify_trees_with_forward(
+            (
+                verified_tokens,
+                verified_tokens_positions,
+                past_key_values,
+                llm_generated_token,
+                valid_lengths,
+                verify_hidden_states,
+                final_positions,
+            ) = self._verify_trees_with_forward(
                 input_ids=current_input_ids,
                 llm_generated_token=llm_generated_token,
                 trees=spec_trees,
@@ -198,8 +236,27 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 seq_lengths=seq_lengths,
                 do_sample=bool(getattr(generation_config, "do_sample", False)),
                 temperature=float(getattr(generation_config, "temperature", 1.0) or 1.0),
-                acceptance_histogram=acceptance_histogram,
             )
+
+            old_seq_lengths = seq_lengths.clone()
+
+            # M1/M3 plumbing: gather the committed-endpoint hidden state and
+            # maintain the full committed-prefix hidden buffer for EAGLE.
+            if verify_hidden_states is not None and final_positions is not None:
+                idx = torch.arange(verify_hidden_states.size(0), device=verify_hidden_states.device)
+                prev_last_hidden = verify_hidden_states[idx, final_positions, :].detach()
+                prev_last_token = llm_generated_token[idx, 0].detach() if llm_generated_token is not None else None
+                if getattr(drafter, "uses_eagle_hidden_states", False):
+                    eagle_prefix_hidden_states = self._update_eagle_prefix_hidden_states(
+                        prefix_hidden_states=eagle_prefix_hidden_states,
+                        verify_hidden_states=verify_hidden_states.detach(),
+                        kv_cache_position_ids=verified_tokens_positions,
+                        old_seq_lengths=old_seq_lengths,
+                        is_first_iteration=is_first_iteration,
+                    )
+            else:
+                prev_last_hidden = None
+                prev_last_token = None
             
             t3 = time.perf_counter()
             logger.info(f"Step {step_idx}: Verified trees with distributed inference in {t3 - t2:.4f} seconds")
@@ -274,6 +331,63 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         
         return current_input_ids
 
+    def _update_eagle_prefix_hidden_states(
+        self,
+        *,
+        prefix_hidden_states: Optional[torch.Tensor],
+        verify_hidden_states: torch.Tensor,
+        kv_cache_position_ids: torch.Tensor,
+        old_seq_lengths: torch.LongTensor,
+        is_first_iteration: bool,
+    ) -> torch.Tensor:
+        """Append target hiddens that are committed before the next root token.
+
+        After a speculative verify step, the next root is the bonus token
+        sampled from the target logits. EAGLE should be conditioned on target
+        hidden states for every token *before* that bonus. For a normal tree
+        verify those hiddens are root + accepted draft tokens; for the initial
+        no-tree warmup they are the full prompt hiddens.
+        """
+        batch_size = verify_hidden_states.shape[0]
+        hidden_size = verify_hidden_states.shape[-1]
+        device = verify_hidden_states.device
+        dtype = verify_hidden_states.dtype
+        rows: List[torch.Tensor] = []
+
+        for b in range(batch_size):
+            old_len = int(old_seq_lengths[b].item())
+            if is_first_iteration and prefix_hidden_states is None:
+                # Warmup/prefill fallback: verify_hidden_states is aligned with
+                # the full prompt, so keep all prompt hiddens before the sampled
+                # bonus root.
+                rows.append(verify_hidden_states[b, :old_len, :])
+                continue
+
+            previous = (
+                prefix_hidden_states[b, : max(old_len - 1, 0), :].to(device=device, dtype=dtype)
+                if prefix_hidden_states is not None
+                else verify_hidden_states.new_empty((0, hidden_size))
+            )
+            root_abs = old_len - 1
+            selected = kv_cache_position_ids[b]
+            selected = selected[selected >= 0]
+            if selected.numel() == 0:
+                rows.append(previous)
+                continue
+            rel = (selected.to(device=device) - root_abs).long()
+            rel = rel[(rel >= 0) & (rel < verify_hidden_states.shape[1])]
+            if rel.numel() == 0:
+                rows.append(previous)
+            else:
+                rows.append(torch.cat([previous, verify_hidden_states[b, rel, :]], dim=0))
+
+        max_len = max((row.shape[0] for row in rows), default=0)
+        out = verify_hidden_states.new_zeros((batch_size, max_len, hidden_size))
+        for b, row in enumerate(rows):
+            if row.numel() > 0:
+                out[b, :row.shape[0], :] = row
+        return out
+
     def _update_input_ids_with_padding(
         self,
         current_input_ids: torch.LongTensor,
@@ -340,8 +454,15 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         seq_lengths: torch.LongTensor,
         do_sample: bool = False,
         temperature: float = 1.0,
-        acceptance_histogram: Optional[AcceptanceHistogram] = None,
-    ) -> Tuple[torch.LongTensor, torch.Tensor, RemotePastKeyValues, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        Optional[torch.LongTensor],
+        torch.Tensor,
+        RemotePastKeyValues,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.LongTensor],
+    ]:
         """
         Verify speculative trees using standard forward() call within the active session context
         
@@ -367,9 +488,30 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         
         if attention_mask is None or tree_tokens.shape[1] == 0:
             logger.warning("No tree tokens to verify, falling back to regular generation")
-            fallback_token = self._fallback_generation_with_forward(input_ids, logits_processor, past_key_values, seq_lengths)
+            (
+                fallback_token,
+                fallback_positions,
+                fallback_hidden_states,
+                fallback_final_positions,
+            ) = self._fallback_generation_with_forward(
+                input_ids,
+                logits_processor,
+                past_key_values,
+                seq_lengths,
+                is_first_iteration=is_first_iteration,
+                do_sample=do_sample,
+                temperature=temperature,
+            )
             valid_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
-            return None, torch.zeros(batch_size, 1, dtype=torch.long, device=device), past_key_values, fallback_token, valid_lengths
+            return (
+                None,
+                fallback_positions,
+                past_key_values,
+                fallback_token,
+                valid_lengths,
+                fallback_hidden_states,
+                fallback_final_positions,
+            )
         
         # tree_mask_packed = self.pack_bool_mask_to_int64(attention_mask)
         tree_mask_packed = attention_mask
@@ -379,13 +521,17 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             if not use_kv_cache:
                 # No cache: process tree tokens directly
                 logger.warning("Processing without KV cache, may cause error!!!")
-                outputs = self(
+                # Split forward so verify can hold both hidden states and
+                # logits separately. EAGLE-2 needs h_last per iteration; the
+                # naive HF path discards the hidden after lm_head().
+                model_out = self.model(
                     input_ids=tree_tokens,
                     attention_mask=tree_mask_packed,
                     past_key_values=past_key_values,
-                    use_cache=False
+                    use_cache=False,
                 )
-                logits = outputs.logits
+                hidden_states = model_out.last_hidden_state
+                logits = self.lm_head(hidden_states)
                 new_past_key_values = past_key_values
                 
             elif is_first_iteration or past_key_values is None:
@@ -394,15 +540,15 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 max_seq_len = seq_lengths.max().item()
                 full_sequence = torch.cat([input_ids[:, :max_seq_len], tree_tokens], dim=-1)
                 
-                outputs = self(
+                model_out = self.model(
                     input_ids=full_sequence,
                     attention_mask=tree_mask_packed,
                     past_key_values=past_key_values,
-                    use_cache=True
+                    use_cache=True,
                 )
-                
-                logits = outputs.logits
-                
+                hidden_states = model_out.last_hidden_state
+                logits = self.lm_head(hidden_states)
+
                 if past_key_values is None:
                     new_past_key_values = RemotePastKeyValues()
                 else:
@@ -424,24 +570,38 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 else:
                     full_sequence = torch.cat([llm_generated_token, tree_tokens], dim=-1)
                 
-                outputs = self(
+                model_out = self.model(
                     input_ids=full_sequence,
                     attention_mask=tree_mask_packed,
                     past_key_values=past_key_values,
-                    use_cache=True
+                    use_cache=True,
                 )
-                
-                logits = outputs.logits
+                hidden_states = model_out.last_hidden_state
+                logits = self.lm_head(hidden_states)
                 new_past_key_values = past_key_values
                 new_past_key_values.update_seen(active_session.position)
                 
-        # Extract verification results - 现在返回 valid_lengths
-        verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths = self._extract_best_verified_paths_fixed(
+        # Extract verification results — also returns final_positions [B] so
+        # callers can gather the committed-endpoint hidden state for EAGLE.
+        (
+            verified_tokens,
+            kv_cache_position_ids,
+            llm_generated_tokens,
+            valid_lengths,
+            final_positions,
+        ) = self._extract_best_verified_paths_fixed(
             logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration,
             do_sample=do_sample, temperature=temperature,
-            acceptance_histogram=acceptance_histogram,
         )
-        return verified_tokens, kv_cache_position_ids, new_past_key_values, llm_generated_tokens, valid_lengths
+        return (
+            verified_tokens,
+            kv_cache_position_ids,
+            new_past_key_values,
+            llm_generated_tokens,
+            valid_lengths,
+            hidden_states,
+            final_positions,
+        )
     
     def pack_bool_mask_to_int64(self, mask_bool: torch.Tensor) -> torch.Tensor:
         assert mask_bool.dtype == torch.bool, "Input must be a bool tensor"
@@ -453,50 +613,101 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         logits_processor: LogitsProcessorList,
         past_key_values: RemotePastKeyValues,
         seq_lengths: torch.LongTensor,
-        temperature: float = 1.0
-    ) -> torch.LongTensor:
+        *,
+        is_first_iteration: bool,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.LongTensor, torch.LongTensor, torch.Tensor, torch.LongTensor]:
         """
         Fallback to regular generation using forward() call within active session
         """
+        def _pick_next(processed_logits: torch.Tensor) -> torch.LongTensor:
+            if do_sample:
+                temp = float(temperature) if temperature and temperature > 0 else 1.0
+                probs = torch.softmax(processed_logits / temp, dim=-1)
+                return torch.multinomial(probs, 1)
+            return torch.argmax(processed_logits, dim=-1, keepdim=True)
+
         try:
             logger.info("[DEBUG] Using fallback generation")
             
             batch_size = input_ids.shape[0]
             device = input_ids.device
+            old_spec_flag = past_key_values.is_spec_decoding
+            # This is a regular target-model step, not tree verification. Run
+            # it with the compact non-spec path so the server cache is seeded
+            # with the true prefix/root instead of a degenerate tree layout.
+            past_key_values.set_is_spec_decoding(torch.tensor([0], dtype=torch.long, device=device))
             
-            # 获取每个序列最后一个有效 token
-            last_tokens = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-            for i in range(batch_size):
-                last_pos = seq_lengths[i].item() - 1
-                last_tokens[i, 0] = input_ids[i, last_pos]
-            
-            outputs = self(
-                input_ids=last_tokens,
-                attention_mask=None,
-                past_key_values=past_key_values,
-                use_cache=True
-            )
-            
-            logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+            if is_first_iteration:
+                max_seq_len = int(seq_lengths.max().item())
+                model_out = self.model(
+                    input_ids=input_ids[:, :max_seq_len],
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                hidden_states = model_out.last_hidden_state
+                logits_full = self.lm_head(hidden_states)
+                logits = torch.stack(
+                    [logits_full[i, int(seq_lengths[i].item()) - 1, :] for i in range(batch_size)],
+                    dim=0,
+                )
+                final_positions = (seq_lengths - 1).to(device=device)
+                kv_cache_position_ids = final_positions[:, None]
+            else:
+                # 获取每个序列最后一个有效 token; this root token has not yet
+                # been run through the target, so use the existing cache plus
+                # one regular decode step and sample the bonus from its logits.
+                last_tokens = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+                for i in range(batch_size):
+                    last_pos = seq_lengths[i].item() - 1
+                    last_tokens[i, 0] = input_ids[i, last_pos]
+
+                model_out = self.model(
+                    input_ids=last_tokens,
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                hidden_states = model_out.last_hidden_state
+                logits = self.lm_head(hidden_states)[:, -1, :]
+                final_positions = torch.zeros(batch_size, dtype=torch.long, device=device)
+                kv_cache_position_ids = (seq_lengths - 1).to(device=device)[:, None]
             
             # Apply logits processors
             processed_logits = logits
             for processor in logits_processor:
                 processed_logits = processor(input_ids, processed_logits)
             
-            # Sample next token
-            if temperature > 0:
-                probs = torch.softmax(processed_logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, 1)
-            else:
-                next_token = torch.argmax(processed_logits, dim=-1, keepdim=True)
+            next_token = _pick_next(processed_logits)
+            past_key_values.set_is_spec_decoding(old_spec_flag)
 
-            return next_token
+            return next_token, kv_cache_position_ids, hidden_states, final_positions
             
         except Exception as e:
+            if "old_spec_flag" in locals():
+                try:
+                    past_key_values.set_is_spec_decoding(old_spec_flag)
+                except Exception:
+                    pass
             logger.error(f"Fallback generation failed: {e}")
             eos_token_id = getattr(self.config, 'eos_token_id', 2)
-            return torch.full((input_ids.shape[0], 1), eos_token_id, device=input_ids.device)
+            batch_size = input_ids.shape[0]
+            device = input_ids.device
+            empty_hidden = torch.zeros(
+                batch_size,
+                1,
+                self.config.hidden_size,
+                dtype=torch.float32,
+                device=device,
+            )
+            return (
+                torch.full((batch_size, 1), eos_token_id, device=device),
+                (seq_lengths - 1).to(device=device)[:, None],
+                empty_hidden,
+                torch.zeros(batch_size, dtype=torch.long, device=device),
+            )
     
     def _build_speculative_trees_batched(
         self, 
@@ -705,7 +916,14 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             path_positions: List[int] = []
 
             for i, node in enumerate(best_path):
-                pos = node.parent.position_in_sequence + 1
+                if node.parent is None or node.parent.parent is None:
+                    pos = actual_len - 1 if is_first_iteration else 0
+                else:
+                    pos = (
+                        actual_len + node.parent.position_in_sequence
+                        if is_first_iteration
+                        else node.parent.position_in_sequence + 1
+                    )
                 path_positions.append(tree_root_position + node.position_in_sequence + 1)
                 row_logits = logits[batch_idx, pos].to(torch.float32)
                 processed = row_logits.unsqueeze(0).clone()
@@ -756,8 +974,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     verified_tokens[i, :v.shape[0]] = v
         else:
             verified_tokens = None
-        return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths
-
+        final_positions = torch.zeros(batch_size, dtype=torch.long, device=device)
+        return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths, final_positions
     def _extract_best_verified_paths_fixed(
         self,
         logits: torch.Tensor,
@@ -769,8 +987,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         is_first_iteration: bool,
         do_sample: bool = False,
         temperature: float = 1.0,
-        acceptance_histogram: Optional[AcceptanceHistogram] = None,
-    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.LongTensor]:
         """
         Returns:
             verified_tokens: [batch_size, max_verified_len] 或 None
@@ -813,6 +1030,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         positions_list = []
         llm_tokens_list = []
         valid_lengths_list = []
+        final_positions_list: List[int] = []
         
         for batch_idx in range(batch_size):
             actual_len = seq_lengths[batch_idx].item()
@@ -840,20 +1058,19 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             best_score = -1
             
             predicted_row = predicted_tokens_cpu[batch_idx] if batch_idx < len(predicted_tokens_cpu) else []
-            # Track the longest path's depth-of-rejection so we can feed the
-            # Sequoia acceptance histogram: every prefix depth before that
-            # counts as an accept at that depth, the first mismatching depth
-            # counts as a reject (unless the path ran out). This matches
-            # Sequoia §4.1's per-depth-Bernoulli approximation.
-            best_path_depth_accepts = 0
-            best_path_rejected_at: Optional[int] = None
             for node_path in node_paths:
                 verified_tokens = []
                 verified_positions = []
 
-                rejected_at_depth: Optional[int] = None
-                for depth_idx, node in enumerate(node_path):
-                    pos = node.parent.position_in_sequence + 1
+                for node in node_path:
+                    if node.parent is None or node.parent.parent is None:
+                        pos = actual_len - 1 if is_first_iteration else 0
+                    else:
+                        pos = (
+                            actual_len + node.parent.position_in_sequence
+                            if is_first_iteration
+                            else node.parent.position_in_sequence + 1
+                        )
                     if pos >= seq_len or pos >= len(predicted_row):
                         break
 
@@ -864,28 +1081,23 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                         absolute_position = tree_root_position + node.position_in_sequence + 1
                         verified_positions.append(absolute_position)
                     else:
-                        rejected_at_depth = depth_idx
                         break
 
                 if len(verified_tokens) > best_score:
                     best_score = len(verified_tokens)
                     best_verified = verified_tokens
                     best_positions = verified_positions
-                    best_path_depth_accepts = len(verified_tokens)
-                    best_path_rejected_at = rejected_at_depth
-
-            if acceptance_histogram is not None:
-                for d in range(best_path_depth_accepts):
-                    acceptance_histogram.record(d, True)
-                if best_path_rejected_at is not None:
-                    acceptance_histogram.record(best_path_rejected_at, False)
             
             # 确定取 llm_token 的位置
+            committed_pos: int  # index into logits/hidden time dim — committed endpoint
             if len(best_verified) > 0:
                 pos = best_positions[-1] - tree_root_position
+                if is_first_iteration:
+                    pos = int(best_positions[-1])
+                committed_pos = int(pos)
                 final_logits = logits[batch_idx, pos].unsqueeze(0)
                 final_logits = _ensure_non_empty_logits(final_logits, reason="best_verified")
-                
+
                 # 检查是否全 0（被裁剪），需要回退
                 if torch.all(final_logits == 0):
                     # 回退：最后一个 verified token 作为 llm_token
@@ -904,6 +1116,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     llm_token = torch.tensor([next_token], device=device)
             else:
                 # fallback: 从 fallback_pos 采样
+                committed_pos = int(real_fallback_pos - 1)
                 final_logits = logits[batch_idx, real_fallback_pos - 1:real_fallback_pos]
                 final_logits = _ensure_non_empty_logits(final_logits, reason="fallback")
                 processed_logits = final_logits.clone()
@@ -914,6 +1127,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     )
                 next_token = torch.argmax(processed_logits[0]).item()
                 llm_token = torch.tensor([next_token], device=device)
+            final_positions_list.append(committed_pos)
             
             # 构建 positions
             all_positions = [tree_root_position] + best_positions
@@ -964,5 +1178,6 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     verified_tokens[i, :v.shape[0]] = v
         else:
             verified_tokens = None
-        
-        return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths
+
+        final_positions = torch.tensor(final_positions_list, dtype=torch.long, device=device)
+        return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths, final_positions
