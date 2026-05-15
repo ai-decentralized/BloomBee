@@ -8,8 +8,8 @@ BloomBee. The drafter:
 * Uses a single Llama decoder layer with an `fc(concat(emb, hidden))` projection
   on the input — this is the EAGLE head architecture from
   ``eagle/model/cnets.py:Model``.
-* Loads pre-trained head weights from ``yuhuili/EAGLE-llama2-chat-7B`` (or any
-  HF checkpoint with the same layout).
+* Loads a pre-trained head selected for the target LLaMA family (or any
+  user-provided HF checkpoint with the same layout).
 * Implements the EAGLE-2 dynamic tree growth: per-iteration top-k expansion
   across the latest layer plus global top-m reranking by accumulated path
   log-probability.
@@ -48,8 +48,9 @@ are available.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -61,6 +62,95 @@ from transformers.cache_utils import DynamicCache
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree
 
 logger = get_logger()
+
+
+_EAGLE_DRAFTER_ENV = "BLOOMBEE_EAGLE_DRAFTER"
+
+_EAGLE_DRAFTER_REGISTRY: Dict[str, Dict[int, str]] = {
+    # Official yuhuili EAGLE/EAGLE-2-compatible head checkpoints. Keep this
+    # conservative: do not cross-use Llama-2, Vicuna, and Llama-3 heads just
+    # because they share `model_type="llama"`.
+    "llama2-chat": {
+        4096: "yuhuili/EAGLE-llama2-chat-7B",
+        5120: "yuhuili/EAGLE-llama2-chat-13B",
+        8192: "yuhuili/EAGLE-llama2-chat-70B",
+    },
+    "vicuna": {
+        4096: "yuhuili/EAGLE-Vicuna-7B-v1.3",
+        5120: "yuhuili/EAGLE-Vicuna-13B-v1.3",
+        6656: "yuhuili/EAGLE-Vicuna-33B-v1.3",
+    },
+    "llama3": {
+        4096: "yuhuili/EAGLE-LLaMA3-Instruct-8B",
+        8192: "yuhuili/EAGLE-LLaMA3-Instruct-70B",
+    },
+    "llama3.1": {
+        4096: "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+    },
+}
+
+
+def _config_name_candidates(target_config: object, target_name_or_path: Optional[str]) -> List[str]:
+    names: List[str] = []
+    if target_name_or_path:
+        names.append(str(target_name_or_path))
+    for attr in ("name_or_path", "_name_or_path", "name"):
+        value = getattr(target_config, attr, None)
+        if value and isinstance(value, str):
+            names.append(value)
+    return names
+
+
+def _infer_eagle_family(name_candidates: Sequence[str]) -> Optional[str]:
+    joined = " ".join(name_candidates).lower()
+    if "vicuna" in joined:
+        return "vicuna"
+    if "llama-3.1" in joined or "llama3.1" in joined:
+        return "llama3.1"
+    if "llama-3" in joined or "llama3" in joined:
+        return "llama3"
+    if ("llama-2" in joined or "llama2" in joined) and "chat" in joined:
+        return "llama2-chat"
+    return None
+
+
+def select_eagle_drafter_for_target(
+    target_config: object,
+    target_name_or_path: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Select an EAGLE head checkpoint for a LLaMA-family target.
+
+    Returns ``(repo_id, source)`` where source is ``env`` or
+    ``registry:<family>``. Unknown targets fail closed instead of silently
+    borrowing a mismatched drafter checkpoint.
+    """
+    env_override = os.environ.get(_EAGLE_DRAFTER_ENV)
+    if env_override:
+        return env_override, "env"
+
+    model_type = (getattr(target_config, "model_type", None) or "").lower()
+    if model_type and model_type != "llama":
+        raise ValueError(
+            "EAGLE drafter auto-selection only supports LLaMA-family targets; "
+            "pass ea_model_path explicitly for custom compatible checkpoints."
+        )
+
+    names = _config_name_candidates(target_config, target_name_or_path)
+    family = _infer_eagle_family(names)
+    if family is None:
+        raise ValueError(
+            "Could not infer a compatible EAGLE drafter for this LLaMA target. "
+            "Pass ea_model_path explicitly, or set BLOOMBEE_EAGLE_DRAFTER."
+        )
+
+    hidden_size = int(getattr(target_config, "hidden_size", 0) or 0)
+    family_registry = _EAGLE_DRAFTER_REGISTRY[family]
+    if hidden_size not in family_registry:
+        raise ValueError(
+            f"No registered EAGLE drafter for family={family!r}, hidden_size={hidden_size}. "
+            "Pass ea_model_path explicitly for a compatible checkpoint."
+        )
+    return family_registry[hidden_size], f"registry:{family}"
 
 
 def _build_eagle_head(
@@ -439,11 +529,22 @@ class EAGLEDrafter:
     def for_target(
         cls,
         target_model,                                  # bloombee DistributedLlamaForCausalLM
-        ea_model_path: str = "yuhuili/EAGLE-llama2-chat-7B",
+        ea_model_path: Optional[str] = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ) -> "EAGLEDrafter":
         cfg = target_model.config
+        if ea_model_path is None:
+            ea_model_path, source = select_eagle_drafter_for_target(cfg)
+        else:
+            source = "explicit"
+        logger.info(
+            "[EAGLE_DRAFTER_SELECT] target_model_type=%r target=%r -> drafter=%r (source=%s)",
+            getattr(cfg, "model_type", None),
+            getattr(cfg, "name_or_path", None) or getattr(cfg, "_name_or_path", None),
+            ea_model_path,
+            source,
+        )
         return cls(
             ea_model_path=ea_model_path,
             target_hidden_size=cfg.hidden_size,
