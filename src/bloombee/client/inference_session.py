@@ -518,6 +518,7 @@ class InferenceSession:
         draft_tokens: Optional[torch.Tensor] = None,
         is_spec_decoding: Optional[torch.Tensor] = None,
         prefill_length: Optional[torch.Tensor] = None,
+        need_pruning: bool = False,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -581,7 +582,7 @@ class InferenceSession:
             is_spec_dec = True
         else:
             is_spec_dec = False
-        need_pruning = is_spec_dec
+        need_pruning = bool(need_pruning) and is_spec_dec
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
                 logger.debug(f"Inference: block {block_idx}, attempt {attempt_no}")
