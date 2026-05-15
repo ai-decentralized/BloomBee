@@ -54,7 +54,7 @@ class TorchCompressedDevice:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        if descriptor is not None:
+        if descriptor is not None and len(descriptor.shape) == 4:
             _, desc_num_heads, desc_head_dim, _ = descriptor.shape
             shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
         else:
