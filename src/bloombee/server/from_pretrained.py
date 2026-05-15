@@ -121,10 +121,14 @@ def load_pretrained_block(
         # For FlexGen-based models (Llama): weights are managed by FlexGen at runtime.
         # FlexGen's OptimizedLlamaDecoderLayer.init_weight() reads _name_or_path off
         # the config to decide between local conversion and the huggyllama download
-        # fallback. HF's PretrainedConfig.from_pretrained clears _name_or_path when
-        # loading from a local directory, so we thread the original model_name back
-        # in here before block construction.
-        if not getattr(config, "_name_or_path", "") and model_name:
+        # fallback. For local directories, prefer the path the user passed to
+        # from_pretrained over a stale _name_or_path saved inside config.json.
+        if os.path.isdir(model_name):
+            try:
+                config._name_or_path = model_name
+            except Exception:
+                pass
+        elif not getattr(config, "_name_or_path", "") and model_name:
             try:
                 config._name_or_path = model_name
             except Exception:
