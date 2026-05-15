@@ -67,6 +67,7 @@ def _build_eagle_head(
     target_hidden_size: int,
     target_vocab_size: int,
     eagle_config: Optional[object] = None,
+    target_config: Optional[object] = None,
 ):
     """Construct the EAGLE drafter head, faithful to ``eagle.model.cnets.Model``.
 
@@ -93,25 +94,40 @@ def _build_eagle_head(
         LlamaRotaryEmbedding,
     )
 
+    def _cfg_value(name: str, default):
+        value = getattr(eagle_config, name, None)
+        if value is None and target_config is not None:
+            value = getattr(target_config, name, None)
+        return default if value is None else value
+
+    if target_hidden_size == 4096:
+        default_intermediate, default_heads = 11008, 32
+    elif target_hidden_size == 5120:
+        default_intermediate, default_heads = 13824, 40
+    elif target_hidden_size == 6656:
+        default_intermediate, default_heads = 17920, 52
+    elif target_hidden_size == 8192:
+        default_intermediate, default_heads = 28672, 64
+    else:
+        default_intermediate = int(target_hidden_size * 8 / 3)
+        default_heads = max(1, target_hidden_size // 128)
+
+    num_attention_heads = int(_cfg_value("num_attention_heads", default_heads))
+    num_key_value_heads = int(_cfg_value("num_key_value_heads", num_attention_heads))
+
     cfg = LlamaConfig(
         hidden_size=target_hidden_size,
-        intermediate_size=int(getattr(eagle_config, "intermediate_size", 11008)),
+        intermediate_size=int(_cfg_value("intermediate_size", default_intermediate)),
         num_hidden_layers=1,
-        num_attention_heads=int(getattr(eagle_config, "num_attention_heads", 32)),
-        num_key_value_heads=int(
-            getattr(
-                eagle_config,
-                "num_key_value_heads",
-                getattr(eagle_config, "num_attention_heads", 32),
-            )
-        ),
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
         vocab_size=target_vocab_size,
-        max_position_embeddings=int(getattr(eagle_config, "max_position_embeddings", 4096)),
-        rms_norm_eps=float(getattr(eagle_config, "rms_norm_eps", 1e-6)),
-        rope_scaling=getattr(eagle_config, "rope_scaling", None),
-        rope_theta=float(getattr(eagle_config, "rope_theta", 10000.0)),
-        hidden_act=str(getattr(eagle_config, "hidden_act", "silu")),
-        pretraining_tp=int(getattr(eagle_config, "pretraining_tp", 1)),
+        max_position_embeddings=int(_cfg_value("max_position_embeddings", 4096)),
+        rms_norm_eps=float(_cfg_value("rms_norm_eps", 1e-6)),
+        rope_scaling=_cfg_value("rope_scaling", None),
+        rope_theta=float(_cfg_value("rope_theta", 10000.0)),
+        hidden_act=str(_cfg_value("hidden_act", "silu")),
+        pretraining_tp=int(_cfg_value("pretraining_tp", 1)),
     )
 
     class EAGLELayer(nn.Module):
@@ -319,6 +335,7 @@ class EAGLEDrafter:
         target_hidden_size: int,
         target_vocab_size: int,
         target_lm_head: torch.nn.Module,
+        target_config: Optional[object] = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ):
@@ -329,7 +346,7 @@ class EAGLEDrafter:
         except Exception as e:
             logger.warning(
                 "[EAGLEDrafter] could not load config for %s (%s); "
-                "falling back to LLaMA-2-7B EAGLE head defaults",
+                "falling back to target model architecture",
                 ea_model_path,
                 e,
             )
@@ -338,6 +355,7 @@ class EAGLEDrafter:
             target_hidden_size,
             target_vocab_size,
             eagle_config=eagle_cfg,
+            target_config=target_config,
         )
         self.head = self.head.to(self.device).to(self.dtype).eval()
         self.target_lm_head = target_lm_head  # kept for metadata/debugging only
@@ -431,6 +449,7 @@ class EAGLEDrafter:
             target_hidden_size=cfg.hidden_size,
             target_vocab_size=cfg.vocab_size,
             target_lm_head=target_model.lm_head,
+            target_config=cfg,
             device=device,
             dtype=dtype,
         )
