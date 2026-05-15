@@ -34,7 +34,7 @@ Output contract matches ``MultiSSMDrafter.build_trees_parallel``:
         *,
         prev_last_hidden: torch.FloatTensor,   # [B, H]  EAGLE conditioning
         prev_last_token: torch.LongTensor,     # [B]     EAGLE conditioning
-        total_token: int = 60,                 # EAGLE-2 global budget
+        total_token: int | None = None,        # EAGLE-2 global budget incl. root
         topk_per_step: int = 10,               # EAGLE-2 per-layer top-k
         max_new_layers: int = 6,               # depth cap (paper uses ~6)
         ...
@@ -65,6 +65,7 @@ logger = get_logger()
 
 
 _EAGLE_DRAFTER_ENV = "BLOOMBEE_EAGLE_DRAFTER"
+_EAGLE_TREE_BUDGET_ENV = "BLOOMBEE_EAGLE_TREE_BUDGET"
 
 _EAGLE_DRAFTER_REGISTRY: Dict[str, Dict[int, str]] = {
     # Official yuhuili EAGLE/EAGLE-2-compatible head checkpoints. Keep this
@@ -284,6 +285,7 @@ def _build_eagle_head(
             input_ids: torch.LongTensor,   # [B, S] tokens to embed for fc
             position_ids: torch.LongTensor,
             past_key_values: Optional[DynamicCache] = None,
+            attention_mask: Optional[torch.Tensor] = None,
         ) -> tuple[torch.Tensor, DynamicCache]:
             inputs_embeds = self.embed_tokens(input_ids).to(hidden_states.dtype)
             # EAGLE's fc(concat([emb, hidden])) → 4096; this matches the
@@ -294,18 +296,22 @@ def _build_eagle_head(
             if past_key_values is None:
                 past_key_values = DynamicCache(config=cfg)
 
-            # 4D additive causal mask. With a non-empty cache, every query can
-            # see all cached keys plus the causal prefix inside this chunk.
-            B, q_len, _ = x.shape
-            past_len = int(past_key_values.get_seq_length(0))
-            kv_len = past_len + q_len
-            neg_inf = torch.finfo(x.dtype).min
-            q_idx = torch.arange(q_len, device=x.device).view(-1, 1)
-            k_idx = torch.arange(kv_len, device=x.device).view(1, -1)
-            allow = (k_idx < past_len) | ((k_idx - past_len) <= q_idx)
-            additive = torch.zeros((q_len, kv_len), dtype=x.dtype, device=x.device)
-            additive = additive.masked_fill(~allow, neg_inf)
-            additive = additive.view(1, 1, q_len, kv_len).expand(B, 1, q_len, kv_len)
+            if attention_mask is None:
+                # 4D additive causal mask. With a non-empty cache, every query
+                # can see all cached keys plus the causal prefix inside this
+                # chunk.
+                B, q_len, _ = x.shape
+                past_len = int(past_key_values.get_seq_length(0))
+                kv_len = past_len + q_len
+                neg_inf = torch.finfo(x.dtype).min
+                q_idx = torch.arange(q_len, device=x.device).view(-1, 1)
+                k_idx = torch.arange(kv_len, device=x.device).view(1, -1)
+                allow = (k_idx < past_len) | ((k_idx - past_len) <= q_idx)
+                additive = torch.zeros((q_len, kv_len), dtype=x.dtype, device=x.device)
+                additive = additive.masked_fill(~allow, neg_inf)
+                additive = additive.view(1, 1, q_len, kv_len).expand(B, 1, q_len, kv_len)
+            else:
+                additive = attention_mask.to(device=x.device, dtype=x.dtype)
 
             new_hidden, past_key_values = self.layer(
                 hidden_states=x,
@@ -416,6 +422,19 @@ def _bind_into_speculative_tree(root_token: int, kept: List[_CandNode]) -> Specu
     return tree
 
 
+def _default_draft_token_budget(beam_width: Union[int, Sequence[int]], max_depth: int) -> int:
+    """Return BloomBee's requested number of draft nodes, excluding the root."""
+    depth = max(0, int(max_depth))
+    if isinstance(beam_width, (list, tuple)):
+        total = 0
+        running = 1
+        for width in beam_width[:depth]:
+            running *= max(int(width), 1)
+            total += running
+        return total
+    return depth * max(int(beam_width), 1)
+
+
 class EAGLEDrafter:
     """EAGLE-2 drafter for BloomBee (drop-in replacement for MultiSSMDrafter)."""
 
@@ -465,6 +484,13 @@ class EAGLEDrafter:
             else None
         )
         self.uses_eagle_hidden_states = True
+        # AutoDistributedSpeculativeModel.generate uses this when callers do
+        # not pass tree_budget; 60 is the paper-style EAGLE-2 draft-node budget.
+        self.default_tree_budget = max(1, int(os.environ.get(_EAGLE_TREE_BUDGET_ENV, "60")))
+        self._prefix_cache: Optional[DynamicCache] = None
+        self._prefix_cache_len = 0
+        self._prefix_cache_ids: Optional[torch.LongTensor] = None
+        self._prefix_last_hidden: Optional[torch.Tensor] = None
 
         self._load_eagle_weights(ea_model_path)
 
@@ -562,6 +588,7 @@ class EAGLEDrafter:
         input_ids: torch.LongTensor,           # [B, S]
         position_ids: torch.LongTensor,        # [B, S]
         past_key_values: Optional[DynamicCache],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, DynamicCache]:
         """One drafter forward; returns ([B, S, H], past_kv)."""
         return self.head(
@@ -569,6 +596,7 @@ class EAGLEDrafter:
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            attention_mask=attention_mask,
         )
 
     @torch.no_grad()
@@ -606,14 +634,47 @@ class EAGLEDrafter:
         if shifted_input_ids.shape[1] == 0:
             raise ValueError("EAGLE prefix prefill received an empty prefix")
 
-        pos_stack = torch.arange(shifted_input_ids.shape[1], device=self.device, dtype=torch.long)[None, :]
-        h_drf, cache = self._step(
-            hidden_states=prefix_hidden_states,
-            input_ids=shifted_input_ids,
-            position_ids=pos_stack,
-            past_key_values=DynamicCache(config=self.head_cfg),
-        )
-        return h_drf[0, -1, :], cache, int(shifted_input_ids.shape[1])
+        total_len = int(shifted_input_ids.shape[1])
+        if (
+            self._prefix_cache is None
+            or self._prefix_cache_ids is None
+            or self._prefix_cache_len > total_len
+            or self._prefix_cache_ids.shape[0] != shifted_input_ids.shape[0]
+            or self._prefix_cache_ids.shape[1] < self._prefix_cache_len
+            or not torch.equal(
+                self._prefix_cache_ids[:, :self._prefix_cache_len],
+                shifted_input_ids[:, :self._prefix_cache_len].detach().cpu(),
+            )
+        ):
+            self._prefix_cache = DynamicCache(config=self.head_cfg)
+            self._prefix_cache_len = 0
+            self._prefix_cache_ids = torch.empty(
+                shifted_input_ids.shape[0],
+                0,
+                dtype=torch.long,
+                device="cpu",
+            )
+            self._prefix_last_hidden = None
+
+        if self._prefix_cache_len < total_len:
+            start = self._prefix_cache_len
+            new_hidden_states = prefix_hidden_states[:, start:total_len, :]
+            new_input_ids = shifted_input_ids[:, start:total_len]
+            pos_stack = torch.arange(start, total_len, device=self.device, dtype=torch.long)[None, :]
+            h_drf, cache = self._step(
+                hidden_states=new_hidden_states,
+                input_ids=new_input_ids,
+                position_ids=pos_stack,
+                past_key_values=self._prefix_cache,
+            )
+            self._prefix_cache = cache
+            self._prefix_cache_len = total_len
+            self._prefix_cache_ids = shifted_input_ids.detach().cpu().clone()
+            self._prefix_last_hidden = h_drf[0, -1, :].detach()
+        elif self._prefix_last_hidden is None:
+            raise RuntimeError("EAGLE prefix cache is populated without a last hidden state")
+
+        return self._prefix_last_hidden, self._prefix_cache, total_len
 
     @torch.no_grad()
     def _advance_cached(
@@ -646,6 +707,158 @@ class EAGLEDrafter:
             hidden, cache = self._advance_cached(hidden, int(tok), pos, cache)
             pos += 1
         return hidden
+
+    def _tree_attention_mask(
+        self,
+        tree_mask: torch.Tensor,
+        prefix_len: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build an additive EAGLE tree mask for one batched expansion layer."""
+        tree_mask = tree_mask.to(device=self.device, dtype=torch.bool)
+        q_len, tree_cols = tree_mask.shape
+        neg_inf = torch.finfo(dtype).min
+        additive = torch.zeros((q_len, prefix_len + tree_cols), dtype=dtype, device=self.device)
+        additive[:, prefix_len:] = additive[:, prefix_len:].masked_fill(~tree_mask, neg_inf)
+        return additive.view(1, 1, q_len, prefix_len + tree_cols)
+
+    @torch.no_grad()
+    def _build_tree_from_prefix_cache(
+        self,
+        *,
+        root_tok: int,
+        root_hidden: torch.Tensor,
+        prefix_cache: DynamicCache,
+        prefix_next_pos: int,
+        max_depth: int,
+        total_token: int,
+        expansion_width: int,
+    ) -> SpeculativeTree:
+        """EAGLE-2 tree expansion with the official layer-wise tree mask.
+
+        This avoids replaying every root-to-node path independently. Each
+        iteration advances the selected top-k frontier nodes in one drafter
+        forward, while the tree mask prevents sibling nodes from attending to
+        each other.
+        """
+        K = max(1, int(expansion_width))
+        root_drafter_hidden = root_hidden
+        logits0 = self._logits(root_drafter_hidden[None, :])
+        logp0 = F.log_softmax(logits0.float(), dim=-1)
+        top0 = torch.topk(logp0, k=K, dim=-1)
+
+        root = _CandNode(
+            token_id=root_tok,
+            parent=None,
+            depth=0,
+            log_p=0.0,
+            path_log_p=0.0,
+            hidden=root_drafter_hidden,
+        )
+        all_nodes: List[_CandNode] = []
+        seeds: List[_CandNode] = []
+        for j in range(top0.indices.shape[-1]):
+            tok = int(top0.indices[0, j].item())
+            lp = float(top0.values[0, j].item())
+            node = _CandNode(
+                token_id=tok,
+                parent=root,
+                depth=1,
+                log_p=lp,
+                path_log_p=lp,
+                hidden=None,
+            )
+            seeds.append(node)
+            all_nodes.append(node)
+
+        work_cache = self._clone_cache(prefix_cache)
+        tree_mask = torch.eye(len(seeds), dtype=torch.bool, device=self.device)
+
+        for depth in range(1, max_depth):
+            if not seeds:
+                break
+
+            parent_hiddens = torch.stack(
+                [
+                    (s.parent.hidden if s.parent is not None and s.parent.hidden is not None else root_drafter_hidden)
+                    for s in seeds
+                ],
+                dim=0,
+            ).to(device=self.device, dtype=self.dtype)
+            seed_input_ids = torch.tensor(
+                [[s.token_id for s in seeds]],
+                device=self.device,
+                dtype=torch.long,
+            )
+            position_ids = torch.full(
+                (1, len(seeds)),
+                int(prefix_next_pos + depth - 1),
+                device=self.device,
+                dtype=torch.long,
+            )
+            attn_mask = self._tree_attention_mask(tree_mask, int(prefix_next_pos), self.dtype)
+            out_hidden, work_cache = self._step(
+                hidden_states=parent_hiddens[None, :, :],
+                input_ids=seed_input_ids,
+                position_ids=position_ids,
+                past_key_values=work_cache,
+                attention_mask=attn_mask,
+            )
+            layer_hidden = out_hidden[0]
+            for idx, seed in enumerate(seeds):
+                seed.hidden = layer_hidden[idx].detach()
+
+            seed_logits = self._logits(layer_hidden)
+            seed_logp = F.log_softmax(seed_logits.float(), dim=-1)
+            top_k = torch.topk(seed_logp, k=K, dim=-1)
+            seed_scores = torch.tensor(
+                [s.path_log_p for s in seeds],
+                dtype=top_k.values.dtype,
+                device=self.device,
+            )
+            cumulative = top_k.values + seed_scores[:, None]
+
+            children_by_seed: List[List[_CandNode]] = []
+            for seed_idx, seed in enumerate(seeds):
+                row: List[_CandNode] = []
+                for c in range(K):
+                    tok = int(top_k.indices[seed_idx, c].item())
+                    lp = float(top_k.values[seed_idx, c].item())
+                    child = _CandNode(
+                        token_id=tok,
+                        parent=seed,
+                        depth=depth + 1,
+                        log_p=lp,
+                        path_log_p=seed.path_log_p + lp,
+                        hidden=None,
+                    )
+                    row.append(child)
+                    all_nodes.append(child)
+                children_by_seed.append(row)
+
+            next_count = min(K, cumulative.numel())
+            if next_count <= 0:
+                break
+            top_next = torch.topk(cumulative.reshape(-1), k=next_count, dim=-1)
+            parent_indices = torch.div(top_next.indices, K, rounding_mode="floor")
+            child_indices = top_next.indices.remainder(K)
+
+            next_seeds: List[_CandNode] = []
+            for parent_idx, child_idx in zip(parent_indices.tolist(), child_indices.tolist()):
+                next_seeds.append(children_by_seed[int(parent_idx)][int(child_idx)])
+            tree_mask = torch.cat(
+                (
+                    tree_mask[parent_indices.to(device=self.device)],
+                    torch.eye(next_count, dtype=torch.bool, device=self.device),
+                ),
+                dim=1,
+            )
+            seeds = next_seeds
+
+        m = max(0, int(total_token) - 1)
+        kept = _topm_global(all_nodes, m=m)
+        kept = _close_under_parents(kept)
+        return _bind_into_speculative_tree(root_token=root_tok, kept=kept)
 
     @torch.no_grad()
     def _replay_path(
@@ -696,7 +909,7 @@ class EAGLEDrafter:
         prev_last_hidden: Optional[torch.Tensor] = None,
         prev_last_token: Optional[torch.LongTensor] = None,
         prefix_hidden_states: Optional[torch.Tensor] = None,
-        total_token: int = 60,
+        total_token: Optional[int] = None,
         topk_per_step: int = 10,
         # EAGLE-2 paper uses a "global top-m" ≈ total_token; we expose it.
         # The other budget-pruner kwargs are accepted for signature parity but ignored.
@@ -722,7 +935,10 @@ class EAGLEDrafter:
           ``prev_last_hidden`` [B, H]: target last-layer hidden of the last
             committed token (the path root). EAGLE conditioning input.
           ``prev_last_token`` [B]: token id at the path root.
-          ``total_token`` int: global tree-size budget after rerank.
+          ``total_token`` int: global tree-size budget including root. When
+            unset, BloomBee's requested draft-token budget is inferred from
+            ``beam_width`` and ``max_depth`` so ``depth=5,width=1`` verifies
+            five draft nodes, not EAGLE's paper-sized 60-node tree.
           ``topk_per_step`` int: per-layer top-k expansion count.
         """
         if (
@@ -746,7 +962,27 @@ class EAGLEDrafter:
         if prefix_hidden_states is not None:
             prefix_hidden_states = prefix_hidden_states.to(self.device).to(self.dtype)
 
-        K_child = max(1, int(topk_per_step))
+        explicit_tree_budget = tree_budget is not None or total_token is not None
+        draft_budget = (
+            max(0, int(tree_budget))
+            if tree_budget is not None
+            else _default_draft_token_budget(beam_width, max_depth)
+        )
+        if total_token is None:
+            total_token = draft_budget + 1
+        else:
+            total_token = max(1, int(total_token))
+        if explicit_tree_budget:
+            expansion_width = int(topk_per_step)
+        elif isinstance(beam_width, (list, tuple)):
+            expansion_width = max((int(w) for w in beam_width[:max_depth]), default=1)
+        else:
+            expansion_width = int(beam_width)
+        # ``topk_per_step`` controls how many candidates the EAGLE-2 paper path
+        # expands before global rerank. Plain BloomBee calls should still honor
+        # their requested tree shape: depth=5,width=1 means one 5-token path,
+        # not five shallow siblings picked by the reranker.
+        K_child = max(1, min(expansion_width, max(1, total_token - 1)))
 
         results: List[SpeculativeTree] = []
         for b in range(int(input_ids.shape[0])):
@@ -772,19 +1008,20 @@ class EAGLEDrafter:
                     prefix_hidden_states[b:b + 1, :prefix_len, :],
                     shifted_ids,
                 )
+                results.append(
+                    self._build_tree_from_prefix_cache(
+                        root_tok=root_tok,
+                        root_hidden=prefix_root_hidden,
+                        prefix_cache=prefix_cache,
+                        prefix_next_pos=prefix_next_pos,
+                        max_depth=max_depth,
+                        total_token=total_token,
+                        expansion_width=K_child,
+                    )
+                )
+                continue
 
             def hidden_for_path(path_tokens: torch.LongTensor) -> torch.Tensor:
-                if use_prefix:
-                    # Pair target hidden states at positions 0..root-1 with
-                    # shifted ids y_1..y_root once, then branch from cloned
-                    # KV caches exactly like EAGLE topK_genrate.
-                    assert prefix_root_hidden is not None and prefix_cache is not None
-                    return self._hidden_from_cached_path(
-                        prefix_root_hidden,
-                        prefix_cache,
-                        prefix_next_pos,
-                        path_tokens,
-                    )
                 if prev_last_hidden is None:
                     raise ValueError("EAGLE replay requires prev_last_hidden without prefix_hidden_states")
                 path_hidden = self._replay_path(
@@ -801,7 +1038,7 @@ class EAGLEDrafter:
             )
             logits0 = self._logits(root_drafter_hidden[None, :])    # [1, V]
             logp0 = F.log_softmax(logits0.float(), dim=-1)
-            top0 = torch.topk(logp0, k=topk_per_step, dim=-1)
+            top0 = torch.topk(logp0, k=K_child, dim=-1)
 
             root = _CandNode(
                 token_id=root_tok,
@@ -830,7 +1067,7 @@ class EAGLEDrafter:
                 latest = layer_nodes[depth]
                 if not latest:
                     break
-                seeds = _topk_per_layer_indices(latest, k=topk_per_step)
+                seeds = _topk_per_layer_indices(latest, k=K_child)
 
                 # For each seed, advance the branch through the head with a
                 # KV cache. The seed's hidden output is used to compute its

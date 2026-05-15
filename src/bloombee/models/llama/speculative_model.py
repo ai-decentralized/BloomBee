@@ -66,6 +66,9 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # with a floor that matches drafter tree growth.
         kwarg_override = session_max_length
         session_max_length = model_kwargs.pop("session_max_length", kwarg_override)
+        effective_tree_budget = tree_budget
+        if effective_tree_budget is None:
+            effective_tree_budget = getattr(drafter, "default_tree_budget", None)
         if session_max_length is None:
             prompt_len = int(input_ids.shape[1])
             # Sequoia plan: total tree budget is sum of products of widths.
@@ -77,6 +80,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     tree_nodes += running
             else:
                 tree_nodes = max_tree_depth * max(int(beam_width), 1)
+            if effective_tree_budget is not None:
+                tree_nodes = max(tree_nodes, int(effective_tree_budget))
             # Each decode step pushes the full tree into the server cache
             # (only the verified prefix is retained in the rollback below, but
             # the server must have room to store the candidates first). Size
@@ -110,7 +115,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 use_kv_cache=use_kv_cache,
                 kv_cache_window=kv_cache_window,
                 max_new_tokens=max_new_tokens,
-                tree_budget=tree_budget,
+                tree_budget=effective_tree_budget,
                 tree_min_log_prob=tree_min_log_prob,
                 **model_kwargs,
             )
