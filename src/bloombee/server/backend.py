@@ -676,7 +676,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             kv_cache_position_ids=kv_cache_position_ids,
                             batch_offset=inference_info.batch_offset,
                             device="cuda",
-                            target_seq_len=seq_len)
+                            target_seq_len=seq_len,
+                            tree_attention_mask=full_mask,
+                            cache_len=cache_len,
+                        )
                     else:
                         rotary_position_ids = None
                     
@@ -950,6 +953,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         batch_offset,
         device: torch.device,
         target_seq_len: Optional[int] = None,  # 目标序列长度（hidden states 的长度）
+        tree_attention_mask: Optional[torch.Tensor] = None,
+        cache_len: Optional[int] = None,
     ) -> torch.Tensor:
         B = prefill_length.shape[0]
         
@@ -1025,6 +1030,20 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 torch.full_like(kv_cache_position_ids, -1),
             ).max(dim=1).values
             base_positions = max_positions + 1
+
+            if tree_attention_mask is not None and cache_len is not None and target_seq_len is not None:
+                tree_attention_mask = tree_attention_mask.to(device)
+                if tree_attention_mask.ndim >= 3 and tree_attention_mask.shape[0] != B:
+                    tree_attention_mask = self._slice_batch_aligned(
+                        tree_attention_mask,
+                        batch_offset,
+                        batch_offset + B,
+                        tree_attention_mask.shape[0],
+                    )
+                local_end = int(cache_len) + int(target_seq_len)
+                local_tree_mask = tree_attention_mask[:, :target_seq_len, int(cache_len):local_end]
+                tree_position_ids = local_tree_mask.to(torch.long).sum(dim=-1).sub_(1).clamp_min_(0)
+                return base_positions.unsqueeze(1) + tree_position_ids
             
             # 生成 position_ids
             # 如果指定了 target_seq_len，使用它；否则使用 tree_len
