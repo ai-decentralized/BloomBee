@@ -1542,12 +1542,13 @@ class KVCacheManager:
 
         end_position = start_position + s_new
         if not (0 <= start_position < S_total and end_position <= S_total):
-            # Out of bounds: use overwrite-tail policy
-            key_t = key_t[:, :, -S_total:]
-            value_t = value_t[:, -S_total:, :]
-            s_new = S_total
-            start_position = 0
-            end_position = S_total
+            raise RuntimeError(
+                "KV cache write exceeds allocated sequence length: "
+                f"start={start_position}, tokens={s_new}, end={end_position}, "
+                f"capacity={S_total}, batch_offset={batch_offset}, "
+                f"full_batch_size={full_batch_size}, micro_batch_size={micro_batch_size}. "
+                "Increase session_max_length/inference_max_length or reduce the speculative tree budget."
+            )
 
         # Align dtype
         if key_t.dtype != k_cache.dtype:
@@ -2171,6 +2172,6 @@ class KVCacheManager:
                     l_acc_target=cache_len, cache_tensors=cache_tensors,
                 )
 
-        except Exception as e:
-            import logging
-            logging.error(f"Async cache reorder failed: {e}")
+        except Exception:
+            logger.exception("Async cache reorder failed")
+            raise

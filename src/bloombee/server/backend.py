@@ -693,13 +693,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             rotary_position_ids=rotary_position_ids,
                         )
                         if step_result is None:
-                            return (hidden_states, None)
+                            raise RuntimeError("module.forward returned None")
                         output_hidden_states_chunk, new_kvs = step_result
                     except Exception as e:
-                        print(f' ERROR in module.forward: {type(e).__name__}: {e}')
-                        import traceback
-                        traceback.print_exc()
-                        return (hidden_states, None)
+                        logger.exception("ERROR in module.forward: %s: %s", type(e).__name__, e)
+                        raise
 
                     if seq_len > max_chunk_length:
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
