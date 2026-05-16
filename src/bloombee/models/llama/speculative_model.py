@@ -1,5 +1,6 @@
 from typing import Optional, Union, List, Tuple, Any
 
+import copy
 import math
 import torch
 import time
@@ -22,6 +23,37 @@ from bloombee.client.inference_session import InferenceSession
 from hivemind.utils.logging import get_logger
 
 logger = get_logger()
+
+_GENERATION_CONFIG_KWARGS = (
+    "do_sample",
+    "temperature",
+    "top_k",
+    "top_p",
+    "typical_p",
+    "pad_token_id",
+    "eos_token_id",
+    "bos_token_id",
+)
+
+
+def _merge_generation_config_kwargs(
+    generation_config: GenerationConfig,
+    model_kwargs: dict,
+) -> GenerationConfig:
+    """Honor common ``generate(..., do_sample=False)`` kwargs.
+
+    HF's ``GenerationMixin.generate`` folds these kwargs into a copied
+    GenerationConfig before decoding. BloomBee's speculative path bypasses that
+    helper, so do the small compatible subset explicitly.
+    """
+    merged = copy.deepcopy(generation_config)
+    for key in _GENERATION_CONFIG_KWARGS:
+        if key in model_kwargs:
+            value = model_kwargs.pop(key)
+            if value is not None:
+                setattr(merged, key, value)
+    return merged
+
 
 class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
     def __init__(self, config: DistributedLlamaConfig):
@@ -47,6 +79,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
     ) -> torch.LongTensor:
 
         generation_config = generation_config or getattr(self, "generation_config", GenerationConfig())
+        generation_config = _merge_generation_config_kwargs(generation_config, model_kwargs)
         logits_processor = logits_processor or LogitsProcessorList()
         stopping_criteria = stopping_criteria or StoppingCriteriaList()
 
