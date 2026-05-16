@@ -52,16 +52,28 @@ def _eos_token_ids(generation_config: GenerationConfig) -> Tuple[int, ...]:
 def _cap_valid_lengths_to_remaining(
     valid_lengths: torch.LongTensor,
     seq_lengths: torch.LongTensor,
-    initial_len: int,
+    initial_len: Union[int, torch.LongTensor],
     max_new_tokens: int,
 ) -> Tuple[torch.LongTensor, torch.LongTensor]:
+    if torch.is_tensor(initial_len):
+        initial_lengths = initial_len.to(device=seq_lengths.device, dtype=seq_lengths.dtype)
+    else:
+        initial_lengths = torch.full_like(seq_lengths, int(initial_len))
     remaining = torch.clamp(
-        int(max_new_tokens) - (seq_lengths - int(initial_len)),
+        int(max_new_tokens) - (seq_lengths - initial_lengths),
         min=0,
     )
     capped_valid_lengths = torch.minimum(valid_lengths, remaining)
     append_llm_token = (remaining > valid_lengths).to(dtype=torch.long)
     return capped_valid_lengths, append_llm_token
+
+
+def _attention_mask_from_seq_lengths(
+    seq_lengths: torch.LongTensor,
+    max_seq_len: int,
+) -> torch.BoolTensor:
+    positions = torch.arange(int(max_seq_len), device=seq_lengths.device)
+    return positions.unsqueeze(0) < seq_lengths.unsqueeze(1)
 
 
 def _merge_generation_config_kwargs(
@@ -247,18 +259,18 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         
         # 计算每个序列的有效 token 数量
         seq_lengths = valid_mask.sum(dim=1)  # [batch_size]
+        initial_seq_lengths = seq_lengths.clone()
         past_key_values.set_prefill_length(seq_lengths)
         
         pad_token_id = generation_config.pad_token_id if generation_config.pad_token_id is not None else 0
         logger.info(f"init input_ids: {input_ids}, seq_lengths: {seq_lengths}")
-        # 修改循环条件：基于最短序列的长度判断
+        # 修改循环条件：基于每个序列自己的初始长度判断
         # t0 = time.perf_counter()
-        initial_len = input_ids.shape[1]
         t0 = time.perf_counter()  # 用于记录第一个达标的时间
         has_printed_first_reach = False # 确保只打印一次
         sample_finish_times = [None] * batch_size
         sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
-        while not finished and (seq_lengths.min().item() - initial_len) < max_new_tokens:
+        while not finished and ((seq_lengths - initial_seq_lengths).min().item()) < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
             # Pass EAGLE-2-style tree-budget kwargs through to the drafter.
@@ -316,7 +328,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             valid_lengths, append_llm_token = _cap_valid_lengths_to_remaining(
                 valid_lengths=valid_lengths,
                 seq_lengths=seq_lengths,
-                initial_len=initial_len,
+                initial_len=initial_seq_lengths,
                 max_new_tokens=max_new_tokens,
             )
             if verified_tokens_positions is not None:
@@ -414,13 +426,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
 
             # 5. Check if finished
             unfinished_sequences = unfinished_sequences & (
-                (seq_lengths - initial_len) < max_new_tokens
+                (seq_lengths - initial_seq_lengths) < max_new_tokens
             ).long()
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(current_input_ids, None)
             finished = unfinished_sequences.max() == 0
             total_time = time.perf_counter() - t1
             logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
-            current_generations = seq_lengths - initial_len
+            current_generations = seq_lengths - initial_seq_lengths
             for i in range(batch_size):
                 if (current_generations[i] >= max_new_tokens and not sample_finished[i]):
                     finish_time = time.perf_counter() - t0
@@ -756,7 +768,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 max_seq_len = int(seq_lengths.max().item())
                 model_out = self.model(
                     input_ids=input_ids[:, :max_seq_len],
-                    attention_mask=None,
+                    attention_mask=_attention_mask_from_seq_lengths(seq_lengths, max_seq_len),
                     past_key_values=past_key_values,
                     use_cache=True,
                 )

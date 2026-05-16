@@ -102,3 +102,31 @@ def test_generation_tree_position_ids_use_logical_length_for_sparse_tree_cache()
     )
 
     assert position_ids.tolist() == [[68, 69, 70]]
+
+
+def test_chunked_prefill_kv_helpers_accumulate_chunks_in_sequence_order():
+    batch_size = 2
+    num_heads = 3
+    head_dim = 2
+    bh = batch_size * num_heads
+
+    key1 = torch.arange(bh * head_dim * 4, dtype=torch.float32).view(bh, head_dim, 4)
+    value1 = torch.arange(bh * 4 * head_dim, dtype=torch.float32).view(bh, 4, head_dim)
+    key2 = torch.arange(bh * head_dim * 5, dtype=torch.float32).view(bh, head_dim, 5) + 1000
+    value2 = torch.arange(bh * 5 * head_dim, dtype=torch.float32).view(bh, 5, head_dim) + 1000
+
+    llama1 = TransformerBackend._kv_to_llama_layout((key1, value1), batch_size)
+    llama2 = TransformerBackend._kv_to_llama_layout((key2, value2), batch_size)
+    combined_llama = TransformerBackend._concat_llama_kvs(llama1, llama2)
+    combined_bloom = TransformerBackend._concat_bloom_kv_chunks([(key1, value1), (key2, value2)])
+
+    assert combined_llama[0].shape == (batch_size, num_heads, 9, head_dim)
+    assert combined_llama[1].shape == (batch_size, num_heads, 9, head_dim)
+    assert torch.equal(combined_llama[0][:, :, :4], llama1[0])
+    assert torch.equal(combined_llama[0][:, :, 4:], llama2[0])
+    assert torch.equal(combined_bloom[0], torch.cat([key1, key2], dim=2))
+    assert torch.equal(combined_bloom[1], torch.cat([value1, value2], dim=1))
+
+    roundtrip_bloom = TransformerBackend._kv_to_bloom_layout(combined_llama, batch_size)
+    assert torch.equal(roundtrip_bloom[0], combined_bloom[0])
+    assert torch.equal(roundtrip_bloom[1], combined_bloom[1])

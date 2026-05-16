@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 from time import perf_counter
 
 import os
@@ -343,6 +343,98 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         output_hidden_states_chunk, new_kvs = forward_result
         return output_hidden_states_chunk, new_kvs
 
+    @staticmethod
+    def _kv_to_llama_layout(
+        kvs: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        batch_size: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if kvs is None:
+            return None
+        key, value = kvs
+        if key.dim() == 4 and value.dim() == 4:
+            return key, value
+        if key.dim() != 3 or value.dim() != 3:
+            return key, value
+
+        bh = int(key.shape[0])
+        if batch_size <= 0 or bh % int(batch_size) != 0:
+            return key, value
+        num_heads = bh // int(batch_size)
+        seq_len = int(value.shape[1])
+        head_dim = int(value.shape[2])
+
+        if key.shape[1] == head_dim and key.shape[2] == seq_len:
+            key_bhsd = key.permute(0, 2, 1).contiguous()
+        elif key.shape[1] == seq_len and key.shape[2] == head_dim:
+            key_bhsd = key.contiguous()
+        else:
+            return key, value
+
+        value_bhsd = value.contiguous()
+        return (
+            key_bhsd.view(batch_size, num_heads, seq_len, head_dim),
+            value_bhsd.view(batch_size, num_heads, seq_len, head_dim),
+        )
+
+    @staticmethod
+    def _kv_to_bloom_layout(
+        kvs: Tuple[torch.Tensor, torch.Tensor],
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key, value = kvs
+        if key.dim() == 3 and value.dim() == 3:
+            return key, value
+        if key.dim() != 4 or value.dim() != 4:
+            return key, value
+
+        bsz, num_heads, seq_len, head_dim = key.shape
+        key_bloom = key.reshape(bsz * num_heads, seq_len, head_dim).permute(0, 2, 1).contiguous()
+        value_bloom = value.reshape(bsz * num_heads, seq_len, head_dim).contiguous()
+        return key_bloom, value_bloom
+
+    @staticmethod
+    def _concat_llama_kvs(
+        left: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        right: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if left is None:
+            return right
+        if right is None:
+            return left
+        left_key, left_value = left
+        right_key, right_value = right
+        if left_key.dim() == 4 and right_key.dim() == 4:
+            return (
+                torch.cat([left_key, right_key], dim=2),
+                torch.cat([left_value, right_value], dim=2),
+            )
+        if left_key.dim() == 3 and right_key.dim() == 3:
+            return (
+                torch.cat([left_key, right_key], dim=2),
+                torch.cat([left_value, right_value], dim=1),
+            )
+        return right
+
+    @staticmethod
+    def _concat_bloom_kv_chunks(
+        chunks: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return chunks[0]
+        keys, values = zip(*chunks)
+        first_key = keys[0]
+        if first_key.dim() == 4:
+            return (
+                torch.cat(list(keys), dim=2),
+                torch.cat(list(values), dim=2),
+            )
+        return (
+            torch.cat(list(keys), dim=2),
+            torch.cat(list(values), dim=1),
+        )
+
     def _finalize_cache_update(
         self,
         new_kvs: Tuple[torch.Tensor, ...],
@@ -635,7 +727,37 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # (B, 1, cache_len+1). Cache it per (B, src_len, device)
                     # so the common decode loop avoids a per-step alloc of
                     # both the bool mask and the -inf scores tensor.
-                    if seq_len == 1 and cache_len >= 0 and not self._is_spec_decoding:
+                    request_attention_mask = inference_info.tree_attention_mask
+                    if (
+                        request_attention_mask is not None
+                        and torch.is_tensor(request_attention_mask)
+                        and request_attention_mask.ndim == 2
+                    ):
+                        request_attention_mask = self._slice_batch_aligned(
+                            request_attention_mask,
+                            inference_info.batch_offset,
+                            inference_info.batch_offset + batch_size,
+                            inference_info.full_batch_size,
+                        ).to(device=device, dtype=torch.bool)
+                        causal_mask = self._create_causal_attention_mask(
+                            batch_size, (seq_len + cache_len), cache_len, hidden_states.device
+                        )
+                        if causal_mask is None:
+                            attention_mask = None
+                        else:
+                            src_len = causal_mask.shape[-1]
+                            if request_attention_mask.shape[1] < src_len:
+                                pad = torch.ones(
+                                    batch_size,
+                                    src_len - request_attention_mask.shape[1],
+                                    dtype=torch.bool,
+                                    device=device,
+                                )
+                                request_attention_mask = torch.cat([pad, request_attention_mask], dim=1)
+                            key_mask = request_attention_mask[:, -src_len:]
+                            full_mask = causal_mask & key_mask.unsqueeze(1)
+                            attention_mask = self.convert_mask_to_scores(full_mask)
+                    elif seq_len == 1 and cache_len >= 0 and not self._is_spec_decoding:
                         src_len = cache_len + 1
                         cache_key = (batch_size, src_len, hidden_states.device)
                         attention_mask = self._decode_mask_scores_cache.get(cache_key)
@@ -656,12 +778,26 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     _prof_fwd_t0 = perf_counter()
+                chunk_layer_past = layer_past
+                chunk_new_kvs: List[Tuple[torch.Tensor, torch.Tensor]] = []
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
                     # print('transformer backend inference step() offset ', offset )
                     # print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
                     
                     chunk_length = min(max_chunk_length, seq_len - offset)
+                    attention_mask_chunk = attention_mask
+                    if (
+                        attention_mask is not None
+                        and attention_mask.ndim >= 3
+                        and attention_mask.shape[-2] == seq_len
+                        and attention_mask.shape[-1] == cache_len + seq_len
+                    ):
+                        attention_mask_chunk = attention_mask[
+                            :,
+                            offset : offset + chunk_length,
+                            : cache_len + offset + chunk_length,
+                        ]
                     cache_key = (chunk_length, batch_size, hidden_states.device)
                     if cache_key not in self._position_ids_cache:
                         base_ids = torch.arange(0, chunk_length, device=hidden_states.device, dtype=torch.long)
@@ -681,14 +817,15 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             tree_attention_mask=full_mask,
                             cache_len=cache_len,
                         )
+                        rotary_position_ids = rotary_position_ids[:, offset : offset + chunk_length]
                     else:
                         rotary_position_ids = None
                     
                     try:
                         step_result = self._run_block_forward(
                             hidden_states_chunk,
-                            layer_past=layer_past,
-                            attention_mask=attention_mask,
+                            layer_past=chunk_layer_past,
+                            attention_mask=attention_mask_chunk,
                             position_ids=position_ids,
                             rotary_position_ids=rotary_position_ids,
                         )
@@ -700,9 +837,21 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         raise
 
                     if seq_len > max_chunk_length:
-                        output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
+                        output_hidden_states[:, offset : offset + chunk_length] = output_hidden_states_chunk
                     else:
                         output_hidden_states = output_hidden_states_chunk
+
+                    if seq_len > max_chunk_length:
+                        new_kvs_bloom = self._kv_to_bloom_layout(new_kvs, batch_size)
+                        chunk_new_kvs.append(new_kvs_bloom)
+                        new_kvs_llama = self._kv_to_llama_layout(new_kvs_bloom, batch_size)
+                        chunk_layer_past_llama = self._kv_to_llama_layout(chunk_layer_past, batch_size)
+                        chunk_layer_past = self._concat_llama_kvs(chunk_layer_past_llama, new_kvs_llama)
+
+                if seq_len > max_chunk_length:
+                    concatenated_kvs = self._concat_bloom_kv_chunks(chunk_new_kvs)
+                    if concatenated_kvs is not None:
+                        new_kvs = concatenated_kvs
 
                 if self._step_profile_enabled:
                     if torch.cuda.is_available():

@@ -6,6 +6,7 @@ from bloombee.models.llama.eagle_drafter import (
     _eagle2_max_candidate_depth,
 )
 from bloombee.models.llama.speculative_model import (
+    _attention_mask_from_seq_lengths,
     _cap_valid_lengths_to_remaining,
     _eos_token_ids,
     _merge_generation_config_kwargs,
@@ -75,3 +76,28 @@ def test_speculative_generation_caps_last_step_to_max_new_tokens():
 
     assert capped.tolist() == [1, 2, 0]
     assert append_llm.tolist() == [0, 1, 0]
+
+
+def test_speculative_generation_caps_variable_length_batch_per_row():
+    valid_lengths = torch.tensor([5, 0, 5])
+    seq_lengths = torch.tensor([9, 14, 20])
+    initial_lengths = torch.tensor([4, 10, 20])
+
+    capped, append_llm = _cap_valid_lengths_to_remaining(
+        valid_lengths=valid_lengths,
+        seq_lengths=seq_lengths,
+        initial_len=initial_lengths,
+        max_new_tokens=5,
+    )
+
+    assert capped.tolist() == [0, 0, 5]
+    assert append_llm.tolist() == [0, 1, 0]
+
+
+def test_speculative_fallback_masks_right_padded_batch():
+    mask = _attention_mask_from_seq_lengths(torch.tensor([2, 4]), max_seq_len=4)
+
+    assert mask.tolist() == [
+        [True, True, False, False],
+        [True, True, True, True],
+    ]

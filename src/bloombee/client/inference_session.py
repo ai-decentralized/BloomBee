@@ -205,9 +205,37 @@ class _ServerInferenceSession:
                 # carry control flags such as is_spec_dec.
                 use_compact_decode_layout = not is_spec_dec
                 if use_compact_decode_layout:
+                    has_attention_payload = tree_attention_mask is not None and not is_dummy(tree_attention_mask)
                     has_prompt_payload = prompts is not None and not is_dummy(prompts)
                     has_hypo_payload = hypo_ids is not None and not is_dummy(hypo_ids)
-                    if has_prompt_payload or has_hypo_payload:
+                    if has_attention_payload:
+                        # Non-spec prefill can still need a padding mask
+                        # (right-padded batches). Reuse the wide tensor layout
+                        # so the server receives tree_attention_mask, but keep
+                        # is_spec_dec unset in metadata so execution remains a
+                        # normal target-model forward.
+                        input_tensors = (
+                            inputs,
+                            normalize_arg(keep_indices),
+                            normalize_arg(tree_attention_mask),
+                            DUMMY_INT64,
+                            DUMMY_INT64,
+                            normalize_arg(prefill_length),
+                            prompts,
+                            hypo_ids,
+                        )
+                        tensor_debug_names = (
+                            "hidden_states",
+                            "keep_indices",
+                            "tree_attention_mask",
+                            "kv_cache_position_ids",
+                            "draft_tokens",
+                            "prefill_length",
+                            "prompts",
+                            "hypo_ids",
+                        )
+                        regular_layout_name = "spec_compact_v1"
+                    elif has_prompt_payload or has_hypo_payload:
                         input_tensors = (
                             inputs,
                             normalize_arg(keep_indices),
