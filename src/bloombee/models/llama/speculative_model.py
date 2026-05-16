@@ -36,6 +36,19 @@ _GENERATION_CONFIG_KWARGS = (
 )
 
 
+def _eos_token_ids(generation_config: GenerationConfig) -> Tuple[int, ...]:
+    eos = getattr(generation_config, "eos_token_id", None)
+    if eos is None:
+        return ()
+    if isinstance(eos, int):
+        return (int(eos),)
+    if isinstance(eos, torch.Tensor):
+        return tuple(int(x) for x in eos.detach().cpu().view(-1).tolist())
+    if isinstance(eos, (list, tuple, set)):
+        return tuple(int(x) for x in eos)
+    return (int(eos),)
+
+
 def _merge_generation_config_kwargs(
     generation_config: GenerationConfig,
     model_kwargs: dict,
@@ -172,7 +185,15 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         **model_kwargs,
     ) -> torch.LongTensor:
         logger.info("Starting speculative decoding with distributed inference session!")
-        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
+        eos_token_ids = _eos_token_ids(generation_config)
+        eos_token_tensor = (
+            torch.tensor(eos_token_ids, dtype=torch.long, device=input_ids.device)
+            if eos_token_ids
+            else None
+        )
+        has_eos_stopping_criteria = bool(eos_token_ids) or any(
+            hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
+        )
         batch_size = input_ids.shape[0]
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         finished = False
@@ -329,6 +350,15 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 seq_lengths=seq_lengths,
                 pad_token_id=pad_token_id,
             )
+
+            if eos_token_tensor is not None:
+                for i in range(batch_size):
+                    start = int(old_seq_lengths[i].item())
+                    end = int(seq_lengths[i].item())
+                    if end > start:
+                        new_tokens = current_input_ids[i, start:end]
+                        if torch.isin(new_tokens, eos_token_tensor).any():
+                            unfinished_sequences[i] = 0
             
             # t4 = time.perf_counter()
             # logger.info(f"Step {step_idx}: Updated input_ids with padding in {t4 - t3:.4f} seconds")

@@ -66,6 +66,7 @@ logger = get_logger()
 
 _EAGLE_DRAFTER_ENV = "BLOOMBEE_EAGLE_DRAFTER"
 _EAGLE_TREE_BUDGET_ENV = "BLOOMBEE_EAGLE_TREE_BUDGET"
+_EAGLE_DEPTH_ENV = "BLOOMBEE_EAGLE_DEPTH"
 
 _EAGLE_DRAFTER_REGISTRY: Dict[str, Dict[int, str]] = {
     # Official yuhuili EAGLE/EAGLE-2-compatible head checkpoints. Keep this
@@ -435,6 +436,21 @@ def _default_draft_token_budget(beam_width: Union[int, Sequence[int]], max_depth
     return depth * max(int(beam_width), 1)
 
 
+def _eagle2_max_candidate_depth(max_depth: int, *, explicit_tree_budget: bool) -> int:
+    """Translate BloomBee depth to EAGLE-2's official dynamic-tree depth.
+
+    BloomBee's legacy ``max_tree_depth`` is the maximum draft path length. The
+    EAGLE-2 reference ``depth`` flag is one less than that: it emits the first
+    draft layer before the loop, then runs ``range(depth)``. With a paper-style
+    tree budget we use the official default depth=5, i.e. up to 6 draft tokens.
+    """
+    max_candidate_depth = max(1, int(max_depth))
+    if explicit_tree_budget:
+        official_depth = max(1, int(os.environ.get(_EAGLE_DEPTH_ENV, "5")))
+        max_candidate_depth = max(max_candidate_depth, official_depth + 1)
+    return max_candidate_depth
+
+
 class EAGLEDrafter:
     """EAGLE-2 drafter for BloomBee (drop-in replacement for MultiSSMDrafter)."""
 
@@ -485,8 +501,9 @@ class EAGLEDrafter:
         )
         self.uses_eagle_hidden_states = True
         # AutoDistributedSpeculativeModel.generate uses this when callers do
-        # not pass tree_budget; 60 is the paper-style EAGLE-2 draft-node budget.
-        self.default_tree_budget = max(1, int(os.environ.get(_EAGLE_TREE_BUDGET_ENV, "60")))
+        # not pass tree_budget. The EAGLE-2 paper default is total-token=60
+        # including the root, while BloomBee's tree_budget counts draft nodes.
+        self.default_tree_budget = max(1, int(os.environ.get(_EAGLE_TREE_BUDGET_ENV, "59")))
         self._prefix_cache: Optional[DynamicCache] = None
         self._prefix_cache_len = 0
         self._prefix_cache_ids: Optional[torch.LongTensor] = None
@@ -730,7 +747,7 @@ class EAGLEDrafter:
         root_hidden: torch.Tensor,
         prefix_cache: DynamicCache,
         prefix_next_pos: int,
-        max_depth: int,
+        max_candidate_depth: int,
         total_token: int,
         expansion_width: int,
     ) -> SpeculativeTree:
@@ -774,7 +791,7 @@ class EAGLEDrafter:
         work_cache = self._clone_cache(prefix_cache)
         tree_mask = torch.eye(len(seeds), dtype=torch.bool, device=self.device)
 
-        for depth in range(1, max_depth):
+        for depth in range(1, max_candidate_depth):
             if not seeds:
                 break
 
@@ -972,6 +989,11 @@ class EAGLEDrafter:
             total_token = draft_budget + 1
         else:
             total_token = max(1, int(total_token))
+
+        max_candidate_depth = _eagle2_max_candidate_depth(
+            max_depth,
+            explicit_tree_budget=explicit_tree_budget,
+        )
         if explicit_tree_budget:
             expansion_width = int(topk_per_step)
         elif isinstance(beam_width, (list, tuple)):
@@ -1014,7 +1036,7 @@ class EAGLEDrafter:
                         root_hidden=prefix_root_hidden,
                         prefix_cache=prefix_cache,
                         prefix_next_pos=prefix_next_pos,
-                        max_depth=max_depth,
+                        max_candidate_depth=max_candidate_depth,
                         total_token=total_token,
                         expansion_width=K_child,
                     )
@@ -1063,7 +1085,7 @@ class EAGLEDrafter:
             all_nodes.extend(children0)
 
             # ---- depth 1..max_depth-1: expand top-k seeds from the latest layer ----
-            for depth in range(1, max_depth):
+            for depth in range(1, max_candidate_depth):
                 latest = layer_nodes[depth]
                 if not latest:
                     break

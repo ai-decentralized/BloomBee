@@ -267,14 +267,14 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         """Optimization: cache test_inputs results to avoid duplicate calculations"""
         cache_key = (prompt_len, num_prompts)
         if cache_key not in self._test_inputs_cache:
-            tokenizer = self._get_tokenizer()
-            if tokenizer is not None:
-                self._test_inputs_cache[cache_key] = get_test_inputs(
-                    prompt_len, num_prompts, tokenizer
-                )
-            else:
-                # If tokenizer is unavailable, use simple default values
-                self._test_inputs_cache[cache_key] = ([0],) * num_prompts
+            # Task only needs a tiny placeholder input for FlexGen scheduling.
+            # Loading a tokenizer here is both unnecessary and expensive in the
+            # decode hot path, especially for local snapshots whose basename is
+            # not a valid Hugging Face repo id.
+            pad_token_id = getattr(self.llama_config, "pad_token_id", 0)
+            if pad_token_id is None:
+                pad_token_id = 0
+            self._test_inputs_cache[cache_key] = ([int(pad_token_id)],) * num_prompts
         return self._test_inputs_cache[cache_key]
 
     def _should_rebuild_task(self, max_new_tokens, actual_prompt_len):
