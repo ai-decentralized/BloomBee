@@ -1,3 +1,4 @@
+import torch
 from transformers import GenerationConfig
 
 from bloombee.models.llama.eagle_drafter import (
@@ -5,6 +6,7 @@ from bloombee.models.llama.eagle_drafter import (
     _eagle2_max_candidate_depth,
 )
 from bloombee.models.llama.speculative_model import (
+    _cap_valid_lengths_to_remaining,
     _eos_token_ids,
     _merge_generation_config_kwargs,
 )
@@ -58,3 +60,18 @@ def test_speculative_generation_reads_generation_config_eos_ids():
     assert _eos_token_ids(GenerationConfig(eos_token_id=None)) == ()
     assert _eos_token_ids(GenerationConfig(eos_token_id=2)) == (2,)
     assert _eos_token_ids(GenerationConfig(eos_token_id=[2, 32000])) == (2, 32000)
+
+
+def test_speculative_generation_caps_last_step_to_max_new_tokens():
+    valid_lengths = torch.tensor([5, 2, 0])
+    seq_lengths = torch.tensor([14, 10, 15])
+
+    capped, append_llm = _cap_valid_lengths_to_remaining(
+        valid_lengths=valid_lengths,
+        seq_lengths=seq_lengths,
+        initial_len=10,
+        max_new_tokens=5,
+    )
+
+    assert capped.tolist() == [1, 2, 0]
+    assert append_llm.tolist() == [0, 1, 0]

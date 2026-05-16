@@ -49,6 +49,21 @@ def _eos_token_ids(generation_config: GenerationConfig) -> Tuple[int, ...]:
     return (int(eos),)
 
 
+def _cap_valid_lengths_to_remaining(
+    valid_lengths: torch.LongTensor,
+    seq_lengths: torch.LongTensor,
+    initial_len: int,
+    max_new_tokens: int,
+) -> Tuple[torch.LongTensor, torch.LongTensor]:
+    remaining = torch.clamp(
+        int(max_new_tokens) - (seq_lengths - int(initial_len)),
+        min=0,
+    )
+    capped_valid_lengths = torch.minimum(valid_lengths, remaining)
+    append_llm_token = (remaining > valid_lengths).to(dtype=torch.long)
+    return capped_valid_lengths, append_llm_token
+
+
 def _merge_generation_config_kwargs(
     generation_config: GenerationConfig,
     model_kwargs: dict,
@@ -298,6 +313,28 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             )
 
             old_seq_lengths = seq_lengths.clone()
+            valid_lengths, append_llm_token = _cap_valid_lengths_to_remaining(
+                valid_lengths=valid_lengths,
+                seq_lengths=seq_lengths,
+                initial_len=initial_len,
+                max_new_tokens=max_new_tokens,
+            )
+            if verified_tokens_positions is not None:
+                position_offsets = torch.arange(
+                    verified_tokens_positions.shape[1],
+                    device=verified_tokens_positions.device,
+                )
+                keep_positions = position_offsets.unsqueeze(0) <= valid_lengths.unsqueeze(1)
+                verified_tokens_positions = verified_tokens_positions.masked_fill(
+                    ~keep_positions,
+                    -1,
+                )
+            if verified_tokens is not None:
+                max_valid_length = int(valid_lengths.max().item())
+                if max_valid_length == 0:
+                    verified_tokens = None
+                elif verified_tokens.shape[1] > max_valid_length:
+                    verified_tokens = verified_tokens[:, :max_valid_length]
 
             # M1/M3 plumbing: gather the committed-endpoint hidden state and
             # maintain the full committed-prefix hidden buffer for EAGLE.
@@ -349,6 +386,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 valid_lengths=valid_lengths,
                 seq_lengths=seq_lengths,
                 pad_token_id=pad_token_id,
+                append_llm_token=append_llm_token,
             )
 
             if eos_token_tensor is not None:
@@ -371,9 +409,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     if unfinished_sequences[i]:
                         if verified_tokens is not None and valid_lengths[i] > 0:
                             streamer.put(verified_tokens[i, :valid_lengths[i]].cpu())
-                        streamer.put(llm_generated_token[i].cpu())
+                        if append_llm_token[i]:
+                            streamer.put(llm_generated_token[i].cpu())
 
             # 5. Check if finished
+            unfinished_sequences = unfinished_sequences & (
+                (seq_lengths - initial_len) < max_new_tokens
+            ).long()
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(current_input_ids, None)
             finished = unfinished_sequences.max() == 0
             total_time = time.perf_counter() - t1
@@ -464,6 +506,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         valid_lengths: torch.LongTensor,
         seq_lengths: torch.LongTensor,
         pad_token_id: int,
+        append_llm_token: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.LongTensor, torch.LongTensor]:
         """
         更新 input_ids，处理不同序列验证通过的 token 数量不同的情况
@@ -474,9 +517,14 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         """
         batch_size = current_input_ids.shape[0]
         device = current_input_ids.device
+
+        if append_llm_token is None:
+            append_llm_token = torch.ones_like(valid_lengths, dtype=torch.long)
+        else:
+            append_llm_token = append_llm_token.to(device=device, dtype=torch.long)
         
-        # 计算每个序列需要添加的 token 数（verified + 1 个 llm token）
-        tokens_to_add = valid_lengths + 1  # [batch_size]
+        # 计算每个序列需要添加的 token 数（verified + optional llm token）
+        tokens_to_add = valid_lengths + append_llm_token  # [batch_size]
         
         # 计算新的序列长度
         new_seq_lengths = seq_lengths + tokens_to_add
@@ -492,7 +540,6 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         
         for i in range(batch_size):
             old_len = seq_lengths[i].item()
-            new_len = new_seq_lengths[i].item()
             
             # 复制原有的有效 token
             new_input_ids[i, :old_len] = current_input_ids[i, :old_len]
@@ -501,11 +548,9 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             v_len = valid_lengths[i].item()
             if v_len > 0 and verified_tokens is not None:
                 new_input_ids[i, old_len:old_len + v_len] = verified_tokens[i, :v_len]
-                # 添加 llm_generated_token
+
+            if append_llm_token[i].item():
                 new_input_ids[i, old_len + v_len] = llm_generated_token[i, 0]
-            else:
-                # 只添加 llm_generated_token
-                new_input_ids[i, old_len] = llm_generated_token[i, 0]
         
         return new_input_ids, new_seq_lengths
     
