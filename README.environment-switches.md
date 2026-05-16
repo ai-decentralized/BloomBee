@@ -13,7 +13,7 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_CACHE` | `~/.cache/bloombee` | Cache directory for downloaded blocks and local BloomBee artifacts. |
 | `BLOOMBEE_LOGGING` | `True` | Set to `0` / `false` to disable BloomBee's logging initialization tweaks. |
 | `BLOOMBEE_ASYNCIO_LOGLEVEL` | `FATAL` (or `DEBUG` if Hivemind is already in debug mode) | Overrides the asyncio logger level. |
-| `BLOOMBEE_IGNORE_DEPENDENCY_VERSION` | unset | Skips the `transformers>=4.43.1,<4.44.0` version assertion. |
+| `BLOOMBEE_IGNORE_DEPENDENCY_VERSION` | unset | Skips the `transformers>=5.5.0` version assertion. |
 | `BLOOMBEE_MAX_RETRIES` | unset | Client-side retry limit before raising an exception. |
 
 ## Micro-Batching, Overlap, and Server-to-Server Push
@@ -43,6 +43,16 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER` | auto | Overrides KV GPU<->CPU transfer mode. If unset, BloomBee enables async KV transfer when micro-batching is enabled. |
 | `BLOOMBEE_ENABLE_KV_WAIT_TIMING` | `1` | Enables KV wait timing counters and logs. |
 | `BLOOMBEE_VERBOSE_KV_LOGS` | `0` | Restores verbose KV allocation / offload / prefetch logs. Also turns on automatically if the KV debug group is enabled. |
+
+## Speculative Decoding and EAGLE-2
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BLOOMBEE_FAST_GENERATE` | `0` | Enables the client-side greedy generate fast path when the request is eligible. |
+| `BLOOMBEE_DRAFTER` | unset | Overrides the default SSM speculative drafter checkpoint. |
+| `BLOOMBEE_EAGLE_DRAFTER` | unset | Overrides EAGLE-2 drafter auto-selection with an explicit compatible checkpoint. |
+| `BLOOMBEE_EAGLE_TREE_BUDGET` | `59` | Default EAGLE-2 draft-node budget. This corresponds to the paper's total-token=60 setting because BloomBee does not count the root token here. |
+| `BLOOMBEE_EAGLE_DEPTH` | `5` | Official EAGLE-2 dynamic-tree depth used when an explicit tree budget is active. |
 
 ## Lossless Transport and Compression Profiling
 
@@ -101,5 +111,5 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 If you add a new switch later, this command is the quickest way to rescan the repository:
 
 ```bash
-rg -n -o "BLOOMBEE_[A-Z0-9_]+" README.md src benchmarks tests | sort -u
+rg -n -o "BLOOMBEE_[A-Z0-9_]+" README*.md src benchmarks tests | sort -u
 ```

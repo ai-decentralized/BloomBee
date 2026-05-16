@@ -51,6 +51,7 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 - [CLI Reference](#cli-reference)
 - [Environment Switches](README.environment-switches.md)
 - [Python API](#python-api)
+  - [Speculative Decoding (EAGLE-2)](#speculative-decoding-eagle-2)
 - [Benchmarking](#benchmarking)
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
@@ -243,12 +244,13 @@ Loads and serves transformer blocks on a peer in the swarm.
 - KV cache and offload flags
 - lossless compression and profiling flags
 - debug groups and log-channel toggles
+- speculative decoding and EAGLE-2 flags
 - activation dumping and runtime helpers
 
 If you add a new switch later, the quickest rescan command is:
 
 ```bash
-rg -n -o "BLOOMBEE_[A-Z0-9_]+" README.md src benchmarks tests | sort -u
+rg -n -o "BLOOMBEE_[A-Z0-9_]+" README*.md src benchmarks tests | sort -u
 ```
 
 ---
@@ -279,6 +281,34 @@ with model.transformer.h.inference_session(max_length=512) as sess:
     for _ in range(20):
         outputs = model.generate(max_new_tokens=1, session=sess)
 ```
+
+### Speculative Decoding (EAGLE-2)
+
+EAGLE-2 speculative decoding is available for LLaMA-family targets through the speculative auto class and EAGLE drafter:
+
+```python
+from transformers import AutoTokenizer
+from bloombee import AutoDistributedSpeculativeModel
+from bloombee.models.llama.eagle_drafter import EAGLEDrafter
+
+model_name = "lmsys/vicuna-33b-v1.3"
+model = AutoDistributedSpeculativeModel.from_pretrained(
+    model_name,
+    initial_peers=["/ip4/YOUR_IP/tcp/31340/p2p/Qm..."],
+).to("cuda")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+drafter = EAGLEDrafter.for_target(model, device="cuda")
+
+input_ids = tokenizer("The quick brown fox", return_tensors="pt")["input_ids"].to("cuda")
+outputs = model.generate(
+    input_ids,
+    drafter=drafter,
+    max_new_tokens=128,
+    max_tree_depth=5,
+)
+```
+
+By default, EAGLE-2 auto-selection is conservative and only picks known LLaMA-family drafter checkpoints. Pass `ea_model_path` explicitly for a custom compatible checkpoint. In current benchmarks, EAGLE-2 is recommended for 33B-class and larger targets; on 13B-class targets the drafter/tree overhead can outweigh the target-side savings.
 
 Available auto classes:
 
@@ -346,13 +376,11 @@ Jupyter notebook examples are in the `examples/` directory:
 - Use a smaller `--max_batch_size`.
 
 **`transformers` version mismatch**
-- On `main`, BloomBee requires `transformers>=4.43.1,<4.44.0`:
+- Current source installs and checks for Transformers 5.x:
   ```bash
-  pip install "transformers>=4.43.1,<4.44.0"
-  ```
-- On `arch-reform-qwen3-4b` (Transformers 5.x + Qwen3), use:
-  ```bash
-  pip install "transformers>=5.5,<5.6"
+  pip install -e .
+  # or, if repairing an existing environment:
+  pip install "transformers>=5.5.0"
   ```
 
 **Slow inference / high latency**
