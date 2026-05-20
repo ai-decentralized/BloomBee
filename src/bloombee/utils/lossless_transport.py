@@ -47,6 +47,10 @@ _ALGO_ZSTD = 1
 _ALGO_ZLIB = 2
 _ALGO_ZSTD_BYTE_SPLIT = 3
 _ALGO_ZIPNN = 4
+_ALGO_ZSTD_DICT_BYTE_SPLIT = 5
+_ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY = 6
+_ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL = 7
+_ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE = 8
 _HEADER_STRUCT = struct.Struct("!4sBBQ")
 _HEADER_SIZE = _HEADER_STRUCT.size
 _BYTE_SPLIT_PAYLOAD_STRUCT = struct.Struct("!BI")
@@ -69,6 +73,10 @@ _WIRE_TRUNCATE_PHASES_ENV = "BLOOMBEE_WIRE_TRUNCATE_PHASES"
 _LOSSLESS_LAYOUT_ENV = "BLOOMBEE_LOSSLESS_LAYOUT"
 _LOSSLESS_SINGLE_PATH_ENV = "BLOOMBEE_LOSSLESS_SINGLE_PATH"
 _LOSSLESS_LAYOUT_TARGETS_ENV = "BLOOMBEE_LOSSLESS_LAYOUT_TARGETS"
+_LOSSLESS_ZSTD_DICT_PATH_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH"
+_LOSSLESS_ZSTD_DICT_PATH_PREFILL_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL"
+_LOSSLESS_ZSTD_DICT_PATH_DECODE_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE"
+_LOSSLESS_HYBRID_DICT_BLOCKS_ENV = "BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS"
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
 )
@@ -149,9 +157,9 @@ def _lossless_algo() -> str:
 
 
 def _lossless_level() -> int:
-    cfg_val = _get_cfg("LOSSLESS_LEVEL", 3)
+    cfg_val = _get_cfg("LOSSLESS_LEVEL", 1)
     if _allow_env_override() and "BLOOMBEE_LOSSLESS_LEVEL" in os.environ:
-        return _get_env_int("BLOOMBEE_LOSSLESS_LEVEL", 3)
+        return _get_env_int("BLOOMBEE_LOSSLESS_LEVEL", 1)
     try:
         return int(cfg_val)
     except Exception:
@@ -376,6 +384,43 @@ def _context_matches_wire_target(debug_context: Optional[Dict[str, object]]) -> 
 
 def _context_matches_lossless_layout_target(debug_context: Optional[Dict[str, object]]) -> bool:
     return _context_matches_target_specs(debug_context, _lossless_layout_targets())
+
+
+def _context_value(debug_context: Optional[Dict[str, object]], key: str) -> str:
+    if not debug_context:
+        return ""
+    return str(debug_context.get(key, "")).strip()
+
+
+def _lossless_hybrid_dict_blocks() -> set[str]:
+    value = os.environ.get(_LOSSLESS_HYBRID_DICT_BLOCKS_ENV, "0:20")
+    return {part.strip() for part in str(value).split(",") if part.strip()}
+
+
+def _adaptive_hybrid_prefers_zstd_dict(debug_context: Optional[Dict[str, object]]) -> bool:
+    if _context_value(debug_context, "phase").lower() != "prefill":
+        return False
+    if _context_value(debug_context, "source").lower() != "client":
+        return False
+    if _context_value(debug_context, "channel").lower() != "rpc_inference":
+        return False
+    if _context_value(debug_context, "tensor_name").lower() != "hidden_states":
+        return False
+    return _context_value(debug_context, "blocks") in _lossless_hybrid_dict_blocks()
+
+
+def _phase_aware_prefers_dict(debug_context):
+    """Phase-aware dict gate.
+
+    Use the trained zstd dictionary only on prefill, where the +9.5% ratio gain
+    pays for the +33% compress-time overhead (long sequences -> compress cost
+    amortized over many bytes). On decode the per-token tensor is small and
+    256 decode steps amplify the +12% per-call compress overhead, so we fall
+    back to plain zstd_byte_split (no dict).
+    """
+    if not debug_context:
+        return False
+    return str(debug_context.get("phase", "")).strip().lower() == "prefill"
 
 
 def _should_wire_truncate_fp16(
@@ -1718,9 +1763,17 @@ def _supports_byte_split_layout(
     raw_size: int,
     debug_context: Optional[Dict[str, object]],
 ) -> bool:
-    if _lossless_layout() != "byte_split":
+    if _lossless_layout() not in ("byte_split", "byte_split_high_only"):
         return False
-    if _lossless_algo() != "zstd":
+    if _lossless_algo() not in (
+        "zstd",
+        "zstd_dict",
+        "zstd_dict_byte_split",
+        "zstd_dict_byte_split_zstd",
+        "adaptive_hybrid",
+        "hybrid_adaptive",
+        "phase_aware_dict",
+    ):
         return False
     if sys.byteorder != "little":
         return False
@@ -1728,7 +1781,7 @@ def _supports_byte_split_layout(
         return False
     if tensor is None or not torch.is_tensor(tensor):
         return False
-    if tensor.dtype not in (torch.float16, torch.float32):
+    if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
     if raw_size != tensor.numel() * tensor.element_size():
         return False
@@ -1789,6 +1842,73 @@ def _get_zstd_decompressor():
         return None
     return _zstd.ZstdDecompressor()
 
+
+def _lossless_zstd_dict_path() -> str:
+    return os.environ.get(_LOSSLESS_ZSTD_DICT_PATH_ENV, "").strip()
+
+
+@lru_cache(maxsize=4)
+def _get_zstd_dict(dict_path: str):
+    if _zstd is None or not dict_path:
+        return None
+    try:
+        with open(dict_path, "rb") as f:
+            data = f.read()
+        if not data:
+            return None
+        return _zstd.ZstdCompressionDict(data)
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=16)
+def _get_zstd_dict_compressor_cached(dict_path: str, level: int):
+    dictionary = _get_zstd_dict(dict_path)
+    if dictionary is None:
+        return None
+    return _zstd.ZstdCompressor(level=level, dict_data=dictionary)
+
+
+def _get_zstd_dict_compressor(level: int):
+    return _get_zstd_dict_compressor_cached(_lossless_zstd_dict_path(), level)
+
+
+@lru_cache(maxsize=4)
+def _get_zstd_dict_decompressor_cached(dict_path: str):
+    dictionary = _get_zstd_dict(dict_path)
+    if dictionary is None:
+        return None
+    return _zstd.ZstdDecompressor(dict_data=dictionary)
+
+
+def _get_zstd_dict_decompressor():
+    return _get_zstd_dict_decompressor_cached(_lossless_zstd_dict_path())
+
+
+def _lossless_zstd_dict_path_prefill() -> str:
+    v = os.environ.get(_LOSSLESS_ZSTD_DICT_PATH_PREFILL_ENV, "").strip()
+    return v or _lossless_zstd_dict_path()
+
+
+def _lossless_zstd_dict_path_decode() -> str:
+    v = os.environ.get(_LOSSLESS_ZSTD_DICT_PATH_DECODE_ENV, "").strip()
+    return v or _lossless_zstd_dict_path()
+
+
+def _get_zstd_dict_compressor_prefill(level: int):
+    return _get_zstd_dict_compressor_cached(_lossless_zstd_dict_path_prefill(), level)
+
+
+def _get_zstd_dict_compressor_decode(level: int):
+    return _get_zstd_dict_compressor_cached(_lossless_zstd_dict_path_decode(), level)
+
+
+def _get_zstd_dict_decompressor_prefill():
+    return _get_zstd_dict_decompressor_cached(_lossless_zstd_dict_path_prefill())
+
+
+def _get_zstd_dict_decompressor_decode():
+    return _get_zstd_dict_decompressor_cached(_lossless_zstd_dict_path_decode())
 
 def _compress_with_algo(raw: bytes, *, algo: str, level: int) -> tuple[int, bytes]:
     if algo in ("", "none", "off", "disabled"):
@@ -1899,6 +2019,106 @@ def _build_zstd_byte_split_wrapper(raw: bytes, *, elem_size: int) -> bytes:
     return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_BYTE_SPLIT, len(raw)) + payload
 
 
+def _build_zstd_dict_byte_split_wrapper(raw: bytes, *, elem_size: int) -> bytes:
+    compressor = _get_zstd_dict_compressor(_lossless_level())
+    if compressor is None:
+        raise RuntimeError("zstd_dict_byte_split requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
+
+    extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
+    t0 = time.perf_counter()
+    extracted_comp = bytes(compressor.compress(extracted_raw))
+    remaining_comp = bytes(compressor.compress(remaining_raw))
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _record_transport_profile("compress_calls", 2.0)
+    _record_transport_profile("compress_ms", dt_ms)
+    _record_transport_profile("compress_input_bytes", float(len(extracted_raw) + len(remaining_raw)))
+    _record_transport_profile("compress_output_bytes", float(len(extracted_comp) + len(remaining_comp)))
+
+    payload = (
+        _BYTE_SPLIT_PAYLOAD_STRUCT.pack(elem_size, len(extracted_comp))
+        + extracted_comp
+        + remaining_comp
+    )
+    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_DICT_BYTE_SPLIT, len(raw)) + payload
+
+
+def _build_zstd_dict_byte_split_prefill_wrapper(raw: bytes, *, elem_size: int) -> bytes:
+    compressor = _get_zstd_dict_compressor_prefill(_lossless_level())
+    if compressor is None:
+        raise RuntimeError("zstd_dict_byte_split_prefill requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL or BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
+    extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
+    t0 = time.perf_counter()
+    extracted_comp = bytes(compressor.compress(extracted_raw))
+    remaining_comp = bytes(compressor.compress(remaining_raw))
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _record_transport_profile("compress_calls", 2.0)
+    _record_transport_profile("compress_ms", dt_ms)
+    _record_transport_profile("compress_input_bytes", float(len(extracted_raw) + len(remaining_raw)))
+    _record_transport_profile("compress_output_bytes", float(len(extracted_comp) + len(remaining_comp)))
+    payload = (
+        _BYTE_SPLIT_PAYLOAD_STRUCT.pack(elem_size, len(extracted_comp))
+        + extracted_comp
+        + remaining_comp
+    )
+    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL, len(raw)) + payload
+
+
+def _build_zstd_dict_byte_split_decode_wrapper(raw: bytes, *, elem_size: int) -> bytes:
+    compressor = _get_zstd_dict_compressor_decode(_lossless_level())
+    if compressor is None:
+        raise RuntimeError("zstd_dict_byte_split_decode requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE or BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
+    extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
+    t0 = time.perf_counter()
+    extracted_comp = bytes(compressor.compress(extracted_raw))
+    remaining_comp = bytes(compressor.compress(remaining_raw))
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _record_transport_profile("compress_calls", 2.0)
+    _record_transport_profile("compress_ms", dt_ms)
+    _record_transport_profile("compress_input_bytes", float(len(extracted_raw) + len(remaining_raw)))
+    _record_transport_profile("compress_output_bytes", float(len(extracted_comp) + len(remaining_comp)))
+    payload = (
+        _BYTE_SPLIT_PAYLOAD_STRUCT.pack(elem_size, len(extracted_comp))
+        + extracted_comp
+        + remaining_comp
+    )
+    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE, len(raw)) + payload
+
+
+def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: int, phase: str) -> bytes:
+    if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
+        raise ValueError("zstd-dict-phase byte-split payload is truncated")
+    elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
+    extracted_end = extracted_start + int(extracted_comp_size)
+    if extracted_end > len(payload):
+        raise ValueError("zstd-dict-phase byte-split payload extracted segment is truncated")
+    if original_size % max(1, elem_size) != 0:
+        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+
+    if phase == "prefill":
+        decompressor = _get_zstd_dict_decompressor_prefill()
+    elif phase == "decode":
+        decompressor = _get_zstd_dict_decompressor_decode()
+    else:
+        raise ValueError(f"unknown phase: {phase}")
+    if decompressor is None:
+        raise RuntimeError(f"zstd_dict_byte_split_{phase} requires its dict env to be set")
+
+    extracted_comp = payload[extracted_start:extracted_end]
+    remaining_comp = payload[extracted_end:]
+    extracted_raw_size = original_size // elem_size
+    remaining_raw_size = original_size - extracted_raw_size
+
+    t0 = time.perf_counter()
+    extracted_raw = decompressor.decompress(extracted_comp, max_output_size=extracted_raw_size)
+    remaining_raw = decompressor.decompress(remaining_comp, max_output_size=remaining_raw_size)
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _record_transport_profile("decompress_calls", 2.0)
+    _record_transport_profile("decompress_ms", dt_ms)
+    _record_transport_profile("decompress_input_bytes", float(len(extracted_comp) + len(remaining_comp)))
+    _record_transport_profile("decompress_output_bytes", float(len(extracted_raw) + len(remaining_raw)))
+    return _reconstruct_high_byte_lane(bytes(extracted_raw), bytes(remaining_raw), elem_size, original_size)
+
 def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes:
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("Byte-split payload is truncated")
@@ -1920,6 +2140,86 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
     return _reconstruct_high_byte_lane(extracted_raw, remaining_raw, elem_size, original_size)
 
 
+def _build_zstd_byte_split_high_only_wrapper(raw: bytes, *, elem_size: int) -> bytes:
+    """Compress only the high byte lane with zstd; ship the low byte lane raw.
+
+    For fp16/bf16/fp32 LLM activations the low byte lane is dominated by
+    mantissa bits and is nearly incompressible. Running zstd on it costs ~50%
+    of the byte_split wrapper time for a fraction of a percent of ratio.
+    Adopted as the default at "mediocre bandwidth" (~250 Mbps).
+    """
+    extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
+    extracted_algo, extracted_comp = _compress_with_algo(extracted_raw, algo="zstd", level=_lossless_level())
+    if extracted_algo != _ALGO_ZSTD:
+        raise RuntimeError("byte_split_high_only wrapper requires zstd")
+    payload = (
+        _BYTE_SPLIT_PAYLOAD_STRUCT.pack(elem_size, len(extracted_comp))
+        + extracted_comp
+        + remaining_raw
+    )
+    return (
+        _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY, len(raw))
+        + payload
+    )
+
+
+def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int) -> bytes:
+    if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
+        raise ValueError("byte_split_high_only payload is truncated")
+    elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    start = _BYTE_SPLIT_PAYLOAD_SIZE
+    end = start + int(extracted_comp_size)
+    if end > len(payload):
+        raise ValueError("byte_split_high_only extracted segment is truncated")
+    if original_size % max(1, elem_size) != 0:
+        raise ValueError(
+            f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}"
+        )
+
+    extracted_comp = payload[start:end]
+    remaining_raw = bytes(payload[end:])
+    extracted_raw_size = original_size // elem_size
+    remaining_raw_size = original_size - extracted_raw_size
+    if len(remaining_raw) != remaining_raw_size:
+        raise ValueError(
+            f"byte_split_high_only low-lane size mismatch: expected {remaining_raw_size}, got {len(remaining_raw)}"
+        )
+    extracted_raw = _decompress_with_algo(_ALGO_ZSTD, extracted_comp, extracted_raw_size)
+    return _reconstruct_high_byte_lane(extracted_raw, remaining_raw, elem_size, original_size)
+
+
+
+def _decode_zstd_dict_byte_split_payload(payload: bytes, original_size: int) -> bytes:
+    if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
+        raise ValueError("zstd-dict byte-split payload is truncated")
+    elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
+    extracted_end = extracted_start + int(extracted_comp_size)
+    if extracted_end > len(payload):
+        raise ValueError("zstd-dict byte-split payload extracted segment is truncated")
+    if original_size % max(1, elem_size) != 0:
+        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+
+    decompressor = _get_zstd_dict_decompressor()
+    if decompressor is None:
+        raise RuntimeError("zstd_dict_byte_split requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
+
+    extracted_comp = payload[extracted_start:extracted_end]
+    remaining_comp = payload[extracted_end:]
+    extracted_raw_size = original_size // elem_size
+    remaining_raw_size = original_size - extracted_raw_size
+
+    t0 = time.perf_counter()
+    extracted_raw = decompressor.decompress(extracted_comp, max_output_size=extracted_raw_size)
+    remaining_raw = decompressor.decompress(remaining_comp, max_output_size=remaining_raw_size)
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    _record_transport_profile("decompress_calls", 2.0)
+    _record_transport_profile("decompress_ms", dt_ms)
+    _record_transport_profile("decompress_input_bytes", float(len(extracted_comp) + len(remaining_comp)))
+    _record_transport_profile("decompress_output_bytes", float(len(extracted_raw) + len(remaining_raw)))
+    return _reconstruct_high_byte_lane(bytes(extracted_raw), bytes(remaining_raw), elem_size, original_size)
+
+
 def _parse_wrapper(buffer: bytes, *, strict: bool = True):
     if len(buffer) < _HEADER_SIZE:
         return None
@@ -1936,6 +2236,53 @@ def _parse_wrapper(buffer: bytes, *, strict: bool = True):
 
     payload = buffer[_HEADER_SIZE:]
     return algo_id, original_size, payload
+
+
+
+
+def _dump_wire_bytes_if_enabled(raw: bytes, tensor, debug_context):
+    """Dump pre-compression raw bytes to disk for dict-training.
+
+    Env:
+      BLOOMBEE_DUMP_WIRE_BYTES_DIR  -- destination dir
+      BLOOMBEE_DUMP_WIRE_BYTES_MAX  -- max samples (default 400)
+    """
+    out_dir = os.environ.get("BLOOMBEE_DUMP_WIRE_BYTES_DIR", "").strip()
+    if not out_dir:
+        return
+    try:
+        max_n = int(os.environ.get("BLOOMBEE_DUMP_WIRE_BYTES_MAX", "400"))
+    except Exception:
+        max_n = 400
+    try:
+        import threading
+        global _wire_dump_lock, _wire_dump_count
+        try:
+            _wire_dump_lock
+        except NameError:
+            _wire_dump_lock = threading.Lock()
+            _wire_dump_count = {"n": 0}
+        with _wire_dump_lock:
+            if _wire_dump_count["n"] >= max_n:
+                return
+            _wire_dump_count["n"] += 1
+            idx = _wire_dump_count["n"]
+        phase = ""
+        blocks = ""
+        if debug_context:
+            phase = str(debug_context.get("phase", "")).strip().lower() or "unknown"
+            blocks = str(debug_context.get("blocks", "")).strip().replace("/", "_").replace(":", "_") or "x"
+        else:
+            phase = "unknown"
+            blocks = "x"
+        elem = int(tensor.element_size()) if tensor is not None else 2
+        dtype_name = str(tensor.dtype).split(".")[-1] if tensor is not None else "unknown"
+        os.makedirs(out_dir, exist_ok=True)
+        fp = os.path.join(out_dir, f"wire_{idx:05d}_{phase}_{blocks}_{dtype_name}_{elem}b_{len(raw)}.bin")
+        with open(fp, "wb") as f:
+            f.write(raw)
+    except Exception:
+        pass
 
 
 def _wrap_serialized_tensor_impl(
@@ -1979,6 +2326,7 @@ def _wrap_serialized_tensor_impl(
             info["reason"] = "already_wrapped"
             return serialized_tensor, info
 
+        _dump_wire_bytes_if_enabled(raw, tensor, debug_context)
         compress_t0 = time.perf_counter()
         candidates: List[tuple[str, int, bytes]] = []
         selected_algo = _lossless_algo()
@@ -1993,6 +2341,71 @@ def _wrap_serialized_tensor_impl(
                     info["zipnn_wrapped_bytes"] = 0
             if not candidates:
                 info["reason"] = _zipnn_skip_reason(tensor, compression_type, len(raw), debug_context)
+                return serialized_tensor, info
+        elif selected_algo in ("zstd_dict", "zstd_dict_byte_split", "zstd_dict_byte_split_zstd"):
+            if _supports_byte_split_layout(tensor, compression_type, len(raw), debug_context):
+                try:
+                    dict_wrapped = _build_zstd_dict_byte_split_wrapper(raw, elem_size=int(tensor.element_size()))
+                    candidates.append(("zstd_dict_byte_split", _ALGO_ZSTD_DICT_BYTE_SPLIT, dict_wrapped))
+                    info["byte_split_wrapped_bytes"] = int(len(dict_wrapped))
+                except Exception:
+                    info["byte_split_wrapped_bytes"] = 0
+            if not candidates:
+                info["reason"] = "zstd_dict_byte_split_unsupported"
+                return serialized_tensor, info
+        elif selected_algo == "phase_aware_dict":
+            supports_bs = _supports_byte_split_layout(tensor, compression_type, len(raw), debug_context)
+            phase_val = str(debug_context.get("phase", "")).strip().lower() if debug_context else ""
+            elem_size = int(tensor.element_size()) if tensor is not None else 2
+            if supports_bs and phase_val == "prefill" and _get_zstd_dict_compressor_prefill(_lossless_level()) is not None:
+                try:
+                    wrapped = _build_zstd_dict_byte_split_prefill_wrapper(raw, elem_size=elem_size)
+                    candidates.append(("zstd_dict_byte_split_prefill", _ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL, wrapped))
+                    info["byte_split_wrapped_bytes"] = int(len(wrapped))
+                except Exception:
+                    info["byte_split_wrapped_bytes"] = 0
+            elif supports_bs and phase_val == "decode" and _get_zstd_dict_compressor_decode(_lossless_level()) is not None:
+                try:
+                    wrapped = _build_zstd_dict_byte_split_decode_wrapper(raw, elem_size=elem_size)
+                    candidates.append(("zstd_dict_byte_split_decode", _ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE, wrapped))
+                    info["byte_split_wrapped_bytes"] = int(len(wrapped))
+                except Exception:
+                    info["byte_split_wrapped_bytes"] = 0
+            if not candidates and supports_bs:
+                try:
+                    split_wrapped = _build_zstd_byte_split_wrapper(raw, elem_size=elem_size)
+                    candidates.append(("byte_split", _ALGO_ZSTD_BYTE_SPLIT, split_wrapped))
+                    info["byte_split_wrapped_bytes"] = int(len(split_wrapped))
+                except Exception:
+                    info["byte_split_wrapped_bytes"] = 0
+            if not candidates:
+                info["reason"] = "phase_aware_dict_unsupported"
+                return serialized_tensor, info
+        elif selected_algo in ("adaptive_hybrid", "hybrid_adaptive"):
+            if (
+                _adaptive_hybrid_prefers_zstd_dict(debug_context)
+                and _supports_byte_split_layout(tensor, compression_type, len(raw), debug_context)
+            ):
+                try:
+                    dict_wrapped = _build_zstd_dict_byte_split_wrapper(raw, elem_size=int(tensor.element_size()))
+                    candidates.append(("zstd_dict_byte_split", _ALGO_ZSTD_DICT_BYTE_SPLIT, dict_wrapped))
+                    info["byte_split_wrapped_bytes"] = int(len(dict_wrapped))
+                except Exception:
+                    info["byte_split_wrapped_bytes"] = 0
+
+            if not candidates and _supports_zipnn_transport(tensor, compression_type, len(raw), debug_context):
+                try:
+                    zipnn_wrapped = _build_zipnn_wrapper(raw, tensor=tensor)
+                    candidates.append(("zipnn", _ALGO_ZIPNN, zipnn_wrapped))
+                    info["zipnn_wrapped_bytes"] = int(len(zipnn_wrapped))
+                except Exception:
+                    info["zipnn_wrapped_bytes"] = 0
+
+            if not candidates:
+                if _adaptive_hybrid_prefers_zstd_dict(debug_context):
+                    info["reason"] = "adaptive_hybrid_dict_unsupported"
+                else:
+                    info["reason"] = _zipnn_skip_reason(tensor, compression_type, len(raw), debug_context)
                 return serialized_tensor, info
         else:
             supports_byte_split = _supports_byte_split_layout(tensor, compression_type, len(raw), debug_context)
@@ -2033,6 +2446,15 @@ def _wrap_serialized_tensor_impl(
         info["compressed_bytes"] = int(max(0, len(wrapped_buffer) - _HEADER_SIZE))
         if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
             info["algo_name"] = "zstd_byte_split"
+        elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT:
+            info["algo_name"] = "zstd_dict_byte_split"
+            info["layout"] = "byte_split"
+        elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL:
+            info["algo_name"] = "zstd_dict_byte_split_prefill"
+            info["layout"] = "byte_split"
+        elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE:
+            info["algo_name"] = "zstd_dict_byte_split_decode"
+            info["layout"] = "byte_split"
         elif algo_id == _ALGO_ZIPNN:
             info["algo_name"] = "zipnn"
             info["layout"] = "zipnn"
@@ -2083,6 +2505,14 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
         algo_id, original_size, payload = parsed
         if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
             raw_buffer = _decode_zstd_byte_split_payload(payload, original_size)
+        elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT:
+            raw_buffer = _decode_zstd_dict_byte_split_payload(payload, original_size)
+        elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL:  # phase_aware_dict_prefill_decode
+            raw_buffer = _decode_zstd_dict_byte_split_phase_payload(payload, original_size, "prefill")
+        elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE:
+            raw_buffer = _decode_zstd_dict_byte_split_phase_payload(payload, original_size, "decode")
+        elif algo_id == _ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY:
+            raw_buffer = _decode_zstd_byte_split_high_only_payload(payload, original_size)
         else:
             raw_buffer = _decompress_buffer(algo_id, payload, original_size)
 
