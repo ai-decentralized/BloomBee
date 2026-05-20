@@ -14,7 +14,7 @@ LOSSLESS_ALGO = "zstd"
 # Compression level:
 # - zstd: typically 1..22 (3 is a good low-latency default)
 # - zlib: -1..9
-LOSSLESS_LEVEL = 3
+LOSSLESS_LEVEL = 1
 
 # "plain" = compress the original serialized buffer as one stream
 # "byte_split" = also try splitting float16/float32 high-byte lanes into a second zstd stream

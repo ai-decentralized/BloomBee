@@ -148,9 +148,9 @@ def _lossless_algo() -> str:
 
 
 def _lossless_level() -> int:
-    cfg_val = _get_cfg("LOSSLESS_LEVEL", 3)
+    cfg_val = _get_cfg("LOSSLESS_LEVEL", 1)
     if _allow_env_override() and "BLOOMBEE_LOSSLESS_LEVEL" in os.environ:
-        return _get_env_int("BLOOMBEE_LOSSLESS_LEVEL", 3)
+        return _get_env_int("BLOOMBEE_LOSSLESS_LEVEL", 1)
     try:
         return int(cfg_val)
     except Exception:
@@ -1617,7 +1617,7 @@ def _supports_byte_split_layout(
         return False
     if tensor is None or not torch.is_tensor(tensor):
         return False
-    if tensor.dtype not in (torch.float16, torch.float32):
+    if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
     if raw_size != tensor.numel() * tensor.element_size():
         return False
