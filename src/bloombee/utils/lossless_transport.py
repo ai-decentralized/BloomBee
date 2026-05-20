@@ -1965,6 +1965,22 @@ def _build_zipnn_wrapper(raw: bytes, *, tensor: torch.Tensor) -> bytes:
     return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZIPNN, len(raw)) + payload
 
 
+def _decompress_zlib_capped(payload: bytes, original_size: int) -> bytes:
+    if original_size < 0:
+        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+
+    decompressor = zlib.decompressobj()
+    limit = original_size + 1
+    raw = decompressor.decompress(payload, limit)
+    if len(raw) > original_size or decompressor.unconsumed_tail:
+        raise ValueError(f"Lossless zlib payload exceeds declared size: {original_size}")
+    if not decompressor.eof:
+        raise ValueError("Truncated zlib lossless payload")
+    if decompressor.unused_data:
+        raise ValueError("Trailing data after zlib lossless payload")
+    return raw
+
+
 def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> bytes:
     t0 = time.perf_counter()
     if algo_id == _ALGO_ZSTD:
@@ -1973,7 +1989,7 @@ def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> b
             raise RuntimeError("Received zstd-wrapped tensor, but 'zstandard' is not installed")
         raw = decompressor.decompress(payload, max_output_size=original_size)
     elif algo_id == _ALGO_ZLIB:
-        raw = zlib.decompress(payload)
+        raw = _decompress_zlib_capped(payload, original_size)
     elif algo_id == _ALGO_ZIPNN:
         decompressor = _get_zipnn_decompressor()
         if decompressor is None:

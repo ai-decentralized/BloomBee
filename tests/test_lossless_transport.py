@@ -1,4 +1,7 @@
+import zlib
+
 import numpy as np
+import pytest
 import torch
 from hivemind.proto import runtime_pb2
 
@@ -114,6 +117,15 @@ def test_byte_split_single_path_skips_plain_candidate(monkeypatch):
     assert parsed is not None
     assert parsed[0] == lt._ALGO_ZSTD_BYTE_SPLIT
     assert torch.equal(lt.deserialize_torch_tensor(serialized), tensor)
+
+
+def test_zlib_wrapper_decompression_is_capped_to_declared_size():
+    raw = b"x" * 128
+    payload = zlib.compress(raw)
+
+    assert lt._decompress_with_algo(lt._ALGO_ZLIB, payload, len(raw)) == raw
+    with pytest.raises(ValueError, match="exceeds declared size"):
+        lt._decompress_with_algo(lt._ALGO_ZLIB, payload, 8)
 
 
 def test_zipnn_compare_candidate_fp16(monkeypatch):
