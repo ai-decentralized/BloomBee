@@ -191,6 +191,49 @@ class KVCacheManager:
             active_batch_size = min(int(actual_batch_size), slot_batch_capacity)
         return working_slot, slot_batch_start, active_batch_size, slot_batch_capacity
 
+    def _source_heads_per_batch(
+        self,
+        attention_heads: int,
+        source_bh: int,
+        full_batch_size: int = 0,
+        micro_batch_size: int = 0,
+    ) -> int:
+        """Infer how many source KV rows belong to each batch item.
+
+        The cache slab is strided by attention heads, but GQA/MQA model blocks
+        return only num_key_value_heads rows per batch. Batched writes must
+        preserve that per-batch stride instead of treating the source rows as
+        one contiguous attention-head block.
+        """
+        attention_heads = max(1, int(attention_heads))
+        source_bh = int(source_bh)
+
+        if full_batch_size > 0 and micro_batch_size > 0:
+            runtime_batch = int(micro_batch_size)
+            if runtime_batch > 0 and source_bh % runtime_batch == 0:
+                heads = source_bh // runtime_batch
+                if 0 < heads <= attention_heads:
+                    return int(heads)
+
+        kv_heads = getattr(self.block_config, "num_key_value_heads", None)
+        if kv_heads is None:
+            groups = getattr(self.block_config, "num_key_value_groups", None)
+            try:
+                groups = int(groups) if groups is not None else 1
+            except (TypeError, ValueError):
+                groups = 1
+            if groups > 1 and attention_heads % groups == 0:
+                kv_heads = attention_heads // groups
+
+        try:
+            kv_heads = int(kv_heads) if kv_heads is not None else attention_heads
+        except (TypeError, ValueError):
+            kv_heads = attention_heads
+
+        if 0 < kv_heads <= attention_heads and source_bh % kv_heads == 0:
+            return int(kv_heads)
+        return attention_heads
+
     def _get_slot_state_key_for_mb(self, mb_index: int) -> Optional[Tuple[int, int]]:
         if not self._active_cache_tensors_stack:
             return None
@@ -503,9 +546,10 @@ class KVCacheManager:
                 return [], 0
             BH, _D, s_new = key_data.shape
             H = getattr(self.block_config, "num_attention_heads", 32) or 32
-            if H <= 0 or BH % H != 0:
+            source_heads = self._source_heads_per_batch(H, BH)
+            if source_heads <= 0 or BH % source_heads != 0:
                 return [], 0
-            B = BH // H
+            B = BH // source_heads
             return list(range(B)), int(s_new)
         except Exception as e:
             logger.debug(f"[PAGED_KV] failed to infer seq ids: {e}")
@@ -1481,6 +1525,12 @@ class KVCacheManager:
         BH_src, D_src, s_new = key_t.shape
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
+        source_heads = self._source_heads_per_batch(H, BH_src, full_batch_size, micro_batch_size)
+        assert BH_src % source_heads == 0, (
+            f"BH_src={BH_src} not divisible by source_heads={source_heads}"
+        )
+        source_batch_size = BH_src // source_heads
+        write_bh_span = source_batch_size * H if source_heads < H else BH_src
         
         working_slot = None
         active_batch_rows = None
@@ -1500,7 +1550,7 @@ class KVCacheManager:
                     if current_mb is not None and current_mb != mb_index:
                         self.sync_offload(current_mb)
                 BH_offset_start = slot_batch_start * H
-                BH_offset_end = BH_offset_start + BH_src
+                BH_offset_end = BH_offset_start + write_bh_span
                 self._log_kv_detail(
                     f"[MBPIPE_MULTIPLEX] _write_kvs: GPU multiplexing ACTIVE, "
                     f"mb_index={mb_index}, slot={working_slot}, writing to BH[{BH_offset_start}:{BH_offset_end}]"
@@ -1508,7 +1558,7 @@ class KVCacheManager:
             else:
                 # Legacy mode: cache holds full batch, use batch_offset for slicing
                 BH_offset_start = batch_offset * H
-                BH_offset_end = BH_offset_start + BH_src
+                BH_offset_end = BH_offset_start + write_bh_span
                 if BH_offset_end > BH_dst:
                     logger.error(f"[MBPIPE_DEBUG] BH offset out of bounds: {BH_offset_end} > {BH_dst}, "
                                 f"clamping to BH_dst={BH_dst}")
@@ -1517,24 +1567,24 @@ class KVCacheManager:
         else:
             # Full batch mode: if BH_src < BH_dst, auto-adapt by writing to first BH_src entries
             # This handles the case where request batch_size < server cache batch_size
-            if BH_src <= BH_dst:
+            if write_bh_span <= BH_dst:
                 BH_offset_start = 0
-                BH_offset_end = BH_src
-                if BH_src < BH_dst:
-                    actual_batch_src = BH_src // H
+                BH_offset_end = write_bh_span
+                if write_bh_span < BH_dst:
+                    actual_batch_src = source_batch_size
                     actual_batch_dst = BH_dst // H
                     self._log_kv_once(
                         ("kv_write_mode", "auto_adapt"),
                         "[MBPIPE_DEBUG] KV auto-adapt mode observed (request batch smaller than cache capacity)",
                     )
                     self._log_kv_detail(
-                        f"[MBPIPE_DEBUG] Auto-adapting: writing first {BH_src} of {BH_dst} BH entries "
+                        f"[MBPIPE_DEBUG] Auto-adapting: writing first {write_bh_span} of {BH_dst} BH entries "
                         f"(batch {actual_batch_src} of {actual_batch_dst})"
                     )
-                logger.debug(f"[MBPIPE] _write_kvs FULL: BH_slice=[0:{BH_src}]")
+                logger.debug(f"[MBPIPE] _write_kvs FULL: BH_slice=[0:{write_bh_span}]")
             else:
                 # This should not happen - source is larger than destination
-                raise AssertionError(f"BH mismatch: src {BH_src} > dst {BH_dst}, cannot write")
+                raise AssertionError(f"BH mismatch: src span {write_bh_span} > dst {BH_dst}, cannot write")
 
         end_position = start_position + s_new
         if not (0 <= start_position < S_total and end_position <= S_total):
@@ -1571,19 +1621,25 @@ class KVCacheManager:
         # [KVCACHE_OFFLOAD] Handle TorchMixedDevice (GPU+CPU split) properly for micro-batch slicing
         # The issue: general_copy's cut_indices uses segment boundaries on BOTH src and dst,
         # but for micro-batch, src size != dst slice size (e.g., src=128 but dst_idx spans [128:256])
-        def _write_to_cache(cache, src_tt, dst_idx, cache_name):
+        def _write_to_cache(cache, src_tt, dst_idx, cache_name, src_idx=None):
             """Write source tensor to cache, handling TorchMixedDevice segment splitting."""
             if hasattr(cache, 'device') and getattr(cache.device, 'device_type', None) == DeviceType.MIXED:
                 # TorchMixedDevice: manually split writes across segments
                 tensors, seg_points = cache.data  # ([gpu_tensor, cpu_tensor, ...], [0, seg1, seg2, ...])
                 s_slice, bh_slice, d_slice = dst_idx
+                if src_idx is None:
+                    src_s_slice = slice(0, src_tt.shape[0])
+                    src_bh_slice = slice(0, src_tt.shape[1])
+                    src_d_slice = slice(0, src_tt.shape[2])
+                else:
+                    src_s_slice, src_bh_slice, src_d_slice = src_idx
                 bh_start, bh_end = bh_slice.start, bh_slice.stop
                 
                 logger.debug(f"[KVCACHE_OFFLOAD] {cache_name} is MixedDevice, seg_points={seg_points}, "
                             f"bh_range=[{bh_start}:{bh_end}]")
                 
                 # Track position in source tensor
-                src_offset = 0
+                src_offset = src_bh_slice.start or 0
                 
                 for i, seg_tensor in enumerate(tensors):
                     if seg_tensor is None:
@@ -1611,7 +1667,7 @@ class KVCacheManager:
                                     f"dst_bh=[{dst_bh_start}:{dst_bh_end}]")
                         
                         # Slice source data
-                        src_data = src_tt.data[:, src_slice_start:src_slice_end, :]
+                        src_data = src_tt.data[src_s_slice, src_slice_start:src_slice_end, src_d_slice]
                         
                         # Get destination tensor data and write
                         if hasattr(seg_tensor, 'data'):
@@ -1623,11 +1679,32 @@ class KVCacheManager:
                         src_offset += overlap_len
             else:
                 # Non-MixedDevice: use regular general_copy
-                general_copy(cache, dst_idx, src_tt, None)
+                general_copy(cache, dst_idx, src_tt, src_idx)
         
         # Actual write with MixedDevice handling
-        _write_to_cache(k_cache, k_src_tt, dst_idx, "k_cache")
-        _write_to_cache(v_cache, v_src_tt, dst_idx, "v_cache")
+        if source_heads < H:
+            # GQA/MQA sources are packed as [batch0 kv-heads, batch1 kv-heads, ...],
+            # but the slab is laid out in attention-head strides per batch.
+            for batch_idx in range(source_batch_size):
+                src_bh_start = batch_idx * source_heads
+                src_bh_end = src_bh_start + source_heads
+                dst_bh_start = BH_offset_start + batch_idx * H
+                dst_bh_end = dst_bh_start + source_heads
+                dst_batch_idx = (
+                    slice(start_position, start_position + s_new),
+                    slice(dst_bh_start, dst_bh_end),
+                    slice(0, D_src),
+                )
+                src_batch_idx = (
+                    slice(0, s_new),
+                    slice(src_bh_start, src_bh_end),
+                    slice(0, D_src),
+                )
+                _write_to_cache(k_cache, k_src_tt, dst_batch_idx, "k_cache", src_batch_idx)
+                _write_to_cache(v_cache, v_src_tt, dst_batch_idx, "v_cache", src_batch_idx)
+        else:
+            _write_to_cache(k_cache, k_src_tt, dst_idx, "k_cache")
+            _write_to_cache(v_cache, v_src_tt, dst_idx, "v_cache")
 
         # In GPU multiplexing mode, immediately offload this micro-batch cache snapshot
         # while still inside use_cache context, so the next micro-batch can reuse GPU slots.
