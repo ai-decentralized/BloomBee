@@ -623,6 +623,9 @@ class TransformerConnectionHandler(ConnectionHandler):
 
     @staticmethod
     def _emit_unconditional_summary(message: str) -> None:
+        # Intentional print(): timing/paper-table summary lines must always reach
+        # stdout regardless of logger configuration so downstream parsers can
+        # grep [PAPER_TIMING_TABLE]/[TIMING_TABLE]/[PIPELINE_GPU2GPU] markers.
         print(message, flush=True)
 
     def _track_session_push_task(self, session_id: Optional[str], task: asyncio.Task) -> None:
@@ -1242,7 +1245,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         cache_manager = requested_backends[0].cache_manager
                         if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
                             cache_manager.clear_offload_state()
-                            logger.info(f"[MBPIPE_FIX] Cleared offload state after request completion")
+                            logger.debug(f"[MBPIPE_FIX] Cleared offload state after request completion")
                 except Exception as e:
                     logger.warning(f"[MBPIPE_FIX] Failed to clear offload state: {e}")
 

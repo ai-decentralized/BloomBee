@@ -791,7 +791,7 @@ class KVCacheManager:
             self._log_kv_detail(f"[MBPIPE_KV_VERIFY] Mode: FULL BATCH - reading BH[0:{BH_full}]")
 
         # Target device for computation (CPU/GPU)
-        compute_dst = self.attention_compute  # 统一在计算设备上物化
+        compute_dst = self.attention_compute  # materialize uniformly on the compute device
 
         # Path determination (whether MIXED)
         if self.offloading_policy.cpu_cache_compute and (
@@ -808,7 +808,7 @@ class KVCacheManager:
         else:
             root_position = kv_cache_position_ids[0]
             prefix_positions = list(range(root_position))  # [0, 1, 2, ..., root-1]
-            s_indices = prefix_positions + kv_cache_position_ids.tolist()  # 完整序列
+            s_indices = prefix_positions + kv_cache_position_ids.tolist()  # full sequence
             expected_continuous = list(range(len(s_indices)))
             need_reorder = False if (s_indices == expected_continuous) else True
             prefix_length = len(s_indices)
@@ -1758,14 +1758,14 @@ class KVCacheManager:
         kv_valid_lengths: torch.Tensor,
     ) -> None:
         """
-        Batch speculative decoding 专用：每个 batch 从不同位置写入 KV cache
+        Batched speculative decoding: each batch item writes to KV cache starting at its own position.
         """
-        # 快速路径：所有 batch 的 start_position 相同
+        # Fast path: all batch items share the same start_position
         if (kv_valid_lengths == kv_valid_lengths[0]).all():
             self._write_kvs(new_kvs, kv_valid_lengths[0].item())
             return
-        
-        # 慢速路径：逐 batch 写入
+
+        # Slow path: write per batch item
         assert self._active_cache_tensors_stack, "write called outside of use_cache context"
         cache_tensors = self._active_cache_tensors_stack[-1]
         (k_cache, v_cache), = cache_tensors
@@ -1809,7 +1809,7 @@ class KVCacheManager:
             head_start = i * H
             head_end = (i + 1) * H
             
-            # 提取第 i 个 batch 的数据并写入
+            # Extract data for batch item i and write
             k_batch = k_write[:actual_len, head_start:head_end, :].contiguous()
             v_batch = v_write[:actual_len, head_start:head_end, :].contiguous()
             
@@ -1902,7 +1902,7 @@ class KVCacheManager:
         kv_cache_position_ids: torch.Tensor,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], bool]:
         """
-        为 reorder 准备：取出所有 batch 需要的 positions 的并集
+        Prepare for reorder: read the union of positions needed across all batch items.
         """
         assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
         
@@ -1921,14 +1921,14 @@ class KVCacheManager:
         if kv_cache_position_ids.dim() == 1:
             kv_cache_position_ids = kv_cache_position_ids.unsqueeze(0)
         
-        # 找出需要的最大 position
+        # Find the largest position we need
         valid_mask = kv_cache_position_ids >= 0
         if not valid_mask.any():
             return None, None, False
-        
+
         max_position = kv_cache_position_ids[valid_mask].max().item()
-        
-        # 取 [0, max_position] 范围
+
+        # Take the range [0, max_position]
         prefix_length = int(max_position) + 1
         idx_all = (slice(0, prefix_length), slice(0, BH))
         
@@ -1943,14 +1943,14 @@ class KVCacheManager:
         k_pkv = _to_pkv(k_sbh)
         v_pkv = _to_pkv(v_sbh)
         
-        # 判断是否需要 reorder
-        need_reorder = True  # 只要有 kv_cache_position_ids 就需要
+        # Decide whether reorder is needed
+        need_reorder = True  # always needed when kv_cache_position_ids is present
         
         return k_pkv, v_pkv, need_reorder
     
     def select_cache_without_reorder(
         self,
-        kv_cache_position_ids: torch.Tensor,  # (B, max_pos_len), -1 是 padding
+        kv_cache_position_ids: torch.Tensor,  # (B, max_pos_len), -1 is padding
         batch_offset: int = 0,
         full_batch_size: int = 0,
         micro_batch_size: int = 0,
@@ -1961,7 +1961,7 @@ class KVCacheManager:
         Returns:
             k_pkv: (B, H, cache_len, D)
             v_pkv: (B, H, cache_len, D)
-            cache_len: 取出的 cache 长度
+            cache_len: length of cache read out
         """
         if cache_tensors is None:
             assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
@@ -1973,7 +1973,7 @@ class KVCacheManager:
         H = getattr(self.block_config, "num_attention_heads", None)
         full_batch_in_cache = BH_full // H
         
-        # 1. 找到需要取的 cache 范围
+        # 1. Locate the cache range to read
         valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
         if not valid_mask.any():
             return None, None, 0
@@ -1989,7 +1989,7 @@ class KVCacheManager:
         ).max(dim=1).values
         cache_len = int((max_positions + 1).max().item())
         
-        # 2. 计算 BH 切片范围 (与 select_cache 保持一致)
+        # 2. Compute BH slice range (consistent with select_cache)
         gpu_multiplexing = full_batch_size > 0 and full_batch_in_cache < full_batch_size
         
         if full_batch_size > 0 and micro_batch_size > 0:
@@ -2013,18 +2013,18 @@ class KVCacheManager:
                     elif pending_mb == mb_index:
                         self.sync_prefetch(mb_index)
             else:
-                # Legacy 模式: cache 存储 full batch，使用 batch_offset 切片
+                # Legacy mode: cache stores the full batch; slice with batch_offset
                 BH_offset_start = batch_offset * H
                 BH_offset_end = BH_offset_start + micro_batch_size * H
                 BH_offset_end = min(BH_offset_end, BH_full)
         else:
-            # Full batch 模式
+            # Full-batch mode
             BH_offset_start = 0
             BH_offset_end = BH_full
         
         BH = BH_offset_end - BH_offset_start
         
-        # 3. 取出 [0, cache_len) 的 cache
+        # 3. Read the cache slice [0, cache_len)
         compute_dst = self.attention_compute
         idx_all = (slice(0, cache_len), slice(BH_offset_start, BH_offset_end))
         
@@ -2086,7 +2086,7 @@ class KVCacheManager:
     def update_cache_and_async_reorder(
         self,
         new_kvs: AdaptedKVCache,
-        kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len), -1 是 padding，可能为 None
+        kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len), -1 is padding; may be None
         cache_tensors: Sequence[torch.Tensor],
         batch_offset: int = 0,
         full_batch_size: int = 0,
@@ -2131,7 +2131,7 @@ class KVCacheManager:
                     )
                     return
 
-                # ============ Generation 阶段 ============
+                # ============ Generation phase ============
                 valid_mask = kv_cache_position_ids >= 0
 
                 if not valid_mask.any():
@@ -2160,7 +2160,7 @@ class KVCacheManager:
                     l_acc_target=write_position, cache_tensors=cache_tensors,
                 )
 
-                # 1. 同步写入新 KV
+                # 1. Synchronously write the new KV
                 self._write_kvs(
                     new_kvs,
                     write_position,
@@ -2177,7 +2177,7 @@ class KVCacheManager:
                     cache_tensors=cache_tensors,
                 )
 
-                # 2. 准备异步重排所需的参数
+                # 2. Prepare parameters for the async reorder
                 new_kvs_data = new_kvs.kvs if hasattr(new_kvs, "kvs") else new_kvs
                 key, _ = new_kvs_data
                 key_data = key.data if hasattr(key, 'data') else key
@@ -2188,17 +2188,17 @@ class KVCacheManager:
 
                 kv_cache_position_ids_copy = kv_cache_position_ids.clone()
 
-                # 构建 extended_position_ids
+                # Build extended_position_ids
                 new_positions = torch.arange(write_position, write_position + tree_len, device=device)
                 new_positions = new_positions.unsqueeze(0).expand(B, tree_len)
                 extended_position_ids = torch.cat([kv_cache_position_ids_copy, new_positions], dim=1)
 
-                # 计算 cache 长度
+                # Compute cache length
                 ext_valid_mask = extended_position_ids >= 0
                 max_ext_position = extended_position_ids[ext_valid_mask].max().item()
                 cache_len = int(max_ext_position) + 1
 
-                # 直接调用现有的 select_cache
+                # Reuse the existing select_cache
                 k_pkv, v_pkv, _ = cache_manager.select_cache(
                     prefix_length=cache_len,
                     hypo_ids=None,
@@ -2212,7 +2212,7 @@ class KVCacheManager:
                 if k_pkv is None:
                     return
 
-                # 重排并写回
+                # Reorder and write back
                 cache_manager.reorder_and_write_cache(
                     k_pkv=k_pkv,
                     v_pkv=v_pkv,

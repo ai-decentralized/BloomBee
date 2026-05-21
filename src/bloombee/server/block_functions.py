@@ -59,15 +59,16 @@ from bloombee.utils.microbatch_schema import (
 # [MBPIPE] Cross-stage streaming push support
 _cross_stage_push_callback = None  # Will be set by handler for cross-stage streaming
 
+logger = get_logger(__name__)
+
 
 from time import perf_counter
 from datetime import datetime, timezone
 def print_time_now(s):
-    # Get the current time in UTC
+    # Get the current time in UTC and emit it through the logger
     current_utc_datetime = datetime.now(timezone.utc)
-    # Format the datetime to the desired string format
     formatted_utc_time = current_utc_datetime.strftime('%Y-%m-%d %H:%M:%S.%f %Z')
-    print('\t\t\t'+s+" UTC Time: "+ str(formatted_utc_time) )
+    logger.debug("\t\t\t%s UTC Time: %s", s, formatted_utc_time)
 
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
@@ -75,8 +76,6 @@ def print_time_now(s):
 # Note: NF4 refers to FlexGen's 4-bit group quantization, not bitsandbytes
 MAX_SHORT_INFERENCE_TOKENS = 81920
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
-
-logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
@@ -452,19 +451,19 @@ async def run_rpc_backward(
     
 def restore_hidden_states(
     flattened_hidden_states: torch.Tensor,  # [N_total_valid, hidden_size]
-    keep_indices: torch.Tensor,  # [B, max_keep_len]，padding 为 -1
-    original_seq_len: int,  # 原始序列长度
+    keep_indices: torch.Tensor,  # [B, max_keep_len], padded with -1
+    original_seq_len: int,  # original sequence length
 ) -> torch.Tensor:
     """
-    将铺平的 hidden states 还原为 [B, original_seq_len, hidden_size]
-    
+    Restore flattened hidden states to [B, original_seq_len, hidden_size].
+
     Args:
-        flattened_hidden_states: [N_total_valid, hidden_size] 铺平后的有效 hidden states
-        keep_indices: [B, max_keep_len] 每个 batch 的 keep indices，padding 为 -1
-        original_seq_len: 原始序列长度
-    
+        flattened_hidden_states: [N_total_valid, hidden_size] flattened valid hidden states
+        keep_indices: [B, max_keep_len] per-batch keep indices, padded with -1
+        original_seq_len: original sequence length
+
     Returns:
-        restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
+        restored_hidden_states: [B, original_seq_len, hidden_size], invalid positions filled with 0
     """
     batch_size, max_keep_len = keep_indices.shape
     device = flattened_hidden_states.device
@@ -520,9 +519,9 @@ def restore_hidden_states(
                 flat_hidden_local = flat_hidden_local[:expected_valid]
         return flat_hidden_local
 
-    # 处理不同维度的输入
+    # Handle different input dimensions
     if flattened_hidden_states.ndim == 2:
-        # [N_total_valid, hidden_size] -> 直接使用
+        # [N_total_valid, hidden_size] -> use directly
         flat_hidden = flattened_hidden_states
         hidden_size = flattened_hidden_states.shape[-1]
     elif flattened_hidden_states.ndim == 3:
@@ -531,31 +530,31 @@ def restore_hidden_states(
     else:
         raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
     
-    # 创建输出 tensor，用 0 填充
+    # Build output tensor, zero-filled
     restored_hidden_states = torch.zeros(
         batch_size, original_seq_len, hidden_size,
         dtype=dtype, device=device
     )
-    
-    # 创建有效 mask: [B, max_keep_len]
+
+    # Valid mask: [B, max_keep_len]
     valid_mask = keep_indices >= 0
-    
-    # 创建 batch 索引: [B, max_keep_len]
+
+    # Batch index broadcast: [B, max_keep_len]
     batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
-    
-    # 取出有效部分的索引
+
+    # Extract valid index pairs
     valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
     valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
-    
-    # 验证维度匹配
+
+    # Verify dimensions match
     n_total_valid = valid_mask.sum().item()
     if flat_hidden.shape[0] != n_total_valid:
         raise ValueError(
             f"Dimension mismatch: flattened_hidden_states has {flat_hidden.shape[0]} elements, "
             f"but keep_indices has {n_total_valid} valid entries"
         )
-    
-    # 写入还原位置
+
+    # Scatter the valid rows back into their original positions
     restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flat_hidden
     
     return restored_hidden_states

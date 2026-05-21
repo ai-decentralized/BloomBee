@@ -404,7 +404,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             tree_attention_mask
         )
         
-        keep_indices = results['keep_indices']  # [B, max_keep_len]，padding 为 -1
+        keep_indices = results['keep_indices']  # [B, max_keep_len], padded with -1
         # logger.info(f"keep_indices: {keep_indices}")
         self.pruner_manager.middle_keep_indices = keep_indices
         return keep_indices
@@ -692,9 +692,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             return (hidden_states, None)
                         output_hidden_states_chunk, new_kvs = step_result
                     except Exception as e:
-                        print(f' ERROR in module.forward: {type(e).__name__}: {e}')
-                        import traceback
-                        traceback.print_exc()
+                        logger.exception("ERROR in module.forward: %s: %s", type(e).__name__, e)
                         return (hidden_states, None)
 
                     if seq_len > max_chunk_length:
@@ -854,8 +852,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self, 
         width: int, 
         depth: int, 
-        prefill_length: torch.Tensor,  # 每个 batch 样本当前的有效总长度（已包含在该样本在 KV cache 中的位置）
-        kv_valid_lengths: torch.Tensor,                  # KV cache 的统一起始偏移量（通常是所有样本对齐后的基准）
+        prefill_length: torch.Tensor,  # per-batch current valid total length (already includes the item's position in KV cache)
+        kv_valid_lengths: torch.Tensor,  # unified KV cache start offset (typically the aligned baseline across batch items)
         device: torch.device,
         batch_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -896,7 +894,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             device=device,
         )
         
-        # 1. 生成 Tree 模板（相对偏移，根节点为 0）
+        # 1. Build the tree template (relative offsets, root at 0)
         tree_position_ids_list = []
         def dfs_generate(node_depth, current_depth):
             tree_position_ids_list.append(node_depth)
@@ -907,56 +905,54 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         tree_len = len(tree_position_ids_list)
         tree_position_ids = torch.tensor(tree_position_ids_list, device=device)
 
-        # 判断是否为 Prefill 阶段 (根据输入长度或 past_len 判断)
-        # 假设如果 past_len == 0 且输入包含 prefill 部分
-        is_prefill = (kv_valid_lengths.max().item() == 0) 
+        # Decide whether we are in the prefill phase (based on input length or past_len)
+        # Assumes prefill iff past_len == 0 (kv cache empty across all batch items)
+        is_prefill = (kv_valid_lengths.max().item() == 0)
 
         if is_prefill:
-            # --- Prefill 阶段逻辑 ---
+            # --- Prefill phase ---
             max_prefill_len = prefill_length.max().item()
             total_len = max_prefill_len + tree_len
             full_position_ids = torch.zeros(batch_size, total_len, dtype=torch.long, device=device)
-            
+
             for i in range(batch_size):
                 pl = prefill_length[i].item()
-                # Prefill 部分: [0, 1, ..., pl-1]
+                # Prefill segment: [0, 1, ..., pl-1]
                 full_position_ids[i, :pl] = torch.arange(pl, device=device)
-                # Tree 部分: 接在有效 Prefill 长度 pl 之后，并推到 total_len 的末尾
+                # Tree segment: appended after the valid prefill length pl, pushed to the end of total_len
                 full_position_ids[i, max_prefill_len:] = tree_position_ids + pl
-                
+
             return full_position_ids
 
         else:
-            # --- Generation / Verify 阶段逻辑 ---
-            # 此时 input_ids 只有 Tree 部分，长度为 tree_len
+            # --- Generation / Verify phase ---
+            # input_ids contains only the tree segment, of length tree_len
             full_position_ids = torch.zeros(batch_size, tree_len, dtype=torch.long, device=device)
-            
+
             for i in range(batch_size):
-                # 重点：这里的 pl 应该是该样本在上一轮结束时已经确认的 token 总数
+                # past_len is the total accepted-token count for item i at the end of last round
                 past_len = kv_valid_lengths[i]
-                # 这里的 ID 必须累加 past_len 和 pl
-                # 如果你的 prefill_length[i] 已经包含了 past_len，则直接加 tree_position_ids
-                # 如果 prefill_length[i] 只是当前请求的长度，则需要 past_len + pl + tree_position_ids
+                # The IDs are tree_position_ids offset by past_len
                 full_position_ids[i, :] = tree_position_ids + past_len
-                
+
             return full_position_ids
         
     def _create_tree_position_ids_with_invalid_cache(
         self, 
         width: int, 
         depth: int, 
-        prefill_length: torch.Tensor,          # (B,) 每个 batch 的实际 prompt 长度
-        kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len) 或 None, -1 是 padding
+        prefill_length: torch.Tensor,          # (B,) per-batch real prompt length
+        kv_cache_position_ids: Optional[torch.Tensor],  # (B, max_pos_len) or None; -1 is padding
         batch_offset,
         device: torch.device,
-        target_seq_len: Optional[int] = None,  # 目标序列长度（hidden states 的长度）
+        target_seq_len: Optional[int] = None,  # target sequence length (length of hidden_states)
     ) -> torch.Tensor:
         B = prefill_length.shape[0]
         
         if isinstance(device, str):
             device = torch.device(device)
         
-        # 1. 生成 Tree 模板
+        # 1. Build the tree template
         tree_position_ids_list = []
         def dfs_generate(node_depth, current_depth):
             tree_position_ids_list.append(node_depth)
@@ -966,41 +962,41 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         dfs_generate(0, 0)
         tree_len = len(tree_position_ids_list)
         tree_position_ids = torch.tensor(tree_position_ids_list, dtype=torch.long, device=device)
-        
-        # 2. 判断是否为 Prefill 阶段
+
+        # 2. Decide whether this is the prefill phase
         is_prefill = (kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0)
-        
+
         prefill_length = prefill_length.to(device)
-        
+
         if is_prefill:
-            # Prefill 阶段
-            # 使用 target_seq_len 作为总长度（如果提供），否则使用 max_prefill_len + tree_len
+            # Prefill phase
+            # Use target_seq_len as the total length when provided, otherwise max_prefill_len + tree_len
             max_prefill_len = prefill_length.max().item()
-            
+
             if target_seq_len is not None:
                 total_len = target_seq_len
-                # 从 target_seq_len 反推 prompt 部分的长度
+                # Derive the prompt-part length from target_seq_len
                 prompt_part_len = target_seq_len - tree_len
             else:
                 total_len = max_prefill_len + tree_len
                 prompt_part_len = max_prefill_len
-            
+
             full_position_ids = torch.zeros(B, total_len, dtype=torch.long, device=device)
-            
-            # Prompt 部分的 position ids
+
+            # Prompt-segment position ids
             if prompt_part_len > 0:
                 prefill_positions = torch.arange(prompt_part_len, dtype=torch.long, device=device)
                 full_position_ids[:, :prompt_part_len] = prefill_positions.unsqueeze(0)
-            
-            # Tree 部分的 position ids
-            # tree_base 是每个 batch 的 prompt 结束位置
+
+            # Tree-segment position ids
+            # tree_base is the per-batch prompt-end position
             tree_base = prefill_length.unsqueeze(1)
             full_position_ids[:, prompt_part_len:] = tree_base + tree_position_ids.unsqueeze(0)
-            
+
             return full_position_ids
-        
+
         else:
-            # Generation 阶段：基于有效 token 数量计算 position
+            # Generation phase: derive positions from the count of valid tokens
             kv_cache_position_ids = kv_cache_position_ids.to(device)
             # Micro-batch inputs may already carry a per-micro-batch slice.
             # Only apply logical batch_offset slicing when the incoming tensor
@@ -1026,16 +1022,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             ).max(dim=1).values
             base_positions = max_positions + 1
             
-            # 生成 position_ids
-            # 如果指定了 target_seq_len，使用它；否则使用 tree_len
+            # Build position_ids
+            # Use target_seq_len when given, otherwise tree_len
             if target_seq_len is not None:
                 actual_tree_len = target_seq_len
-                # 如果 target_seq_len > tree_len，需要扩展 tree_position_ids
+                # If target_seq_len > tree_len, extend tree_position_ids
                 if actual_tree_len > tree_len:
-                    # 扩展时用最后一个值填充（或者其他逻辑）
+                    # Pad by repeating the last value (preserve the trailing depth)
                     extended_tree = torch.zeros(actual_tree_len, dtype=torch.long, device=device)
                     extended_tree[:tree_len] = tree_position_ids
-                    # 填充剩余部分（保持最后的深度）
+                    # Fill the remainder (keep the last depth)
                     if tree_len > 0:
                         extended_tree[tree_len:] = tree_position_ids[-1]
                     tree_position_ids = extended_tree

@@ -203,7 +203,7 @@ class _ServerInferenceSession:
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
-            self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # 将当前输入的最后n_input_tokens个token拼接到历史记录中
+            self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
         #     f"Broken input cache: span={self.span} shape={self.history.shape} "
@@ -552,15 +552,16 @@ class InferenceSession:
     def position(self) -> int:
         return self._position
 
-    @position.setter 
-    def position(self, start_from_position: int) -> None: # 设置一个位置属性，并确保所有相关的会话对象都同步更新这个位置。
-        self._position = start_from_position # set a position attribute and ensure that all related session objects are updated to reflect this position synchronously.
+    @position.setter
+    def position(self, start_from_position: int) -> None:
+        # Set the position and keep all related session objects in sync.
+        self._position = start_from_position
         for session in self._server_sessions:
             assert isinstance(session, _ServerInferenceSession)
             session.position = start_from_position
 
     def _enter_server_sessions(self, chosen_spans: List[RemoteSpanInfo]) -> List[_ServerInferenceSession]:
-        server_sessions = [] # 创建一组服务器会话，并在发生错误时确保已创建的会话能够正确退出。
+        server_sessions = []  # build server sessions; on error, ensure already-created ones exit cleanly
         try:
             for span in chosen_spans:
                 span_uids = CHAIN_DELIMITER.join(self._sequence_manager.block_uids[span.start : span.end])
@@ -596,7 +597,9 @@ class InferenceSession:
         assert not self._closed and not self._server_sessions
         return self
 
-    def step(   # 执行一次推理步骤，处理输入数据和相应的提示与假设 ID，同时在可能出现错误的情况下进行重试。
+    # Execute one inference step over inputs / prompts / hypothesis IDs,
+    # retrying on transient errors.
+    def step(
         self,
         inputs: torch.Tensor,
         prompts: Optional[torch.Tensor] = None,
@@ -788,15 +791,15 @@ class InferenceSession:
         original_seq_len: int,
     ) -> torch.Tensor:
         """
-        将铺平的 hidden states 还原为 [B, original_seq_len, hidden_size]
-        
+        Restore flattened hidden states to [B, original_seq_len, hidden_size].
+
         Args:
-            flattened_hidden_states: [N_total_valid, hidden_size] 铺平后的有效 hidden states
-            keep_indices: [B, max_keep_len] 每个 batch 的 keep indices，padding 为 -1
-            original_seq_len: 原始序列长度
-        
+            flattened_hidden_states: [N_total_valid, hidden_size] flattened valid hidden states
+            keep_indices: [B, max_keep_len] per-batch keep indices, padded with -1
+            original_seq_len: original sequence length
+
         Returns:
-            restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
+            restored_hidden_states: [B, original_seq_len, hidden_size], invalid positions filled with 0
         """
         batch_size, max_keep_len = keep_indices.shape
         device = flattened_hidden_states.device
@@ -847,9 +850,9 @@ class InferenceSession:
                     flat_hidden_local = flat_hidden_local[:expected_valid]
             return flat_hidden_local
 
-        # 处理不同维度的输入
+        # Handle different input dimensions
         if flattened_hidden_states.ndim == 2:
-            # [N_total_valid, hidden_size] -> 直接使用
+            # [N_total_valid, hidden_size] -> use directly
             flat_hidden = flattened_hidden_states
             hidden_size = flattened_hidden_states.shape[-1]
         elif flattened_hidden_states.ndim == 3:
@@ -858,31 +861,31 @@ class InferenceSession:
         else:
             raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
         
-        # 创建输出 tensor，用 0 填充
+        # Build output tensor, zero-filled
         restored_hidden_states = torch.zeros(
             batch_size, original_seq_len, hidden_size,
             dtype=dtype, device=device
         )
-        
-        # 创建有效 mask: [B, max_keep_len]
+
+        # Valid mask: [B, max_keep_len]
         valid_mask = keep_indices >= 0
-        
-        # 创建 batch 索引: [B, max_keep_len]
+
+        # Batch index broadcast: [B, max_keep_len]
         batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
-        
-        # 取出有效部分的索引
+
+        # Extract valid index pairs
         valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
         valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
-        
-        # 验证维度匹配
+
+        # Verify dimensions match
         n_total_valid = valid_mask.sum().item()
         if flat_hidden.shape[0] != n_total_valid:
             raise ValueError(
                 f"Dimension mismatch: flattened_hidden_states has {flat_hidden.shape[0]} elements, "
                 f"but keep_indices has {n_total_valid} valid entries"
             )
-        
-        # 写入还原位置
+
+        # Scatter the valid rows back into their original positions
         restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flat_hidden
         
         return restored_hidden_states
