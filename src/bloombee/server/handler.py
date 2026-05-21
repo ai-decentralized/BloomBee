@@ -5,6 +5,7 @@ import contextlib
 import multiprocessing as mp
 import os
 import sys
+import uuid
 from collections import deque
 from enum import Enum
 from itertools import chain
@@ -57,6 +58,7 @@ from bloombee.utils.microbatch_schema import (
     is_microbatch_queue_item,
     MBPIPE_SCHEMA_PREFIX,
 )
+from bloombee.utils.p2p import apply_p2p_max_msg_size, get_default_p2p_max_msg_size
 
 logger = get_logger(__name__)
 
@@ -73,6 +75,90 @@ if _s2s_output_compression_name:
 
 if TYPE_CHECKING:
     from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+
+
+def _local_shm_s2s_enabled() -> bool:
+    return os.environ.get("BLOOMBEE_ENABLE_LOCAL_SHM_S2S", "0") == "1"
+
+
+def _local_shm_s2s_dir() -> str:
+    configured = os.environ.get("BLOOMBEE_LOCAL_SHM_S2S_DIR", "").strip()
+    if configured:
+        return configured
+    return "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+
+
+def _write_s2s_tensors_to_local_shm(
+    tensors: Sequence[runtime_pb2.Tensor],
+) -> Tuple[List[Dict[str, Union[str, int]]], int]:
+    shm_dir = _local_shm_s2s_dir()
+    os.makedirs(shm_dir, exist_ok=True)
+
+    refs: List[Dict[str, Union[str, int]]] = []
+    total_bytes = 0
+    try:
+        for index, tensor in enumerate(tensors):
+            payload = tensor.SerializeToString()
+            name = f"bloombee_s2s_{os.getpid()}_{time.time_ns()}_{index}_{uuid.uuid4().hex}.pb"
+            path = os.path.join(shm_dir, name)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+            refs.append({"path": path, "size": len(payload)})
+            total_bytes += len(payload)
+    except Exception:
+        _cleanup_s2s_local_shm_refs(refs)
+        raise
+
+    return refs, total_bytes
+
+
+def _cleanup_s2s_local_shm_refs(refs: Any) -> None:
+    if not isinstance(refs, (list, tuple)):
+        return
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        path = ref.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def _read_s2s_tensors_from_local_shm(refs: Any) -> List[runtime_pb2.Tensor]:
+    if not isinstance(refs, (list, tuple)):
+        raise ValueError("Invalid local shm tensor refs")
+
+    shm_root = os.path.realpath(_local_shm_s2s_dir())
+    tensors: List[runtime_pb2.Tensor] = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            raise ValueError(f"Invalid local shm tensor ref: {ref!r}")
+        path = ref.get("path")
+        size = int(ref.get("size", 0))
+        if not isinstance(path, str) or size <= 0:
+            raise ValueError(f"Invalid local shm tensor ref: {ref!r}")
+
+        real_path = os.path.realpath(path)
+        if not real_path.startswith(shm_root + os.sep):
+            raise ValueError(f"Refusing to read local shm tensor outside {shm_root}: {real_path}")
+
+        with open(real_path, "rb") as handle:
+            payload = handle.read(size)
+        if len(payload) != size:
+            raise ValueError(f"Local shm tensor size mismatch for {real_path}: got {len(payload)}, expected {size}")
+
+        tensor = runtime_pb2.Tensor()
+        tensor.ParseFromString(payload)
+        tensors.append(tensor)
+
+    return tensors
 
 
 # Create dedicated offloading debug logger
@@ -391,6 +477,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         task_prioritizer: TaskPrioritizerBase = DummyTaskPrioritizer(),
         quant_type: QuantType,
         pruner_manager: Optional[SpeculativePrunerManager],
+        p2p_max_msg_size: Optional[int] = None,
     ):
         super().__init__(dht, module_backends)
         for module_backend in self.module_backends.values():
@@ -406,6 +493,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._session_timing: Dict[str, list] = {}
         self._session_comm_timing: Dict[str, Dict[str, Dict[str, float]]] = {}
         self._session_background_push_tasks: Dict[str, set] = {}
+        self._p2p_max_msg_size = p2p_max_msg_size or get_default_p2p_max_msg_size()
         # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
         # Key: (session_id, step_id) -> Queue holding individual micro-batches
         self._mb_queues: Dict[tuple, asyncio.Queue] = {}
@@ -761,6 +849,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         if self._listener_task is None:
             # Start listening to our own event queue before we accept any requests
             self._listener_task = asyncio.create_task(self._listen_to_event_queue())
+        if args:
+            apply_p2p_max_msg_size(args[0], self._p2p_max_msg_size)
         await super().add_p2p_handlers(*args, **kwargs)
 
     def shutdown(self):
@@ -1066,18 +1156,21 @@ class TransformerConnectionHandler(ConnectionHandler):
                     
                     # [MBPIPE] Cross-stage streaming push callback (for micro-batch level streaming)
                     # This enables Server2 to start processing micro-batch N while Server1 computes N+1
-                    cross_stage_push_microbatch = None
-                    
-                    if is_microbatch_enabled():
-                        # Create the cross-stage push function that captures required context
-                        async def _cross_stage_push_wrapper(mb_hidden, mb_keep, push_metadata):
-                            """Wrapper that calls _push_microbatch with required backends."""
-                            await self._push_microbatch(
-                                mb_hidden, mb_keep, push_metadata, requested_backends
-                            )
-                        
-                        cross_stage_push_microbatch = _cross_stage_push_wrapper
-                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
+                    async def _cross_stage_push_wrapper(mb_hidden, mb_keep, push_metadata, spec_tensors=None):
+                        """Wrapper that calls _push_microbatch with required backends."""
+                        await self._push_microbatch(
+                            mb_hidden,
+                            mb_keep,
+                            push_metadata,
+                            requested_backends,
+                            spec_tensors=spec_tensors,
+                        )
+
+                    # Always pass the callback down. The runtime path itself
+                    # decides whether to split into micro-batches; providing the
+                    # callback here prevents handler/runtime config skew from
+                    # silently disabling cross-stage overlap.
+                    cross_stage_push_microbatch = _cross_stage_push_wrapper
                     
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
@@ -1760,7 +1853,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                                 f"mb_idx={mb_item.get('mb_idx')} for immediate processing"
                             )
                             
-                            yield mb_item.get("payload"), mb_metadata
+                            mb_payload = mb_item.get("payload")
+                            mb_metadata["_source_request"] = mb_payload
+                            yield mb_payload, mb_metadata
                             
                             # Continue to next item from queue
                             request = None
@@ -1799,6 +1894,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             metadata["_queue_source"] = queue_source
                             metadata["_queue_wait_start_us"] = int(queue_wait_start_us)
                             metadata["_queue_wait_end_us"] = int(queue_wait_end_us)
+                            metadata["_source_request"] = request
                             yield request, metadata
                             if step_id is not None:
                                 processed_step_ids.add(step_id)
@@ -1935,6 +2031,21 @@ class TransformerConnectionHandler(ConnectionHandler):
         full_batch_size = metadata.get("full_batch_size", mb_size)
         start_from_position = metadata.get("start_from_position", None)
         receive_us = self._now_us()
+
+        shm_refs = metadata.get("_s2s_local_shm_refs")
+        if shm_refs:
+            shm_load_start = perf_counter()
+            loaded_tensors = _read_s2s_tensors_from_local_shm(shm_refs)
+            request.ClearField("tensors")
+            request.tensors.extend(loaded_tensors)
+            _cleanup_s2s_local_shm_refs(shm_refs)
+            metadata["_s2s_local_shm_load_ms"] = (perf_counter() - shm_load_start) * 1000.0
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} Local shm S2S payload loaded: "
+                f"step_id={step_id} mb_idx={int(mb_idx)} tensors={len(loaded_tensors)} "
+                f"logical_bytes={metadata.get('_s2s_logical_tensor_bytes', 0)} "
+                f"load_ms={metadata['_s2s_local_shm_load_ms']:.3f}"
+            )
         
         # Use total_micro_batches from metadata if available, otherwise calculate
         expected_num_mb = resolve_expected_num_microbatches(
@@ -2022,11 +2133,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                 e2e_from_serialize_end_ms = max(0.0, (receive_us - sender_ser_end_local_us) / 1000.0)
 
         payload_bytes = sum(len(t.buffer) for t in request.tensors)
+        rpc_payload_bytes = int(metadata.get("_s2s_rpc_tensor_bytes", payload_bytes))
+        logical_payload_bytes = int(metadata.get("_s2s_logical_tensor_bytes", payload_bytes))
+        s2s_transport = str(metadata.get("_s2s_transport", "rpc"))
         metadata_bytes = len(request.metadata) if request.metadata else 0
         logger.info(
             f"[S2S_WIRE] step_id={step_id} mb_idx={int(mb_idx)} "
             f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
-            f"batch={int(mb_size)} payload_kb={payload_bytes/1024.0:.2f} metadata_b={metadata_bytes} "
+            f"batch={int(mb_size)} transport={s2s_transport} "
+            f"payload_kb={payload_bytes/1024.0:.2f} rpc_payload_kb={rpc_payload_bytes/1024.0:.2f} "
+            f"logical_payload_kb={logical_payload_bytes/1024.0:.2f} metadata_b={metadata_bytes} "
             f"raw_transfer_ms={raw_transfer_ms:.3f} "
             f"sender_compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
             f"sender_serialize_ms={sender_serialize_ms:.3f} "
@@ -2044,7 +2160,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             channel="micro_batch",
             sender_blocks=sender_blocks,
             receiver_blocks=receiver_blocks,
-            payload_bytes=payload_bytes,
+            payload_bytes=rpc_payload_bytes,
             metadata_bytes=metadata_bytes,
             raw_transfer_ms=raw_transfer_ms,
             wire_ms=wire_ms,
@@ -2055,7 +2171,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         metadata["_s2s_sender_cpu2nic_ms"] = float(metadata.get("s2s_sender_cpu2nic_ms", sender_prep_ms if sender_prep_ms >= 0.0 else 0.0))
         metadata["_s2s_wire_ms"] = float(wire_ms if wire_ms >= 0.0 else raw_transfer_ms if raw_transfer_ms >= 0.0 else 0.0)
-        metadata["_s2s_payload_bytes"] = int(payload_bytes)
+        metadata["_s2s_payload_bytes"] = int(rpc_payload_bytes)
+        metadata["_s2s_logical_payload_bytes"] = int(logical_payload_bytes)
         
         # Initialize tracking for this (session, step) if not exists
         if mb_key not in self._mb_queues:
@@ -2243,6 +2360,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         metadata: dict,
         raise_on_error: bool = False,
     ) -> None:
+        source_request = metadata.get("_source_request") if isinstance(metadata, dict) else None
+        if isinstance(source_request, runtime_pb2.ExpertRequest):
+            request = source_request
         # print('_push_outputs metadata ', metadata)
         push_start_time = perf_counter()
         next_peer_id = None
@@ -2456,6 +2576,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         mb_keep_indices: Optional[torch.Tensor],
         metadata: dict,
         requested_backends: Sequence[TransformerBackend],
+        spec_tensors: Optional[dict] = None,
     ) -> None:
         """
         [MBPIPE] Push a single micro-batch to the next server for cross-stage overlap.
@@ -2488,12 +2609,12 @@ class TransformerConnectionHandler(ConnectionHandler):
             full_batch_size = metadata.get("full_batch_size", mb_size)
             is_spec_push = bool(metadata.get("is_spec_dec", False))
 
-            # Speculative decoding requires strict full-batch context (tree/draft/kv alignment).
-            # Do not use cross-stage micro-batch push for this mode.
-            if is_spec_push:
+            enable_spec_push = os.environ.get("BLOOMBEE_ENABLE_SPEC_CROSS_STAGE_PUSH", "1") == "1"
+            if is_spec_push and (not enable_spec_push or not spec_tensors):
+                reason = "disabled" if not enable_spec_push else "missing spec payload"
                 logger.info(
                     f"{MBPIPE_LOG_PREFIX} Cross-stage push skipped for speculative decoding "
-                    f"(step_id={metadata.get('step_id')}, mb_idx={mb_idx})"
+                    f"(reason={reason}, step_id={metadata.get('step_id')}, mb_idx={mb_idx})"
                 )
                 return
             
@@ -2518,7 +2639,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             outputs_schema = requested_backends[-1].decode_outputs_schema
             sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
             serialize_start_us = self._now_us()
-            transport_phase = "prefill" if mb_hidden.ndim >= 2 and int(mb_hidden.shape[1]) > 1 else "decode"
+            transport_phase = (
+                "spec_verify"
+                if is_spec_push
+                else ("prefill" if mb_hidden.ndim >= 2 and int(mb_hidden.shape[1]) > 1 else "decode")
+            )
             sender_blocks_str = str(metadata.get("sender_blocks", "unknown"))
             sender_blocks = sender_blocks_str
             push_blocks = f"{sender_blocks_str}->{next_start}:{next_end}"
@@ -2564,6 +2689,34 @@ class TransformerConnectionHandler(ConnectionHandler):
                             "batch": int(mb_size),
                         },
                     )
+                serialized_spec_tensors = []
+                if is_spec_push and spec_tensors:
+                    for tensor_name in (
+                        "tree_attention_mask",
+                        "kv_cache_position_ids",
+                        "draft_tokens",
+                        "prefill_length",
+                    ):
+                        value = spec_tensors.get(tensor_name)
+                        if value is None:
+                            value = torch.empty(0, dtype=torch.int64)
+                        elif not torch.is_tensor(value):
+                            value = torch.as_tensor(value)
+                        serialized_spec_tensors.append(
+                            serialize_torch_tensor(
+                                value,
+                                runtime_pb2.CompressionType.NONE,
+                                allow_inplace=True,
+                                debug_context={
+                                    "phase": transport_phase,
+                                    "tensor_name": tensor_name,
+                                    "source": "server",
+                                    "channel": "rpc_push_microbatch",
+                                    "blocks": push_blocks,
+                                    "batch": int(mb_size),
+                                },
+                            )
+                        )
             serialize_end_perf = perf_counter()
             serialize_end_us = self._now_us()
             sender_serialize_ms = max(0.0, (serialize_end_us - serialize_start_us) / 1000.0)
@@ -2707,16 +2860,38 @@ class TransformerConnectionHandler(ConnectionHandler):
             push_metadata["s2s_sender_sem_wait_ms"] = float(sem_wait_time)
             push_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
             push_metadata["clock_sync_sender_send_us"] = int(push_metadata["s2s_sender_enqueue_us"])
-            serialized_push_metadata = MSGPackSerializer.dumps(push_metadata)
+
+            tensor_messages = [serialized_hidden, serialized_keep, *serialized_spec_tensors]
+            logical_push_tensor_bytes = sum(len(tensor.buffer) for tensor in tensor_messages)
+            if _local_shm_s2s_enabled() and tensor_messages:
+                try:
+                    shm_refs, shm_payload_bytes = _write_s2s_tensors_to_local_shm(tensor_messages)
+                    push_metadata["_s2s_local_shm_refs"] = shm_refs
+                    push_metadata["_s2s_local_shm_payload_bytes"] = int(shm_payload_bytes)
+                    push_metadata["_s2s_logical_tensor_bytes"] = int(logical_push_tensor_bytes)
+                    push_metadata["_s2s_transport"] = "local_shm"
+                    tensor_messages = []
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} Local shm S2S payload enabled: "
+                        f"step_id={metadata.get('step_id', 'unknown')} mb_idx={int(mb_idx)} "
+                        f"logical_bytes={logical_push_tensor_bytes} refs={len(shm_refs)}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"{MBPIPE_LOG_PREFIX} Local shm S2S payload failed; falling back to RPC payload: {e}",
+                        exc_info=True,
+                    )
+
             rpc_request = runtime_pb2.ExpertRequest(
                 uid=next_uid,
-                tensors=[serialized_hidden, serialized_keep],
-                metadata=serialized_push_metadata,
+                tensors=tensor_messages,
+                metadata=MSGPackSerializer.dumps(push_metadata),
             )
             t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
             push_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
+            push_tensor_bytes = sum(len(tensor.buffer) for tensor in tensor_messages)
+            push_metadata["_s2s_rpc_tensor_bytes"] = int(push_tensor_bytes)
             rpc_request.metadata = MSGPackSerializer.dumps(push_metadata)
-            push_tensor_bytes = len(serialized_hidden.buffer) + len(serialized_keep.buffer)
             
             # Create task for background sending - don't await
             send_task = asyncio.create_task(
@@ -2785,6 +2960,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         send_start = perf_counter()
         send_time = 0.0
         success = False
+        request_metadata = None
         try:
             payload_bytes = sum(len(t.buffer) for t in request.tensors)
             metadata_bytes = len(request.metadata) if request.metadata else 0
@@ -2796,6 +2972,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         request_metadata["clock_sync_sender_send_us"] = sender_send_us
                         request.metadata = MSGPackSerializer.dumps(request_metadata)
                 except Exception:
+                    request_metadata = None
                     pass
 
             response = await stub.rpc_push(request, timeout=self.request_timeout)
@@ -2852,6 +3029,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send failed: {e}"
             )
         finally:
+            if isinstance(request_metadata, dict):
+                _cleanup_s2s_local_shm_refs(request_metadata.get("_s2s_local_shm_refs"))
             # Release slot and feed metrics to adaptive limiter.
             if release_slot and hasattr(self, "_push_limiter"):
                 measured_send_ms = send_time if send_time > 0 else (perf_counter() - send_start) * 1000.0

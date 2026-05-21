@@ -2,10 +2,12 @@ from typing import Optional, Union, List, Tuple, Any
 
 import copy
 import math
+import os
 import torch
 import time
 import numpy as np
 import contextlib
+import torch.nn.functional as F
 from transformers.generation import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
 from transformers.generation.utils import GenerateNonBeamOutput, GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -76,6 +78,50 @@ def _attention_mask_from_seq_lengths(
     return positions.unsqueeze(0) < seq_lengths.unsqueeze(1)
 
 
+def _compact_prefix_length_from_kv_positions(
+    kv_cache_position_ids: Optional[torch.Tensor],
+) -> Optional[int]:
+    """Return the compact prefix length represented by accepted KV positions."""
+    if kv_cache_position_ids is None:
+        return None
+    if not torch.is_tensor(kv_cache_position_ids) or kv_cache_position_ids.numel() == 0:
+        return None
+    ids = kv_cache_position_ids
+    if ids.ndim == 1:
+        ids = ids.unsqueeze(0)
+    valid_mask = ids >= 0
+    if not bool(valid_mask.any().item()):
+        return 0
+    has_valid = valid_mask.any(dim=1)
+    first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+    batch_idx = torch.arange(ids.shape[0], device=ids.device)
+    root_positions = torch.where(
+        has_valid,
+        ids[batch_idx, first_valid_idx],
+        torch.zeros_like(first_valid_idx),
+    )
+    valid_counts = valid_mask.to(torch.long).sum(dim=1)
+    return int((root_positions + valid_counts).max().item())
+
+
+def _seq_lengths_from_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    input_ids: torch.LongTensor,
+) -> torch.LongTensor:
+    if attention_mask is not None:
+        if attention_mask.shape[:2] != input_ids.shape[:2]:
+            raise ValueError(
+                "attention_mask must have the same batch and sequence dimensions as input_ids"
+            )
+        return attention_mask.to(device=input_ids.device, dtype=torch.long).sum(dim=1)
+
+    pad_token_ids = [0, 2]
+    valid_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    for token_id in pad_token_ids:
+        valid_mask = valid_mask & (input_ids != token_id)
+    return valid_mask.sum(dim=1)
+
+
 def _merge_generation_config_kwargs(
     generation_config: GenerationConfig,
     model_kwargs: dict,
@@ -93,6 +139,70 @@ def _merge_generation_config_kwargs(
             if value is not None:
                 setattr(merged, key, value)
     return merged
+
+
+def _project_lm_head(
+    lm_head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    drafter: Optional[Any] = None,
+) -> torch.Tensor:
+    """Project hidden states to logits, reusing EAGLE's GPU lm_head copy when present."""
+    weight = getattr(drafter, "lm_head_weight", None)
+    if torch.is_tensor(weight):
+        bias = getattr(drafter, "lm_head_bias", None)
+        return F.linear(
+            hidden_states.to(device=weight.device, dtype=weight.dtype),
+            weight,
+            bias,
+        )
+    return lm_head(hidden_states)
+
+
+def _project_lm_head_rows(
+    lm_head: torch.nn.Module,
+    hidden_rows: torch.Tensor,
+    drafter: Optional[Any] = None,
+) -> torch.Tensor:
+    """Project a sparse set of hidden rows to logits."""
+    if hidden_rows.ndim != 2:
+        raise ValueError(f"hidden_rows must be rank-2 [N, H], got {tuple(hidden_rows.shape)}")
+    return _project_lm_head(lm_head, hidden_rows[:, None, :], drafter)[:, 0, :]
+
+
+def _speculative_session_max_length(
+    *,
+    prompt_len: int,
+    max_new_tokens: int,
+    beam_width: Union[int, List[int], Tuple[int, ...]],
+    max_tree_depth: int,
+    effective_tree_budget: Optional[int],
+) -> int:
+    """Return the remote KV-cache length required for speculative decoding.
+
+    The server only needs enough room for the committed prefix plus the current
+    speculative tree. Rejected tree nodes are discarded between verify rounds,
+    so multiplying the tree size by max_new_tokens over-reserves KV memory.
+    """
+    prompt_len = max(0, int(prompt_len))
+    max_new_tokens = max(0, int(max_new_tokens))
+
+    if isinstance(beam_width, (list, tuple)):
+        draft_nodes = 0
+        running = 1
+        for w in beam_width[:max(0, int(max_tree_depth))]:
+            running *= max(int(w), 1)
+            draft_nodes += running
+    else:
+        draft_nodes = max(0, int(max_tree_depth)) * max(int(beam_width), 1)
+
+    if effective_tree_budget is not None:
+        draft_nodes = max(draft_nodes, max(0, int(effective_tree_budget)))
+
+    tree_nodes_including_root = draft_nodes + 1
+    return max(
+        prompt_len + max_new_tokens + tree_nodes_including_root + 8,
+        prompt_len + max_new_tokens + 32,
+    )
 
 
 class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
@@ -114,7 +224,9 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         max_new_tokens: int = 128,
         session_max_length: Optional[int] = None,
         tree_budget: Optional[int] = None,
+        topk_per_step: Optional[int] = None,
         tree_min_log_prob: Optional[float] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
 
@@ -131,38 +243,29 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # target model.
         generation_config.return_dict_in_generate = False
 
-        # Resolve session_max_length from (in order): kwarg > model_kwargs > config
-        # > a conservative fallback. The previous hardcoded 624 made every
-        # speculation session request a 624-token cache regardless of actual
-        # prompt + max_new_tokens, which wastes KV budget and constrains
-        # admission under continuous batching. We use ceil(prompt + budget)
-        # with a floor that matches drafter tree growth.
+        # Resolve session_max_length from (in order): kwarg > model_kwargs >
+        # current speculative peak. Rejected tree nodes are not retained across
+        # verify rounds, so this should scale with one current tree rather than
+        # max_new_tokens copies of that tree.
         kwarg_override = session_max_length
         session_max_length = model_kwargs.pop("session_max_length", kwarg_override)
         effective_tree_budget = tree_budget
         if effective_tree_budget is None:
             effective_tree_budget = getattr(drafter, "default_tree_budget", None)
+        if attention_mask is None:
+            attention_mask = model_kwargs.pop("attention_mask", None)
+        prompt_len = (
+            int(_seq_lengths_from_attention_mask(attention_mask, input_ids).max().item())
+            if attention_mask is not None
+            else int(input_ids.shape[1])
+        )
         if session_max_length is None:
-            prompt_len = int(input_ids.shape[1])
-            # Sequoia plan: total tree budget is sum of products of widths.
-            if isinstance(beam_width, (list, tuple)):
-                tree_nodes = 0
-                running = 1
-                for w in beam_width:
-                    running *= max(int(w), 1)
-                    tree_nodes += running
-            else:
-                tree_nodes = max_tree_depth * max(int(beam_width), 1)
-            if effective_tree_budget is not None:
-                tree_nodes = max(tree_nodes, int(effective_tree_budget))
-            # Each decode step pushes the full tree into the server cache
-            # (only the verified prefix is retained in the rollback below, but
-            # the server must have room to store the candidates first). Size
-            # for max_new_tokens worth of steps with one verified token each,
-            # plus one full tree-sized spike per step.
-            session_max_length = max(
-                prompt_len + int(max_new_tokens) * (tree_nodes + 1) + 32,
-                prompt_len + 256,
+            session_max_length = _speculative_session_max_length(
+                prompt_len=prompt_len,
+                max_new_tokens=max_new_tokens,
+                beam_width=beam_width,
+                max_tree_depth=max_tree_depth,
+                effective_tree_budget=effective_tree_budget,
             )
         logger.info(
             "Speculative session_max_length=%s (prompt=%s max_new_tokens=%s depth=%s width=%s)",
@@ -189,7 +292,9 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 kv_cache_window=kv_cache_window,
                 max_new_tokens=max_new_tokens,
                 tree_budget=effective_tree_budget,
+                topk_per_step=topk_per_step,
                 tree_min_log_prob=tree_min_log_prob,
+                attention_mask=attention_mask,
                 **model_kwargs,
             )
 
@@ -208,13 +313,16 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         kv_cache_window: int = 2048,
         max_new_tokens: int = 128,
         tree_budget: Optional[int] = None,
+        topk_per_step: Optional[int] = None,
         tree_min_log_prob: Optional[float] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
         logger.info("Starting speculative decoding with distributed inference session!")
+        device = input_ids.device
         eos_token_ids = _eos_token_ids(generation_config)
         eos_token_tensor = (
-            torch.tensor(eos_token_ids, dtype=torch.long, device=input_ids.device)
+            torch.tensor(eos_token_ids, dtype=torch.long, device=device)
             if eos_token_ids
             else None
         )
@@ -222,7 +330,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
         )
         batch_size = input_ids.shape[0]
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=device)
         finished = False
         
         # Initialize past_key_values for session tracking
@@ -231,10 +339,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             (batch_size,), 
             session.position,
             dtype=torch.long,
-            device="cuda"
+            device=device,
         )
         past_key_values.update_seen(batch_positions)
-        past_key_values.set_is_spec_decoding(torch.tensor([1], dtype=torch.long, device="cuda"))
+        past_key_values.set_is_spec_decoding(torch.tensor([1], dtype=torch.long, device=device))
         
         is_first_iteration = True
         step_idx = 0
@@ -250,15 +358,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # L == seq_lengths[b] - 1 for each active row.
         eagle_prefix_hidden_states: Optional[torch.Tensor] = None
 
-        # 新增：维护每个序列的真实长度
-        seq_lengths = torch.full((batch_size,), input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-        ignore_token_ids: list = [0, 2]
-        valid_mask = torch.ones_like(input_ids, dtype=torch.bool)
-        for token_id in ignore_token_ids:
-            valid_mask = valid_mask & (input_ids != token_id)
-        
-        # 计算每个序列的有效 token 数量
-        seq_lengths = valid_mask.sum(dim=1)  # [batch_size]
+        # Track each row's real prefix length. Prefer the caller's tokenizer
+        # attention mask; only fall back to BloomBee's historical pad-token
+        # heuristic when no mask is provided.
+        if attention_mask is None:
+            attention_mask = model_kwargs.pop("attention_mask", None)
+        seq_lengths = _seq_lengths_from_attention_mask(attention_mask, input_ids)
         initial_seq_lengths = seq_lengths.clone()
         past_key_values.set_prefill_length(seq_lengths)
         
@@ -269,7 +374,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         t0 = time.perf_counter()  # 用于记录第一个达标的时间
         has_printed_first_reach = False # 确保只打印一次
         sample_finish_times = [None] * batch_size
-        sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         while not finished and ((seq_lengths - initial_seq_lengths).min().item()) < max_new_tokens:
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
@@ -280,8 +385,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             # target's last committed hidden + token id (EAGLE conditioning).
             drafter_kwargs = {
                 'tree_budget': tree_budget,
+                'topk_per_step': topk_per_step,
                 'tree_min_log_prob': tree_min_log_prob,
             }
+            if getattr(drafter, "uses_eagle_hidden_states", False):
+                drafter_kwargs['do_sample'] = bool(getattr(generation_config, "do_sample", False))
             if prev_last_hidden is not None:
                 drafter_kwargs['prev_last_hidden'] = prev_last_hidden
                 drafter_kwargs['prev_last_token'] = prev_last_token
@@ -314,6 +422,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 input_ids=current_input_ids,
                 llm_generated_token=llm_generated_token,
                 trees=spec_trees,
+                drafter=drafter,
                 logits_processor=logits_processor,
                 past_key_values=past_key_values,
                 is_first_iteration=is_first_iteration,
@@ -352,8 +461,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             # maintain the full committed-prefix hidden buffer for EAGLE.
             if verify_hidden_states is not None and final_positions is not None:
                 idx = torch.arange(verify_hidden_states.size(0), device=verify_hidden_states.device)
-                prev_last_hidden = verify_hidden_states[idx, final_positions, :].detach()
-                prev_last_token = llm_generated_token[idx, 0].detach() if llm_generated_token is not None else None
+                final_positions_for_hidden = final_positions.to(device=verify_hidden_states.device)
+                prev_last_hidden = verify_hidden_states[idx, final_positions_for_hidden, :].detach()
+                if llm_generated_token is not None:
+                    token_idx = torch.arange(llm_generated_token.size(0), device=llm_generated_token.device)
+                    prev_last_token = llm_generated_token[token_idx, 0].detach()
+                else:
+                    prev_last_token = None
                 if getattr(drafter, "uses_eagle_hidden_states", False):
                     eagle_prefix_hidden_states = self._update_eagle_prefix_hidden_states(
                         prefix_hidden_states=eagle_prefix_hidden_states,
@@ -372,6 +486,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             # logger.info(f"verified_tokens_positions: {verified_tokens_positions}")
             
             past_key_values.set_kv_cache(verified_tokens_positions)
+            compact_prefix_length = _compact_prefix_length_from_kv_positions(verified_tokens_positions)
+            if compact_prefix_length is not None:
+                session.position = compact_prefix_length
+                past_key_values.update_seen(compact_prefix_length)
             
             is_first_iteration = False
             
@@ -478,17 +596,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
 
         for b in range(batch_size):
             old_len = int(old_seq_lengths[b].item())
-            if is_first_iteration and prefix_hidden_states is None:
-                # Warmup/prefill fallback: verify_hidden_states is aligned with
-                # the full prompt, so keep all prompt hiddens before the sampled
-                # bonus root.
-                rows.append(verify_hidden_states[b, :old_len, :])
-                continue
-
             previous = (
                 prefix_hidden_states[b, : max(old_len - 1, 0), :].to(device=device, dtype=dtype)
                 if prefix_hidden_states is not None
-                else verify_hidden_states.new_empty((0, hidden_size))
+                else verify_hidden_states[b, : max(old_len - 1, 0), :]
             )
             root_abs = old_len - 1
             selected = kv_cache_position_ids[b]
@@ -496,7 +607,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             if selected.numel() == 0:
                 rows.append(previous)
                 continue
-            rel = (selected.to(device=device) - root_abs).long()
+            if is_first_iteration:
+                rel = selected.to(device=device, dtype=torch.long)
+            else:
+                rel = (selected.to(device=device) - root_abs).long()
             rel = rel[(rel >= 0) & (rel < verify_hidden_states.shape[1])]
             if rel.numel() == 0:
                 rows.append(previous)
@@ -571,6 +685,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         input_ids: torch.LongTensor,
         llm_generated_token: torch.Tensor,
         trees: List[SpeculativeTree],
+        drafter: Optional[Any],
         logits_processor: LogitsProcessorList,
         past_key_values: RemotePastKeyValues,
         is_first_iteration: bool,
@@ -601,8 +716,18 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # logger.info(f"input_ids: {input_ids}")
         # logger.info(f"seq_lengths: {seq_lengths}")
         # logger.info(f"kv_cache_position_ids: {past_key_values.kv_cache_position_ids}")
+        use_local_tree_mask = (
+            not is_first_iteration
+            and os.environ.get("BLOOMBEE_DISABLE_LOCAL_TREE_MASK", "0") != "1"
+        )
         tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tree_batch(
-            trees, input_ids, input_ids.device, seq_lengths=seq_lengths, is_prefill=is_first_iteration, kv_cache_position_ids=past_key_values.kv_cache_position_ids
+            trees,
+            input_ids,
+            input_ids.device,
+            seq_lengths=seq_lengths,
+            is_prefill=is_first_iteration,
+            kv_cache_position_ids=past_key_values.kv_cache_position_ids,
+            return_local_tree_mask=use_local_tree_mask,
         )
         
         # logger.info(f"tree_tokens: {tree_tokens}, attention_mask: {attention_mask.shape}")
@@ -623,6 +748,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 logits_processor,
                 past_key_values,
                 seq_lengths,
+                drafter=drafter,
                 is_first_iteration=is_first_iteration,
                 do_sample=do_sample,
                 temperature=temperature,
@@ -642,6 +768,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         tree_mask_packed = attention_mask
         # logger.info(f"tree_mask_packed: {tree_mask_packed}")
         
+        logits: Optional[torch.Tensor] = None
         with torch.no_grad():
             if not use_kv_cache:
                 # No cache: process tree tokens directly
@@ -656,7 +783,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     use_cache=False,
                 )
                 hidden_states = model_out.last_hidden_state
-                logits = self.lm_head(hidden_states)
+                if do_sample:
+                    logits = _project_lm_head(self.lm_head, hidden_states, drafter)
                 new_past_key_values = past_key_values
                 
             elif is_first_iteration or past_key_values is None:
@@ -672,7 +800,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     use_cache=True,
                 )
                 hidden_states = model_out.last_hidden_state
-                logits = self.lm_head(hidden_states)
+                if do_sample:
+                    logits = _project_lm_head(self.lm_head, hidden_states, drafter)
 
                 if past_key_values is None:
                     new_past_key_values = RemotePastKeyValues()
@@ -702,22 +831,43 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     use_cache=True,
                 )
                 hidden_states = model_out.last_hidden_state
-                logits = self.lm_head(hidden_states)
+                if do_sample:
+                    logits = _project_lm_head(self.lm_head, hidden_states, drafter)
                 new_past_key_values = past_key_values
                 new_past_key_values.update_seen(active_session.position)
                 
         # Extract verification results — also returns final_positions [B] so
         # callers can gather the committed-endpoint hidden state for EAGLE.
-        (
-            verified_tokens,
-            kv_cache_position_ids,
-            llm_generated_tokens,
-            valid_lengths,
-            final_positions,
-        ) = self._extract_best_verified_paths_fixed(
-            logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration,
-            do_sample=do_sample, temperature=temperature,
-        )
+        if do_sample:
+            if logits is None:
+                logits = _project_lm_head(self.lm_head, hidden_states, drafter)
+            (
+                verified_tokens,
+                kv_cache_position_ids,
+                llm_generated_tokens,
+                valid_lengths,
+                final_positions,
+            ) = self._extract_best_verified_paths_fixed(
+                logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration,
+                do_sample=do_sample, temperature=temperature,
+            )
+        else:
+            (
+                verified_tokens,
+                kv_cache_position_ids,
+                llm_generated_tokens,
+                valid_lengths,
+                final_positions,
+            ) = self._extract_greedy_verified_paths_from_hidden(
+                hidden_states=hidden_states,
+                trees=trees,
+                input_ids=input_ids,
+                logits_processor=logits_processor,
+                tree_len=tree_tokens.shape[1],
+                seq_lengths=seq_lengths,
+                is_first_iteration=is_first_iteration,
+                drafter=drafter,
+            )
         return (
             verified_tokens,
             kv_cache_position_ids,
@@ -727,6 +877,199 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             hidden_states,
             final_positions,
         )
+
+    def _tree_parent_logits_position(
+        self,
+        *,
+        parent: TreeNode,
+        actual_len: int,
+        is_first_iteration: bool,
+    ) -> int:
+        if parent.parent is None:
+            return actual_len - 1 if is_first_iteration else 0
+        if is_first_iteration:
+            return actual_len + int(parent.position_in_sequence)
+        return int(parent.position_in_sequence) + 1
+
+    def _extract_greedy_verified_paths_from_hidden(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        trees: List[SpeculativeTree],
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        tree_len: int,
+        seq_lengths: torch.LongTensor,
+        is_first_iteration: bool,
+        drafter: Optional[Any],
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.LongTensor]:
+        """Greedy verification without projecting logits for the whole tree.
+
+        For greedy decoding the accepted path is obtained by repeatedly taking
+        the target argmax at the current parent and checking whether that token
+        is one of the parent's draft children. The old implementation first
+        computed ``B x tree_size x vocab`` logits and then walked Python paths.
+        This sparse path projects at most one parent per active row per depth,
+        plus the final bonus-token position.
+        """
+        batch_size = int(hidden_states.shape[0])
+        seq_len = int(hidden_states.shape[1])
+        hidden_device = hidden_states.device
+        out_device = input_ids.device
+        fallback_pos = max(0, seq_len - int(tree_len))
+
+        parents: List[Optional[TreeNode]] = []
+        active: List[bool] = []
+        verified_tokens_by_batch: List[List[int]] = [[] for _ in range(batch_size)]
+        positions_by_batch: List[List[int]] = [[] for _ in range(batch_size)]
+        tree_root_positions = [
+            int(seq_lengths[b].item()) - 1
+            for b in range(batch_size)
+        ]
+
+        for b in range(batch_size):
+            tree = trees[b] if b < len(trees) else None
+            parent = tree.root if tree is not None else None
+            parents.append(parent)
+            active.append(parent is not None and bool(parent.children))
+
+        depth_guard = 0
+        while any(active) and depth_guard <= max(int(tree_len), 0) + 1:
+            gather_batch: List[int] = []
+            gather_pos: List[int] = []
+            for b, is_active in enumerate(active):
+                if not is_active:
+                    continue
+                parent = parents[b]
+                if parent is None:
+                    active[b] = False
+                    continue
+                pos = self._tree_parent_logits_position(
+                    parent=parent,
+                    actual_len=int(seq_lengths[b].item()),
+                    is_first_iteration=is_first_iteration,
+                )
+                if pos < 0 or pos >= seq_len:
+                    logger.warning(
+                        "Greedy speculative verify skipped an out-of-window parent "
+                        "(batch=%s pos=%s seq_len=%s first=%s)",
+                        b,
+                        pos,
+                        seq_len,
+                        is_first_iteration,
+                    )
+                    active[b] = False
+                    continue
+                gather_batch.append(b)
+                gather_pos.append(pos)
+
+            if not gather_batch:
+                break
+
+            batch_index = torch.tensor(gather_batch, dtype=torch.long, device=hidden_device)
+            pos_index = torch.tensor(gather_pos, dtype=torch.long, device=hidden_device)
+            parent_hidden = hidden_states[batch_index, pos_index, :]
+            parent_logits = _project_lm_head_rows(self.lm_head, parent_hidden, drafter)
+            predicted_tokens = parent_logits.argmax(dim=-1).detach().cpu().tolist()
+
+            for slot, b in enumerate(gather_batch):
+                parent = parents[b]
+                if parent is None:
+                    active[b] = False
+                    continue
+                predicted = int(predicted_tokens[slot])
+                matched_child = None
+                for child in parent.children:
+                    if int(child.token_id) == predicted:
+                        matched_child = child
+                        break
+                if matched_child is None:
+                    active[b] = False
+                    continue
+
+                verified_tokens_by_batch[b].append(int(matched_child.token_id))
+                absolute_position = tree_root_positions[b] + int(matched_child.position_in_sequence) + 1
+                positions_by_batch[b].append(absolute_position)
+                parents[b] = matched_child
+                active[b] = bool(matched_child.children)
+
+            depth_guard += 1
+
+        final_positions_list: List[int] = []
+        final_pos_index: List[int] = []
+        for b in range(batch_size):
+            if positions_by_batch[b]:
+                pos = positions_by_batch[b][-1] - tree_root_positions[b]
+                if is_first_iteration:
+                    pos = positions_by_batch[b][-1]
+            else:
+                real_fallback_pos = int(seq_lengths[b].item()) if is_first_iteration else fallback_pos
+                pos = real_fallback_pos - 1
+
+            if pos < 0 or pos >= seq_len:
+                logger.warning(
+                    "Greedy speculative verify clamped bonus-logits position "
+                    "(batch=%s pos=%s seq_len=%s first=%s)",
+                    b,
+                    pos,
+                    seq_len,
+                    is_first_iteration,
+                )
+                pos = min(max(int(pos), 0), max(seq_len - 1, 0))
+            final_positions_list.append(int(pos))
+            final_pos_index.append(int(pos))
+
+        row_index = torch.arange(batch_size, dtype=torch.long, device=hidden_device)
+        pos_index = torch.tensor(final_pos_index, dtype=torch.long, device=hidden_device)
+        final_hidden = hidden_states[row_index, pos_index, :]
+        final_logits = _project_lm_head_rows(self.lm_head, final_hidden, drafter)
+
+        llm_rows: List[torch.Tensor] = []
+        for b in range(batch_size):
+            processed = final_logits[b:b + 1].clone()
+            for processor in logits_processor:
+                processed = processor(input_ids[b:b + 1], processed)
+            llm_rows.append(torch.argmax(processed[0], dim=-1, keepdim=True).to(out_device))
+        llm_generated_tokens = torch.stack(llm_rows, dim=0)
+
+        valid_lengths = torch.tensor(
+            [len(v) for v in verified_tokens_by_batch],
+            dtype=torch.long,
+            device=out_device,
+        )
+
+        positions_list: List[torch.Tensor] = []
+        for b in range(batch_size):
+            all_positions = [tree_root_positions[b]] + positions_by_batch[b]
+            positions_list.append(torch.tensor(all_positions, dtype=torch.long, device=out_device))
+
+        max_pos_len = max((pos.shape[0] for pos in positions_list), default=1)
+        kv_cache_position_ids = torch.full(
+            (batch_size, max_pos_len),
+            -1,
+            dtype=torch.long,
+            device=out_device,
+        )
+        for b, pos in enumerate(positions_list):
+            kv_cache_position_ids[b, :pos.shape[0]] = pos
+
+        max_verified_len = max((len(v) for v in verified_tokens_by_batch), default=0)
+        verified_tokens: Optional[torch.Tensor]
+        if max_verified_len > 0:
+            verified_tokens = torch.full(
+                (batch_size, max_verified_len),
+                -1,
+                dtype=torch.long,
+                device=out_device,
+            )
+            for b, row in enumerate(verified_tokens_by_batch):
+                if row:
+                    verified_tokens[b, :len(row)] = torch.tensor(row, dtype=torch.long, device=out_device)
+        else:
+            verified_tokens = None
+
+        final_positions = torch.tensor(final_positions_list, dtype=torch.long, device=out_device)
+        return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths, final_positions
     
     def pack_bool_mask_to_int64(self, mask_bool: torch.Tensor) -> torch.Tensor:
         assert mask_bool.dtype == torch.bool, "Input must be a bool tensor"
@@ -739,6 +1082,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         past_key_values: RemotePastKeyValues,
         seq_lengths: torch.LongTensor,
         *,
+        drafter: Optional[Any] = None,
         is_first_iteration: bool,
         do_sample: bool = False,
         temperature: float = 1.0,
@@ -773,10 +1117,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     use_cache=True,
                 )
                 hidden_states = model_out.last_hidden_state
-                logits_full = self.lm_head(hidden_states)
-                logits = torch.stack(
-                    [logits_full[i, int(seq_lengths[i].item()) - 1, :] for i in range(batch_size)],
-                    dim=0,
+                last_positions = (seq_lengths - 1).to(device=hidden_states.device, dtype=torch.long)
+                row_index = torch.arange(batch_size, device=hidden_states.device)
+                last_hidden = hidden_states[row_index, last_positions, :]
+                logits = _project_lm_head_rows(
+                    self.lm_head,
+                    last_hidden,
+                    drafter,
                 )
                 final_positions = (seq_lengths - 1).to(device=device)
                 kv_cache_position_ids = final_positions[:, None]
@@ -796,7 +1143,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     use_cache=True,
                 )
                 hidden_states = model_out.last_hidden_state
-                logits = self.lm_head(hidden_states)[:, -1, :]
+                logits = _project_lm_head(self.lm_head, hidden_states, drafter)[:, -1, :]
                 final_positions = torch.zeros(batch_size, dtype=torch.long, device=device)
                 kv_cache_position_ids = (seq_lengths - 1).to(device=device)[:, None]
             
@@ -987,6 +1334,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         positions_list: List[torch.Tensor] = []
         llm_tokens_list: List[torch.Tensor] = []
         valid_lengths_list: List[int] = []
+        final_positions_list: List[int] = []
 
         for batch_idx in range(batch_size):
             actual_len = seq_lengths[batch_idx].item()
@@ -1032,6 +1380,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 positions_list.append(torch.tensor([tree_root_position], device=device))
                 llm_tokens_list.append(torch.tensor([next_token], device=device))
                 valid_lengths_list.append(0)
+                final_positions_list.append(max(0, real_fallback_pos - 1))
                 continue
 
             path_len = len(best_path)
@@ -1071,9 +1420,14 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             if accepted_len > 0:
                 best_verified = committed[:accepted_len]
                 best_positions = path_positions[:accepted_len]
+                if is_first_iteration:
+                    final_positions_list.append(int(best_positions[-1]))
+                else:
+                    final_positions_list.append(int(best_positions[-1] - tree_root_position))
             else:
                 best_verified = []
                 best_positions = []
+                final_positions_list.append(max(0, real_fallback_pos - 1))
             llm_token_val = int(committed[accepted_len]) if accepted_len < len(committed) else int(committed[-1])
 
             all_positions = [tree_root_position] + best_positions
@@ -1099,7 +1453,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     verified_tokens[i, :v.shape[0]] = v
         else:
             verified_tokens = None
-        final_positions = torch.zeros(batch_size, dtype=torch.long, device=device)
+        final_positions = torch.tensor(final_positions_list, dtype=torch.long, device=device)
         return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths, final_positions
     def _extract_best_verified_paths_fixed(
         self,

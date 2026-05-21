@@ -38,6 +38,7 @@ from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
+    get_micro_batch_size_for_request,
     should_split_batch,
     compute_micro_batch_ranges,
     split_tensor_to_microbatches,
@@ -115,6 +116,24 @@ def _should_log_mb_detail(step_metadata: Optional[Dict[str, Any]]) -> bool:
     return pos <= 2 or (pos % every_n == 0)
 
 
+def _compute_micro_batch_ranges_for_request(
+    batch_size: int,
+    *,
+    is_spec_dec: bool,
+) -> list[tuple[int, int]]:
+    micro_batch_size = get_micro_batch_size_for_request(is_spec_dec=is_spec_dec)
+    ranges = compute_micro_batch_ranges(batch_size, micro_batch_size=micro_batch_size)
+    if is_spec_dec and micro_batch_size > 0 and micro_batch_size != get_micro_batch_size():
+        logger.info(
+            "%s Speculative verify micro-batch override: batch=%s micro_batch_size=%s num_micro_batches=%s",
+            MBPIPE_LOG_PREFIX,
+            batch_size,
+            micro_batch_size,
+            len(ranges),
+        )
+    return ranges
+
+
 def _to_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -181,22 +200,14 @@ def _effective_token_increment(
 ) -> int:
     """
     Compute logical token increment for session position accounting.
-    For speculative decoding, align with client-side logic:
-    use kv_cache_position_ids[0].numel() when available.
+
+    Speculative requests send a root plus the current draft tree. The target
+    stage writes that entire forward window into KV, then the next request uses
+    kv_cache_position_ids to compact only the accepted path. Therefore the
+    per-request capacity check must be based on the current hidden-state
+    window, not on the padded accepted-position tensor from the previous round.
     """
-    default_inc = int(hidden_states.shape[1]) if torch.is_tensor(hidden_states) and hidden_states.ndim >= 2 else 0
-    if not _as_python_bool(is_spec_dec):
-        return default_inc
-    if kv_cache_position_ids is None or is_dummy(kv_cache_position_ids):
-        return default_inc
-    if not torch.is_tensor(kv_cache_position_ids):
-        try:
-            kv_cache_position_ids = torch.as_tensor(kv_cache_position_ids)
-        except Exception:
-            return default_inc
-    if kv_cache_position_ids.numel() == 0:
-        return 0
-    return int(kv_cache_position_ids[0].numel())
+    return int(hidden_states.shape[1]) if torch.is_tensor(hidden_states) and hidden_states.ndim >= 2 else 0
 
 
 def _unpack_inference_submit_result(result: Any) -> Tuple[torch.Tensor, Any, Optional[Dict[str, float]]]:
@@ -617,11 +628,18 @@ def _optional_output_tensor(value: Any, empty_tensor: torch.Tensor) -> torch.Ten
     return value
 
 
+def _compact_spec_response_enabled() -> bool:
+    return os.environ.get("BLOOMBEE_DISABLE_COMPACT_SPEC_RESPONSE", "0") != "1"
+
+
 def _select_inference_output_schema(
     requested_backends: Sequence[TransformerBackend],
     *,
     is_spec_dec: bool,
+    compact_spec_response: bool = False,
 ):
+    if is_spec_dec and compact_spec_response:
+        return requested_backends[-1].decode_outputs_schema
     if is_spec_dec:
         return requested_backends[-1].spec_outputs_schema
     return requested_backends[-1].decode_outputs_schema
@@ -789,6 +807,14 @@ async def iterate_rpc_inference(
             else:
                 mb_hidden_states = flat_tensors[0] if flat_tensors else None
                 mb_keep_indices = None
+            spec_payload_present = (
+                _as_python_bool(step_metadata.get("is_spec_dec", 0))
+                and len(flat_tensors) >= 6
+            )
+            mb_tree_attention_mask = flat_tensors[2] if spec_payload_present else None
+            mb_kv_cache_position_ids = flat_tensors[3] if spec_payload_present else None
+            mb_draft_tokens = flat_tensors[4] if spec_payload_present else None
+            mb_prefill_length = flat_tensors[5] if spec_payload_present else None
             
             # [MB_DEBUG] Log extracted tensors
             logger.debug(f"[MB_DEBUG] mb_hidden_states: shape={mb_hidden_states.shape if mb_hidden_states is not None else 'None'}")
@@ -827,9 +853,11 @@ async def iterate_rpc_inference(
             else:
                 logger.debug(f"[MB_DEBUG] Reusing RequestContext for current micro-batch step")
 
-            # Cross-stage micro-batch pushes only carry hidden_states/keep_indices.
-            # Seed a per-step context explicitly so schema fallback does not emit warnings.
-            if not request_context.is_initialized:
+            # Cross-stage micro-batch pushes normally carry hidden_states and
+            # keep_indices. Speculative pushes additionally carry the per-mb
+            # tree/KV/draft context; without it downstream stages silently
+            # degrade to non-spec metadata and cannot be streamed safely.
+            if spec_payload_present or not request_context.is_initialized:
                 spec_from_metadata = _as_python_bool(step_metadata.get("is_spec_dec", 0))
                 pruning_from_metadata = _as_python_bool(step_metadata.get("need_pruning", 0))
                 if pruning_from_metadata and not spec_pruner_enabled:
@@ -838,10 +866,14 @@ async def iterate_rpc_inference(
                 request_context.cache_from_mb0(
                     prompts=[None] * len(requested_backends),
                     hypo_ids=torch.arange(mb_size, dtype=torch.int64, device=mb_hidden_states.device),
-                    tree_attention_mask=None,
-                    kv_cache_position_ids=None,
-                    draft_tokens=None,
-                    prefill_length=int(step_metadata.get("prefill_length", 0) or 0),
+                    tree_attention_mask=mb_tree_attention_mask,
+                    kv_cache_position_ids=mb_kv_cache_position_ids,
+                    draft_tokens=mb_draft_tokens,
+                    prefill_length=(
+                        mb_prefill_length
+                        if mb_prefill_length is not None and not is_dummy(mb_prefill_length)
+                        else int(step_metadata.get("prefill_length", 0) or 0)
+                    ),
                     is_spec_dec=spec_from_metadata,
                     need_pruning=pruning_from_metadata,
                     num_backends=len(requested_backends),
@@ -1112,9 +1144,18 @@ async def iterate_rpc_inference(
                 push_keep = keep_indices.detach().clone() if torch.is_tensor(keep_indices) else keep_indices
 
                 # Fire-and-forget async push - don't wait for completion
+                spec_tensors = None
+                if is_spec_dec:
+                    spec_tensors = {
+                        "tree_attention_mask": tree_attention_mask,
+                        "kv_cache_position_ids": kv_cache_position_ids,
+                        "draft_tokens": draft_tokens,
+                        "prefill_length": prefill_length,
+                    }
                 asyncio.create_task(
-                    cross_stage_push_fn(push_hidden, push_keep, push_metadata)
+                    cross_stage_push_fn(push_hidden, push_keep, push_metadata, spec_tensors)
                 )
+                step_metadata["cross_stage_pushed"] = True
                 
                 if log_mb_detail:
                     logger.info(
@@ -2064,7 +2105,10 @@ async def iterate_rpc_inference(
                     log_mb_detail = _should_log_mb_detail(step_metadata)
                     verbose_mb = _mbpipe_verbose_enabled()
                     
-                    micro_ranges = compute_micro_batch_ranges(batch_size)
+                    micro_ranges = _compute_micro_batch_ranges_for_request(
+                        batch_size,
+                        is_spec_dec=is_spec_dec,
+                    )
                     log_microbatch_split(logger, batch_size, len(micro_ranges), "iterate_rpc_inference.merged_pools")
                     
                     # Track timing for overlap statistics
@@ -2074,15 +2118,20 @@ async def iterate_rpc_inference(
                     
                     # [MBPIPE] Get next_servers from step_metadata for cross-stage streaming
                     next_servers = step_metadata.get("next_servers", None) if step_metadata else None
+                    enable_spec_cross_stage = os.environ.get(
+                        "BLOOMBEE_ENABLE_SPEC_CROSS_STAGE_PUSH",
+                        "1",
+                    ) == "1"
                     enable_cross_stage = (
                         cross_stage_push_fn is not None
                         and next_servers is not None
-                        and not is_spec_dec
+                        and (not is_spec_dec or enable_spec_cross_stage)
                     )
                     if (
                         is_spec_dec
                         and cross_stage_push_fn is not None
                         and next_servers is not None
+                        and not enable_spec_cross_stage
                         and log_mb_detail
                     ):
                         logger.info(
@@ -2350,8 +2399,16 @@ async def iterate_rpc_inference(
                             push_hidden = mb_out_hidden.detach().clone()
                             push_keep = mb_out_keep.detach().clone() if torch.is_tensor(mb_out_keep) else mb_out_keep
 
+                            spec_tensors = None
+                            if is_spec_dec:
+                                spec_tensors = {
+                                    "tree_attention_mask": mb_inputs.tree_attention_mask,
+                                    "kv_cache_position_ids": mb_inputs.kv_cache_position_ids,
+                                    "draft_tokens": mb_inputs.draft_tokens,
+                                    "prefill_length": mb_inputs.prefill_length,
+                                }
                             push_task = asyncio.create_task(
-                                cross_stage_push_fn(push_hidden, push_keep, push_metadata)
+                                cross_stage_push_fn(push_hidden, push_keep, push_metadata, spec_tensors)
                             )
                             cross_stage_push_tasks.append(push_task)
                             if log_mb_detail:
@@ -2485,7 +2542,10 @@ async def iterate_rpc_inference(
                 if should_split_batch(batch_size):
                     execution_mode = "separate_microbatch"
                     # Micro-batch pipeline path: split batch, process with overlap
-                    micro_ranges = compute_micro_batch_ranges(batch_size)
+                    micro_ranges = _compute_micro_batch_ranges_for_request(
+                        batch_size,
+                        is_spec_dec=is_spec_dec,
+                    )
                     log_microbatch_split(logger, batch_size, len(micro_ranges), "iterate_rpc_inference.separate_pools")
                     
                     # Process micro-batches with pipeline overlap using asyncio
@@ -2499,12 +2559,16 @@ async def iterate_rpc_inference(
                     
                     # [MBPIPE] Get next_servers from step_metadata for cross-stage streaming
                     next_servers = step_metadata.get("next_servers", None) if step_metadata else None
+                    enable_spec_cross_stage = os.environ.get(
+                        "BLOOMBEE_ENABLE_SPEC_CROSS_STAGE_PUSH",
+                        "1",
+                    ) == "1"
                     enable_cross_stage = (
                         cross_stage_push_fn is not None
                         and next_servers is not None
-                        and not is_spec_dec
+                        and (not is_spec_dec or enable_spec_cross_stage)
                     )
-                    if is_spec_dec and cross_stage_push_fn is not None and next_servers is not None:
+                    if is_spec_dec and cross_stage_push_fn is not None and next_servers is not None and not enable_spec_cross_stage:
                         logger.info(
                             f"{MBPIPE_LOG_PREFIX} Cross-stage streaming disabled (separate_pools) for speculative decoding "
                             f"(preserve full spec context)"
@@ -2584,8 +2648,16 @@ async def iterate_rpc_inference(
                             # [MBPIPE_FIX] Clone tensors before async push to avoid buffer reuse races.
                             push_hidden = mb_hidden.detach().clone()
                             push_keep = mb_keep_idx.detach().clone() if torch.is_tensor(mb_keep_idx) else mb_keep_idx
+                            spec_tensors = None
+                            if is_spec_dec:
+                                spec_tensors = {
+                                    "tree_attention_mask": mb_inputs.tree_attention_mask,
+                                    "kv_cache_position_ids": mb_inputs.kv_cache_position_ids,
+                                    "draft_tokens": mb_inputs.draft_tokens,
+                                    "prefill_length": mb_inputs.prefill_length,
+                                }
                             push_task = asyncio.create_task(
-                                cross_stage_push_fn(push_hidden, push_keep, push_metadata)
+                                cross_stage_push_fn(push_hidden, push_keep, push_metadata, spec_tensors)
                             )
                             cross_stage_push_tasks.append(push_task)
                             logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage push: micro-batch {mb_idx+1}/{len(micro_ranges)} sent to next stage")
@@ -2725,13 +2797,15 @@ async def iterate_rpc_inference(
         
         serialize_start = perf_counter()
         transport_phase = "prefill" if hidden_states.ndim >= 2 and int(hidden_states.shape[1]) > 1 else "decode"
+        compact_spec_response = bool(is_spec_dec) and _compact_spec_response_enabled()
         output_schema = _select_inference_output_schema(
             requested_backends,
             is_spec_dec=is_spec_dec,
+            compact_spec_response=compact_spec_response,
         )
         flat_tensors = (
             ensure_tensors((hidden_states, keep_indices))
-            if not is_spec_dec
+            if (not is_spec_dec or compact_spec_response)
             else ensure_tensors(
                 (
                     hidden_states,
@@ -2745,7 +2819,7 @@ async def iterate_rpc_inference(
         )
         output_debug_names = (
             ("hidden_states", "keep_indices")
-            if not is_spec_dec
+            if (not is_spec_dec or compact_spec_response)
             else (
                 "hidden_states",
                 "keep_indices",

@@ -308,7 +308,7 @@ outputs = model.generate(
 )
 ```
 
-By default, EAGLE-2 auto-selection is conservative and only picks known LLaMA-family drafter checkpoints. Pass `ea_model_path` explicitly for a custom compatible checkpoint. In current benchmarks, EAGLE-2 is recommended for 33B-class and larger targets; on 13B-class targets the drafter/tree overhead can outweigh the target-side savings.
+By default, EAGLE-2 auto-selection is conservative and only picks known LLaMA-family drafter checkpoints. Pass `ea_model_path` explicitly for a custom compatible checkpoint. Runtime generation uses a compact tree budget by default; pass `tree_budget=59, topk_per_step=10` to reproduce the paper's total-token=60 tree. In current benchmarks, EAGLE-2 shows positive throughput on 13B-class targets and is recommended most strongly for 33B-class and larger targets, where target verification cost amortizes the drafter/tree overhead better.
 
 Available auto classes:
 

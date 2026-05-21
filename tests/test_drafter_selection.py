@@ -5,8 +5,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from bloombee.models.llama.eagle_drafter import select_eagle_drafter_for_target
+from bloombee.models.llama.eagle_drafter import EAGLEDrafter, select_eagle_drafter_for_target
 from bloombee.models.llama.spec_decoding_drafter import (
     _DEFAULT_DRAFTER,
     select_drafter_for_target,
@@ -113,3 +114,25 @@ def test_eagle_env_override_wins(monkeypatch):
     drafter_id, source = select_eagle_drafter_for_target(cfg)
     assert drafter_id == "myorg/my-eagle-head"
     assert source == "env"
+
+
+def test_eagle_loads_local_drafter_directory(tmp_path):
+    ckpt = tmp_path / "pytorch_model.bin"
+    torch.save({"layers.0.self_attn.q_proj.weight": torch.ones(1)}, ckpt)
+
+    class FakeHead:
+        def __init__(self):
+            self.loaded = None
+
+        def load_state_dict(self, state_dict, strict=False):
+            self.loaded = (state_dict, strict)
+            return [], []
+
+    drafter = object.__new__(EAGLEDrafter)
+    drafter.head = FakeHead()
+
+    drafter._load_eagle_weights(str(tmp_path))
+
+    state_dict, strict = drafter.head.loaded
+    assert strict is False
+    assert "layer.self_attn.q_proj.weight" in state_dict

@@ -3,6 +3,33 @@ import torch
 from bloombee.server.backend import TransformerBackend
 
 
+def test_expand_local_tree_attention_mask_uses_compacted_cache_prefix():
+    backend = object.__new__(TransformerBackend)
+
+    local_tree_mask = torch.tensor(
+        [[[True, False], [True, True]]],
+        dtype=torch.bool,
+    )
+    full_mask = backend._expand_local_tree_attention_mask(
+        local_tree_mask,
+        kv_cache_position_ids=torch.tensor([[5, 9, 11]], dtype=torch.long),
+        batch_size=1,
+        seq_len=2,
+        cache_len=8,
+        batch_offset=0,
+        full_batch_size=1,
+        device=torch.device("cpu"),
+    )
+
+    assert full_mask.shape == (1, 2, 10)
+    assert full_mask[0, 0, :8].all()
+    assert full_mask[0, 0, 8].item()
+    assert not full_mask[0, 0, 9].item()
+    assert full_mask[0, 1, :8].all()
+    assert full_mask[0, 1, 8].item()
+    assert full_mask[0, 1, 9].item()
+
+
 def test_generation_tree_position_ids_follow_tree_depths():
     backend = object.__new__(TransformerBackend)
 

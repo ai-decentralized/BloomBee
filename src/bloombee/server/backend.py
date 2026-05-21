@@ -501,6 +501,143 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.pruner_manager.middle_keep_indices = keep_indices
         return keep_indices
 
+    def _is_local_tree_attention_mask(
+        self,
+        tree_attention_mask: Optional[torch.Tensor],
+        *,
+        seq_len: int,
+        cache_len: int,
+    ) -> bool:
+        """Detect compact speculative masks that contain only root/tree columns."""
+        return (
+            torch.is_tensor(tree_attention_mask)
+            and tree_attention_mask.ndim == 3
+            and int(cache_len) > 0
+            and int(tree_attention_mask.shape[-2]) == int(seq_len)
+            and int(tree_attention_mask.shape[-1]) == int(seq_len)
+        )
+
+    def _spec_cache_valid_mask(
+        self,
+        *,
+        kv_cache_position_ids: Optional[torch.Tensor],
+        batch_size: int,
+        cache_len: int,
+        batch_offset: int,
+        full_batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if cache_len <= 0:
+            return torch.empty(batch_size, 0, dtype=torch.bool, device=device)
+        if kv_cache_position_ids is None or is_dummy(kv_cache_position_ids):
+            return torch.ones(batch_size, cache_len, dtype=torch.bool, device=device)
+
+        ids = kv_cache_position_ids
+        if not torch.is_tensor(ids):
+            ids = torch.as_tensor(ids)
+        ids = ids.to(device=device, dtype=torch.long)
+        if ids.ndim == 1:
+            ids = ids.unsqueeze(0)
+        if ids.ndim >= 2 and ids.shape[0] != batch_size:
+            ids = self._slice_batch_aligned(
+                ids,
+                batch_offset,
+                batch_offset + batch_size,
+                full_batch_size if full_batch_size > 0 else ids.shape[0],
+            )
+        if ids.ndim >= 2 and ids.shape[0] == 1 and batch_size > 1:
+            ids = ids.expand(batch_size, -1)
+        if ids.ndim < 2 or ids.shape[0] != batch_size:
+            logger.warning(
+                "[SPEC_LOCAL_MASK] kv_cache_position_ids batch mismatch: got=%s expected=%s; "
+                "falling back to all-prefix-valid cache mask",
+                tuple(ids.shape) if torch.is_tensor(ids) else None,
+                batch_size,
+            )
+            return torch.ones(batch_size, cache_len, dtype=torch.bool, device=device)
+
+        valid_mask = ids >= 0
+        has_valid = valid_mask.any(dim=1)
+        if not bool(has_valid.any().item()):
+            return torch.zeros(batch_size, cache_len, dtype=torch.bool, device=device)
+
+        first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+        batch_idx = torch.arange(batch_size, device=device)
+        root_positions = torch.where(
+            has_valid,
+            ids[batch_idx, first_valid_idx],
+            torch.zeros_like(first_valid_idx),
+        )
+        valid_counts = valid_mask.to(torch.long).sum(dim=1)
+        compact_lengths = torch.clamp(root_positions + valid_counts, min=0, max=int(cache_len))
+        positions = torch.arange(cache_len, device=device, dtype=torch.long)
+        return positions.unsqueeze(0) < compact_lengths.unsqueeze(1)
+
+    def _expand_local_tree_attention_mask(
+        self,
+        local_tree_mask: torch.Tensor,
+        *,
+        kv_cache_position_ids: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        cache_len: int,
+        batch_offset: int,
+        full_batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Expand a vLLM-style local root/tree mask into BloomBee's full mask.
+
+        The compact mask carries only the query-query tree bias. The prefix
+        side is reconstructed from the compacted cache layout for this stage.
+        """
+        mask = local_tree_mask
+        if mask.ndim >= 3 and mask.shape[0] != batch_size:
+            mask = self._slice_batch_aligned(
+                mask,
+                batch_offset,
+                batch_offset + batch_size,
+                full_batch_size if full_batch_size > 0 else mask.shape[0],
+            )
+        if mask.ndim >= 3 and mask.shape[0] == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, -1, -1)
+        if mask.shape[0] != batch_size:
+            raise RuntimeError(
+                "Local speculative tree mask batch mismatch after slicing: "
+                f"mask={tuple(mask.shape)}, batch_size={batch_size}"
+            )
+
+        mask = mask.to(device=device, dtype=torch.bool)
+        if mask.shape[-2] != seq_len or mask.shape[-1] != seq_len:
+            fixed = torch.zeros(batch_size, seq_len, seq_len, dtype=torch.bool, device=device)
+            rows = min(seq_len, int(mask.shape[-2]))
+            cols = min(seq_len, int(mask.shape[-1]))
+            fixed[:, :rows, :cols] = mask[:, :rows, :cols]
+            mask = fixed
+
+        full_mask = torch.zeros(
+            batch_size,
+            seq_len,
+            int(cache_len) + seq_len,
+            dtype=torch.bool,
+            device=device,
+        )
+        if cache_len > 0:
+            cache_valid = self._spec_cache_valid_mask(
+                kv_cache_position_ids=kv_cache_position_ids,
+                batch_size=batch_size,
+                cache_len=int(cache_len),
+                batch_offset=batch_offset,
+                full_batch_size=full_batch_size,
+                device=device,
+            )
+            full_mask[:, :, :int(cache_len)] = cache_valid.unsqueeze(1).expand(
+                batch_size,
+                seq_len,
+                int(cache_len),
+            )
+        full_mask[:, :, int(cache_len): int(cache_len) + seq_len] = mask
+        return full_mask
+
     def forward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
         *inputs, active_adapter = inputs
         with self._peft_module.using_adapter(active_adapter):
@@ -689,8 +826,24 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 device = hidden_states.device
                 
                 if self._is_spec_decoding:
-                    full_mask = inference_info.tree_attention_mask.to(device)
+                    raw_tree_mask = inference_info.tree_attention_mask
+                    full_mask = raw_tree_mask.to(device) if raw_tree_mask is not None else None
                     if full_mask is not None:
+                        if self._is_local_tree_attention_mask(
+                            full_mask,
+                            seq_len=seq_len,
+                            cache_len=cache_len,
+                        ):
+                            full_mask = self._expand_local_tree_attention_mask(
+                                full_mask,
+                                kv_cache_position_ids=kv_cache_position_ids,
+                                batch_size=batch_size,
+                                seq_len=seq_len,
+                                cache_len=cache_len,
+                                batch_offset=inference_info.batch_offset,
+                                full_batch_size=inference_info.full_batch_size,
+                                device=device,
+                            )
                         expected_rows = seq_len
                         expected_cols = cache_len + seq_len
                         if full_mask.ndim == 3:
@@ -717,6 +870,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                                     expected_rows,
                                     expected_cols,
                                 )
+                        # Use the same additive-mask representation as the
+                        # target-only cached path. The bool full_mask is still
+                        # kept for tree-depth RoPE positions below.
                         attention_mask = self.convert_mask_to_scores(full_mask)
                     else:
                         attention_mask = None
@@ -812,7 +968,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             prefill_length=inference_info.prefill_length - 1,
                             kv_cache_position_ids=kv_cache_position_ids,
                             batch_offset=inference_info.batch_offset,
-                            device="cuda",
+                            device=hidden_states.device,
                             target_seq_len=seq_len,
                             tree_attention_mask=full_mask,
                             cache_len=cache_len,
@@ -1176,11 +1332,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 prefill_length.to(device),
             )
             accepted_counts = valid_mask.to(torch.long).sum(dim=1)
-            # The cache ids are physical slots in the sparse tree layout, because
-            # attention must read the accepted draft nodes from their original
-            # locations. RoPE positions are logical sequence positions, so the
-            # next root starts after root + accepted draft tokens, not after the
-            # largest sparse slot.
+            # The cache ids name physical slots in the previous tree, but the
+            # cache manager compacts those accepted slots before this forward.
+            # RoPE positions are logical sequence positions, so the next root
+            # starts after root + accepted draft tokens, not after the largest
+            # sparse slot.
             base_positions = root_positions + accepted_counts
 
             if tree_attention_mask is not None and cache_len is not None and target_seq_len is not None:

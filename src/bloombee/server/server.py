@@ -52,6 +52,7 @@ from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
 from bloombee.utils.misc import get_size_in_bytes
+from bloombee.utils.p2p import get_default_p2p_max_msg_size
 from bloombee.utils.ping import PingAggregator
 from bloombee.utils.random import sample_up_to
 from bloombee.utils.microbatch_config import get_micro_batch_size
@@ -156,6 +157,7 @@ class Server:
         self.stats_report_interval, self.update_period = stats_report_interval, update_period
         self.prefetch_batches, self.sender_threads = prefetch_batches, sender_threads
         self.revision, self.token = revision, token
+        kwargs.setdefault("persistent_conn_max_msg_size", get_default_p2p_max_msg_size())
 
         if custom_module_path is not None:
             add_custom_models_from_file(custom_module_path)
@@ -818,6 +820,7 @@ class ModuleContainer(threading.Thread):
         # Queue size scales with batch_size, so we use a conservative limit
         max_queue_size = 500  # Reduced from 1000 to further limit shared memory usage
         handler_event_queues = [mp.Queue(maxsize=max_queue_size) for _ in range(num_handlers)]
+        p2p_max_msg_size = kwargs.get("persistent_conn_max_msg_size")
         self.conn_handlers = [
             TransformerConnectionHandler(
                 dht,
@@ -832,6 +835,7 @@ class ModuleContainer(threading.Thread):
                 step_timeout=step_timeout,
                 quant_type=QuantType[server_info.quant_type.upper()],
                 pruner_manager = pruner_manager,
+                p2p_max_msg_size=p2p_max_msg_size,
             )
             for i in range(num_handlers)
         ]

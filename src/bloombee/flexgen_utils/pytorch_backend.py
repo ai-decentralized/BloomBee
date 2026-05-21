@@ -920,8 +920,11 @@ class TorchDevice:
         # shape: (b * n_head, tgt_s, src_s)
         attn_scores = torch.bmm(q, k) / math.sqrt(head_dim)
         attn_scores = attn_scores.view(b, n_head, tgt_s, src_s).to(torch.float32)
-        mask_expanded = mask.view(b, 1, tgt_s, src_s).to(attn_scores.device)
-        attn_scores = attn_scores + mask_expanded
+        mask_expanded = mask.reshape(b, 1, tgt_s, src_s).to(attn_scores.device)
+        if mask_expanded.dtype == torch.bool:
+            attn_scores = attn_scores.masked_fill(~mask_expanded, -65504.0)
+        else:
+            attn_scores = attn_scores + mask_expanded
         attn_weights = F.softmax(attn_scores, dim=-1)  # [b, n_head, tgt_s, src_s]
         
         attn_weights = attn_weights.view(b * n_head, tgt_s, src_s)
@@ -929,6 +932,28 @@ class TorchDevice:
 
 
     def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
+        if (
+            q.is_cuda
+            and hasattr(F, "scaled_dot_product_attention")
+            and os.environ.get("BLOOMBEE_DISABLE_SDPA_ATTENTION", "0") != "1"
+        ):
+            try:
+                q_4d = q.reshape(b, n_head, tgt_s, head_dim)
+                k_4d = k.transpose(1, 2).reshape(b, n_head, src_s, head_dim)
+                v_4d = v.reshape(b, n_head, src_s, head_dim)
+                attn_mask = mask.reshape(b, 1, tgt_s, src_s).to(q.device)
+                if attn_mask.dtype != torch.bool:
+                    attn_mask = attn_mask.to(dtype=q.dtype)
+                return F.scaled_dot_product_attention(
+                    q_4d,
+                    k_4d,
+                    v_4d,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
+            except RuntimeError:
+                logger.debug("SDPA attention path failed; falling back to bmm attention", exc_info=True)
         attn_weights = self._attention_weights(q, k, mask, b, src_s, tgt_s, n_head, head_dim)
         return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 

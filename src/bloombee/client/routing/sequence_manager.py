@@ -24,6 +24,7 @@ from bloombee.data_structures import ModuleUID, RemoteSpanInfo, ServerState
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.dht import get_remote_module_infos
 from bloombee.utils.hivemind_compat import Blacklist, DHT, MSGPackSerializer, P2P, PeerID
+from bloombee.utils.p2p import apply_p2p_max_msg_size
 from bloombee.utils.ping import PingAggregator
 from bloombee.utils.random import sample_up_to
 
@@ -101,6 +102,7 @@ class RemoteSequenceManager:
                 client_mode=True,
                 num_workers=32,
                 startup_timeout=config.daemon_startup_timeout,
+                persistent_conn_max_msg_size=config.p2p_max_msg_size,
                 start=True,
             )
         assert isinstance(dht, DHT) and dht.is_alive(), "`dht` must be a running hivemind.DHT instance"
@@ -109,6 +111,7 @@ class RemoteSequenceManager:
         created_p2p = state.p2p is None
         if state.p2p is None:
             state.p2p = RemoteExpertWorker.run_coroutine(dht.replicate_p2p())
+        apply_p2p_max_msg_size(state.p2p, config.p2p_max_msg_size)
 
         if _shared_resources is None:
             _shared_resources = _SharedSequenceManagerResources(owns_dht=created_dht, owns_p2p=created_p2p)

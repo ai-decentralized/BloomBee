@@ -1889,7 +1889,7 @@ class KVCacheManager:
         Returns:
             k_pkv: (B, H, cache_len, D)
             v_pkv: (B, H, cache_len, D)
-            cache_len: 取出的 cache 长度
+            cache_len: compacted cache 长度
         """
         if cache_tensors is None:
             assert self._active_cache_tensors_stack, "select_cache called outside of use_cache"
@@ -1900,22 +1900,46 @@ class KVCacheManager:
         
         H = getattr(self.block_config, "num_attention_heads", None)
         full_batch_in_cache = BH_full // H
+
+        if kv_cache_position_ids.dim() == 1:
+            kv_cache_position_ids = kv_cache_position_ids.unsqueeze(0)
+
+        # Micro-batch callers normally pass an already sliced tensor, but keep
+        # this path robust for direct/full-batch request metadata.
+        if (
+            full_batch_size > 0
+            and micro_batch_size > 0
+            and kv_cache_position_ids.shape[0] == full_batch_size
+        ):
+            mb_end = min(batch_offset + micro_batch_size, kv_cache_position_ids.shape[0])
+            kv_cache_position_ids = kv_cache_position_ids[batch_offset:mb_end]
         
-        # 1. 找到需要取的 cache 范围
+        # 1. 找到需要读取的物理 cache 范围，以及 forward 要看到的紧凑长度。
         valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
         if not valid_mask.any():
             return None, None, 0
         
-        # Speculative kv_cache_position_ids describe the positions that are already
-        # materialized in cache from the previous verified step. The cache window we
-        # need to read is therefore bounded by the largest valid position + 1, which
-        # must stay consistent with prepare_incremental_tree_batch().
+        # The incoming ids are physical slots from the previous speculative
+        # tree. The next forward must see only the accepted path as a contiguous
+        # prefix, so we read up to the largest physical source slot and compact
+        # the selected slots before returning layer_past.
         max_positions = torch.where(
             valid_mask,
             kv_cache_position_ids,
             torch.full_like(kv_cache_position_ids, -1),
         ).max(dim=1).values
-        cache_len = int((max_positions + 1).max().item())
+        physical_cache_len = int((max_positions + 1).max().item())
+
+        has_valid = valid_mask.any(dim=1)
+        first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+        batch_idx = torch.arange(kv_cache_position_ids.shape[0], device=kv_cache_position_ids.device)
+        root_positions = torch.where(
+            has_valid,
+            kv_cache_position_ids[batch_idx, first_valid_idx],
+            torch.zeros_like(first_valid_idx),
+        )
+        valid_counts = valid_mask.to(torch.long).sum(dim=1)
+        compact_cache_len = int((root_positions + valid_counts).max().item())
         
         # 2. 计算 BH 切片范围 (与 select_cache 保持一致)
         gpu_multiplexing = full_batch_size > 0 and full_batch_in_cache < full_batch_size
@@ -1933,7 +1957,7 @@ class KVCacheManager:
                 BH_offset_start = slot_batch_start * H
                 BH_offset_end = min(BH_offset_start + actual_mb_size * H, BH_full)
                 
-                if cache_len > 0:
+                if physical_cache_len > 0:
                     if current_mb != mb_index:
                         if pending_mb != mb_index:
                             self.prefetch_microbatch_kv(mb_index)
@@ -1949,12 +1973,18 @@ class KVCacheManager:
             # Full batch 模式
             BH_offset_start = 0
             BH_offset_end = BH_full
+
+        requested_rows = int(kv_cache_position_ids.shape[0])
+        if full_batch_size <= 0 and requested_rows > 0:
+            requested_bh = requested_rows * H
+            if requested_bh < (BH_offset_end - BH_offset_start):
+                BH_offset_end = BH_offset_start + requested_bh
         
         BH = BH_offset_end - BH_offset_start
         
-        # 3. 取出 [0, cache_len) 的 cache
+        # 3. 取出 [0, physical_cache_len) 的 cache
         compute_dst = self.attention_compute
-        idx_all = (slice(0, cache_len), slice(BH_offset_start, BH_offset_end))
+        idx_all = (slice(0, physical_cache_len), slice(BH_offset_start, BH_offset_end))
         
         def _as_torch(x):
             return x.data if hasattr(x, "data") else x
@@ -1985,7 +2015,7 @@ class KVCacheManager:
                 v_parts.append(v_data[s_slice, local_bh_start:local_bh_end, :].to(compute_dst.dev, non_blocking=True))
 
             if not k_parts:
-                return None, None, cache_len
+                return None, None, compact_cache_len
             if len(k_parts) == 1:
                 k_sbh = k_parts[0]
                 v_sbh = v_parts[0]
@@ -1995,7 +2025,7 @@ class KVCacheManager:
         else:
             k_sel, _ = k_cache.smart_copy(compute_dst, idx_all)
             v_sel, _ = v_cache.smart_copy(compute_dst, idx_all)
-            k_sbh = _as_torch(k_sel)  # (cache_len, BH, D)
+            k_sbh = _as_torch(k_sel)  # (physical_cache_len, BH, D)
             v_sbh = _as_torch(v_sel)
         
         if BH < H:
@@ -2004,12 +2034,60 @@ class KVCacheManager:
         B = BH // H
 
         def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:
-            return x_sbh.view(cache_len, B, H, D).permute(1, 2, 0, 3)
+            return x_sbh.view(physical_cache_len, B, H, D).permute(1, 2, 0, 3)
         
-        k_pkv = _to_pkv(k_sbh)  # (B, H, cache_len, D)
+        k_pkv = _to_pkv(k_sbh)  # (B, H, physical_cache_len, D)
         v_pkv = _to_pkv(v_sbh)
+
+        if kv_cache_position_ids.shape[0] != B:
+            if kv_cache_position_ids.shape[0] < B:
+                B = kv_cache_position_ids.shape[0]
+                k_pkv = k_pkv[:B]
+                v_pkv = v_pkv[:B]
+            else:
+                kv_cache_position_ids = kv_cache_position_ids[:B]
+
+        if compact_cache_len <= 0:
+            return None, None, 0
+
+        ids = kv_cache_position_ids.to(device=k_pkv.device, dtype=torch.long)
+        valid_mask = ids >= 0
+        has_valid = valid_mask.any(dim=1)
+        first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+        batch_idx = torch.arange(B, device=k_pkv.device)
+        root_positions = torch.where(
+            has_valid,
+            ids[batch_idx, first_valid_idx],
+            torch.zeros_like(first_valid_idx),
+        )
+
+        if int(ids[valid_mask].max().item()) >= physical_cache_len:
+            raise RuntimeError(
+                "Speculative cache position exceeds materialized cache: "
+                f"max_position={int(ids[valid_mask].max().item())}, "
+                f"physical_cache_len={physical_cache_len}"
+            )
+
+        dst_positions = torch.arange(compact_cache_len, device=k_pkv.device, dtype=torch.long)
+        prefix_mask = dst_positions.unsqueeze(0) < root_positions.unsqueeze(1)
+        accepted_offsets = dst_positions.unsqueeze(0) - root_positions.unsqueeze(1)
+        accepted_mask = (accepted_offsets >= 0) & (accepted_offsets < valid_mask.sum(dim=1, keepdim=True))
+
+        ids_safe = ids.clamp(min=0, max=max(physical_cache_len - 1, 0))
+        gather_offsets = accepted_offsets.clamp(min=0, max=max(ids.shape[1] - 1, 0))
+        accepted_sources = ids_safe.gather(1, gather_offsets)
+        prefix_sources = dst_positions.unsqueeze(0).expand(B, compact_cache_len)
+        source_positions = torch.where(prefix_mask, prefix_sources, accepted_sources)
+        live_positions = prefix_mask | accepted_mask
+
+        gather_index = source_positions[:, None, :, None].expand(B, H, compact_cache_len, D)
+        k_compact = torch.gather(k_pkv, dim=2, index=gather_index)
+        v_compact = torch.gather(v_pkv, dim=2, index=gather_index)
+        live_mask = live_positions[:, None, :, None]
+        k_compact = k_compact.masked_fill(~live_mask, 0)
+        v_compact = v_compact.masked_fill(~live_mask, 0)
         
-        return k_pkv, v_pkv, cache_len
+        return k_compact, v_compact, compact_cache_len
 
     def update_cache_and_async_reorder(
         self,
@@ -2035,6 +2113,226 @@ class KVCacheManager:
         )
         with self._pending_reorder_lock:
             self._pending_reorder = future
+
+    @staticmethod
+    def _plain_tensor_or_none(value):
+        data = getattr(value, "data", value)
+        return data if torch.is_tensor(data) else None
+
+    def _resolve_write_bh_slice(
+        self,
+        *,
+        bh_src: int,
+        bh_dst: int,
+        batch_offset: int,
+        full_batch_size: int,
+        micro_batch_size: int,
+    ) -> Tuple[int, int, Optional[int], Optional[int], Optional[int]]:
+        """Resolve the destination BH slice using the same placement as _write_kvs."""
+        H = getattr(self.block_config, "num_attention_heads", 32)
+        cache_batch_size = bh_dst // max(1, H)
+        gpu_multiplexing = full_batch_size > 0 and cache_batch_size < full_batch_size
+        working_slot = None
+        active_batch_rows = None
+        mb_index = None
+
+        if full_batch_size > 0:
+            if gpu_multiplexing:
+                mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size, full_batch_size)
+                working_slot, slot_batch_start, active_batch_rows, _ = self._resolve_working_slot(
+                    mb_index, cache_batch_size, micro_batch_size
+                )
+                slot_state_key = self._get_slot_state_key(working_slot)
+                if slot_state_key is not None:
+                    pending_mb = self._pending_gpu_mb.get(slot_state_key)
+                    if pending_mb is not None and pending_mb != mb_index:
+                        self.sync_prefetch(pending_mb)
+                    current_mb = self._current_gpu_mb.get(slot_state_key)
+                    if current_mb is not None and current_mb != mb_index:
+                        self.sync_offload(current_mb)
+                bh_start = slot_batch_start * H
+                bh_end = bh_start + bh_src
+            else:
+                bh_start = int(batch_offset) * H
+                bh_end = bh_start + bh_src
+        else:
+            bh_start = 0
+            bh_end = bh_src
+
+        if bh_start < 0 or bh_end > bh_dst or bh_start >= bh_end:
+            raise RuntimeError(
+                "KV cache BH write slice is out of bounds: "
+                f"BH=[{bh_start}:{bh_end}], bh_dst={bh_dst}, bh_src={bh_src}, "
+                f"batch_offset={batch_offset}, full_batch_size={full_batch_size}, "
+                f"micro_batch_size={micro_batch_size}"
+            )
+        return bh_start, bh_end, mb_index, working_slot, active_batch_rows
+
+    def _try_fast_spec_cache_update(
+        self,
+        *,
+        new_kvs: AdaptedKVCache,
+        kv_cache_position_ids: torch.Tensor,
+        compact_lengths: torch.Tensor,
+        cache_tensors: Sequence[torch.Tensor],
+        batch_offset: int,
+        full_batch_size: int,
+        micro_batch_size: int,
+        cache_manager: "KVCacheManager",
+    ) -> bool:
+        """Fast speculative cache update.
+
+        The legacy update path writes the new tree to a scratch range, reads the
+        whole physical prefix back, then rewrites prefix + accepted path + tree
+        into compact layout. That is O(prefix length) extra work per layer per
+        speculative round. This path preserves the same final cache layout with
+        O(accepted path + tree) work:
+
+        1. copy only the previously accepted sparse slots into their compact
+           per-row destinations;
+        2. write the current root+tree KVs directly after each row's compact
+           prefix.
+
+        It is intentionally limited to plain tensor-backed cache slabs. Mixed
+        device/offload wrappers fall back to the existing conservative path.
+        """
+        if os.environ.get("BLOOMBEE_DISABLE_FAST_SPEC_CACHE_UPDATE", "0") == "1":
+            return False
+        if cache_manager._paged_kv_enabled:
+            return False
+
+        try:
+            (k_cache, v_cache), = cache_tensors
+        except Exception:
+            return False
+
+        k_backing = self._plain_tensor_or_none(k_cache)
+        v_backing = self._plain_tensor_or_none(v_cache)
+        if k_backing is None or v_backing is None:
+            return False
+        if k_backing.ndim != 3 or v_backing.shape != k_backing.shape:
+            return False
+
+        new_kvs_data = new_kvs.kvs if hasattr(new_kvs, "kvs") else new_kvs
+        try:
+            key, value = new_kvs_data
+        except Exception:
+            return False
+        key_t = self._plain_tensor_or_none(key)
+        value_t = self._plain_tensor_or_none(value)
+        if key_t is None or value_t is None:
+            return False
+        if key_t.ndim != 3 or value_t.ndim != 3:
+            return False
+
+        S_total, BH_dst, D_dst = k_backing.shape
+        BH_src, D_src, s_new = key_t.shape
+        if value_t.shape != (BH_src, s_new, D_src) or D_src != D_dst:
+            return False
+
+        H = getattr(self.block_config, "num_attention_heads", None)
+        if H is None or H <= 0 or BH_src % H != 0:
+            return False
+        B = BH_src // H
+        if kv_cache_position_ids.shape[0] != B or compact_lengths.shape[0] != B:
+            return False
+
+        max_end = int(compact_lengths.max().item()) + int(s_new)
+        if max_end > S_total:
+            raise RuntimeError(
+                "KV cache write exceeds allocated sequence length: "
+                f"max_end={max_end}, capacity={S_total}, tree_tokens={s_new}. "
+                "Increase session_max_length/inference_max_length or reduce the speculative tree budget."
+            )
+
+        bh_start, bh_end, mb_index, working_slot, active_batch_rows = self._resolve_write_bh_slice(
+            bh_src=BH_src,
+            bh_dst=BH_dst,
+            batch_offset=batch_offset,
+            full_batch_size=full_batch_size,
+            micro_batch_size=micro_batch_size,
+        )
+
+        device = k_backing.device
+        ids = kv_cache_position_ids.to(device=device, dtype=torch.long)
+        valid_mask = ids >= 0
+        has_valid = valid_mask.any(dim=1)
+        first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+        batch_idx = torch.arange(B, device=device)
+        root_positions = torch.where(
+            has_valid,
+            ids[batch_idx, first_valid_idx],
+            torch.zeros_like(first_valid_idx),
+        )
+        valid_counts = valid_mask.to(torch.long).sum(dim=1)
+
+        if key_t.dtype != k_backing.dtype:
+            key_t = key_t.to(dtype=k_backing.dtype)
+        if value_t.dtype != v_backing.dtype:
+            value_t = value_t.to(dtype=v_backing.dtype)
+        if key_t.device != device:
+            key_t = key_t.to(device=device, non_blocking=True)
+        if value_t.device != v_backing.device:
+            value_t = value_t.to(device=v_backing.device, non_blocking=True)
+
+        k_write = key_t.permute(2, 0, 1)    # (s_new, BH_src, D)
+        v_write = value_t.permute(1, 0, 2)  # (s_new, BH_src, D)
+
+        # Compact only the sparse accepted path from the previous tree. Prefix
+        # [0:root) is already compact from the prior update.
+        for b in range(B):
+            count = int(valid_counts[b].item())
+            if count <= 0:
+                continue
+            src_positions = ids[b, :][valid_mask[b]]
+            root = int(root_positions[b].item())
+            dst_positions = torch.arange(root, root + count, device=device, dtype=torch.long)
+            if int(src_positions.max().item()) >= S_total:
+                raise RuntimeError(
+                    "Speculative cache position exceeds cache capacity during compaction: "
+                    f"max_position={int(src_positions.max().item())}, capacity={S_total}"
+                )
+            bh0 = bh_start + b * H
+            bh1 = bh0 + H
+            if not torch.equal(src_positions, dst_positions):
+                # Clone first because destination slots can overlap later source
+                # slots in the same row.
+                k_tmp = k_backing[src_positions, bh0:bh1, :].clone()
+                v_tmp = v_backing[src_positions, bh0:bh1, :].clone()
+                k_backing[dst_positions, bh0:bh1, :] = k_tmp
+                v_backing[dst_positions, bh0:bh1, :] = v_tmp
+
+        # Write the new root+tree KVs directly after each row's compact prefix.
+        # A same-start bulk write is the common fast case when the batch accepts
+        # the same number of tokens.
+        if bool(torch.all(compact_lengths == compact_lengths[0]).item()):
+            start = int(compact_lengths[0].item())
+            end = start + int(s_new)
+            k_backing[start:end, bh_start:bh_end, :].copy_(k_write)
+            v_backing[start:end, bh_start:bh_end, :].copy_(v_write)
+        else:
+            starts = compact_lengths.to(device=device, dtype=torch.long)
+            for b in range(B):
+                start = int(starts[b].item())
+                end = start + int(s_new)
+                src_bh0 = b * H
+                src_bh1 = src_bh0 + H
+                dst_bh0 = bh_start + src_bh0
+                dst_bh1 = dst_bh0 + H
+                k_backing[start:end, dst_bh0:dst_bh1, :].copy_(k_write[:, src_bh0:src_bh1, :])
+                v_backing[start:end, dst_bh0:dst_bh1, :].copy_(v_write[:, src_bh0:src_bh1, :])
+
+        # Keep the existing micro-batch staging semantics when GPU slots are
+        # multiplexed across logical micro-batches.
+        if mb_index is not None:
+            cache_manager.offload_microbatch_kv(
+                mb_index,
+                prefix_length=max_end,
+                working_slot=working_slot,
+                batch_rows=active_batch_rows,
+            )
+
+        return True
 
     def wait_for_pending_reorder(self) -> None:
         """Ensure the previous speculative KV compaction is visible before reuse."""
@@ -2091,22 +2389,52 @@ class KVCacheManager:
                     )
                     return
 
-                max_position = kv_cache_position_ids[valid_mask].max().item()
-                write_position = int(max_position) + 1
+                if kv_cache_position_ids.dim() == 1:
+                    kv_cache_position_ids = kv_cache_position_ids.unsqueeze(0)
+                    valid_mask = kv_cache_position_ids >= 0
+
+                has_valid = valid_mask.any(dim=1)
+                first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+                batch_idx = torch.arange(kv_cache_position_ids.shape[0], device=kv_cache_position_ids.device)
+                root_positions = torch.where(
+                    has_valid,
+                    kv_cache_position_ids[batch_idx, first_valid_idx],
+                    torch.zeros_like(first_valid_idx),
+                )
+                valid_counts = valid_mask.to(torch.long).sum(dim=1)
+                compact_lengths = root_positions + valid_counts
+                compact_write_position = int(compact_lengths.max().item())
+                # The global backing cache still holds the previously accepted
+                # path at its sparse physical tree slots. Do not overwrite those
+                # sources before reorder_and_write_cache has copied them into
+                # the compact prefix.
+                physical_write_position = int(kv_cache_position_ids[valid_mask].max().item()) + 1
 
                 # Phase 3: before the new tree lands, invalidate any speculated
                 # bytes left from the prior step past the committed prefix.
-                # write_position is the start of the new tree, i.e. the length
-                # of the accepted prefix — everything at or beyond this offset
-                # was speculative and must be dropped to free pages.
+                # compact_write_position is the start of the new tree after the
+                # accepted sparse path is compacted.
                 cache_manager._rollback_paged_to(
-                    l_acc_target=write_position, cache_tensors=cache_tensors,
+                    l_acc_target=compact_write_position, cache_tensors=cache_tensors,
                 )
 
-                # 1. 同步写入新 KV
+                if self._try_fast_spec_cache_update(
+                    new_kvs=new_kvs,
+                    kv_cache_position_ids=kv_cache_position_ids,
+                    compact_lengths=compact_lengths,
+                    cache_tensors=cache_tensors,
+                    batch_offset=batch_offset,
+                    full_batch_size=full_batch_size,
+                    micro_batch_size=micro_batch_size,
+                    cache_manager=cache_manager,
+                ):
+                    return
+
+                # 1. Write new KV to a scratch physical range that cannot
+                # overlap any sparse source slots from the previous tree.
                 self._write_kvs(
                     new_kvs,
-                    write_position,
+                    physical_write_position,
                     batch_offset=batch_offset,
                     full_batch_size=full_batch_size,
                     micro_batch_size=micro_batch_size,
@@ -2115,7 +2443,7 @@ class KVCacheManager:
                 # Tree write is speculative — only raises l_seq, not l_acc.
                 cache_manager._track_paged_write(
                     new_kvs,
-                    start_position=write_position,
+                    start_position=physical_write_position,
                     commit=False,
                     cache_tensors=cache_tensors,
                 )
@@ -2131,8 +2459,15 @@ class KVCacheManager:
 
                 kv_cache_position_ids_copy = kv_cache_position_ids.clone()
 
-                # 构建 extended_position_ids
-                new_positions = torch.arange(write_position, write_position + tree_len, device=device)
+                # Build physical source ids: previous accepted sparse slots plus
+                # the scratch range for this tree. reorder_and_write_cache then
+                # compacts them into [0, compacted_cache_len), so client-side
+                # compact positions remain valid for the next request.
+                new_positions = torch.arange(
+                    physical_write_position,
+                    physical_write_position + tree_len,
+                    device=device,
+                )
                 new_positions = new_positions.unsqueeze(0).expand(B, tree_len)
                 extended_position_ids = torch.cat([kv_cache_position_ids_copy, new_positions], dim=1)
 
@@ -2155,8 +2490,7 @@ class KVCacheManager:
                 if k_pkv is None:
                     return
 
-                # 重排并写回
-                cache_manager.reorder_and_write_cache(
+                compacted_cache_len, _ = cache_manager.reorder_and_write_cache(
                     k_pkv=k_pkv,
                     v_pkv=v_pkv,
                     kv_cache_position_ids=extended_position_ids,
@@ -2165,11 +2499,11 @@ class KVCacheManager:
                     full_batch_size=full_batch_size,
                     micro_batch_size=micro_batch_size,
                 )
-                # After reorder compacts the accepted prefix into [0, cache_len),
+                # After reorder compacts the accepted prefix into [0, compacted_cache_len),
                 # promote those bytes to committed so rollback next step drops
                 # only the next tree's speculation.
                 cache_manager._commit_paged_to(
-                    l_acc_target=cache_len, cache_tensors=cache_tensors,
+                    l_acc_target=compacted_cache_len, cache_tensors=cache_tensors,
                 )
 
         except Exception:

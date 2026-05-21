@@ -30,6 +30,7 @@ def mbpipe_info_logs_enabled() -> bool:
 # Environment variable names
 ENV_ENABLE_MICROBATCH = "BLOOMBEE_ENABLE_MICROBATCH_PIPELINE"
 ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
+ENV_SPEC_MICRO_BATCH_SIZE = "BLOOMBEE_SPEC_MICRO_BATCH_SIZE"
 ENV_ENABLE_GPU_MULTIPLEXING = "BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING"
 
 # Default values
@@ -70,6 +71,36 @@ def get_micro_batch_size() -> int:
         return size
     except ValueError:
         return DEFAULT_MICRO_BATCH_SIZE if DEFAULT_MICRO_BATCH_SIZE > 0 else 0
+
+
+def get_spec_micro_batch_size() -> int:
+    """
+    Get the speculative-verify micro-batch size override.
+
+    Speculative tree verification has a different cost profile from normal
+    decode: it usually sends a wide tree through the target model, so overly
+    small micro-batches can dominate latency. If the override is unset or
+    invalid, fall back to the normal micro-batch size.
+    """
+    if not _is_microbatch_flag_enabled():
+        return 0
+
+    env_value = os.environ.get(ENV_SPEC_MICRO_BATCH_SIZE, "")
+    if not env_value:
+        return get_micro_batch_size()
+
+    try:
+        size = int(env_value)
+        if size < 1:
+            return get_micro_batch_size()
+        return size
+    except ValueError:
+        return get_micro_batch_size()
+
+
+def get_micro_batch_size_for_request(*, is_spec_dec: bool = False) -> int:
+    """Return the effective micro-batch size for a request kind."""
+    return get_spec_micro_batch_size() if is_spec_dec else get_micro_batch_size()
 
 
 def is_microbatch_enabled() -> bool:
@@ -333,7 +364,10 @@ def should_split_batch(batch_size: int) -> bool:
 
 
 
-def compute_micro_batch_ranges(batch_size: int) -> List[Tuple[int, int]]:
+def compute_micro_batch_ranges(
+    batch_size: int,
+    micro_batch_size: Optional[int] = None,
+) -> List[Tuple[int, int]]:
     """
     Compute the (start, end) ranges for each micro-batch.
     
@@ -343,7 +377,8 @@ def compute_micro_batch_ranges(batch_size: int) -> List[Tuple[int, int]]:
     Returns:
         A list of (start, end) tuples for each micro-batch.
     """
-    micro_batch_size = get_micro_batch_size()
+    if micro_batch_size is None:
+        micro_batch_size = get_micro_batch_size()
 
     if batch_size <= 0:
         return []

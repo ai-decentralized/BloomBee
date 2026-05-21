@@ -131,10 +131,7 @@ class _ServerInferenceSession:
         """
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
-        if is_spec_dec:
-            n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
-        else:
-            n_input_tokens = inputs.shape[1]
+        n_input_tokens = inputs.shape[1]
         # print('client step() n_input_tokens', n_input_tokens)
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
@@ -180,7 +177,6 @@ class _ServerInferenceSession:
             and getattr(self.config, "push_only_downstream_decode", False)
             and self.stepped
             and self.span.start > 0
-            and not is_spec_dec
         )
         transport_phase = "push_only_decode" if push_only_decode else (
             "spec_decode" if is_spec_dec else ("prefill" if not self.stepped else "decode")
@@ -298,12 +294,12 @@ class _ServerInferenceSession:
                 request_metadata["inference_layout"] = (
                     regular_layout_name if use_compact_decode_layout else "spec_compact_v1"
                 )
-                if is_spec_dec:
-                    request_metadata["start_from_position"] = self._position + n_input_tokens
-                elif self._position is not None:
+                if self._position is not None:
                     request_metadata["start_from_position"] = self._position
-                # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
-                # Speculative decoding keeps strict full-batch semantics; avoid cross-stage push.
+                # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER.
+                # Speculative downstream stages use the same push-only receive
+                # path as normal decode; the server includes the current tree/KV
+                # payload whenever a spec step still has downstream stages.
                 if self.config.use_server_to_server:
                     next_servers = self._collect_next_servers()
                     if next_servers:
@@ -586,7 +582,7 @@ class InferenceSession:
             batch_size = inputs.shape[0] if inputs.ndim >= 1 else 1
             mbpipe_log_path_entry(logger, "client.InferenceSession.step", batch_size=batch_size)
 
-        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
+        n_input_tokens = inputs.shape[1]
         if self._position + n_input_tokens > self._max_length:
             raise ValueError(
                 f"Maximum length exceeded: prefix {self._position} + current {n_input_tokens} exceeds pre-allocated maximum {self._max_length}"

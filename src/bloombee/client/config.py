@@ -5,9 +5,11 @@ from typing import Optional, Sequence, Union
 from bloombee.utils.hivemind_compat import PeerID
 
 from bloombee.constants import PUBLIC_INITIAL_PEERS
+from bloombee.utils.p2p import get_default_p2p_max_msg_size
 
 _max_retries = os.getenv("BLOOMBEE_MAX_RETRIES")
 DEFAULT_MAX_RETRIES = int(_max_retries) if isinstance(_max_retries, str) else None
+DEFAULT_P2P_MAX_MSG_SIZE = get_default_p2p_max_msg_size()
 _push_only_downstream_decode = os.getenv("BLOOMBEE_PUSH_ONLY_DOWNSTREAM_DECODE")
 DEFAULT_PUSH_ONLY_DOWNSTREAM_DECODE = (
     _push_only_downstream_decode.strip().lower() not in {"0", "false", "no", "off"}
@@ -21,6 +23,7 @@ class ClientConfig:
     initial_peers: Sequence[str] = tuple(PUBLIC_INITIAL_PEERS)  # a list of initial peers for hivemind DHT
     dht_prefix: Optional[str] = None  # a prefix for all dht keys that correspond to this model (default: model name)
     daemon_startup_timeout: int = 60  # timeout for the libp2p daemon connecting to initial peers
+    p2p_max_msg_size: int = DEFAULT_P2P_MAX_MSG_SIZE
 
     show_route: Union[str, bool] = "inference"  # show chosen route through servers. one of [False, "inference", True]
     allowed_servers: Optional[Sequence[Union[PeerID, str]]] = None  # if defined, send requests only to these servers

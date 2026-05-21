@@ -51,8 +51,11 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_FAST_GENERATE` | `0` | Enables the client-side greedy generate fast path when the request is eligible. |
 | `BLOOMBEE_DRAFTER` | unset | Overrides the default SSM speculative drafter checkpoint. |
 | `BLOOMBEE_EAGLE_DRAFTER` | unset | Overrides EAGLE-2 drafter auto-selection with an explicit compatible checkpoint. |
-| `BLOOMBEE_EAGLE_TREE_BUDGET` | `59` | Default EAGLE-2 draft-node budget. This corresponds to the paper's total-token=60 setting because BloomBee does not count the root token here. |
+| `BLOOMBEE_EAGLE_TREE_BUDGET` | `10` | Default EAGLE-2 draft-node budget used by runtime generation. Set this to `59` to reproduce the paper's total-token=60 tree because BloomBee does not count the root token here. |
 | `BLOOMBEE_EAGLE_DEPTH` | `5` | Official EAGLE-2 dynamic-tree depth used when an explicit tree budget is active. |
+| `BLOOMBEE_EAGLE_TOPK_PER_STEP` | auto | Overrides EAGLE-2 per-layer expansion width. The automatic value keeps compact trees narrow and uses `10` for paper-style trees. |
+| `BLOOMBEE_DISABLE_LOCAL_TREE_MASK` | `0` | Disables the compact local EAGLE tree mask and sends the legacy dense `[batch, tree, cache+tree]` mask instead. |
+| `BLOOMBEE_DISABLE_COMPACT_SPEC_RESPONSE` | `0` | Disables compact speculative RPC responses. By default speculative stages return only hidden states and keep indices; downstream routing reuses the original request metadata. |
 
 ## Lossless Transport and Compression Profiling
 
