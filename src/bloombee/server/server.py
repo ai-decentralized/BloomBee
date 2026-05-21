@@ -279,7 +279,7 @@ class Server:
         self.adapters = adapters
 
         ##############################################################
-        self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
+        self.env = ExecutionEnv.create(os.path.expanduser("~/.cache/bloombee/flexgen_offload_dir"), device_type=device.type) ##########
 
         # Policy: keep weights, KV cache, and activations on GPU by default.
         #

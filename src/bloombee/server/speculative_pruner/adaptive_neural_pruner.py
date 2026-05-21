@@ -453,8 +453,10 @@ class AdaptiveNeuralPruner:
             final_logits, attention_mask, draft_tokens
         )
         logger.info(f"train_step, accepted_indices: {accepted_indices}")
+        with torch.no_grad():
+            middle_logits = self.lm_head(middle_hidden_states).float()
         prob_features, labels = self.collect_training_data(
-            middle_hidden_states, attention_mask, draft_tokens
+            middle_logits, attention_mask, draft_tokens
         )
 
         self.ite += 1

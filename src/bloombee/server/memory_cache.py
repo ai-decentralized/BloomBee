@@ -98,6 +98,8 @@ class MemoryCache:
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
         self._allocated_tensors: Dict[Handle, Any] = {}
         self._handle_size_bytes: Dict[Handle, int] = {}
+        self._handle_to_allocation: Dict[Handle, Tuple[Handle, ...]] = {}
+        self._allocation_tokens: Dict[Tuple[Handle, ...], int] = {}
         # Phase 2 shim: per-handle PagedKVTable aliased onto the same slab
         # storage as _allocated_tensors[handle]. Populated lazily at
         # allocation time; only present when BLOOMBEE_PAGED_KV=1.
@@ -157,6 +159,9 @@ class MemoryCache:
                     handles = tuple(int(self.handle_counter) + i for i in range(len(descriptors)))
                     self.current_size_tokens += alloc_tokens_num
                     self.handle_counter += len(handles)  # note: this will eventually overflow and it is okay
+                    self._allocation_tokens[handles] = alloc_tokens_num
+                    for handle in handles:
+                        self._handle_to_allocation[handle] = handles
                     self._pipe_send.send((handles, descriptors))
                     return handles
         except TimeoutError:
@@ -200,9 +205,44 @@ class MemoryCache:
             return
         handles = alloc_task.result()
 
+        self.force_free(*handles, alloc_tokens_num=alloc_tokens_num)
+
+    def force_free(self, *handles: Handle, alloc_tokens_num: Optional[int] = None):
+        """Free cache handles early while keeping allocation token accounting consistent."""
+        if not handles:
+            return
+
         with self._lock_metadata:
-            self._pipe_send.send((handles, None))  # signal runtime to free these handles
-            self.current_size_tokens -= alloc_tokens_num
+            groups = []
+            seen = set()
+            for handle in handles:
+                group = self._handle_to_allocation.get(handle)
+                if group is None:
+                    if alloc_tokens_num is not None:
+                        continue
+                    group = (handle,)
+                if group in seen:
+                    continue
+                seen.add(group)
+                groups.append(group)
+
+            tokens_to_free = 0
+            handles_to_free = []
+            for group in groups:
+                group_tokens = self._allocation_tokens.pop(group, None)
+                if group_tokens is None and alloc_tokens_num is not None:
+                    continue
+                if group_tokens is not None:
+                    tokens_to_free += group_tokens
+
+                for handle in group:
+                    self._handle_to_allocation.pop(handle, None)
+                    handles_to_free.append(handle)
+
+            if handles_to_free:
+                self._pipe_send.send((tuple(handles_to_free), None))  # signal runtime to free these handles
+            if tokens_to_free:
+                self.current_size_tokens = max(0, self.current_size_tokens - tokens_to_free)
         self._memory_freed_event.set()
 
     def _wait_until_available(self, alloc_tokens_num: int, timeout: Optional[float] = None):

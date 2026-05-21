@@ -665,10 +665,10 @@ class InferenceSession:
             device=inputs.device
         ).unsqueeze(0).expand(inputs.shape[0], -1)
         self.keep_indices = keep_indices
-        if is_spec_decoding is not None and is_spec_decoding.item() == 1:
-            is_spec_dec = True
+        if torch.is_tensor(is_spec_decoding):
+            is_spec_dec = bool(is_spec_decoding.detach().bool().any().item()) if is_spec_decoding.numel() > 0 else False
         else:
-            is_spec_dec = False
+            is_spec_dec = bool(is_spec_decoding)
         need_pruning = is_spec_dec
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
