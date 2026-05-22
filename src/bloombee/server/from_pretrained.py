@@ -178,8 +178,6 @@ def _load_state_dict_from_repo(
         token = True
 
     index_file = _find_index_file(model_name, revision=revision, token=token, cache_dir=cache_dir)
-    # print('index_file :', index_file)
-    # print('cache_dir : ', cache_dir)
     if index_file.endswith(".index.json"):  # Sharded model
         path = get_file_from_repo(model_name, filename=index_file, use_auth_token=token, cache_dir=cache_dir)
         if path is None:
@@ -199,7 +197,6 @@ def _load_state_dict_from_repo(
 
     state_dict = {}
     for filename in filenames:
-        # print('filename ', filename)
         shard_state_dict = _load_state_dict_from_repo_file(
             model_name,
             filename,
@@ -262,7 +259,6 @@ def _load_state_dict_from_repo_file(
     delay: float = 30,
 ) -> StateDict:
     # First, try to find the weights locally
-    # print('from_pretrained.py  _load_state_dict_from_repo_file(): filename ', filename)
     try:
         with allow_cache_reads(cache_dir):
             path = get_file_from_repo(
@@ -273,7 +269,6 @@ def _load_state_dict_from_repo_file(
                 cache_dir=cache_dir,
                 local_files_only=True,
             )
-            # print('path ', path)
             if path is not None:
                 return _load_state_dict_from_local_file(path, block_prefix=block_prefix)
     except Exception:
@@ -289,7 +284,6 @@ def _load_state_dict_from_repo_file(
                     free_disk_space_for(file_size, cache_dir=cache_dir, max_disk_space=max_disk_space)
                 else:
                     logger.warning(f"Failed to fetch size of file {filename} from repo {model_name}")
-                # print('from_pretrained.py  _load_state_dict_from_repo_file(): filename ', filename)
                 path = get_file_from_repo(
                     model_name,
                     filename,
@@ -313,93 +307,9 @@ def _load_state_dict_from_local_file(path: str, *, block_prefix: Optional[str] =
     if path.endswith(".safetensors"):
         with safetensors.safe_open(path, framework="pt", device="cpu") as f:
             res = {key: f.get_tensor(key) for key in f.keys() if block_prefix is None or key.startswith(block_prefix)}
-            # print('res ', res)
             return res
 
     raise ValueError(f"Unknown weight format: {path}")
-
-
-    #state_dict={
-        # 'model.layers.0.input_layernorm.weight': tensor([0.0446, 0.0191, 0.0188,  ..., 0.0319, 0.0243, 0.0264], dtype=torch.float16), 
-        # 'model.layers.0.mlp.down_proj.weight': tensor([[-0.0075, -0.0083,  0.0520,  ..., -0.0033,  0.0243,  0.0004],
-        # ...
-        # 'model.layers.0.self_attn.v_proj.weight': tensor([[ 0.0061,  0.0045,  0.0020,  ..., -0.0079,  0.0114,  0.0150],
-        #  ...
-        # [ 0.0099, -0.0020, -0.0023,  ..., -0.0068,  0.0156,  0.0027]], dtype=torch.float16)
-        # }
-
-
-# def init_weight_list(state_dict, policy, env, block):
-#     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
-#     dev_choices = [env.disk, env.cpu, env.gpu]
-#     print('block')
-#     # import pdb; pdb.set_trace()
-#     sizes=[]
-#     for param_name, _ in block.named_parameters():
-#         assert param_name in state_dict, f"{param_name} not in state dict"
-#         param = state_dict[param_name]
-#         cur_shape = np.array(param.size())
-#         # print('current shape ', cur_shape)
-#         cur_size = np.prod(cur_shape)
-#         sizes.append(cur_size)
-#         # print('current size ', cur_size)
-#     # sizes=[16777216, 16777216, 16777216, 16777216, 45088768, 45088768, 45088768, 4096, 4096]  
-#     sizes_cumsum = np.cumsum(sizes)   
-#     # sizes_cumsum  [ 16777216  33554432  50331648  67108864 112197632 157286400 202375168 202379264 202383360]
-#     # print('sizes_cumsum ', sizes_cumsum)
-    
-#     ret = []
-#     i=0
-#     for param_name, _param in block.named_parameters():
-#         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
-#         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
-#         # print('home ', home)
-#         # print('state_dict', state_dict)
-#         # print('state_dict[param_name]', state_dict[param_name])
-#         # print('param_name', param_name)
-#         param = state_dict[param_name]
-#         # print()
-#         shape = param.size()
-#         dtype = param.dtype
-        
-#         if len(shape) < 2:
-#             pin_memory = True
-#             compress = False
-#         else:
-#             pin_memory = policy.pin_weight
-#             compress = policy.compress_weight
-
-#         if not compress:
-#             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
-#             weight.load_from_state_dict(param) ###############
-#             print('weight.shape ', weight.shape)
-#             if DUMMY_WEIGHT not in filename:
-#                 weight.load_from_np_file(weight_specs[i][2])
-#             else:
-#                 weight.load_from_np(np.ones(shape, dtype))
-#                 #weight.load_from_np(np.random.rand(*shape).astype(dtype))
-#         else: # compress
-#             weight = home.compressed_device.allocate(
-#                 shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
-
-#             if DUMMY_WEIGHT not in filename:
-#                 # weight.load_from_np_file(weight_specs[i][2])
-#                 weight.load_from_state_dict(param)
-#             else:
-#                 for i in range(2):
-#                     x = weight.data[i]
-#                     x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
-#         i+=1
-#         ret.append(weight)
-#         # set_module_tensor_to_device(block, param_name, weight.device.dev, weight, value=param, dtype=param.dtype)
-#         # set_module_tensor_to_device(block, param_name, "cpu", weight, value=param, dtype=param.dtype)
-        
-#         # block._parameters[tmp_name]= weight.data
-        
-     
-       
-
-    
 
 def get_choice(cur_percent, percents, choices):
     percents = np.cumsum(percents)
@@ -531,18 +441,4 @@ def set_module_tensor_to_device(
     if device != "cpu": #---------
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
-# def compare_tensors(new_value, weight_data):  
-#     print('new_value ', new_value.device)
-#     print('weight_data ', weight_data.device)
-#     print()
-#     # Compare data types  
-#     if new_value.dtype != weight_data.dtype:  
-#         return f"Data types are different: {new_value.dtype} vs {weight_data.dtype}"  
-    
-#     # Compare values  
-#     if torch.equal(new_value.to('cpu'), weight_data.to('cpu')):  
-#         return "The tensors are equal in value."  
-#     else:  
-#         return "The tensors are not equal in value."  
     
