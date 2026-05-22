@@ -50,6 +50,7 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
   - [3. Run Inference or Fine-tuning](#3-run-inference-or-fine-tuning)
 - [CLI Reference](#cli-reference)
 - [Environment Switches](README.environment-switches.md)
+- [Logging Reference](README.logging.md)
 - [Python API](#python-api)
 - [Benchmarking](#benchmarking)
 - [Examples](#examples)
