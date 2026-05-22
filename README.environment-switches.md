@@ -15,6 +15,7 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_ASYNCIO_LOGLEVEL` | `FATAL` (or `DEBUG` if Hivemind is already in debug mode) | Overrides the asyncio logger level. |
 | `BLOOMBEE_IGNORE_DEPENDENCY_VERSION` | unset | Skips the `transformers>=4.43.1,<4.44.0` version assertion. |
 | `BLOOMBEE_MAX_RETRIES` | unset | Client-side retry limit before raising an exception. |
+| `BLOOMBEE_FAST_GENERATE` | `0` | Opt-in fast-path generation on the client. See `client/remote_generation.py` for the trade-offs (skips some safety checks for lower per-step overhead). |
 
 ## Micro-Batching, Overlap, and Server-to-Server Push
 
@@ -35,6 +36,15 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_CLOCK_SYNC_LOG_EVERY` | `64` | Clock sync logging interval. |
 | `BLOOMBEE_S2S_STATS_WINDOW` | `32` | Rolling window size for server-to-server telemetry. |
 | `BLOOMBEE_S2S_STATS_LOG_EVERY` | `8` | How often S2S telemetry summaries are logged. |
+| `BLOOMBEE_PUSH_ONLY_DOWNSTREAM_DECODE` | `1` | When set, the client only opens push-only sessions to the downstream worker during decode (default behavior). Set to `0` / `false` / `no` / `off` to disable. |
+
+## Speculative Decoding
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BLOOMBEE_ENABLE_SPEC_PRUNER` | `1` | Toggles the server-side speculative pruner manager. Set to `0` to skip lazy pruner init entirely. |
+| `BLOOMBEE_SPEC_PRUNER_METHOD` | `simple_probability` | Picks the pruner method by name (`PruningMethod` enum value). Currently `simple_probability` is the only stable choice. |
+| `BLOOMBEE_DRAFTER` | unset | Override the speculative-decoding drafter model (e.g. `huggyllama/llama-68m`). When unset, BloomBee picks a safe default per the target model. |
 
 ## KV Cache and Offload
 
@@ -43,6 +53,7 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER` | auto | Overrides KV GPU<->CPU transfer mode. If unset, BloomBee enables async KV transfer when micro-batching is enabled. |
 | `BLOOMBEE_ENABLE_KV_WAIT_TIMING` | `1` | Enables KV wait timing counters and logs. |
 | `BLOOMBEE_VERBOSE_KV_LOGS` | `0` | Restores verbose KV allocation / offload / prefetch logs. Also turns on automatically if the KV debug group is enabled. |
+| `BLOOMBEE_PAGED_KV` | `0` | Opt-in Phase 2 paged-KV shim. Aliases per-handle PagedKVTable onto the same slab as the regular cache; only takes effect when set to `1`. |
 
 ## Lossless Transport and Compression Profiling
 
@@ -69,6 +80,12 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_WIRE_TRUNCATE_FP16` | `0` | Truncates selected FP32 tensors to FP16 before serialization. |
 | `BLOOMBEE_WIRE_TRUNCATE_TARGETS` | `client:rpc_inference:hidden_states` | `source:channel:tensor_name` selectors for FP16 wire truncation. |
 | `BLOOMBEE_WIRE_TRUNCATE_PHASES` | `prefill,decode,spec_decode` | Which phases allow FP16 wire truncation. |
+| `BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH` | unset | Path to a trained Zstd dictionary, used for the byte-split high-lane compressor when no phase-specific dict is set. |
+| `BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL` | unset | Phase-specific override: Zstd dictionary used during the prefill phase. |
+| `BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE` | unset | Phase-specific override: Zstd dictionary used during the decode phase. |
+| `BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS` | unset | Comma-separated block ranges (e.g. `0:10,20:30`) where the dict-based hybrid layout should be preferred over plain `byte_split`. |
+| `BLOOMBEE_DUMP_WIRE_BYTES_DIR` | unset | If set, dumps every wire payload (raw bytes pre/post-compression) into this directory for offline codec studies. |
+| `BLOOMBEE_DUMP_WIRE_BYTES_MAX` | `400` | Hard cap on the number of wire-byte dumps per run (avoids filling the disk). |
 
 ## Activation Dumping
 
@@ -97,6 +114,8 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_CLIENT_INFERENCE_LOGS` | follows the inference debug group | Controls client inference transport logs such as `[NETWORK_TX]` and `[CLIENT_INFERENCE_END]`. |
 | `BLOOMBEE_CROSS_GPU_TRANSFER_LOGS` | follows the micro-batch debug group | Controls cross-GPU transfer logs. |
 | `BLOOMBEE_KV_SOURCE_PROBE_LOGS` | follows the KV debug group | Controls `[KV_SOURCE_PROBE]` logs. |
+| `BLOOMBEE_STEP_PROFILE` | `0` | Enables `[STEP_PROFILE]` per-step server-side profiling logs from `backend.py`. |
+| `BLOOMBEE_STEP_PROFILE_INTERVAL` | `32` | Sampling interval for `[STEP_PROFILE]` logs when `BLOOMBEE_STEP_PROFILE=1`. |
 
 ## Refreshing This List
 

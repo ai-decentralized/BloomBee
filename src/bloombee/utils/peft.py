@@ -37,7 +37,7 @@ def load_specific_module(block_idx: int, filepath: str, framework: str = "pt", d
     tensors = dict()
     is_tensors_found = dict()
     common_layer_patter_re = (
-        ".+\." + "".join(f"({common_name})?" for common_name in COMMON_LAYERS_PATTERN) + f"\.({block_idx})?\..+"
+        r".+\." + "".join(f"({common_name})?" for common_name in COMMON_LAYERS_PATTERN) + rf"\.({block_idx})?\..+"
     )
     with safe_open(filepath, framework=framework, device=device) as f:
         for k in f.keys():

@@ -33,7 +33,7 @@ default_model_name: llama-7b
 hf_tokenizer_prefix: huggyllama
 
 # custom implementation
-shared_impl_snippet: /home/twei11/new/BloomBee/src/bloombee/models/template/decoder_shared_impl.pyfrag #custom decoder
+shared_impl_snippet: decoder_shared_impl.pyfrag  # path relative to this YAML file, resolved by gen_block.py
 
 
 # ============================================================
