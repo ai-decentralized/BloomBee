@@ -96,6 +96,12 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             if total_len > 0:
                 causal = torch.triu(causal, diagonal=past_key_values_length + 1)
             attention_mask = causal.unsqueeze(0).unsqueeze(0)
+        elif attention_mask.dim() == 3:
+            # BloomBee's backend builds the mask as [B, S, K]; Qwen3 attention
+            # expects 4D [B, 1, S, K] so it broadcasts over the heads dim.
+            # Without this lift, bs>1 fails with "tensor a (num_heads) must match
+            # tensor b (B) at non-singleton dimension 1".
+            attention_mask = attention_mask.unsqueeze(1)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
