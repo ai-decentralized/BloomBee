@@ -174,6 +174,13 @@ class WrappedGemma4Block(_BaseDecoderLayer):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+        elif attention_mask.dim() == 3:
+            # BloomBee's backend builds the mask as [B, S, K]; Gemma4 attention
+            # expects 4D [B, 1, S, K] so it broadcasts over the heads dim.
+            # Without this lift, bs>1 fails with "tensor a (num_heads) must match
+            # tensor b (B) at non-singleton dimension 1" (same root cause as the
+            # Qwen3 fix in 1be0a3e).
+            attention_mask = attention_mask.unsqueeze(1)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
