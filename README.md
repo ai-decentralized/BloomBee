@@ -12,16 +12,18 @@
     <a href="https://github.com/ai-decentralized/bloombee"><img src="https://img.shields.io/github/stars/ai-decentralized/bloombee?style=social"></a>
 </p>
 
-The rapid rise of generative AI has boosted demand for large language model (LLM) inference and fine-tuning services. While proprietary models are still favored, advancements in open-source LLMs have made them competitive. However, high costs and limited GPU resources hinder deployment. BloomBee is a decentralized offline serving system that leverages idle GPU resources to provide cost-effective access to LLMs.
+The rapid rise of generative AI has boosted demand for large language model (LLM) inference services. While proprietary models are still favored, advancements in open-source LLMs have made them competitive. However, high costs and limited GPU resources hinder deployment. BloomBee is a decentralized offline serving system that leverages idle GPU resources to provide cost-effective access to LLMs.
 
-Instead of requiring a single powerful machine, BloomBee splits a model's transformer blocks across multiple peers in a P2P network. If your GPU can only hold a small portion of a large model like LLaMA 3.1 (405B), you can join a network of servers each hosting different layers and collaboratively serve inference or fine-tuning requests.
+Instead of requiring a single powerful machine, BloomBee splits a model's transformer blocks across multiple peers in a P2P network. If your GPU can only hold a small portion of a large model like LLaMA 3.1 (405B), you can join a network of servers each hosting different layers and collaboratively serve inference requests.
 
 <p align="center">
+    📄 &nbsp;<b><a href="https://arxiv.org/abs/2604.21072">Read the paper</a></b> &nbsp;|&nbsp;
     🚀 &nbsp;<b><a href="https://colab.research.google.com/drive/1BZn0KrEGaNA2dlzmCTtTIjJKx3bNzOMs#scrollTo=1Qhi4I2PSGgg">Try now in Colab</a></b>
 </p>
 
 ## News
 
+- `2026/04/22` : Released our [paper](https://arxiv.org/abs/2604.21072) on arXiv.
 - `2026/02/23` : Improve documentation, CI, and developer tooling (PR [#41](../../pull/41) by @dadaism).
 - `2026/02/19` : Support micro batching and lossless compression (PR [#39](../../pull/39) by @JiuChen0).
 - `2026/02/05` : Add batch support for speculative decoding and its pruning (PR [#38](../../pull/38) by @xiongxu1998).
@@ -35,8 +37,13 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 - `2025/11/01` : Add multi-batch inference support, fix hivemind dependency, and improve installation process (PR [#27](../../pull/27) by @JiuChen0).
 
 
+## Key Features
 
-
+Running an LLM across decentralized GPUs is bottlenecked by inter-node bandwidth and per-node memory. BloomBee addresses both, with a focus on communication:
+- **Tensor offloading** — reduces per-node memory consumption so each peer can host more layers, shrinking the total number of network hops.
+- **Speculative decoding** — reduces communication frequency by sending multiple draft tokens per round-trip.
+- **Lossless compression** — shrinks the bytes transferred per activation, without accuracy loss.
+- **Micro-batch pipelining** — overlaps communication with computation to hide network latency.
 
 
 ## Table of Contents
@@ -48,7 +55,7 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 - [Quick Start](#quick-start)
   - [1. Start a Bootstrap Node](#1-start-a-bootstrap-node)
   - [2. Start Worker Servers](#2-start-worker-servers)
-  - [3. Run Inference or Fine-tuning](#3-run-inference-or-fine-tuning)
+  - [3. Run Inference](#3-run-inference)
 - [CLI Reference](#cli-reference)
 - [Environment Switches](README.environment-switches.md)
 - [Logging Reference](README.logging.md)
@@ -205,9 +212,7 @@ python -m bloombee.cli.run_server meta-llama/Llama-2-7b-hf \
 
 Workers will automatically download their assigned model layers from HuggingFace on first run.
 
-### 3. Run Inference or Fine-tuning
-
-#### Inference
+### 3. Run Inference
 
 ```bash
 python benchmarks/benchmark_inference.py \
@@ -217,7 +222,7 @@ python benchmarks/benchmark_inference.py \
   --seq_len 128
 ```
 
-#### Fine-tuning
+<!-- #### Fine-tuning
 
 ```bash
 python benchmarks/benchmark_training.py \
@@ -227,7 +232,7 @@ python benchmarks/benchmark_training.py \
   --n_steps 20 \
   --batch_size 32 \
   --seq_len 128
-```
+``` -->
 
 ---
 
@@ -312,7 +317,7 @@ Available auto classes:
 | Class | Use case |
 |---|---|
 | `AutoDistributedModelForCausalLM` | Text generation |
-| `AutoDistributedModelForSequenceClassification` | Classification / fine-tuning |
+| `AutoDistributedModelForSequenceClassification` | Classification |
 | `AutoDistributedModel` | Raw transformer (no LM head) |
 
 ---
