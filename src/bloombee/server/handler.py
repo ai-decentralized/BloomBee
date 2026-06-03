@@ -44,6 +44,10 @@ from bloombee.utils.lossless_transport import (
     tensor_nnz_ratio,
     tensor_raw_nbytes,
 )
+from bloombee.utils.s2s_activation_quant import (
+    quantize_s2s_hidden_for_transport,
+    s2s_activation_quant_enabled,
+)
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -159,6 +163,28 @@ def _read_s2s_tensors_from_local_shm(refs: Any) -> List[runtime_pb2.Tensor]:
         tensors.append(tensor)
 
     return tensors
+
+
+def _synthetic_s2s_delay_ms(payload_bytes: int) -> float:
+    bandwidth_value = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BANDWIDTH_MBPS")
+    latency_value = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BASE_LATENCY_MS")
+    if bandwidth_value is None and latency_value is None:
+        return 0.0
+
+    delay_ms = 0.0
+    if latency_value is not None:
+        try:
+            delay_ms += max(0.0, float(latency_value))
+        except Exception:
+            pass
+    if bandwidth_value is not None:
+        try:
+            bandwidth_mbps = float(bandwidth_value)
+        except Exception:
+            bandwidth_mbps = 0.0
+        if bandwidth_mbps > 0.0 and payload_bytes > 0:
+            delay_ms += (float(payload_bytes) * 8.0) / (bandwidth_mbps * 1_000_000.0) * 1000.0
+    return delay_ms
 
 
 # Create dedicated offloading debug logger
@@ -2397,7 +2423,14 @@ class TransformerConnectionHandler(ConnectionHandler):
             # metadata when possible.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
             next_need_pruning = None
-            if len(normalized_outputs) == 2:
+            output_scale_tensor = None
+            output_quant_meta = metadata.get("s2s_hidden_quant") if isinstance(metadata, dict) else None
+            output_has_quant_scale = isinstance(output_quant_meta, dict)
+            if len(normalized_outputs) in (2, 3):
+                if len(normalized_outputs) == 3:
+                    if not output_has_quant_scale:
+                        raise ValueError("Received 3 routing tensors without S2S activation quantization metadata")
+                    output_scale_tensor = normalized_outputs[2]
                 inference_layout = metadata.get("inference_layout")
                 if inference_layout in {"decode_minimal_v2", "decode_compact_v2"}:
                     if inference_layout == "decode_minimal_v2":
@@ -2413,8 +2446,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                             *list(request.tensors[2:]),
                         ]
                 else:
-                    next_tensors = normalized_outputs + list(request.tensors[2:])
-            elif len(normalized_outputs) == 6:
+                    next_tensors = list(normalized_outputs[:2]) + list(request.tensors[2:])
+            elif len(normalized_outputs) in (6, 7):
+                if len(normalized_outputs) == 7:
+                    if not output_has_quant_scale:
+                        raise ValueError("Received 7 routing tensors without S2S activation quantization metadata")
+                    output_scale_tensor = normalized_outputs[6]
                 inference_layout = metadata.get("inference_layout")
                 if inference_layout == "spec_compact_v1":
                     need_pruning_next = deserialize_torch_tensor(normalized_outputs[2])
@@ -2433,7 +2470,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         request.tensors[7],
                     ]
                 else:
-                    next_tensors = normalized_outputs + list(request.tensors[6:])
+                    next_tensors = list(normalized_outputs[:6]) + list(request.tensors[6:])
             else:
                 raise ValueError(
                     f"Unexpected routing tensor count from upstream stage: {len(normalized_outputs)}"
@@ -2463,11 +2500,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                 if key in metadata:
                     next_metadata[key] = metadata[key]
             if (
-                len(normalized_outputs) == 6
+                len(normalized_outputs) in (6, 7)
                 and metadata.get("inference_layout") == "spec_compact_v1"
                 and next_need_pruning
             ):
                 next_metadata["need_pruning"] = next_need_pruning
+            if output_scale_tensor is not None:
+                next_tensors = list(next_tensors)
+                quant_meta = dict(output_quant_meta)
+                quant_meta["scale_tensor_index"] = int(len(next_tensors))
+                next_tensors.append(output_scale_tensor)
+                next_metadata["s2s_hidden_quant"] = quant_meta
             next_metadata["sender_blocks"] = sender_blocks
             next_metadata["receiver_blocks"] = f"{next_start}:{next_end}"
             next_metadata["s2s_channel"] = "full_batch"
@@ -2483,14 +2526,77 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_metadata["s2s_sender_gpu2cpu_ms"] = float(t_gpu2cpu_ms)
 
             stub = self.get_stub(self._p2p, next_peer_id)
+            is_spec_push = bool(metadata.get("is_spec_dec", False))
+            if (
+                next_tensors
+                and "s2s_hidden_quant" not in next_metadata
+                and s2s_activation_quant_enabled(is_spec_dec=is_spec_push)
+            ):
+                hidden_for_quant = deserialize_torch_tensor(next_tensors[0])
+                quantized_hidden, scale_tensor, quant_meta = quantize_s2s_hidden_for_transport(
+                    hidden_for_quant,
+                    is_spec_dec=is_spec_push,
+                    logger=logger,
+                    context=f"full_batch:{sender_blocks}->{next_start}:{next_end}",
+                )
+                if quant_meta is not None:
+                    next_tensors = list(next_tensors)
+                    scale_tensor_index = len(next_tensors)
+                    quant_meta["scale_tensor_index"] = int(scale_tensor_index)
+                    next_tensors[0] = serialize_torch_tensor(
+                        quantized_hidden,
+                        runtime_pb2.CompressionType.NONE,
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": "spec_verify" if is_spec_push else "decode",
+                            "tensor_name": "hidden_states_int8",
+                            "source": "server",
+                            "channel": "rpc_push_full_batch",
+                            "blocks": f"{sender_blocks}->{next_start}:{next_end}",
+                            "batch": int(quantized_hidden.shape[0]) if quantized_hidden.ndim >= 1 else 1,
+                        },
+                    )
+                    if scale_tensor is None:
+                        raise ValueError("S2S activation quantization produced metadata without a scale tensor")
+                    next_tensors.append(
+                        serialize_torch_tensor(
+                            scale_tensor,
+                            runtime_pb2.CompressionType.NONE,
+                            allow_inplace=True,
+                            debug_context={
+                                "phase": "spec_verify" if is_spec_push else "decode",
+                                "tensor_name": "hidden_states_int8_scale",
+                                "source": "server",
+                                "channel": "rpc_push_full_batch",
+                                "blocks": f"{sender_blocks}->{next_start}:{next_end}",
+                                "batch": int(scale_tensor.shape[0]) if scale_tensor.ndim >= 1 else 1,
+                            },
+                        )
+                    )
+                    next_metadata["s2s_hidden_quant"] = quant_meta
             push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
             cpu2nic_prep_end = perf_counter()
             t_cpu2nic_ms = max(0.0, (cpu2nic_prep_end - push_start_time) * 1000.0)
             next_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
             serialized_next_metadata = MSGPackSerializer.dumps(next_metadata)
             push_metadata_bytes = len(serialized_next_metadata)
+            synthetic_delay_ms = _synthetic_s2s_delay_ms(push_tensor_bytes + push_metadata_bytes)
+            if synthetic_delay_ms > 0.0:
+                next_metadata["s2s_synthetic_delay_ms"] = float(synthetic_delay_ms)
+                serialized_next_metadata = MSGPackSerializer.dumps(next_metadata)
+                push_metadata_bytes = len(serialized_next_metadata)
             rpc_request = runtime_pb2.ExpertRequest(uid=next_uid, tensors=next_tensors, metadata=serialized_next_metadata)
 
+            if synthetic_delay_ms > 0.0:
+                logger.debug(
+                    "[S2S_SYNTHETIC_DELAY] channel=full_batch blocks=%s->%s:%s payload_kb=%.2f delay_ms=%.2f",
+                    sender_blocks,
+                    next_start,
+                    next_end,
+                    (push_tensor_bytes + push_metadata_bytes) / 1024.0,
+                    synthetic_delay_ms,
+                )
+                await asyncio.sleep(synthetic_delay_ms / 1000.0)
             nic2nic_start = perf_counter()
             response = await stub.rpc_push(rpc_request, timeout=self.request_timeout)
             nic2nic_end = perf_counter()
@@ -2648,13 +2754,20 @@ class TransformerConnectionHandler(ConnectionHandler):
             sender_blocks = sender_blocks_str
             push_blocks = f"{sender_blocks_str}->{next_start}:{next_end}"
             with transport_profile_scope() as push_transport_profile:
+                hidden_to_send = mb_hidden.to(outputs_schema[0].dtype)
+                hidden_to_send, scale_tensor, quant_meta = quantize_s2s_hidden_for_transport(
+                    hidden_to_send,
+                    is_spec_dec=is_spec_push,
+                    logger=logger,
+                    context=f"micro_batch:{sender_blocks}->{next_start}:{next_end}",
+                )
                 serialized_hidden = serialize_torch_tensor(
-                    mb_hidden.to(outputs_schema[0].dtype),
+                    hidden_to_send,
                     _s2s_output_compression if _s2s_output_compression is not None else outputs_schema[0].compression,
                     allow_inplace=True,
                     debug_context={
                         "phase": transport_phase,
-                        "tensor_name": "hidden_states",
+                        "tensor_name": "hidden_states_int8" if quant_meta is not None else "hidden_states",
                         "source": "server",
                         "channel": "rpc_push_microbatch",
                         "blocks": push_blocks,
@@ -2717,6 +2830,23 @@ class TransformerConnectionHandler(ConnectionHandler):
                                 },
                             )
                         )
+                serialized_scale = None
+                if quant_meta is not None:
+                    if scale_tensor is None:
+                        raise ValueError("S2S activation quantization produced metadata without a scale tensor")
+                    serialized_scale = serialize_torch_tensor(
+                        scale_tensor,
+                        runtime_pb2.CompressionType.NONE,
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": transport_phase,
+                            "tensor_name": "hidden_states_int8_scale",
+                            "source": "server",
+                            "channel": "rpc_push_microbatch",
+                            "blocks": push_blocks,
+                            "batch": int(mb_size),
+                        },
+                    )
             serialize_end_perf = perf_counter()
             serialize_end_us = self._now_us()
             sender_serialize_ms = max(0.0, (serialize_end_us - serialize_start_us) / 1000.0)
@@ -2805,6 +2935,10 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "s2s_sender_compute_to_serialize_start_ms": float(sender_compute_to_serialize_start_ms),
                 "s2s_sender_gpu2cpu_ms": float(t_gpu2cpu_ms),
             }
+            if quant_meta is not None:
+                scale_tensor_index = 2 + len(serialized_spec_tensors)
+                quant_meta["scale_tensor_index"] = int(scale_tensor_index)
+                push_metadata["s2s_hidden_quant"] = quant_meta
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
             # on downstream stage: downstream_local_time ~= upstream_time + offset_us.
@@ -2862,6 +2996,8 @@ class TransformerConnectionHandler(ConnectionHandler):
             push_metadata["clock_sync_sender_send_us"] = int(push_metadata["s2s_sender_enqueue_us"])
 
             tensor_messages = [serialized_hidden, serialized_keep, *serialized_spec_tensors]
+            if quant_meta is not None:
+                tensor_messages.append(serialized_scale)
             logical_push_tensor_bytes = sum(len(tensor.buffer) for tensor in tensor_messages)
             if _local_shm_s2s_enabled() and tensor_messages:
                 try:
@@ -2974,6 +3110,22 @@ class TransformerConnectionHandler(ConnectionHandler):
                 except Exception:
                     request_metadata = None
                     pass
+
+            metadata_bytes = len(request.metadata) if request.metadata else 0
+            synthetic_delay_ms = _synthetic_s2s_delay_ms(payload_bytes + metadata_bytes)
+            if synthetic_delay_ms > 0.0:
+                if isinstance(request_metadata, dict):
+                    request_metadata["s2s_synthetic_delay_ms"] = float(synthetic_delay_ms)
+                    request.metadata = MSGPackSerializer.dumps(request_metadata)
+                    metadata_bytes = len(request.metadata) if request.metadata else 0
+                logger.debug(
+                    "[S2S_SYNTHETIC_DELAY] channel=micro_batch mb_idx=%s to_blocks=%s payload_kb=%.2f delay_ms=%.2f",
+                    mb_idx,
+                    to_blocks,
+                    (payload_bytes + metadata_bytes) / 1024.0,
+                    synthetic_delay_ms,
+                )
+                await asyncio.sleep(synthetic_delay_ms / 1000.0)
 
             response = await stub.rpc_push(request, timeout=self.request_timeout)
             sender_ack_us = self._now_us()

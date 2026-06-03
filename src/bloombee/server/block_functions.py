@@ -33,6 +33,11 @@ from bloombee.utils.lossless_transport import (
     tensor_raw_nbytes,
     transport_profile_scope,
 )
+from bloombee.utils.s2s_activation_quant import (
+    dequantize_s2s_hidden_from_transport,
+    quantize_s2s_hidden_for_transport,
+    s2s_activation_quant_enabled,
+)
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
@@ -191,6 +196,30 @@ def _as_python_bool(value: Any) -> bool:
             return False
         return bool(value.bool().any().item())
     return bool(value)
+
+
+def _s2s_quant_scale_tensor(
+    flat_tensors: Sequence[torch.Tensor],
+    step_metadata: Optional[Dict[str, Any]],
+) -> Optional[torch.Tensor]:
+    if not isinstance(step_metadata, dict):
+        return None
+    quant_meta = step_metadata.get("s2s_hidden_quant")
+    if not isinstance(quant_meta, dict):
+        return None
+    index = quant_meta.get("scale_tensor_index")
+    if index is None:
+        return None
+    try:
+        index_int = int(index)
+    except Exception:
+        return None
+    if index_int < 0 or index_int >= len(flat_tensors):
+        raise ValueError(
+            f"Invalid S2S activation quantization scale tensor index: "
+            f"index={index_int}, tensors={len(flat_tensors)}"
+        )
+    return flat_tensors[index_int]
 
 
 def _effective_token_increment(
@@ -807,6 +836,7 @@ async def iterate_rpc_inference(
             else:
                 mb_hidden_states = flat_tensors[0] if flat_tensors else None
                 mb_keep_indices = None
+            mb_scale_tensor = _s2s_quant_scale_tensor(flat_tensors, step_metadata)
             spec_payload_present = (
                 _as_python_bool(step_metadata.get("is_spec_dec", 0))
                 and len(flat_tensors) >= 6
@@ -823,6 +853,13 @@ async def iterate_rpc_inference(
             if mb_hidden_states is None:
                 logger.warning(f"{MBPIPE_SCHEMA_PREFIX} Empty micro-batch received, skipping")
                 continue
+            mb_hidden_states = dequantize_s2s_hidden_from_transport(
+                mb_hidden_states,
+                step_metadata,
+                mb_scale_tensor,
+                logger=logger,
+                context="micro_batch",
+            )
             
             # Ensure contiguous
             if not mb_hidden_states.is_contiguous():
@@ -1925,11 +1962,11 @@ async def iterate_rpc_inference(
         inferred_layout = inference_layout
         if inferred_layout is None:
             is_spec_layout = _as_python_bool(step_metadata.get("is_spec_dec", 0))
-            if not is_spec_layout and len(flat_tensors) == 3:
+            if not is_spec_layout and len(flat_tensors) in (3, 4):
                 inferred_layout = "decode_minimal_v2"
-            elif not is_spec_layout and len(flat_tensors) == 5:
+            elif not is_spec_layout and len(flat_tensors) in (5, 6):
                 inferred_layout = "decode_compact_v2"
-            elif is_spec_layout and len(flat_tensors) == 8:
+            elif is_spec_layout and len(flat_tensors) in (8, 9):
                 inferred_layout = "spec_compact_v1"
 
         if inferred_layout == "decode_minimal_v2":
@@ -1959,6 +1996,14 @@ async def iterate_rpc_inference(
                 f"num_tensors={len(flat_tensors)}, is_spec_dec={step_metadata.get('is_spec_dec', 0)!r}"
             )
         draft_tokens = draft_tokens if draft_tokens is not None and not is_dummy(draft_tokens) else None
+        scale_tensor = _s2s_quant_scale_tensor(flat_tensors, step_metadata)
+        hidden_states = dequantize_s2s_hidden_from_transport(
+            hidden_states,
+            step_metadata,
+            scale_tensor,
+            logger=logger,
+            context="full_batch",
+        )
 
         # Fix for bus error in cross-machine setups: ensure tensors are contiguous
         if not hidden_states.is_contiguous():
@@ -2803,12 +2848,22 @@ async def iterate_rpc_inference(
             is_spec_dec=is_spec_dec,
             compact_spec_response=compact_spec_response,
         )
+        hidden_states_for_output = hidden_states
+        output_scale_tensor = None
+        output_quant_meta = None
+        if step_metadata.get("next_servers") and s2s_activation_quant_enabled(is_spec_dec=bool(is_spec_dec)):
+            hidden_states_for_output, output_scale_tensor, output_quant_meta = quantize_s2s_hidden_for_transport(
+                hidden_states,
+                is_spec_dec=bool(is_spec_dec),
+                logger=logger,
+                context=f"rpc_inference_final:{_block_span_from_uids(requested_uids)}",
+            )
         flat_tensors = (
-            ensure_tensors((hidden_states, keep_indices))
+            ensure_tensors((hidden_states_for_output, keep_indices))
             if (not is_spec_dec or compact_spec_response)
             else ensure_tensors(
                 (
-                    hidden_states,
+                    hidden_states_for_output,
                     keep_indices,
                     torch.tensor(0),
                     _optional_output_tensor(tree_attention_mask, torch.empty(0, dtype=torch.bool)),
@@ -2817,11 +2872,18 @@ async def iterate_rpc_inference(
                 )
             )
         )
+        if output_quant_meta is not None:
+            if output_scale_tensor is None:
+                raise ValueError("S2S activation quantization produced metadata without a scale tensor")
+            output_quant_meta = dict(output_quant_meta)
+            output_quant_meta["scale_tensor_index"] = int(len(flat_tensors))
+            step_metadata["s2s_hidden_quant"] = output_quant_meta
+            flat_tensors = (*flat_tensors, output_scale_tensor)
         output_debug_names = (
-            ("hidden_states", "keep_indices")
+            ("hidden_states_int8" if output_quant_meta is not None else "hidden_states", "keep_indices")
             if (not is_spec_dec or compact_spec_response)
             else (
-                "hidden_states",
+                "hidden_states_int8" if output_quant_meta is not None else "hidden_states",
                 "keep_indices",
                 "need_pruning_next",
                 "tree_attention_mask",
@@ -2829,25 +2891,33 @@ async def iterate_rpc_inference(
                 "draft_tokens",
             )
         )
+        if output_quant_meta is not None:
+            output_debug_names = (*output_debug_names, "hidden_states_int8_scale")
         with transport_profile_scope() as full_serialize_profile:
-            output_tensors = [
-                serialize_torch_tensor(
-                    result.to(proto.dtype),
-                    proto.compression,
-                    allow_inplace=True,
-                    debug_context={
-                        "phase": transport_phase,
-                        "tensor_name": output_debug_names[idx] if idx < len(output_debug_names) else f"output_{idx}",
-                        "source": "server",
-                        "channel": "rpc_inference_final",
-                        "blocks": _block_span_from_uids(requested_uids),
-                        "batch": int(hidden_states.shape[0]) if hidden_states.ndim >= 1 else 1,
-                    },
+            output_tensors = []
+            for idx, result in enumerate(flat_tensors):
+                proto = output_schema[idx] if idx < len(output_schema) else None
+                tensor_for_wire = result
+                compression = runtime_pb2.CompressionType.NONE
+                if proto is not None:
+                    compression = proto.compression
+                    if not (output_quant_meta is not None and idx == 0):
+                        tensor_for_wire = result.to(proto.dtype)
+                output_tensors.append(
+                    serialize_torch_tensor(
+                        tensor_for_wire,
+                        compression,
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": transport_phase,
+                            "tensor_name": output_debug_names[idx] if idx < len(output_debug_names) else f"output_{idx}",
+                            "source": "server",
+                            "channel": "rpc_inference_final",
+                            "blocks": _block_span_from_uids(requested_uids),
+                            "batch": int(hidden_states.shape[0]) if hidden_states.ndim >= 1 else 1,
+                        },
+                    )
                 )
-                for idx, (result, proto) in enumerate(
-                    zip(flat_tensors, output_schema)
-                )
-            ]
         full_serialize_summary = summarize_transport_profile(full_serialize_profile)
         log_comp_ratio_event(
             logger,
