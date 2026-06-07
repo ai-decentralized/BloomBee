@@ -19,6 +19,12 @@ from bloombee.models.llama.model import DistributedLlamaForCausalLM
 from bloombee.models.llama.spec_decoding_drafter import MultiSSMDrafter
 from bloombee.models.llama.spec_decoding_verify import verify_path
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree, TreeNode, prepare_incremental_tree_batch
+from bloombee.models.llama.tensor_tree import (
+    tensor_tree_from_speculative_trees,
+    greedy_verify_tensorized,
+)
+
+_TENSOR_TREE_ENABLED = os.environ.get("BLOOMBEE_TENSOR_TREE", "0").strip().lower() in ("1", "true", "on", "yes")
 
 from bloombee.client.remote_generation import RemotePastKeyValues
 from bloombee.client.inference_session import InferenceSession
@@ -754,6 +760,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             is_prefill=is_first_iteration,
             kv_cache_position_ids=past_key_values.kv_cache_position_ids,
             return_local_tree_mask=use_local_tree_mask,
+            return_node_paths=bool(do_sample),
         )
         
         # logger.info(f"tree_tokens: {tree_tokens}, attention_mask: {attention_mask.shape}")
@@ -876,6 +883,28 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             ) = self._extract_best_verified_paths_fixed(
                 logits, batch_node_paths, input_ids, logits_processor, tree_tokens.shape[1], seq_lengths, is_first_iteration,
                 do_sample=do_sample, temperature=temperature,
+            )
+        elif _TENSOR_TREE_ENABLED:
+            # GPU-tree migration: tensorized greedy verifier (no per-depth host
+            # sync, no Python TreeNode walk). Token-identical to the Python path
+            # (validated by scripts/test_tensor_greedy_identity.py).
+            tt = tensor_tree_from_speculative_trees(trees, hidden_states.device)
+            project = lambda rows: _project_lm_head_rows(self.lm_head, rows, drafter)
+            (
+                verified_tokens,
+                kv_cache_position_ids,
+                llm_generated_tokens,
+                valid_lengths,
+                final_positions,
+            ) = greedy_verify_tensorized(
+                tt=tt,
+                hidden_states=hidden_states,
+                seq_lengths=seq_lengths,
+                tree_len=tree_tokens.shape[1],
+                is_first_iteration=is_first_iteration,
+                project_rows=project,
+                logits_processor=logits_processor,
+                input_ids=input_ids,
             )
         else:
             (

@@ -203,6 +203,7 @@ def prepare_incremental_tree_batch(
     is_prefill: bool = False,
     kv_cache_position_ids: Optional[torch.Tensor] = None,  # (B, max_pos_len), -1 是 padding
     return_local_tree_mask: bool = False,
+    return_node_paths: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
     """
     准备增量 tree batch，支持不同序列长度
@@ -342,7 +343,12 @@ def prepare_incremental_tree_batch(
                 mask = padded_mask
 
         batch_attention_masks.append(mask)
-        batch_node_paths.append(tree.root.get_all_leaf_node_paths())
+        # Leaf-path DFS is only consumed by the sampling verifier; skip it for
+        # greedy decode (return_node_paths=False) to avoid the recursive Python walk.
+        if return_node_paths:
+            batch_node_paths.append(tree.root.get_all_leaf_node_paths())
+        else:
+            batch_node_paths.append([])
 
     tree_tokens = torch.tensor(batch_tree_tokens, device=device)
 
