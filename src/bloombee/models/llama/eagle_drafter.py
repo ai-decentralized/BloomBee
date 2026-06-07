@@ -68,6 +68,38 @@ _EAGLE_DRAFTER_ENV = "BLOOMBEE_EAGLE_DRAFTER"
 _EAGLE_TREE_BUDGET_ENV = "BLOOMBEE_EAGLE_TREE_BUDGET"
 _EAGLE_TOPK_PER_STEP_ENV = "BLOOMBEE_EAGLE_TOPK_PER_STEP"
 _EAGLE_DEPTH_ENV = "BLOOMBEE_EAGLE_DEPTH"
+# Bandwidth-adaptive tree budget: when the operator declares the S2S link
+# bandwidth (Mbps) via this env var, the drafter shrinks the tree on slow links.
+# Rationale: the speculative S2S hidden payload scales as B*(budget+1)*H*bytes, so
+# on a bandwidth-starved link a smaller tree (fewer nodes to ship) wins on
+# throughput even though it accepts slightly fewer tokens/round. Empirically
+# (vicuna-13b, 2-server split, batch 32, E5=20Mbps): budget 4 -> 1.26x no-SD,
+# budget 8 -> 1.23x, budget 12 -> 1.06x, budget 16 -> 0.92x, budget 24 -> 0.76x;
+# i.e. budget 4-8 is the sweet spot at 20Mbps, while on a fast link a larger tree
+# (higher accept) wins. See results/.../budget_sweep_b32_e5 and CODEX_VLLM_ANALYSIS.
+_EAGLE_BANDWIDTH_MBPS_ENV = "BLOOMBEE_EAGLE_BANDWIDTH_MBPS"
+
+
+def select_bandwidth_adaptive_budget(bandwidth_mbps: Optional[float], default_budget: int) -> int:
+    """Pick an EAGLE tree budget for the given S2S link bandwidth (Mbps).
+
+    Returns ``default_budget`` when bandwidth is unknown (None / <= 0) so the
+    behavior is unchanged unless the operator opts in. The thresholds below are
+    calibrated from the batch-32 E1-E5 throughput sweep: small trees win on slow
+    links (payload-bound), large trees win on fast links (accept-bound)."""
+    if bandwidth_mbps is None or bandwidth_mbps <= 0:
+        return default_budget
+    # Cap by the operator's default so this only ever *shrinks* the tree on slow
+    # links relative to what they asked for (never silently grows it).
+    if bandwidth_mbps <= 30:        # ~E5 (20 Mbps): heavily payload-bound
+        chosen = 6
+    elif bandwidth_mbps <= 150:     # ~E4 (125 Mbps)
+        chosen = 8
+    elif bandwidth_mbps <= 400:     # ~E3 (250 Mbps)
+        chosen = 10
+    else:                            # ~E1/E2 (>=500 Mbps / LAN): accept-bound
+        chosen = default_budget
+    return max(1, min(int(chosen), int(default_budget)))
 
 _EAGLE_DRAFTER_REGISTRY: Dict[str, Dict[int, str]] = {
     # Official yuhuili EAGLE/EAGLE-2-compatible head checkpoints. Keep this
@@ -562,6 +594,23 @@ class EAGLEDrafter:
         # dynamic tree preserves EAGLE-2 acceptance while keeping verify latency
         # under control. Set BLOOMBEE_EAGLE_TREE_BUDGET=59 for the paper tree.
         self.default_tree_budget = max(1, int(os.environ.get(_EAGLE_TREE_BUDGET_ENV, "10")))
+        # Optional bandwidth-adaptive budget: shrink the tree on slow S2S links so
+        # the per-round speculative payload (B*(budget+1)*H) stays under the link's
+        # throughput break-even. Only applies when the operator sets the bandwidth
+        # hint AND does not pass an explicit tree_budget at generate() time.
+        _bw_env = os.environ.get(_EAGLE_BANDWIDTH_MBPS_ENV)
+        if _bw_env is not None:
+            try:
+                _bw = float(_bw_env)
+            except ValueError:
+                _bw = None
+            adapted = select_bandwidth_adaptive_budget(_bw, self.default_tree_budget)
+            if adapted != self.default_tree_budget:
+                logger.info(
+                    "EAGLE bandwidth-adaptive budget: link=%s Mbps -> tree_budget %d (was %d)",
+                    _bw_env, adapted, self.default_tree_budget,
+                )
+            self.default_tree_budget = adapted
         self._prefix_states: Dict[int, _PrefixCacheState] = {}
 
         self._load_eagle_weights(ea_model_path)
