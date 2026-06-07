@@ -1014,6 +1014,11 @@ class EAGLEDrafter:
         top0 = self._topk_logprobs(logits0, k=K)
         seed_count = int(top0.indices.shape[-1])
 
+        # PERF (tensorization, codex topology opt B): batch the GPU->CPU transfers.
+        # Reading top-k values/indices with one `.tolist()` each is a single CUDA
+        # sync; the old per-element `.item()` was O(B*K) separate syncs per depth.
+        top0_vals = top0.values.detach().cpu().tolist()      # [B][seed_count]
+        top0_idx = top0.indices.detach().cpu().tolist()      # [B][seed_count]
         roots: List[_CandNode] = []
         all_nodes_by_batch: List[List[_CandNode]] = []
         seeds_by_batch: List[List[_CandNode]] = []
@@ -1030,9 +1035,9 @@ class EAGLEDrafter:
             all_nodes: List[_CandNode] = []
             seeds: List[_CandNode] = []
             for j in range(seed_count):
-                lp = float(top0.values[b, j].item())
+                lp = float(top0_vals[b][j])
                 node = _CandNode(
-                    token_id=int(top0.indices[b, j].item()),
+                    token_id=int(top0_idx[b][j]),
                     parent=root,
                     depth=1,
                     log_p=lp,
@@ -1063,27 +1068,29 @@ class EAGLEDrafter:
                     break
 
                 current_seed_count = len(seeds_by_batch[0])
-                parent_hiddens = torch.empty(
-                    (batch_size, current_seed_count, root_hiddens.shape[-1]),
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                seed_input_ids = torch.empty(
-                    (batch_size, current_seed_count),
-                    device=self.device,
-                    dtype=torch.long,
-                )
+                # PERF (tensorization): build seed_input_ids in one host->device
+                # copy instead of per-(b,s) scalar assignment (each of which was a
+                # device sync). parent_hiddens are stacked from already-on-device
+                # tensors via torch.stack (no per-element sync).
+                seed_token_rows: List[List[int]] = []
+                parent_hidden_rows: List[torch.Tensor] = []
                 for b, seeds in enumerate(seeds_by_batch):
                     if len(seeds) != current_seed_count:
                         raise ValueError("Batched EAGLE expansion requires uniform seed count")
-                    for s_idx, seed in enumerate(seeds):
+                    seed_token_rows.append([int(seed.token_id) for seed in seeds])
+                    ph_row = []
+                    for seed in seeds:
                         parent_hidden = (
                             seed.parent.hidden
                             if seed.parent is not None and seed.parent.hidden is not None
                             else roots[b].hidden
                         )
-                        parent_hiddens[b, s_idx] = parent_hidden.to(device=self.device, dtype=self.dtype)
-                        seed_input_ids[b, s_idx] = int(seed.token_id)
+                        ph_row.append(parent_hidden.to(device=self.device, dtype=self.dtype))
+                    parent_hidden_rows.append(torch.stack(ph_row, dim=0))
+                parent_hiddens = torch.stack(parent_hidden_rows, dim=0)
+                seed_input_ids = torch.tensor(
+                    seed_token_rows, device=self.device, dtype=torch.long
+                )
 
                 position_ids = torch.full(
                     (batch_size, current_seed_count),
@@ -1119,15 +1126,19 @@ class EAGLEDrafter:
                 )
                 cumulative = top_values + seed_scores[:, :, None]
 
+                # PERF (tensorization): one `.tolist()` per tensor (two CUDA syncs
+                # total) instead of B*K*K separate `.item()` calls per depth.
+                tv_list = top_values.detach().cpu().tolist()    # [B][seed][child]
+                ti_list = top_indices.detach().cpu().tolist()   # [B][seed][child]
                 children_by_batch: List[List[List[_CandNode]]] = []
                 for b, seeds in enumerate(seeds_by_batch):
                     children_by_seed: List[List[_CandNode]] = []
                     for s_idx, seed in enumerate(seeds):
                         row: List[_CandNode] = []
                         for c in range(child_count):
-                            lp = float(top_values[b, s_idx, c].item())
+                            lp = float(tv_list[b][s_idx][c])
                             child = _CandNode(
-                                token_id=int(top_indices[b, s_idx, c].item()),
+                                token_id=int(ti_list[b][s_idx][c]),
                                 parent=seed,
                                 depth=depth + 1,
                                 log_p=lp,
@@ -1146,10 +1157,14 @@ class EAGLEDrafter:
                 parent_indices = torch.div(top_next.indices, child_count, rounding_mode="floor")
                 child_indices = top_next.indices.remainder(child_count)
 
+                # PERF (tensorization): one `.tolist()` for the whole [B, next_count]
+                # selection instead of 2*B per-row `.tolist()` calls.
+                parent_idx_list = parent_indices.detach().cpu().tolist()
+                child_idx_list = child_indices.detach().cpu().tolist()
                 next_seeds_by_batch: List[List[_CandNode]] = []
                 for b in range(batch_size):
                     next_seeds: List[_CandNode] = []
-                    for parent_idx, child_idx in zip(parent_indices[b].tolist(), child_indices[b].tolist()):
+                    for parent_idx, child_idx in zip(parent_idx_list[b], child_idx_list[b]):
                         next_seeds.append(children_by_batch[b][int(parent_idx)][int(child_idx)])
                     next_seeds_by_batch.append(next_seeds)
 
