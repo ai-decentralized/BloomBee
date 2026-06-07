@@ -332,7 +332,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         batch_size = input_ids.shape[0]
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=device)
         finished = False
-        
+        # Active-row acceptance accumulators (compaction Stage 0, metric-only).
+        self._spec_active_rows_accum = 0
+        self._spec_active_committed_accum = 0
+
         # Initialize past_key_values for session tracking
         past_key_values = RemotePastKeyValues()
         batch_positions = torch.full(
@@ -440,6 +443,29 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 initial_len=initial_seq_lengths,
                 max_new_tokens=max_new_tokens,
             )
+            # Active-row acceptance instrumentation (compaction Stage 0, metric-only).
+            # The fixed-batch loop verifies all rows every round, so the aggregate
+            # accept (total committed / rounds) is dragged toward the slowest row
+            # once fast rows finish. The TRUE per-active-row acceptance only counts
+            # rows that were still unfinished entering this round. This changes no
+            # tokens; it just reports the number a continuous-batching runtime
+            # (e.g. vLLM) would report. See results/.../CODEX_COMPACTION_PLAN.md.
+            try:
+                _active_mask = unfinished_sequences.bool() & (
+                    (seq_lengths - initial_seq_lengths) < max_new_tokens
+                )
+                _active_rows = int(_active_mask.sum().item())
+                if _active_rows > 0:
+                    _committed = (valid_lengths + append_llm_token).to(torch.long)
+                    _active_committed = int(_committed[_active_mask].sum().item())
+                    self._spec_active_rows_accum = getattr(self, "_spec_active_rows_accum", 0) + _active_rows
+                    self._spec_active_committed_accum = getattr(self, "_spec_active_committed_accum", 0) + _active_committed
+                    logger.info(
+                        f"Step {step_idx}: ActiveAccept active_rows={_active_rows} "
+                        f"committed={_active_committed} active_accept={_active_committed/_active_rows:.4f}"
+                    )
+            except Exception:
+                pass
             if verified_tokens_positions is not None:
                 position_offsets = torch.arange(
                     verified_tokens_positions.shape[1],
