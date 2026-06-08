@@ -282,6 +282,156 @@ def row_last_node(node_steps: List[int]) -> int:
     return last
 
 
+@torch.no_grad()
+def tensor_tree_from_eagle_candidate_tensors(
+    *,
+    root_tokens: torch.Tensor,        # [B] long
+    cand_token: torch.Tensor,         # [B, C] long
+    cand_parent_cidx: torch.Tensor,   # [B, C] long, parent candidate slot (-1 if parent is root)
+    cand_depth: torch.Tensor,         # [B, C] long (>=1 for draft candidates)
+    cand_path_logp64: torch.Tensor,   # [B, C] float64 cumulative path log-prob
+    cand_valid: torch.Tensor,         # [B, C] bool
+    total_token: int,                 # tree budget incl. root (m = total_token - 1 kept draft nodes)
+    max_candidate_depth: int,
+    pad_token_id: int = 0,
+) -> TensorTreeBatch:
+    """Reconstruct a TensorTreeBatch directly from per-row EAGLE candidate tensors,
+    reproducing the Python `_topm_global` + `_close_under_parents` + `_bind` +
+    DFS-preorder pipeline EXACTLY (with creation_index == candidate slot index).
+
+    Determinism contract (must match eagle_drafter.py):
+      * top-m kept set: largest m valid candidates by (-path_logp64, depth, slot),
+        stable on ties (slot ascending) — matches _topm_global stable sort.
+      * parent closure: add ancestors (via cand_parent_cidx) — matches _close_under_parents.
+      * final DFS pre-order: children visited in (depth, slot) order — matches _bind
+        (sorts kept by (depth, creation_index)) + linearize_tree_with_positions.
+    """
+    device = cand_token.device
+    B, C = cand_token.shape
+    m = max(0, int(total_token) - 1)
+    NEG_INF = torch.tensor(float("-inf"), dtype=torch.float64, device=device)
+
+    # --- 1. top-m selection by (-path_logp64, depth, slot), stable, valid only ---
+    slot = torch.arange(C, device=device).unsqueeze(0).expand(B, C)  # [B,C] creation_index
+    # Build a single sortable key per candidate that lexicographically orders by
+    # (path_logp64 DESC, depth ASC, slot ASC). We sort by composite via successive
+    # stable sorts (least-significant key first): slot (already ascending), then
+    # depth ascending, then path_logp64 descending. Invalid -> sorted to the end.
+    # Use rank assignment rather than float packing to avoid precision loss.
+    # Order candidates: primary path_logp64 desc, then depth asc, then slot asc.
+    # Implement with a stable argsort chain.
+    order = torch.arange(C, device=device).unsqueeze(0).expand(B, C).clone()  # identity (slot asc)
+    # stable sort by depth ascending (slot asc already the tie-order)
+    dep_keys = torch.gather(cand_depth, 1, order)
+    idx = torch.argsort(dep_keys, dim=1, stable=True)
+    order = torch.gather(order, 1, idx)
+    # stable sort by path_logp64 descending
+    lp_keys = torch.gather(cand_path_logp64, 1, order)
+    idx = torch.argsort(-lp_keys, dim=1, stable=True)
+    order = torch.gather(order, 1, idx)
+    # Now `order[b]` lists candidate slots best-first by (-logp, depth, slot)...
+    # but invalid candidates must be pushed last. Re-rank with validity as the
+    # most-significant key (valid first), stable over the (-logp,depth,slot) order.
+    valid_keys = torch.gather(cand_valid.long(), 1, order)  # 1 valid, 0 invalid
+    idx = torch.argsort(-valid_keys, dim=1, stable=True)
+    order = torch.gather(order, 1, idx)
+    # selected = first m slots in `order` that are valid
+    rank = torch.arange(C, device=device).unsqueeze(0).expand(B, C)
+    n_valid = cand_valid.sum(dim=1, keepdim=True)  # [B,1]
+    take = torch.minimum(torch.full_like(n_valid, m), n_valid)  # [B,1]
+    sel_in_order = rank < take  # [B,C] over the ordered positions
+    selected = torch.zeros(B, C, dtype=torch.bool, device=device)
+    selected.scatter_(1, order, sel_in_order)
+    selected = selected & cand_valid
+
+    # --- 2. parent closure: add ancestors of selected (depth-bounded) ---
+    closed = selected.clone()
+    for _ in range(int(max_candidate_depth) + 1):
+        # parent slot of each closed candidate (>=0 means parent is a candidate)
+        par = cand_parent_cidx.clone()
+        has_par = (par >= 0) & closed
+        if not bool(has_par.any()):
+            break
+        par_safe = par.clamp(min=0)
+        add = torch.zeros(B, C, dtype=torch.bool, device=device)
+        add.scatter_(1, par_safe, has_par)  # mark parents of closed nodes
+        new_closed = closed | (add & cand_valid)
+        if bool((new_closed == closed).all()):
+            break
+        closed = new_closed
+
+    # --- 3. final DFS pre-order via path-key lexsort ---
+    # path_key[b,c] = [slot at depth1 ancestor, slot at depth2 ancestor, ..., own slot]
+    # padded with -1 suffix so a parent sorts before its descendants.
+    D = int(max_candidate_depth)
+    path_key = torch.full((B, C, D), -1, dtype=torch.long, device=device)
+    # walk ancestors: level 0 = own slot at position depth-1; fill from the node up.
+    cur = slot.clone()                       # [B,C] current ancestor slot (start: self)
+    cur_depth = cand_depth.clamp(min=0)      # [B,C]
+    # For each node, its own slot goes at column (depth-1); ancestors fill earlier cols.
+    for _level in range(D):
+        col = (cur_depth - 1).clamp(min=0, max=D - 1)  # [B,C]
+        valid_cur = cur >= 0
+        # scatter cur into path_key[:, :, col] per node
+        # build via advanced indexing
+        bidx = torch.arange(B, device=device).view(B, 1).expand(B, C)
+        nidx = torch.arange(C, device=device).view(1, C).expand(B, C)
+        pk = path_key.clone()
+        pk[bidx[valid_cur], nidx[valid_cur], col[valid_cur]] = cur[valid_cur]
+        path_key = pk
+        # step up to parent
+        par = torch.gather(cand_parent_cidx, 1, slot)  # parent slot of each node's chain head
+        # advance cur to its parent
+        parent_of_cur = torch.where(cur >= 0, torch.gather(cand_parent_cidx, 1, cur.clamp(min=0)), torch.full_like(cur, -1))
+        parent_of_cur = torch.where(cur >= 0, parent_of_cur, torch.full_like(cur, -1))
+        cur = parent_of_cur
+        cur_depth = (cur_depth - 1).clamp(min=0)
+    # closed candidates sort by path_key ascending (lexicographic over columns);
+    # unclosed -> large sentinel so they fall to the end.
+    BIG = C + 1
+    sortable = path_key.clone()
+    # replace -1 with -1 (parent-first) is already correct; mask unclosed rows to BIG.
+    unclosed = ~closed
+    sortable[unclosed] = BIG
+    # lexsort over D columns: stable sorts from last column to first.
+    order2 = torch.arange(C, device=device).unsqueeze(0).expand(B, C).clone()
+    for col in range(D - 1, -1, -1):
+        keys = torch.gather(sortable[:, :, col], 1, order2)
+        idx = torch.argsort(keys, dim=1, stable=True)
+        order2 = torch.gather(order2, 1, idx)
+    # order2[b] now lists closed candidates in DFS pre-order, then unclosed.
+    draft_count = closed.sum(dim=1)  # [B]
+    max_draft = int(draft_count.max().item()) if B > 0 else 0
+    max_nodes = max_draft + 1
+
+    token = torch.full((B, max_nodes), pad_token_id, dtype=torch.long, device=device)
+    parent_idx = torch.full((B, max_nodes), -1, dtype=torch.long, device=device)
+    depth = torch.zeros((B, max_nodes), dtype=torch.long, device=device)
+    n_nodes = torch.ones(B, dtype=torch.long, device=device)
+    token[:, 0] = root_tokens.to(device)
+
+    # cand slot -> node index map (node 0 = root). Build per row.
+    cand_to_node = torch.full((B, C), -1, dtype=torch.long, device=device)
+    for b in range(B):
+        dc = int(draft_count[b].item())
+        if dc == 0:
+            n_nodes[b] = 1
+            continue
+        ordered = order2[b, :dc]  # candidate slots in DFS order
+        node_indices = torch.arange(1, dc + 1, device=device)
+        cand_to_node[b, ordered] = node_indices
+        token[b, 1:dc + 1] = cand_token[b, ordered]
+        depth[b, 1:dc + 1] = cand_depth[b, ordered]
+        # parent node index: 0 if parent is root, else cand_to_node[parent slot]
+        par_slots = cand_parent_cidx[b, ordered]  # [-1 means root]
+        par_nodes = torch.where(par_slots < 0, torch.zeros_like(par_slots), cand_to_node[b, par_slots.clamp(min=0)])
+        parent_idx[b, 1:dc + 1] = par_nodes
+        n_nodes[b] = dc + 1
+
+    return TensorTreeBatch(token=token, parent_idx=parent_idx, depth=depth,
+                           n_nodes=n_nodes, device=device, max_nodes=max_nodes)
+
+
 def parent_pos_list_per_row(tt: TensorTreeBatch) -> List[List[int]]:
     """Return, per row, the `parent_indices` list (DFS-position space, root=-1)
     for the DRAFT nodes only — the exact input `build_tree_attention_mask_with_root`
