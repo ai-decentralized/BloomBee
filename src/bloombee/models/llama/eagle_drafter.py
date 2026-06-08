@@ -359,6 +359,10 @@ def _build_eagle_head(
     return EAGLEHead(), cfg
 
 
+import itertools as _itertools
+_CAND_NODE_COUNTER = _itertools.count()
+
+
 @dataclass
 class _CandNode:
     """Mutable EAGLE-tree node used during expansion."""
@@ -372,6 +376,12 @@ class _CandNode:
     children: List["_CandNode"] = field(default_factory=list)
     # Position assigned during flat-tree linearization (set later)
     flat_index: Optional[int] = None
+    # Monotonic allocation index, assigned at construction. Makes sibling order
+    # deterministic and tensor-reproducible (replaces id()-based tie-breaks in
+    # _bind_into_speculative_tree). Equivalent to the old id() ordering because
+    # nodes are created in the same deterministic loop order; a counter is a
+    # language-level allocation order that a tensor path can reproduce.
+    creation_index: int = field(default_factory=lambda: next(_CAND_NODE_COUNTER))
 
 
 @dataclass
@@ -465,7 +475,7 @@ def _bind_into_speculative_tree(root_token: int, kept: List[_CandNode]) -> Specu
     # Map each EAGLE _CandNode (id(...)) to the corresponding BloomBee TreeNode.
     # Root: kept doesn't include root explicitly, so when n.parent is None we
     # graft onto tree.root.
-    kept_sorted = sorted(kept, key=lambda n: (n.depth, id(n)))
+    kept_sorted = sorted(kept, key=lambda n: (n.depth, n.creation_index))
     for n in kept_sorted:
         if n.parent is None:
             parent_bb = tree.root
