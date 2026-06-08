@@ -152,11 +152,9 @@ def greedy_verify_tensorized(
     tree_root_positions = seq_h - 1
 
     active_node = torch.zeros(B, dtype=torch.long, device=device_h)  # current parent node index (0 = root)
-    # A row is active iff its current parent has at least one child.
-    has_child = (parent_idx.unsqueeze(1) == node_ar.unsqueeze(2)) & alive.unsqueeze(1)  # [B, N(parent), N(child)]
-    # child existence for active_node:
-    def children_exist(node_b):  # node_b: [B]
-        return ((parent_idx == node_b.unsqueeze(1)) & alive).any(dim=1)  # [B]
+    # A row is active iff its current parent (active_node) has at least one live child.
+    def children_exist(node_b):  # node_b: [B] -> [B] bool
+        return ((parent_idx == node_b.unsqueeze(1)) & alive).any(dim=1)
     active = children_exist(active_node) & (n_nodes.to(device_h) > 1)
 
     max_steps = max(int(tree_len), 0) + 1
