@@ -1,6 +1,5 @@
 import multiprocessing as mp
 import platform
-import threading
 import time
 
 import pytest
@@ -54,12 +53,13 @@ def test_priority_pools():
         PrioritizedTaskPool(dummy_pool_func, name="B", max_batch_size=1),
     )
 
-    # Simulate requests coming from ConnectionHandlers. A thread (not a
-    # ForkProcess) drives submission: forking after torch/hivemind threads
-    # exist deadlocks the child's MPFuture machinery on inherited locks
-    # (observed as a permanent mpfuture.result() hang on multi-GPU hosts),
-    # and the scheduling behavior under test is identical either way.
-    proc = threading.Thread(target=_submit_tasks, args=(runtime_ready, pools, results_valid))
+    # Simulate requests coming from ConnectionHandlers. This MUST be a separate
+    # process, not a thread: Task objects travel through an mp.SimpleQueue, so
+    # the runtime receives a pickled MPFuture copy. Cross-process, set_result
+    # routes the result back through hivemind's update pipe to this original
+    # future; same-process, the copy thinks it *is* the origin (same pid) and
+    # resolves only itself, leaving the original waiting forever.
+    proc = mp.context.ForkProcess(target=_submit_tasks, args=(runtime_ready, pools, results_valid))
     proc.start()
 
     runtime = Runtime({str(i): DummyBackend([pool]) for i, pool in enumerate(pools)}, prefetch_batches=0)
