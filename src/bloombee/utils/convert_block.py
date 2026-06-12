@@ -124,6 +124,15 @@ def convert_block(
             output_device,
             policy=policy,
         )
+    if len(tensor_parallel_devices) > 1:
+        # Only the FlexGen-native LLaMA path implements tensor parallelism.
+        # Silently running single-device while the operator believes TP is on
+        # would corrupt any scaling experiment, so say it loudly.
+        logger.warning(
+            "--tensor_parallel_devices is only implemented for LLaMA (FlexGen-native TP); "
+            f"model_type={config.model_type!r} will run on a single device and the TP "
+            f"request across {len(tensor_parallel_devices)} devices is ignored."
+        )
 
     # Skip tensor parallelism for FlexGen blocks - they manage their own weights and devices
     log_prefix = f"[convert_block:{block_index}]"
