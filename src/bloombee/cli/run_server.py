@@ -73,6 +73,12 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Number of sequences to process in parallel (GPU batch size). '
                              'Default: 1 (no batching). Higher values improve throughput but use more memory.')
+    parser.add_argument('--w_gpu_percent', type=int, default=100,
+                        help='Percent of block weights kept on GPU; the rest is offloaded to CPU '
+                             '(FlexGen-style). Default: 100 (no weight offload).')
+    parser.add_argument('--cache_gpu_percent', type=int, default=100,
+                        help='Percent of the KV cache kept on GPU; the rest is offloaded to CPU. '
+                             'Default: 100 (no KV offload).')
     parser.add_argument('--min_batch_size', type=int, default=1,
                         help='Minimum required batch size for all operations (in total tokens)')
     parser.add_argument('--max_batch_size', type=int, default=None,

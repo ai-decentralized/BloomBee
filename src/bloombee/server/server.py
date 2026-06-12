@@ -115,6 +115,8 @@ class Server:
         inference_max_length: Optional[int] = None,
         min_batch_size: int = 1,
         max_batch_size: Optional[int] = None,
+        w_gpu_percent: int = 100,
+        cache_gpu_percent: int = 100,
         max_chunk_size_bytes: int = 256 * 1024 * 1024,
         max_alloc_timeout: float = 600,
         attn_cache_tokens: Optional[int] = None,
@@ -310,10 +312,14 @@ class Server:
             gpu_batch_size = batch_size
             logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
 
+        if not 0 <= w_gpu_percent <= 100:
+            raise ValueError(f"--w_gpu_percent must be in [0, 100], got {w_gpu_percent}")
+        if not 0 <= cache_gpu_percent <= 100:
+            raise ValueError(f"--cache_gpu_percent must be in [0, 100], got {cache_gpu_percent}")
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
-            100, 0,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent, cache_cpu_percent
+            w_gpu_percent, 100 - w_gpu_percent,          # weights: GPU%, CPU%
+            cache_gpu_percent, 100 - cache_gpu_percent,  # KV cache: GPU%, CPU%
             100, 0,                   # act_gpu_percent, act_cpu_percent (mixed activation offload is unsupported)
             overlap=True, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
