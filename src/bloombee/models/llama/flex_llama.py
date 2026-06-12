@@ -303,23 +303,40 @@ class FLEX_LlamaAttention(LlamaAttention):
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, np.float16)
+        head_dim = getattr(self.config, "head_dim", None) or h // self.num_heads
+        q_dim = self.num_heads * head_dim
+        # GQA/MQA checkpoints project K/V to num_key_value_heads * head_dim rows
+        # (== hidden_size only for MHA); the kernels broadcast them back to
+        # num_attention_heads at compute time.
+        kv_dim = self.num_key_value_heads * head_dim
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
         weight_specs = [
             # 5 weight files
             # w_q
-            ((h, h), dtype, path + "self_attn.q_proj.weight"),
+            ((q_dim, h), dtype, path + "self_attn.q_proj.weight"),
             # w_k
-            ((h, h), dtype, path + "self_attn.k_proj.weight"),
+            ((kv_dim, h), dtype, path + "self_attn.k_proj.weight"),
             # w_v
-            ((h, h), dtype, path + "self_attn.v_proj.weight"),
+            ((kv_dim, h), dtype, path + "self_attn.v_proj.weight"),
             # w_out
-            ((h, h), dtype, path + "self_attn.o_proj.weight"),
+            ((h, q_dim), dtype, path + "self_attn.o_proj.weight"),
             # input layer norm
             ((h, ), dtype, path + "input_layernorm.weight"),
             # rotary_embed
-            ((64, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
+            ((head_dim // 2, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
+        # transformers >= 4.38 no longer persists rotary_emb.inv_freq, so the
+        # np file is usually absent and the slot holds uninitialized memory.
+        # The value is fully determined by the config; always recompute it.
+        rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        try:
+            weights[5].data.copy_(inv_freq.to(weights[5].data.dtype))
+        except Exception:
+            logger.warning("Could not overwrite rotary inv_freq; falling back to file contents")
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):

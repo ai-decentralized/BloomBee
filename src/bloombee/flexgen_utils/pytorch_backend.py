@@ -684,6 +684,10 @@ class TorchDevice:
             f"q_proj rows={qkv_hidden_size} must be divisible by num_attention_heads={num_attention_heads}"
         )
         head_dim = qkv_hidden_size // num_attention_heads
+        # GQA/MQA: k/v projections may produce fewer heads than q. They are
+        # broadcast to num_attention_heads right after rotary, so the cache
+        # and everything below keeps the MHA layout.
+        num_kv_heads = w_k.shape[0] // head_dim
         
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
@@ -695,14 +699,18 @@ class TorchDevice:
         v = F.linear(hidden, w_v.data)
         
         q = q.view(bsz, q_len, num_attention_heads, head_dim)
-        k = k.view(bsz, q_len, num_attention_heads, head_dim)
-        v = v.view(bsz, q_len, num_attention_heads, head_dim)
+        k = k.view(bsz, q_len, num_kv_heads, head_dim)
+        v = v.view(bsz, q_len, num_kv_heads, head_dim)
         
         if rotary_position_ids is not None:
             freqs_slice = freq_cis
         else:
             freqs_slice = freq_cis[:q_len]
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
+        if num_kv_heads < num_attention_heads:
+            groups = num_attention_heads // num_kv_heads
+            k = k.repeat_interleave(groups, dim=2)
+            v = v.repeat_interleave(groups, dim=2)
         
         # (b * n_head, s, d), (b * n_head, d, s), (b * n_head, s, d)
         q = q.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
@@ -756,6 +764,9 @@ class TorchDevice:
             f"q_proj rows={qkv_hidden_size} must be divisible by n_head={n_head}"
         )
         head_dim = qkv_hidden_size // n_head
+        # GQA/MQA: see mha_llama; new k/v are broadcast to n_head below so the
+        # cache keeps its (s, b * n_head, head_dim) layout.
+        num_kv_heads = w_k.shape[0] // head_dim
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
 
@@ -768,10 +779,10 @@ class TorchDevice:
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
         
-        # shape: (b, 1, n_head, head_dim)
+        # shape: (b, 1, n_head, head_dim) for q; (b, 1, n_kv, head_dim) for k/v
         q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, n_head, head_dim)
-        v = v.view(b, tgt_s, n_head, head_dim)
+        k = k.view(b, tgt_s, num_kv_heads, head_dim)
+        v = v.view(b, tgt_s, num_kv_heads, head_dim)
         
         # logger.info(f"after projection, query_states: {q}")
         # logger.info(f"after projection, key_states: {k}")
@@ -789,9 +800,10 @@ class TorchDevice:
             freqs_slice = freq_cis[src_s - tgt_s: src_s]
         
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
-        
-        # logger.info(f"after rotary, query_states: {q}")
-        # logger.info(f"after rotary, key_states: {k}")
+        if num_kv_heads < n_head:
+            groups = n_head // num_kv_heads
+            k = k.repeat_interleave(groups, dim=2)
+            v = v.repeat_interleave(groups, dim=2)
         
         # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
