@@ -810,14 +810,6 @@ def log_stage_timing(
     )
 
 
-def log_timing_summary(logger: logging.Logger) -> None:
-    """Log a summary of all timing statistics."""
-    tracker = get_timing_tracker()
-    summary = tracker.get_summary()
-    
-    logger.info(f"{MBPIPE_LOG_PREFIX} TimingSummary: {summary}")
-
-
 # =============================================================================
 # Step 2: Async Output Buffer for Compute/Communication Overlap
 # =============================================================================
@@ -1051,80 +1043,3 @@ class AsyncOutputBuffer:
     def is_running(self) -> bool:
         """Whether the buffer is running."""
         return self._running
-
-
-class BufferedPipelineManager:
-    """
-    Manager for multiple async output buffers in a pipeline.
-    
-    Manages buffer creation and lifecycle for multi-stage pipelines,
-    with support for dynamic buffer decisions based on timing data.
-    """
-    
-    def __init__(self, logger: Optional[logging.Logger] = None):
-        self.logger = logger
-        self._buffers: dict[str, AsyncOutputBuffer] = {}
-        self._enabled = True
-    
-    def get_or_create_buffer(
-        self,
-        stage_id: str,
-        max_pending: int = 2
-    ) -> AsyncOutputBuffer:
-        """Get or create a buffer for a specific stage."""
-        if stage_id not in self._buffers:
-            self._buffers[stage_id] = AsyncOutputBuffer(
-                max_pending=max_pending,
-                logger=self.logger,
-                name=f"stage_{stage_id}"
-            )
-        return self._buffers[stage_id]
-    
-    async def start_all(self, push_fn_factory: Callable[[str], Callable]) -> None:
-        """
-        Start all buffers with their respective push functions.
-        
-        Args:
-            push_fn_factory: Function that takes stage_id and returns push_fn.
-        """
-        for stage_id, buffer in self._buffers.items():
-            push_fn = push_fn_factory(stage_id)
-            await buffer.start_sender(push_fn)
-    
-    async def stop_all(self) -> None:
-        """Stop all buffers."""
-        for buffer in self._buffers.values():
-            await buffer.stop()   
-        self._buffers.clear()
-    
-    def should_use_buffer_for_stage(self, stage_id: str) -> bool:
-        """
-        Determine if buffer should be used for a specific stage.
-        Uses the global timing tracker for decision.
-        """
-        if not self._enabled:
-            return False
-        
-        tracker = get_timing_tracker()
-        use_buffer, _ = tracker.should_use_buffer()
-        return use_buffer
-    
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
-    
-    @enabled.setter
-    def enabled(self, value: bool) -> None:
-        self._enabled = value
-
-
-# Global pipeline buffer manager
-_buffer_manager: Optional[BufferedPipelineManager] = None
-
-
-def get_buffer_manager(logger: Optional[logging.Logger] = None) -> BufferedPipelineManager:
-    """Get the global buffered pipeline manager."""
-    global _buffer_manager
-    if _buffer_manager is None:
-        _buffer_manager = BufferedPipelineManager(logger=logger)
-    return _buffer_manager

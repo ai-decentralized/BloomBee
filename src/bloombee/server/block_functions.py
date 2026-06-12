@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
 import logging
 import os
+import time
 
 import torch
 from hivemind.moe.expert_uid import ExpertUID
@@ -656,6 +657,35 @@ def _select_inference_output_schema(
         return requested_backends[-1].spec_outputs_schema
     return requested_backends[-1].decode_outputs_schema
 
+# [MBPIPE] Per-(session_id, step_id) state for cross-stage micro-batch steps.
+# Module-level with a TTL sweep: if a step never collects all of its
+# micro-batches (upstream died, session aborted), its entry must not pin
+# cloned hidden-state tensors forever.
+_MB_STEP_STATE_TTL_S = 300.0
+_CROSS_STAGE_OVERLAP_DATA: Dict[Any, Dict[int, Dict[str, Any]]] = {}
+_MB_ACCUMULATORS: Dict[Any, Dict[str, Any]] = {}
+_MB_STEP_STATE_TOUCHED_AT: Dict[Any, float] = {}
+
+
+def _touch_mb_step_state(key: Any) -> None:
+    now = time.monotonic()
+    _MB_STEP_STATE_TOUCHED_AT[key] = now
+    stale = [k for k, t in _MB_STEP_STATE_TOUCHED_AT.items() if now - t > _MB_STEP_STATE_TTL_S]
+    for k in stale:
+        _MB_STEP_STATE_TOUCHED_AT.pop(k, None)
+        _CROSS_STAGE_OVERLAP_DATA.pop(k, None)
+        _MB_ACCUMULATORS.pop(k, None)
+
+
+def _drop_mb_step_state(key: Any, *, overlap: bool = False, accum: bool = False) -> None:
+    if overlap:
+        _CROSS_STAGE_OVERLAP_DATA.pop(key, None)
+    if accum:
+        _MB_ACCUMULATORS.pop(key, None)
+    if key not in _CROSS_STAGE_OVERLAP_DATA and key not in _MB_ACCUMULATORS:
+        _MB_STEP_STATE_TOUCHED_AT.pop(key, None)
+
+
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
     requested_backends: Sequence[TransformerBackend],
@@ -755,12 +785,11 @@ async def iterate_rpc_inference(
             # We store: prev_stage_compute_start (when prev stage STARTED computing this MB)
             #           this_stage_receive_time (when we received this MB)
             overlap_tracking_key = (step_metadata.get("session_id", "unknown"), step_metadata.get("step_id"))
-            if not hasattr(iterate_rpc_inference, '_cross_stage_overlap_data'):
-                iterate_rpc_inference._cross_stage_overlap_data = {}
-            if overlap_tracking_key not in iterate_rpc_inference._cross_stage_overlap_data:
-                iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key] = {}
-            
-            iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key][mb_idx] = {
+            _touch_mb_step_state(overlap_tracking_key)
+            if overlap_tracking_key not in _CROSS_STAGE_OVERLAP_DATA:
+                _CROSS_STAGE_OVERLAP_DATA[overlap_tracking_key] = {}
+
+            _CROSS_STAGE_OVERLAP_DATA[overlap_tracking_key][mb_idx] = {
                 'prev_stage_compute_start_us': compute_start_timestamp_us,
                 'prev_stage_compute_end_us': compute_end_timestamp_us,
                 'prev_stage_clock_offset_us': sender_to_receiver_clock_offset_us,
@@ -1069,11 +1098,9 @@ async def iterate_rpc_inference(
             
             # [CROSS_STAGE_OVERLAP] Record this stage's compute times and calculate overlap
             overlap_tracking_key = (step_metadata.get("session_id", "unknown"), step_metadata.get("step_id"))
-            if hasattr(iterate_rpc_inference, '_cross_stage_overlap_data') and \
-               overlap_tracking_key in iterate_rpc_inference._cross_stage_overlap_data and \
-               mb_idx in iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]:
-                
-                overlap_data = iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key][mb_idx]
+            if mb_idx in _CROSS_STAGE_OVERLAP_DATA.get(overlap_tracking_key, {}):
+
+                overlap_data = _CROSS_STAGE_OVERLAP_DATA[overlap_tracking_key][mb_idx]
                 overlap_data['this_stage_compute_start_us'] = compute_done_timestamp_us - int(process_time_ms * 1000)
                 overlap_data['this_stage_compute_end_us'] = compute_done_timestamp_us
                 overlap_data['this_stage_process_time_ms'] = process_time_ms
@@ -1159,11 +1186,9 @@ async def iterate_rpc_inference(
             # ========== ACCUMULATE MICRO-BATCH RESULTS ==========
             # Store this micro-batch result in accumulator
             mb_accum_key = (session_id, step_id)
-            if not hasattr(iterate_rpc_inference, '_mb_accumulators'):
-                iterate_rpc_inference._mb_accumulators = {}
-            
-            if mb_accum_key not in iterate_rpc_inference._mb_accumulators:
-                iterate_rpc_inference._mb_accumulators[mb_accum_key] = {
+            _touch_mb_step_state(mb_accum_key)
+            if mb_accum_key not in _MB_ACCUMULATORS:
+                _MB_ACCUMULATORS[mb_accum_key] = {
                     'expected': expected_num_mb,
                     'results': {},  # mb_idx -> (hidden_states, keep_indices, offset)
                     'full_batch_size': full_batch_size,
@@ -1186,7 +1211,7 @@ async def iterate_rpc_inference(
                     'token_increment': int(token_increment),
                 }
             
-            accum = iterate_rpc_inference._mb_accumulators[mb_accum_key]
+            accum = _MB_ACCUMULATORS[mb_accum_key]
             if int(accum.get('token_increment', token_increment)) != int(token_increment):
                 logger.warning(
                     f"{MBPIPE_LOG_PREFIX} token_increment mismatch within step_id={step_id}: "
@@ -1300,15 +1325,10 @@ async def iterate_rpc_inference(
                     logger.debug(f"[MB_DEBUG] Merged hidden_states.abs().mean()={merged_hidden_states.abs().mean().item():.6f}")
                 
                 # [CROSS_STAGE_OVERLAP] Calculate and log final overlap summary
-                if hasattr(iterate_rpc_inference, '_cross_stage_overlap_data') and \
-                   overlap_tracking_key in iterate_rpc_inference._cross_stage_overlap_data:
-                    
-                    overlap_summary = iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]
-                    overlap_accum = (
-                        getattr(iterate_rpc_inference, '_mb_accumulators', {}).get(mb_accum_key, {})
-                        if hasattr(iterate_rpc_inference, '_mb_accumulators')
-                        else {}
-                    )
+                if overlap_tracking_key in _CROSS_STAGE_OVERLAP_DATA:
+
+                    overlap_summary = _CROSS_STAGE_OVERLAP_DATA[overlap_tracking_key]
+                    overlap_accum = _MB_ACCUMULATORS.get(mb_accum_key, {})
                     total_overlap_ms = 0.0
                     total_stage2_compute_ms = 0.0
                     total_comparable_stage2_compute_ms = 0.0
@@ -1708,7 +1728,7 @@ async def iterate_rpc_inference(
                         )
                     
                     # Cleanup overlap tracking data
-                    del iterate_rpc_inference._cross_stage_overlap_data[overlap_tracking_key]
+                    _drop_mb_step_state(overlap_tracking_key, overlap=True)
                 
                 # Now serialize and yield the merged result
                 if merged_keep_indices is not None:
@@ -1932,7 +1952,7 @@ async def iterate_rpc_inference(
                     },
                 )
                 # Cleanup accumulator
-                del iterate_rpc_inference._mb_accumulators[mb_accum_key]
+                _drop_mb_step_state(mb_accum_key, accum=True)
                 
                 can_push = True  # Micro-batch results don't have prompts
                 yield output_tensors, can_push, accum['step_metadata']

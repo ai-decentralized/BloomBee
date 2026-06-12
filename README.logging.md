@@ -1,5 +1,8 @@
 # BloomBee Logging Reference
 
+> **Note:** per-step wire telemetry tags (`[S2S_WIRE]`, `[S2S_NET]`, `[COMM_BREAKDOWN]`, `[COMM_BREAKDOWN_MB]`, `[NETWORK_RX]`, `[NETWORK_S2S]`, `[ACTIVATION_XFER_CHECK]`, `[S2S_PUSH_BREAKDOWN]`) are gated behind `BLOOMBEE_S2S_WIRE_LOGS=1` (or `BLOOMBEE_DEBUG_MICROBATCH=1`); `[KVCACHE_IO]`, `[STEP_TIMING_BREAKDOWN_MB]`, `[CROSS_STAGE_OVERLAP_SUMMARY]` and `[MBPIPE_SUMMARY]` are sampled via `BLOOMBEE_MBPIPE_LOG_EVERY_STEPS` (default 16) unless `BLOOMBEE_MBPIPE_VERBOSE=1`. Enable these when running experiments that parse the tags.
+
+
 BloomBee emits a lot of timing/throughput-related log lines from three
 different processes (client, server, DHT) and many timer scopes. The same
 word — *latency*, *throughput*, *bytes* — can mean very different things

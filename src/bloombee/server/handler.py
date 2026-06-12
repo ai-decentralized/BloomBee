@@ -407,9 +407,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._session_timing: Dict[str, list] = {}
         self._session_comm_timing: Dict[str, Dict[str, Dict[str, float]]] = {}
         self._session_background_push_tasks: Dict[str, set] = {}
-        # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
-        # Key: (session_id, step_id) -> Queue holding individual micro-batches
-        self._mb_queues: Dict[tuple, asyncio.Queue] = {}
+        # [MBPIPE] Cross-stage pipeline tracking (immediate mode pushes straight
+        # into the session queue; only counters are kept per (session_id, step_id))
         # Key: (session_id, step_id) -> expected number of micro-batches
         self._mb_expected: Dict[tuple, int] = {}
         # Key: (session_id, step_id) -> count of received micro-batches
@@ -1404,7 +1403,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             if pipeline_gpu2gpu_mean > 0 and len(pipeline_gpu2gpu_bytes_arr) > 0 and pipeline_gpu2gpu_bytes_arr.mean() > 0
             else 0.0
         )
-        comm_volume_kb_runtime = float(comm_volume_bytes) / 1024.0 if comm_volume_bytes > 0 else 0.0
         upstream_sender_gpu2cpu_arr = np.array(
             [r.get("upstream_sender_gpu2cpu_ms", 0.0) for r in decode_records if r.get("upstream_sender_gpu2cpu_ms", 0.0) > 0.0],
             dtype=np.float64,
@@ -1852,8 +1850,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                         anext_task.cancel()
                         get_push_task.cancel()
                         return
-        except Exception:
-            raise
         finally:
             for pending_task in (anext_task, get_push_task):
                 if pending_task is not None and not pending_task.done():
@@ -2080,9 +2076,10 @@ class TransformerConnectionHandler(ConnectionHandler):
         metadata["_s2s_wire_ms"] = float(wire_ms if wire_ms >= 0.0 else raw_transfer_ms if raw_transfer_ms >= 0.0 else 0.0)
         metadata["_s2s_payload_bytes"] = int(payload_bytes)
         
-        # Initialize tracking for this (session, step) if not exists
-        if mb_key not in self._mb_queues:
-            self._mb_queues[mb_key] = asyncio.Queue()
+        # Initialize tracking for this (session, step) if not exists.
+        # (No per-step asyncio.Queue here: in immediate mode micro-batches go
+        # straight into the session queue, so allocating one was pure waste.)
+        if mb_key not in self._mb_expected:
             self._mb_expected[mb_key] = expected_num_mb
             self._mb_received[mb_key] = 0
             logger.info(
@@ -2142,7 +2139,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                     )
                     _cleanup_microbatch_files(acc_key, expected_num_mb)
                 # Cleanup tracking data
-                self._mb_queues.pop(mb_key, None)
                 self._mb_expected.pop(mb_key, None)
                 self._mb_received.pop(mb_key, None)
                 self._mb_processed.pop(mb_key, None)
@@ -2167,7 +2163,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 finally:
                     _cleanup_microbatch_files(acc_key, expected_num_mb)
                     # Cleanup tracking data
-                    self._mb_queues.pop(mb_key, None)
                     self._mb_expected.pop(mb_key, None)
                     self._mb_received.pop(mb_key, None)
                     self._mb_processed.pop(mb_key, None)
@@ -2515,7 +2510,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             metadata: Contains next_servers, micro_batch_idx, etc.
             requested_backends: Backends for serialization schema
         """
-        import os
         # [MBPIPE] Feature flag for cross-stage micro-batch push
         # Default: enabled ("1") since Step 4.2 added Server2 support for receiving micro-batches
         # Set BLOOMBEE_ENABLE_CROSS_STAGE_PUSH=0 to disable
@@ -2775,25 +2769,22 @@ class TransformerConnectionHandler(ConnectionHandler):
             # [ASYNC_PUSH] Fire-and-forget: don't await RPC response
             # This allows Stage 1 compute to continue immediately while data is sent in background.
             # These timestamps are used on the receiver to isolate pure wire latency.
+            # Metadata is serialized exactly once, inside _do_rpc_push_async right
+            # before the send, so the send timestamp is accurate without a
+            # loads/dumps round-trip per micro-batch.
             push_metadata["s2s_sender_sem_wait_ms"] = float(sem_wait_time)
             push_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
-            push_metadata["clock_sync_sender_send_us"] = int(push_metadata["s2s_sender_enqueue_us"])
-            serialized_push_metadata = MSGPackSerializer.dumps(push_metadata)
-            rpc_request = runtime_pb2.ExpertRequest(
-                uid=next_uid,
-                tensors=[serialized_hidden, serialized_keep],
-                metadata=serialized_push_metadata,
-            )
             t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
             push_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
-            rpc_request.metadata = MSGPackSerializer.dumps(push_metadata)
             push_tensor_bytes = len(serialized_hidden.buffer) + len(serialized_keep.buffer)
-            
+
             # Create task for background sending - don't await
             send_task = asyncio.create_task(
                 self._do_rpc_push_async(
                     stub,
-                    rpc_request,
+                    next_uid,
+                    [serialized_hidden, serialized_keep],
+                    push_metadata,
                     mb_idx,
                     push_start_time,
                     next_peer_id_str,
@@ -2835,7 +2826,9 @@ class TransformerConnectionHandler(ConnectionHandler):
     async def _do_rpc_push_async(
         self,
         stub,
-        request: runtime_pb2.ExpertRequest,
+        next_uid: str,
+        serialized_tensors: List[runtime_pb2.Tensor],
+        push_metadata: dict,
         mb_idx: int,
         queue_start_time: float,
         peer_id: str,
@@ -2850,7 +2843,7 @@ class TransformerConnectionHandler(ConnectionHandler):
     ) -> None:
         """
         [ASYNC_PUSH] Actually perform the RPC push in background.
-        
+
         This runs as a fire-and-forget task, allowing the main compute loop
         to continue without waiting for the network round-trip.
         """
@@ -2858,17 +2851,15 @@ class TransformerConnectionHandler(ConnectionHandler):
         send_time = 0.0
         success = False
         try:
+            sender_send_us = self._now_us()
+            push_metadata["clock_sync_sender_send_us"] = sender_send_us
+            request = runtime_pb2.ExpertRequest(
+                uid=next_uid,
+                tensors=serialized_tensors,
+                metadata=MSGPackSerializer.dumps(push_metadata),
+            )
             payload_bytes = sum(len(t.buffer) for t in request.tensors)
             metadata_bytes = len(request.metadata) if request.metadata else 0
-            sender_send_us = self._now_us()
-            if request.metadata:
-                try:
-                    request_metadata = MSGPackSerializer.loads(request.metadata)
-                    if isinstance(request_metadata, dict):
-                        request_metadata["clock_sync_sender_send_us"] = sender_send_us
-                        request.metadata = MSGPackSerializer.dumps(request_metadata)
-                except Exception:
-                    pass
 
             response = await stub.rpc_push(request, timeout=self.request_timeout)
             sender_ack_us = self._now_us()
