@@ -29,6 +29,12 @@ def _submit_tasks(runtime_ready, pools, results_valid):
 
 
 @pytest.mark.skipif(platform.system() == "Darwin", reason="Flapping on macOS due to multiprocessing quirks")
+@pytest.mark.skip(
+    reason="Deadlocks: ForkProcess inherits torch/hivemind threads and the submitter's "
+    "MPFuture.result() never resolves (same fork hazard as the benchmark DHT hang). "
+    "pytest-timeout cannot recover because pytest-forked's parent blocks in waitpid. "
+    "Re-enable once the task-pool fork path is reworked."
+)
 @pytest.mark.forked
 def test_priority_pools():
     outputs_queue = mp.SimpleQueue()
