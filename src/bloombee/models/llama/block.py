@@ -363,7 +363,12 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             elif (h, L) == (8192, 80):
                 model_name = "llama-70b" if I == 28672 else "llama-65b"
             else:
-                model_name = "llama-7b"  # safe default for 32-layer-ish models
+                raise ValueError(
+                    f"Cannot resolve FlexGen weights: config has no usable name_or_path and "
+                    f"architecture (hidden={h}, layers={L}, intermediate={I}) does not match a "
+                    f"canonical llama size. Refusing to fall back to llama-7b weights, which "
+                    f"would silently load mismatched parameters."
+                )
 
         # Remove -hf suffix if present, as huggyllama repos don't use it
         if model_name.endswith('-hf'):
@@ -377,6 +382,15 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             if local_src_dir is not None:
                 from bloombee.flexgen_utils.llama_config import convert_local_llama_weights
                 convert_local_llama_weights(local_src_dir, model_name, self.path)
+            elif raw_path and "/" in raw_path:
+                # A real hub repo id: convert the actual repo's weights instead of
+                # guessing a huggyllama mirror (which only exists for canonical
+                # llama-7b/13b/30b/65b sizes and silently mismatches anything else,
+                # e.g. TinyLlama).
+                from huggingface_hub import snapshot_download
+                from bloombee.flexgen_utils.llama_config import convert_local_llama_weights
+                src_dir = snapshot_download(raw_path, allow_patterns=["*.safetensors", "*.bin", "*.json"])
+                convert_local_llama_weights(src_dir, model_name, self.path)
             else:
                 download_llama_weights(self.llama_config.name, self.path)
 

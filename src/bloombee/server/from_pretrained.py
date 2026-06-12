@@ -79,6 +79,15 @@ def load_pretrained_block(
     assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
     torch_dtype = resolve_block_dtype(config, torch_dtype)
 
+    # transformers 5.x returns configs with an empty _name_or_path; FlexGen's
+    # weight resolution reads it to locate/convert weights, so thread the real
+    # model name back in for every load path (not just the non-TP one).
+    if model_name and not getattr(config, "_name_or_path", ""):
+        try:
+            config._name_or_path = model_name
+        except Exception:
+            pass
+
     use_native_flexgen_llama_tp = (
         getattr(config, "model_type", None) == "llama"
         and tensor_parallel_devices is not None
