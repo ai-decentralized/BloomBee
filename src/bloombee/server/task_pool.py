@@ -128,7 +128,12 @@ class PrioritizedTaskPool(threading.Thread):
         self, timeout: Optional[float] = None, device: Optional[torch.device] = None
     ) -> Tuple[Any, List[torch.Tensor]]:
         """receive next batch of arrays"""
-        device = torch.device(device if device is not None else self.device)  # If device not specified, use default device
+        # Resolve the target device; both the runtime arg and self.device may be
+        # None (CPU-only runtime). torch.device(None) raises TypeError, which
+        # previously killed the Runtime thread and left every submitted
+        # MPFuture waiting forever (test_priority_pools hung on exactly this).
+        target_device = device if device is not None else self.device
+        device = torch.device(target_device) if target_device is not None else None
         # print('-=-==-=-=-=-=- task pool: load_batch_to_runtime(): device ', device)
         task = self._ordered_tasks.get(block=True, timeout=timeout)  # Get next task from ordered task queue, may block until timeout 
         batch_inputs = []
@@ -143,7 +148,9 @@ class PrioritizedTaskPool(threading.Thread):
                 src_device = arg.device
                 tensor_bytes = float(arg.numel() * arg.element_size())
                 transfer_start = time.perf_counter()
-                moved_arg = _move_to_device_if_tensor(arg, device, share_memory=False)
+                moved_arg = (
+                    _move_to_device_if_tensor(arg, device, share_memory=False) if device is not None else arg
+                )
                 transfer_ms = (time.perf_counter() - transfer_start) * 1000.0
                 dst_device = moved_arg.device
                 if src_device != dst_device:
