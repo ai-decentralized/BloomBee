@@ -78,8 +78,13 @@ def main():
     else:
         args.n_processes = int(args.n_processes)
 
-    pipe_recv, pipe_send = mp.Pipe(duplex=False)
-    processes = [mp.Process(target=benchmark_inference, args=(i, args, pipe_send)) for i in range(args.n_processes)]
+    # Use spawn, not fork: by this point the parent already runs background
+    # threads (HF hub I/O, torch). Forking then makes the child's hivemind DHT
+    # subprocess inherit a held import lock and deadlock in
+    # importlib._bootstrap.acquire before the swarm connection even starts.
+    ctx = mp.get_context("spawn")
+    pipe_recv, pipe_send = ctx.Pipe(duplex=False)
+    processes = [ctx.Process(target=benchmark_inference, args=(i, args, pipe_send)) for i in range(args.n_processes)]
     for proc in processes:
         proc.start()
     for proc in processes:
