@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import platform
+import threading
 import time
 
 import pytest
@@ -29,12 +30,6 @@ def _submit_tasks(runtime_ready, pools, results_valid):
 
 
 @pytest.mark.skipif(platform.system() == "Darwin", reason="Flapping on macOS due to multiprocessing quirks")
-@pytest.mark.skip(
-    reason="Deadlocks: ForkProcess inherits torch/hivemind threads and the submitter's "
-    "MPFuture.result() never resolves (same fork hazard as the benchmark DHT hang). "
-    "pytest-timeout cannot recover because pytest-forked's parent blocks in waitpid. "
-    "Re-enable once the task-pool fork path is reworked."
-)
 @pytest.mark.forked
 def test_priority_pools():
     outputs_queue = mp.SimpleQueue()
@@ -59,8 +54,12 @@ def test_priority_pools():
         PrioritizedTaskPool(dummy_pool_func, name="B", max_batch_size=1),
     )
 
-    # Simulate requests coming from ConnectionHandlers
-    proc = mp.context.ForkProcess(target=_submit_tasks, args=(runtime_ready, pools, results_valid))
+    # Simulate requests coming from ConnectionHandlers. A thread (not a
+    # ForkProcess) drives submission: forking after torch/hivemind threads
+    # exist deadlocks the child's MPFuture machinery on inherited locks
+    # (observed as a permanent mpfuture.result() hang on multi-GPU hosts),
+    # and the scheduling behavior under test is identical either way.
+    proc = threading.Thread(target=_submit_tasks, args=(runtime_ready, pools, results_valid))
     proc.start()
 
     runtime = Runtime({str(i): DummyBackend([pool]) for i, pool in enumerate(pools)}, prefetch_batches=0)
