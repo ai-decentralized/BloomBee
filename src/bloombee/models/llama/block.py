@@ -327,6 +327,23 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             self.init_weight(j)
 
     def init_weight(self, j):
+        # FlexGen's llama kernels assume MHA: weight specs, attention compute and
+        # cache layout are all sized num_attention_heads. GQA checkpoints
+        # (num_key_value_heads < num_attention_heads, e.g. TinyLlama, Llama-2-70B,
+        # Llama-3.x) load k/v projections of a different shape and fail deep in
+        # init_weight_list, so refuse them up front with an actionable message.
+        n_heads = getattr(self.llama_config, "num_attention_heads", None) or getattr(
+            self.llama_config, "n_head", None
+        )
+        n_kv_heads = getattr(self.llama_config, "num_key_value_heads", None)
+        if n_heads and n_kv_heads and int(n_kv_heads) != int(n_heads):
+            raise NotImplementedError(
+                f"FlexGen llama path supports MHA models only "
+                f"(num_attention_heads={n_heads}, num_key_value_heads={n_kv_heads}). "
+                f"GQA llama checkpoints are not supported yet; use an MHA model "
+                f"(e.g. huggyllama/llama-7b or llama-13b)."
+            )
+
         # If the HF config points at a local directory, always prefer the
         # local-conversion path — it works for any LLaMA-arch model (including
         # TinyLlama, Vicuna, etc.) without needing a matching huggyllama
