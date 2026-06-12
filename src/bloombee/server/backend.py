@@ -693,7 +693,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         output_hidden_states_chunk, new_kvs = step_result
                     except Exception as e:
                         logger.exception("ERROR in module.forward: %s: %s", type(e).__name__, e)
-                        return (hidden_states, None)
+                        raise
 
                     if seq_len > max_chunk_length:
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
@@ -784,7 +784,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 inference_info.prefix_length if 'inference_info' in locals() else None,
                 e,
             )
-            return (hidden_states, None)  # Return original input as fallback
+            # Propagate: returning the input unchanged here would silently feed
+            # garbage to downstream blocks and the client would report a
+            # "successful" generation. Petals-style client retry/rerouting only
+            # works if the RPC actually fails.
+            raise
 
     def _normalize_keep_indices(
         self,
