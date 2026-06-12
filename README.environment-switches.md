@@ -25,8 +25,6 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_MICRO_BATCH_SIZE` | `0` | Micro-batch size used for overlap scheduling. `0` (default) means disabled even if the master switch is `1`. Set both this and `BLOOMBEE_ENABLE_MICROBATCH_PIPELINE` to enable. |
 | `BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING` | parsed, but currently effectively `0` | Intended to shrink active GPU working slots. Right now BloomBee forces `overlap_only`, so this is effectively a no-op. |
 | `BLOOMBEE_ENABLE_CROSS_STAGE_PUSH` | `1` | Enables actual server-to-server micro-batch push. Set `0` for dry-run / fallback behavior. |
-| `BLOOMBEE_ENABLE_IMMEDIATE_MB_QUEUE` | `1` | Enables immediate in-memory micro-batch queuing on the downstream server. |
-| `BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE` | `0` | In immediate mode, also persist micro-batches to files for legacy compatibility. |
 | `BLOOMBEE_MB0_SEMAPHORE_BYPASS` | `1` | Lets MB0 bypass the push limiter to reduce pipeline startup bubble. |
 | `BLOOMBEE_MBPIPE_VERBOSE` | `0` | Emits full per-micro-batch logs on every step. |
 | `BLOOMBEE_MBPIPE_LOG_EVERY_STEPS` | `16` | Sampling interval for detailed micro-batch logs when verbose mode is off. |

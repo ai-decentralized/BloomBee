@@ -109,11 +109,6 @@ class Event(Enum):
 # Uses filesystem for cross-process synchronization since multiprocessing.Manager
 # doesn't work across independently spawned processes (Hivemind workers)
 import threading
-import hashlib
-import pickle
-import fcntl
-import os
-import tempfile
 from dataclasses import dataclass, field
 @dataclass
 class S2SLinkTelemetry:
@@ -165,93 +160,6 @@ class S2SLinkTelemetry:
         self.jitter_ms_window.append(float(jitter_ms))
         self.raw_latency_ms_window.append(float(raw_latency_ms))
         return jitter_ms
-
-# Directory for storing micro-batch accumulator data
-_MB_ACCUMULATOR_DIR = os.path.join(tempfile.gettempdir(), "bloombee_mb_accumulator")
-
-def _get_mb_file_path(acc_key: str, mb_idx: int) -> str:
-    """Get file path for a micro-batch."""
-    # Use hash to create a safe filename
-    key_hash = hashlib.md5(acc_key.encode()).hexdigest()[:16]
-    return os.path.join(_MB_ACCUMULATOR_DIR, f"{key_hash}_mb{mb_idx}.pkl")
-
-def _get_mb_lock_path(acc_key: str) -> str:
-    """Get lock file path for a step."""
-    key_hash = hashlib.md5(acc_key.encode()).hexdigest()[:16]
-    return os.path.join(_MB_ACCUMULATOR_DIR, f"{key_hash}.lock")
-
-def _store_microbatch_to_file(acc_key: str, mb_idx: int, tensor_bytes: list, metadata: dict) -> int:
-    """
-    Store a micro-batch to file and return the count of micro-batches for this step.
-    Uses file locking for cross-process safety.
-    """
-    os.makedirs(_MB_ACCUMULATOR_DIR, exist_ok=True)
-    
-    lock_path = _get_mb_lock_path(acc_key)
-    file_path = _get_mb_file_path(acc_key, mb_idx)
-    
-    # Use file locking for cross-process synchronization
-    with open(lock_path, 'w') as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            # Store this micro-batch
-            with open(file_path, 'wb') as f:
-                pickle.dump({
-                    'tensor_bytes': tensor_bytes,
-                    'metadata': metadata
-                }, f)
-            
-            # Count how many micro-batches exist for this step
-            key_hash = hashlib.md5(acc_key.encode()).hexdigest()[:16]
-            count = sum(
-                1 for fname in os.listdir(_MB_ACCUMULATOR_DIR)
-                if fname.startswith(key_hash) and fname.endswith('.pkl')
-            )
-            return count
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-def _load_all_microbatches_from_files(acc_key: str, expected_num: int) -> dict:
-    """
-    Load all micro-batches for a step from files.
-    Returns dict mapping mb_idx to (tensor_bytes, metadata).
-    """
-    lock_path = _get_mb_lock_path(acc_key)
-    
-    with open(lock_path, 'w') as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            result = {}
-            for mb_idx in range(expected_num):
-                file_path = _get_mb_file_path(acc_key, mb_idx)
-                if os.path.exists(file_path):
-                    with open(file_path, 'rb') as f:
-                        data = pickle.load(f)
-                        result[mb_idx] = (data['tensor_bytes'], data['metadata'])
-            return result
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-def _cleanup_microbatch_files(acc_key: str, expected_num: int) -> None:
-    """Remove all micro-batch files for a step."""
-    lock_path = _get_mb_lock_path(acc_key)
-    
-    try:
-        with open(lock_path, 'w') as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                for mb_idx in range(expected_num):
-                    file_path = _get_mb_file_path(acc_key, mb_idx)
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        # Also remove lock file
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-    except Exception as e:
-        logger.debug(f"{MBPIPE_LOG_PREFIX} Failed to cleanup files: {e}")
-
 
 class AdaptivePushConcurrency:
     """
@@ -417,23 +325,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._mb_processed: Dict[tuple, set] = {}
         self._mb_processed_timestamps: Dict[tuple, float] = {}
         self._MB_PROCESSED_TTL = 120  # seconds
-        # Feature flag for immediate queuing - ENABLED for cross-stage pipeline overlap
-        self._enable_immediate_mb_queue = os.environ.get(
-            "BLOOMBEE_ENABLE_IMMEDIATE_MB_QUEUE", "1"
-        ) == "1"
-        # Optional compatibility mode: also write MB payloads to filesystem in immediate mode.
-        # Disabled by default to reduce first-micro-batch latency.
-        self._store_mb_files_in_immediate = os.environ.get(
-            "BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE", "0"
-        ) == "1"
-        
-        logger.info(f"{MBPIPE_LOG_PREFIX} Immediate micro-batch queuing: {'ENABLED' if self._enable_immediate_mb_queue else 'disabled'}")
-        logger.info(
-            f"{MBPIPE_LOG_PREFIX} Immediate-mode file store: "
-            f"{'ENABLED' if self._store_mb_files_in_immediate else 'disabled'} "
-            f"(set BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE=1 for legacy behavior)"
-        )
-        
+
         # [CLOCK_SYNC] Per-peer clock offset estimator for cross-machine strict overlap.
         # offset_us is "remote_clock - local_clock" for the target peer.
         self._clock_sync_state: Dict[str, Dict[str, float]] = {}
@@ -2084,8 +1976,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             self._mb_received[mb_key] = 0
             logger.info(
                 f"{MBPIPE_LOG_PREFIX} rpc_push: created tracking for step={step_id}, "
-                f"expecting {expected_num_mb} micro-batches, "
-                f"immediate_queue={'enabled' if self._enable_immediate_mb_queue else 'disabled'}"
+                f"expecting {expected_num_mb} micro-batches"
             )
         
         self._mb_received[mb_key] = self._mb_received.get(mb_key, 0) + 1
@@ -2096,166 +1987,42 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"start_from_position={start_from_position}, received={received_count}/{expected_num_mb}"
         )
         
-        acc_key = f"{session_id}|{step_id}"
-        file_received_count = 0
-        wrote_file = False
-        if (not self._enable_immediate_mb_queue) or self._store_mb_files_in_immediate:
-            # Legacy fallback: keep file-based storage for reconstruction/diagnostics.
-            tensor_bytes = [t.SerializeToString() for t in request.tensors]
-            file_received_count = _store_microbatch_to_file(acc_key, mb_idx, tensor_bytes, metadata.copy())
-            wrote_file = True
-        
-        if self._enable_immediate_mb_queue:
-            # ========== IMMEDIATE QUEUING PATH (Step A) ==========
-            # Put each micro-batch directly into session queue as a queue item
-            metadata["s2s_receiver_queue_put_us"] = int(self._now_us())
-            
-            mb_queue_item = create_microbatch_queue_item(
-                request_id=session_id,
-                step_id=step_id,
-                mb_idx=mb_idx,
-                expected_num_mb=expected_num_mb,
-                payload=request,
-                metadata=metadata.copy(),
-                offset=mb_offset,
-                size=mb_size,
-                full_batch_size=full_batch_size,
-            )
-            
-            # Put into session queue immediately (wrapped in dict to distinguish from regular requests)
-            self._put_into_session_queue(session_id, mb_queue_item)
-            
-            logger.debug(
-                f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} IMMEDIATELY queued to session "
-                f"(received={received_count}/{expected_num_mb})"
-            )
-            
-            # Cleanup tracking when all micro-batches for this step are queued.
-            if received_count >= expected_num_mb:
-                if wrote_file:
-                    logger.info(
-                        f"{MBPIPE_LOG_PREFIX} rpc_push: all {expected_num_mb} micro-batches queued, "
-                        f"cleaning up file storage"
-                    )
-                    _cleanup_microbatch_files(acc_key, expected_num_mb)
-                # Cleanup tracking data
-                self._mb_expected.pop(mb_key, None)
-                self._mb_received.pop(mb_key, None)
-                self._mb_processed.pop(mb_key, None)
-                self._mb_processed_timestamps.pop(mb_key, None)
-        else:
-            # ========== LEGACY PATH (wait-all-then-assemble) ==========
-            logger.info(
-                f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} stored to file "
-                f"(file_count={file_received_count}/{expected_num_mb})"
-            )
-            
-            if file_received_count >= expected_num_mb:
-                logger.info(
-                    f"{MBPIPE_LOG_PREFIX} rpc_push: all {expected_num_mb} micro-batches received, "
-                    f"assembling and forwarding to session"
-                )
-                try:
-                    assembled_request = await self._assemble_microbatches(
-                        acc_key, expected_num_mb, requested_uids
-                    )
-                    self._put_into_session_queue(session_id, assembled_request)
-                finally:
-                    _cleanup_microbatch_files(acc_key, expected_num_mb)
-                    # Cleanup tracking data
-                    self._mb_expected.pop(mb_key, None)
-                    self._mb_received.pop(mb_key, None)
-                    self._mb_processed.pop(mb_key, None)
-                    self._mb_processed_timestamps.pop(mb_key, None)
-        
+        # Each micro-batch goes straight into the session queue as a queue item;
+        # the consume side (_iterate_inference_steps) detects and processes them
+        # individually for pipeline overlap. (The old wait-all-then-assemble
+        # fallback stored pickles under a shared /tmp dir and was removed: it was
+        # both a local-privilege-escalation vector and dead weight.)
+        metadata["s2s_receiver_queue_put_us"] = int(self._now_us())
+
+        mb_queue_item = create_microbatch_queue_item(
+            request_id=session_id,
+            step_id=step_id,
+            mb_idx=mb_idx,
+            expected_num_mb=expected_num_mb,
+            payload=request,
+            metadata=metadata.copy(),
+            offset=mb_offset,
+            size=mb_size,
+            full_batch_size=full_batch_size,
+        )
+
+        self._put_into_session_queue(session_id, mb_queue_item)
+
+        logger.debug(
+            f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} queued to session "
+            f"(received={received_count}/{expected_num_mb})"
+        )
+
+        # Cleanup tracking when all micro-batches for this step are queued.
+        if received_count >= expected_num_mb:
+            self._mb_expected.pop(mb_key, None)
+            self._mb_received.pop(mb_key, None)
+            self._mb_processed.pop(mb_key, None)
+            self._mb_processed_timestamps.pop(mb_key, None)
+
         return runtime_pb2.ExpertResponse()
 
     
-    async def _assemble_microbatches(
-        self,
-        acc_key: str,
-        expected_num_mb: int,
-        requested_uids: Sequence[str],
-    ) -> runtime_pb2.ExpertRequest:
-        """
-        [MBPIPE] Assemble accumulated micro-batches into a single request.
-        
-        This reconstructs the original full batch from multiple micro-batch pushes
-        stored in files.
-        """
-        # Load all micro-batches from files
-        accumulated_raw = _load_all_microbatches_from_files(acc_key, expected_num_mb)
-        
-        # Deserialize protobuf tensors
-        accumulated = {
-            k: (
-                [runtime_pb2.Tensor.FromString(t) for t in v[0]],  # Deserialize from bytes
-                v[1].copy()
-            )
-            for k, v in accumulated_raw.items()
-        }
-        
-        # Sort by micro-batch index to maintain order
-        sorted_mb_indices = sorted(accumulated.keys())
-        
-        if len(sorted_mb_indices) != expected_num_mb:
-            raise ValueError(
-                f"{MBPIPE_LOG_PREFIX} Micro-batch count mismatch: "
-                f"expected {expected_num_mb}, got {len(sorted_mb_indices)}"
-            )
-        
-        # Collect tensors from each micro-batch
-        # Assume each micro-batch has same number of tensors (hidden_states, keep_indices)
-        first_tensors, first_metadata = accumulated[sorted_mb_indices[0]]
-        num_tensor_types = len(first_tensors)
-        
-        # Deserialize and concatenate tensors
-        assembled_tensors = []
-        for tensor_idx in range(num_tensor_types):
-            tensor_parts = []
-            for mb_idx in sorted_mb_indices:
-                tensors, _ = accumulated[mb_idx]
-                if tensor_idx < len(tensors):
-                    # Deserialize tensor
-                    tensor = deserialize_torch_tensor(tensors[tensor_idx])
-                    tensor_parts.append(tensor)
-            
-            if tensor_parts:
-                # Concatenate along batch dimension
-                if len(tensor_parts) > 1:
-                    assembled = torch.cat(tensor_parts, dim=0)
-                else:
-                    assembled = tensor_parts[0]
-                
-                # Re-serialize for the ExpertRequest
-                # Get compression settings from original tensor proto
-                original_proto = first_tensors[tensor_idx]
-                assembled_proto = serialize_torch_tensor(
-                    assembled, original_proto.compression, allow_inplace=True
-                )
-                assembled_tensors.append(assembled_proto)
-        
-        # Build assembled metadata (use first micro-batch's metadata as base)
-        assembled_metadata = first_metadata.copy()
-        # Remove micro-batch specific fields
-        assembled_metadata.pop("is_microbatch_push", None)
-        assembled_metadata.pop("micro_batch_idx", None)
-        assembled_metadata.pop("micro_batch_offset", None)
-        assembled_metadata.pop("micro_batch_size", None)
-        assembled_metadata.pop("full_batch_size", None)
-        
-        logger.info(
-            f"{MBPIPE_LOG_PREFIX} Assembled {len(sorted_mb_indices)} micro-batches: "
-            f"{[t.size for t in assembled_tensors if hasattr(t, 'size')]}"
-        )
-        
-        # Create assembled request
-        return runtime_pb2.ExpertRequest(
-            uid=CHAIN_DELIMITER.join(requested_uids),
-            tensors=assembled_tensors,
-            metadata=MSGPackSerializer.dumps(assembled_metadata),
-        )
-
     async def _push_outputs(
         self,
         request: runtime_pb2.ExpertRequest,
