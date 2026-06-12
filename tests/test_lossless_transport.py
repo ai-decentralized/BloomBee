@@ -246,3 +246,41 @@ def test_adaptive_hybrid_routes_dict_only_for_first_prefill_stage(monkeypatch):
     parsed = lt._parse_wrapper(serialized.buffer)
     assert parsed is not None
     assert parsed[0] == lt._ALGO_ZIPNN
+
+
+def test_serialize_torch_tensor_byte_split_high_only_roundtrip(monkeypatch):
+    tensor = _make_split_friendly_fp16().contiguous()
+    debug_context = {
+        "phase": "decode",
+        "tensor_name": "hidden_states",
+        "source": "client",
+        "channel": "rpc_inference",
+    }
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "zstd")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "byte_split_high_only")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_SINGLE_PATH", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
+    _clear_transport_caches()
+
+    serialized = lt.serialize_torch_tensor(
+        tensor, runtime_pb2.CompressionType.NONE, debug_context=debug_context
+    )
+    parsed = lt._parse_wrapper(serialized.buffer, strict=True)
+    assert parsed is not None, "high_only layout must produce a wrapped buffer"
+    algo_id, original_size, _ = parsed
+    assert algo_id == lt._ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY
+    assert original_size == tensor.numel() * tensor.element_size()
+
+    restored = lt.deserialize_torch_tensor(serialized)
+    assert torch.equal(restored, tensor)
+
+
+def test_unwrap_rejects_oversized_declared_size(monkeypatch):
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES", "1024")
+    payload = zlib.compress(b"x" * 64)
+    fake_buffer = lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZLIB, 1 << 40) + payload
+    serialized = runtime_pb2.Tensor(buffer=fake_buffer)
+    with pytest.raises(ValueError, match="MAX_DECODED_BYTES"):
+        lt.unwrap_serialized_tensor(serialized)

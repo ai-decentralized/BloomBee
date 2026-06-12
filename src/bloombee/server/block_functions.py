@@ -4,6 +4,7 @@ This module implements server-side computations on served blocks: forward, backw
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
+import logging
 import os
 
 import torch
@@ -903,7 +904,8 @@ async def iterate_rpc_inference(
             # [MB_DEBUG] Log after fill_microbatch_defaults
             logger.debug(f"[MB_DEBUG] After fill_microbatch_defaults:")
             logger.debug(f"[MB_DEBUG]   hidden_states.shape={hidden_states.shape}")
-            if hidden_states.numel() > 0:
+            # Guarded: .item() forces a CUDA sync, so it must never run unless DEBUG is on.
+            if hidden_states.numel() > 0 and logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"[MB_DEBUG]   hidden_states.abs().mean()={hidden_states.abs().mean().item():.6f}")
             logger.debug(f"[MB_DEBUG]   keep_indices={keep_indices}")
             logger.debug(f"[MB_DEBUG]   tree_attention_mask={tree_attention_mask is not None}")
@@ -918,9 +920,10 @@ async def iterate_rpc_inference(
             else:
                 hypo_ids = hypo_ids.to(dtype=torch.int64, device=hidden_states.device)
             
-            # [MB_DEBUG] Log prompts and hypo_ids
-            logger.debug(f"[MB_DEBUG] prompts_count={len(prompts)}")
-            logger.debug(f"[MB_DEBUG] hypo_ids.shape={hypo_ids.shape}, values={hypo_ids.tolist()}")
+            # [MB_DEBUG] Log prompts and hypo_ids (guarded: .tolist() syncs the GPU)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[MB_DEBUG] prompts_count={len(prompts)}")
+                logger.debug(f"[MB_DEBUG] hypo_ids.shape={hypo_ids.shape}, values={hypo_ids.tolist()}")
             
             # [DEBUG] Log prompts info for debugging
             logger.debug(
@@ -1001,10 +1004,11 @@ async def iterate_rpc_inference(
                         f"submitting with {len(prompts)} prompts"
                     )
                     
-                    # [MB_DEBUG] Log before submit_task
-                    logger.debug(f"[MB_DEBUG] === SUBMIT TASK ===")
-                    logger.debug(f"[MB_DEBUG] hidden_states.shape={hidden_states.shape}")
-                    logger.debug(f"[MB_DEBUG] hypo_ids.shape={hypo_ids.shape}, values={hypo_ids.tolist()}")
+                    # [MB_DEBUG] Log before submit_task (guarded: .tolist() syncs the GPU)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[MB_DEBUG] === SUBMIT TASK ===")
+                        logger.debug(f"[MB_DEBUG] hidden_states.shape={hidden_states.shape}")
+                        logger.debug(f"[MB_DEBUG] hypo_ids.shape={hypo_ids.shape}, values={hypo_ids.tolist()}")
                     
                     submit_start = perf_counter()
                     submit_result = await requested_backends[0].inference_pool.submit_task(
@@ -1110,7 +1114,7 @@ async def iterate_rpc_inference(
                     f"{MBPIPE_LOG_PREFIX} Micro-batch {mb_idx} processed in {process_time_ms:.1f}ms, "
                     f"output shape: {hidden_states.shape}"
                 )
-            if hidden_states.numel() > 0:
+            if hidden_states.numel() > 0 and logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"[MB_DEBUG] Output hidden_states.abs().mean()={hidden_states.abs().mean().item():.6f} for mb_idx={mb_idx}")
             
             # ========== [MBPIPE_STREAMING] CROSS-STAGE PUSH FOR DECODE OVERLAP ==========
@@ -1292,8 +1296,8 @@ async def iterate_rpc_inference(
                     logger.info(
                         f"{MBPIPE_LOG_PREFIX} Merged output shape: {merged_hidden_states.shape}"
                     )
-                if merged_hidden_states.numel() > 0:
-                     logger.debug(f"[MB_DEBUG] Merged hidden_states.abs().mean()={merged_hidden_states.abs().mean().item():.6f}")
+                if merged_hidden_states.numel() > 0 and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[MB_DEBUG] Merged hidden_states.abs().mean()={merged_hidden_states.abs().mean().item():.6f}")
                 
                 # [CROSS_STAGE_OVERLAP] Calculate and log final overlap summary
                 if hasattr(iterate_rpc_inference, '_cross_stage_overlap_data') and \
@@ -1665,8 +1669,9 @@ async def iterate_rpc_inference(
                             if clock_sync_pairs > 0
                             else 0.0
                         )
-                        logger.info(
-                            f"[CROSS_STAGE_OVERLAP_SUMMARY] step={overlap_tracking_key[1]} overlap={total_overlap_ms:.1f}ms, "
+                        if log_mb_detail:
+                            logger.info(
+                                f"[CROSS_STAGE_OVERLAP_SUMMARY] step={overlap_tracking_key[1]} overlap={total_overlap_ms:.1f}ms, "
                             f"Stage2_compute={total_stage2_compute_ms:.1f}ms, "
                             f"Stage2_queue_wait={stage2_queue_wait_sum_ms:.1f}ms, "
                             f"Stage2_queue_wait_pre={stage2_queue_wait_pre_ms:.1f}ms, "
@@ -1864,8 +1869,9 @@ async def iterate_rpc_inference(
                 accum["step_metadata"]["_receiver_nic2cpu_exposed_ms"] = nic2cpu_sum_ms
                 accum["step_metadata"]["_receiver_cpu2gpu_exposed_ms"] = cpu2gpu_sum_ms
                 accum["step_metadata"]["_pipeline_overlap_breakdown_ready"] = int(queue_wait_pre_breakdown_ready)
-                logger.info(
-                    f"[STEP_TIMING_BREAKDOWN_MB] step_id={step_id} mode=micro_batch "
+                if log_mb_detail:
+                    logger.info(
+                        f"[STEP_TIMING_BREAKDOWN_MB] step_id={step_id} mode=micro_batch "
                     f"expected_mb={accum.get('expected', 0)} recv_mb={len(accum.get('results', {}))} "
                     f"queue_wait_sum={queue_wait_sum_ms:.2f}ms "
                     f"deserialize_sum={deserialize_sum_ms:.2f}ms "
@@ -2319,8 +2325,9 @@ async def iterate_rpc_inference(
                                 f"wait_total={transfer_wait_time_ms:.2f}ms, launch_total={transfer_launch_time_ms:.2f}ms, "
                                 f"total={total_mb_time_ms:.2f}ms"
                             )
-                        logger.info(
-                            f"[KVCACHE_IO] step_id={step_metadata.get('step_id', 'unknown') if isinstance(step_metadata, dict) else 'unknown'} "
+                        if log_mb_detail:
+                            logger.info(
+                                f"[KVCACHE_IO] step_id={step_metadata.get('step_id', 'unknown') if isinstance(step_metadata, dict) else 'unknown'} "
                             f"mb_idx={mb_idx} blocks={_block_span_from_uids(requested_uids)} "
                             f"batch={mb_size} compute_ms={compute_time_ms:.2f} "
                             f"pcie_submit_ms={transfer_launch_time_ms:.2f} "
@@ -2493,8 +2500,9 @@ async def iterate_rpc_inference(
                         launch_overhead_ratio = (total_launch_overhead / total_elapsed * 100) if total_elapsed > 0 else 0
                         
                         start_pos_for_log = step_metadata.get("start_from_position") if isinstance(step_metadata, dict) else "unknown"
-                        logger.info(
-                            f"[MBPIPE_SUMMARY] step={start_pos_for_log} mb={len(kv_timing_stats)} "
+                        if log_mb_detail:
+                            logger.info(
+                                f"[MBPIPE_SUMMARY] step={start_pos_for_log} mb={len(kv_timing_stats)} "
                             f"compute={total_compute:.1f}ms elapsed={total_elapsed:.1f}ms "
                             f"wait={total_wait_overhead:.1f}ms({wait_overhead_ratio:.1f}%) "
                             f"launch={total_launch_overhead:.1f}ms({launch_overhead_ratio:.1f}%) "

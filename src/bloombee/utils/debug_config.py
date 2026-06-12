@@ -56,6 +56,14 @@ _LOG_CHANNELS = {
         "envs": ("BLOOMBEE_KV_SOURCE_PROBE_LOGS",),
         "groups": ("kv_cache",),
     },
+    # Per-push / per-micro-batch wire telemetry ([S2S_WIRE], [COMM_BREAKDOWN],
+    # [NETWORK_RX], [ACTIVATION_XFER_CHECK], ...). These fire on every decode
+    # step, so they are opt-in; experiment runs that parse these tags should
+    # set BLOOMBEE_S2S_WIRE_LOGS=1 (or BLOOMBEE_DEBUG_MICROBATCH=1).
+    "s2s_wire_logs": {
+        "envs": ("BLOOMBEE_S2S_WIRE_LOGS",),
+        "groups": ("microbatch",),
+    },
 }
 
 

@@ -723,15 +723,16 @@ class TransformerConnectionHandler(ConnectionHandler):
             clock_sync_ok=clock_sync_ok,
         )
 
-        logger.info(
-            f"[S2S_NET] link={link_key} samples={telemetry.samples} "
-            f"latency_ms={effective_latency_ms:.3f} "
-            f"bandwidth_mbps={bandwidth_mbps:.3f} "
-            f"jitter_ms={jitter_ms:.3f} "
-            f"payload_kb={payload_bytes / 1024.0:.2f} "
-            f"metadata_b={metadata_bytes} "
-            f"clock_sync={int(clock_sync_ok)}"
-        )
+        if is_log_channel_enabled("s2s_wire_logs"):
+            logger.info(
+                f"[S2S_NET] link={link_key} samples={telemetry.samples} "
+                f"latency_ms={effective_latency_ms:.3f} "
+                f"bandwidth_mbps={bandwidth_mbps:.3f} "
+                f"jitter_ms={jitter_ms:.3f} "
+                f"payload_kb={payload_bytes / 1024.0:.2f} "
+                f"metadata_b={metadata_bytes} "
+                f"clock_sync={int(clock_sync_ok)}"
+            )
 
         if telemetry.samples <= 3 or telemetry.samples % self._s2s_stats_log_every == 0:
             latency_mean_ms, latency_std_ms, latency_p50_ms, latency_p95_ms = self._window_stats(
@@ -825,18 +826,24 @@ class TransformerConnectionHandler(ConnectionHandler):
             total_request_size = sum(request_tensor_sizes) + request_metadata_size
             recv_time_ms = (recv_end - recv_start) * 1000
             
-            logger.info(f"[NETWORK_RX] SERVER_RECV | "
-                       f"tensor_size={sum(request_tensor_sizes)/1024:.2f}KB | "
-                       f"metadata_size={request_metadata_size}B | "
-                       f"total={total_request_size/1024:.2f}KB | "
-                       f"recv_time={recv_time_ms:.2f}ms")
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(f"[NETWORK_RX] SERVER_RECV | "
+                           f"tensor_size={sum(request_tensor_sizes)/1024:.2f}KB | "
+                           f"metadata_size={request_metadata_size}B | "
+                           f"total={total_request_size/1024:.2f}KB | "
+                           f"recv_time={recv_time_ms:.2f}ms")
             
 
             requested_uids = self._check_uids(request.uid)
             self._log_request("rpc_inference.open", requested_uids, context)
+            # Initialized before the try block: the finally clause below references
+            # these even when metadata parsing or backend lookup raises early.
+            requested_backends: Tuple[TransformerBackend, ...] = ()
+            session_id = None
+            background_tasks: set = set()
             try:
                 start_time = perf_counter()
-                
+
                 metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
                 end_msg_serial_time = perf_counter()
                 # print_time_now('')
@@ -1888,13 +1895,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                 wire_ms = max(0.0, (receive_us - sender_send_local_us) / 1000.0)
             payload_bytes = sum(len(t.buffer) for t in request.tensors)
             metadata_bytes = len(request.metadata) if request.metadata else 0
-            logger.info(
-                f"[S2S_WIRE] step_id={metadata.get('step_id')} channel=full_batch "
-                f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
-                f"payload_kb={payload_bytes / 1024.0:.2f} metadata_b={metadata_bytes} "
-                f"raw_transfer_ms={raw_transfer_ms:.3f} wire_ms={wire_ms:.3f} "
-                f"clock_sync={int(clock_sync_ok)}"
-            )
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[S2S_WIRE] step_id={metadata.get('step_id')} channel=full_batch "
+                    f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
+                    f"payload_kb={payload_bytes / 1024.0:.2f} metadata_b={metadata_bytes} "
+                    f"raw_transfer_ms={raw_transfer_ms:.3f} wire_ms={wire_ms:.3f} "
+                    f"clock_sync={int(clock_sync_ok)}"
+                )
             self._record_s2s_network_sample(
                 channel="full_batch",
                 sender_blocks=sender_blocks,
@@ -2037,8 +2045,9 @@ class TransformerConnectionHandler(ConnectionHandler):
 
         payload_bytes = sum(len(t.buffer) for t in request.tensors)
         metadata_bytes = len(request.metadata) if request.metadata else 0
-        logger.info(
-            f"[S2S_WIRE] step_id={step_id} mb_idx={int(mb_idx)} "
+        if is_log_channel_enabled("s2s_wire_logs"):
+            logger.info(
+                f"[S2S_WIRE] step_id={step_id} mb_idx={int(mb_idx)} "
             f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
             f"batch={int(mb_size)} payload_kb={payload_bytes/1024.0:.2f} metadata_b={metadata_bytes} "
             f"raw_transfer_ms={raw_transfer_ms:.3f} "
@@ -2455,8 +2464,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 receiver_processing_ms=receiver_processing_ms,
                 wire_bytes=push_tensor_bytes,
             )
-            logger.info(
-                f"[COMM_BREAKDOWN] step_id={step_id} "
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[COMM_BREAKDOWN] step_id={step_id} "
                 f"to_blocks={next_start}:{next_end} "
                 f"T(GPU→CPU)={t_gpu2cpu_ms:.2f}ms({gpu2cpu_pct:.1f}%) "
                 f"T(CPU→NIC)={t_cpu2nic_ms:.2f}ms({cpu2nic_pct:.1f}%) "
@@ -2470,12 +2480,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"wire_bytes={push_tensor_bytes}"
             )
 
-            logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "
-                       f"from_blocks={sender_blocks} | to_blocks={next_start}:{next_end} | "
-                       f"tensor_size={push_tensor_bytes/1024:.2f}KB | "
-                       f"metadata_size={push_metadata_bytes}B | "
-                       f"transfer_time={transfer_time_ms:.2f}ms | "
-                       f"approx_bw={transfer_bw_mbps:.2f}Mbps")
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "
+                           f"from_blocks={sender_blocks} | to_blocks={next_start}:{next_end} | "
+                           f"tensor_size={push_tensor_bytes/1024:.2f}KB | "
+                           f"metadata_size={push_metadata_bytes}B | "
+                           f"transfer_time={transfer_time_ms:.2f}ms | "
+                           f"approx_bw={transfer_bw_mbps:.2f}Mbps")
             
         except Exception:
             logger.warning(
@@ -2674,8 +2685,9 @@ class TransformerConnectionHandler(ConnectionHandler):
             kv_to_activation_ratio = (
                 (kv_pcie_bytes / activation_wire_bytes) if activation_wire_bytes > 0 else 0.0
             )
-            logger.info(
-                f"[ACTIVATION_XFER_CHECK] step_id={metadata.get('step_id', 'unknown')} "
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[ACTIVATION_XFER_CHECK] step_id={metadata.get('step_id', 'unknown')} "
                 f"mb_idx={int(mb_idx)} blocks={sender_blocks}->{next_start}:{next_end} "
                 f"batch={int(mb_size)} activation_raw_bytes={activation_raw_bytes} "
                 f"activation_wire_bytes={activation_wire_bytes} activation_ratio={activation_ratio:.6f} "
@@ -2794,8 +2806,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                     release_slot=acquired_slot,
                 )
             )
-            logger.info(
-                f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
                 f"mb_idx={int(mb_idx)} sender_blocks={sender_blocks} receiver_blocks={next_start}:{next_end} "
                 f"compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
                 f"serialize_ms={sender_serialize_ms:.3f} "
@@ -2893,8 +2906,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms, "
                 f"payload_kb={payload_bytes / 1024.0:.2f}, approx_bw={approx_bw_mbps:.2f}Mbps"
             )
-            logger.info(
-                f"[COMM_BREAKDOWN_MB] step_id={step_id or 'unknown'} mb_idx={mb_idx} "
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[COMM_BREAKDOWN_MB] step_id={step_id or 'unknown'} mb_idx={mb_idx} "
                 f"to_blocks={to_blocks} "
                 f"T(GPU→CPU)={t_gpu2cpu_ms:.2f}ms "
                 f"T(CPU→NIC)={t_cpu2nic_ms:.2f}ms "
@@ -2934,11 +2948,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points, (float, int)
             ), f"rpc_forward should have number of points as number or None, got {points}"
 
-            # Log server processing start
-            logger.info(f"[SERVER_PROCESSING_START] Server processing request with {len(requested_uids)} backends")
-            
-            # Measure network transfer time for S1->S2 communication
-            network_start_time = perf_counter()
+            forward_start_time = perf_counter()
             hidden_states = await run_rpc_forward(
                 *flat_inputs,
                 requested_backends=requested_backends,
@@ -2946,19 +2956,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                 active_adapter=active_adapter,
                 points=points,
             )
-            network_end_time = perf_counter()
-            network_transfer_time = (network_end_time - network_start_time) * 1000
-            
-            # Calculate server processing latency
-            server_end_time = perf_counter()
-            server_processing_latency = (server_end_time - server_start_time) * 1000
-            
-            logger.info(f"[NETWORK_TRANSFER_LATENCY] S1->S2 Transfer: {network_transfer_time:.2f}ms | "
-                       f"Backends: {len(requested_backends)} | "
-                       f"Output Shape: {hidden_states.shape}")
-            logger.info(f"[SERVER_PROCESSING_LATENCY] Total: {server_processing_latency:.2f}ms | "
-                       f"Backends: {len(requested_backends)} | "
-                       f"Output Shape: {hidden_states.shape}")
+            forward_compute_ms = (perf_counter() - forward_start_time) * 1000
+
+            server_processing_latency = (perf_counter() - server_start_time) * 1000
+
+            if is_log_channel_enabled("handler_step_timing_logs"):
+                logger.info(f"[FORWARD_COMPUTE_LATENCY] run_rpc_forward: {forward_compute_ms:.2f}ms | "
+                           f"Backends: {len(requested_backends)} | "
+                           f"Output Shape: {hidden_states.shape}")
+                logger.info(f"[SERVER_PROCESSING_LATENCY] Total: {server_processing_latency:.2f}ms | "
+                           f"Backends: {len(requested_backends)} | "
+                           f"Output Shape: {hidden_states.shape}")
             
             return runtime_pb2.ExpertResponse(
                 tensors=self._serialize_outputs(hidden_states, requested_backends, metadata)
