@@ -762,7 +762,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # Centralized select: aggregate + reorder + slice
                 # [MERGED] Speculative decoding flow with micro-batch support
                 kv_cache_position_ids = inference_info.kv_cache_position_ids
-                self.cache_manager.wait_for_pending_reorder()
+                _prof_wait = 0.0
+                if self._step_profile_enabled:
+                    _prof_wait_t0 = perf_counter()
+                    self.cache_manager.wait_for_pending_reorder()
+                    _prof_wait = perf_counter() - _prof_wait_t0
+                else:
+                    self.cache_manager.wait_for_pending_reorder()
                 
                 logger.debug(f"[MB_DEBUG] backend.inference_step: uid={inference_info.uid}, "
                             f"batch_offset={inference_info.batch_offset}, "
@@ -1029,6 +1035,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     _prof_update = perf_counter() - _prof_upd_t0
                     _prof_total = perf_counter() - _prof_t0
                     buf = self._step_profile_buf
+                    buf.setdefault("wait", []).append(_prof_wait)
                     buf["select"].append(_prof_select)
                     buf["forward"].append(_prof_forward)
                     buf["update"].append(_prof_update)
@@ -1049,9 +1056,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             )
                         logger.info(
                             "[STEP_PROFILE] %s B=%s seq=%s cache=%s | "
-                            "select: %s | forward: %s | update: %s | total: %s",
+                            "wait: %s | select: %s | forward: %s | update: %s | total: %s",
                             self.name, batch_size, seq_len, cache_len,
-                            _summary("select"), _summary("forward"),
+                            _summary("wait"), _summary("select"), _summary("forward"),
                             _summary("update"), _summary("total"),
                         )
                         for k in buf:
@@ -1711,6 +1718,7 @@ class _MergedInferenceStep:
             mbpipe_log_path_entry(logger, "backend._MergedInferenceStep", batch_size=batch_size)
         
         kv_timing_before = self._snapshot_kv_timing()
+        _pool_inner_t0 = perf_counter()
 
         # Process all blocks for this micro-batch
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
@@ -1722,5 +1730,6 @@ class _MergedInferenceStep:
 
         kv_timing_after = self._snapshot_kv_timing()
         kv_timing_delta = self._compute_kv_timing_delta(kv_timing_before, kv_timing_after)
+        kv_timing_delta["pool_inner_ms"] = (perf_counter() - _pool_inner_t0) * 1000.0
 
         return (hidden_states, keep_indices, kv_timing_delta)

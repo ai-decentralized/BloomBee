@@ -259,7 +259,7 @@ def _accumulate_runtime_timing(
 ) -> None:
     if not isinstance(sample, dict):
         return
-    for key in ("t_cpu2gpu_ms", "t_gpu2cpu_ms", "t_gpu2gpu_ms", "input_bytes", "output_bytes", "gpu2gpu_bytes"):
+    for key in ("t_cpu2gpu_ms", "t_gpu2cpu_ms", "t_gpu2gpu_ms", "input_bytes", "output_bytes", "gpu2gpu_bytes", "pool_inner_ms"):
         try:
             total[key] = float(total.get(key, 0.0)) + float(sample.get(key, 0.0))
         except Exception:
@@ -2978,7 +2978,8 @@ async def iterate_rpc_inference(
             f"[STEP_TIMING_BREAKDOWN] step_id={step_id_for_log} mode={execution_mode} "
             f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
             f"t_nic2cpu={t_nic2cpu_ms:.2f}ms t_cpu2gpu={t_cpu2gpu_ms:.2f}ms "
-            f"t_gpu2gpu={t_gpu2gpu_ms:.2f}ms compute={compute_time:.2f}ms t_gpu2cpu={t_gpu2cpu_ms:.2f}ms "
+            f"t_gpu2gpu={t_gpu2gpu_ms:.2f}ms compute={compute_time:.2f}ms "
+            f"pool_inner={float(runtime_timing_total.get('pool_inner_ms', 0.0)):.2f}ms t_gpu2cpu={t_gpu2cpu_ms:.2f}ms "
             f"serialize_cpu={cpu_serialize_ms:.2f}ms residual={step_residual_ms:.2f}ms "
             f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
             f"compute_pct={compute_pct:.1f}% mem_copy_pct={comm_overhead_pct:.1f}% "
