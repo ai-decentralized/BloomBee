@@ -437,6 +437,14 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         pending_row_perm: Optional[torch.Tensor] = None  # sent as hypo_ids on the NEXT step
         if compaction_enabled:
             logger.info(f"[ROW_COMPACT] enabled: batch={batch_size} (greedy, full-batch layout)")
+            # A previous compacted generate() in this process leaves the drafter's
+            # per-row prefix caches keyed by COMPACTED slots. Row-slot aliasing is
+            # only guarded by token-id prefix checks, which heterogeneous prompts
+            # sharing a chat-template prefix can pass with the WRONG row's hiddens
+            # (silently lowering acceptance). Start compacted runs from a clean
+            # prefix cache; it is rebuilt deterministically on the first round.
+            if hasattr(drafter, "reorder_prefix_states"):
+                drafter.reorder_prefix_states([])
         while not finished and bool(((seq_lengths - initial_seq_lengths) < row_max_new).any().item()):
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
