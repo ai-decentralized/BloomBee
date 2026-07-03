@@ -1,4 +1,4 @@
-from typing import Optional, Union, List, Tuple, Any
+from typing import Optional, Union, List, Tuple, Any, Sequence, Dict
 
 import copy
 import math
@@ -61,14 +61,18 @@ def _cap_valid_lengths_to_remaining(
     valid_lengths: torch.LongTensor,
     seq_lengths: torch.LongTensor,
     initial_len: Union[int, torch.LongTensor],
-    max_new_tokens: int,
+    max_new_tokens: Union[int, torch.LongTensor],
 ) -> Tuple[torch.LongTensor, torch.LongTensor]:
     if torch.is_tensor(initial_len):
         initial_lengths = initial_len.to(device=seq_lengths.device, dtype=seq_lengths.dtype)
     else:
         initial_lengths = torch.full_like(seq_lengths, int(initial_len))
+    if torch.is_tensor(max_new_tokens):
+        max_new = max_new_tokens.to(device=seq_lengths.device, dtype=seq_lengths.dtype)
+    else:
+        max_new = torch.full_like(seq_lengths, int(max_new_tokens))
     remaining = torch.clamp(
-        int(max_new_tokens) - (seq_lengths - initial_lengths),
+        max_new - (seq_lengths - initial_lengths),
         min=0,
     )
     capped_valid_lengths = torch.minimum(valid_lengths, remaining)
@@ -241,6 +245,18 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         logits_processor = logits_processor or LogitsProcessorList()
         stopping_criteria = stopping_criteria or StoppingCriteriaList()
 
+        # Per-row generation quotas (long-tail workloads): row i stops after
+        # per_row_max_new_tokens[i] committed tokens. Scalar max_new_tokens is
+        # raised to the largest quota so session sizing still covers every row.
+        per_row_max_new_tokens = model_kwargs.pop("per_row_max_new_tokens", None)
+        if per_row_max_new_tokens is not None:
+            quotas = [int(q) for q in per_row_max_new_tokens]
+            if len(quotas) != int(input_ids.shape[0]):
+                raise ValueError(
+                    f"per_row_max_new_tokens has {len(quotas)} entries for batch {int(input_ids.shape[0])}"
+                )
+            max_new_tokens = max(max_new_tokens, max(quotas))
+
         # Do not override do_sample here. When do_sample=False the verify loop
         # takes the argmax path (token-identical to greedy decoding on the
         # target model, same as before). When do_sample=True the verify loop
@@ -297,6 +313,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 use_kv_cache=use_kv_cache,
                 kv_cache_window=kv_cache_window,
                 max_new_tokens=max_new_tokens,
+                per_row_max_new_tokens=per_row_max_new_tokens,
                 tree_budget=effective_tree_budget,
                 topk_per_step=topk_per_step,
                 tree_min_log_prob=tree_min_log_prob,
@@ -318,6 +335,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
         max_new_tokens: int = 128,
+        per_row_max_new_tokens: Optional[Sequence[int]] = None,
         tree_budget: Optional[int] = None,
         topk_per_step: Optional[int] = None,
         tree_min_log_prob: Optional[float] = None,
@@ -326,6 +344,16 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
     ) -> torch.LongTensor:
         logger.info("Starting speculative decoding with distributed inference session!")
         device = input_ids.device
+        # Per-row quota tensor: row i is done after row_max_new[i] committed
+        # tokens. Defaults to the scalar max_new_tokens for every row.
+        if per_row_max_new_tokens is not None:
+            row_max_new = torch.tensor(
+                [int(q) for q in per_row_max_new_tokens], dtype=torch.long, device=device
+            )
+        else:
+            row_max_new = torch.full(
+                (input_ids.shape[0],), int(max_new_tokens), dtype=torch.long, device=device
+            )
         eos_token_ids = _eos_token_ids(generation_config)
         eos_token_tensor = (
             torch.tensor(eos_token_ids, dtype=torch.long, device=device)
@@ -384,7 +412,32 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         has_printed_first_reach = False # 确保只打印一次
         sample_finish_times = [None] * batch_size
         sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        while not finished and ((seq_lengths - initial_seq_lengths).min().item()) < max_new_tokens:
+
+        # ---- Active-row compaction (continuous-batching-lite) ----
+        # When rows finish (per-row quota or EOS) the fixed-batch loop otherwise
+        # keeps drafting/verifying/shipping them until the slowest row is done —
+        # the b32 long-tail loss. With BLOOMBEE_ACTIVE_ROW_COMPACTION=1 we gather
+        # the still-active rows to the front: one full-B step carries hypo_ids
+        # (the surviving-row gather) so every server permutes its KV rows; from
+        # the next step the client sends only the first B_active rows, shrinking
+        # drafter work, verify compute, and the S2S payload. Finished rows'
+        # outputs are scattered back into a full-B buffer at the end.
+        # Constraints: greedy only (token-identity gated), no microbatch pipeline.
+        compaction_enabled = (
+            os.environ.get("BLOOMBEE_ACTIVE_ROW_COMPACTION", "0") == "1"
+            and not bool(getattr(generation_config, "do_sample", False))
+            and os.environ.get("BLOOMBEE_ENABLE_MICROBATCH_PIPELINE", "0") != "1"
+        )
+        # row_origin[i] = original batch index living at compacted slot i.
+        row_origin = list(range(batch_size))
+        # Full-size result buffers (indexed by ORIGINAL row): rows are parked
+        # here when they finish and the batch compacts past them.
+        done_rows: Dict[int, torch.Tensor] = {}
+        done_lengths: Dict[int, int] = {}
+        pending_row_perm: Optional[torch.Tensor] = None  # sent as hypo_ids on the NEXT step
+        if compaction_enabled:
+            logger.info(f"[ROW_COMPACT] enabled: batch={batch_size} (greedy, full-batch layout)")
+        while not finished and bool(((seq_lengths - initial_seq_lengths) < row_max_new).any().item()):
             # 1. Build speculative trees using SSM - 传入 seq_lengths
             t1 = time.perf_counter()
             # Pass EAGLE-2-style tree-budget kwargs through to the drafter.
@@ -418,6 +471,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
             # logger.info(f"spec_trees, {spec_trees}")
             
+            # Active-row compaction: ship the pending KV row-gather with this
+            # step (hypo_ids tensor slot). Every server moves the surviving
+            # rows to the front of its KV slab before reading; this step's
+            # tensors are already sliced to those rows in the same order.
+            if pending_row_perm is not None:
+                past_key_values.hypo_ids = pending_row_perm
+
             # 2. Verify trees using distributed inference
             (
                 verified_tokens,
@@ -441,13 +501,18 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 do_sample=bool(getattr(generation_config, "do_sample", False)),
                 temperature=float(getattr(generation_config, "temperature", 1.0) or 1.0),
             )
+            if pending_row_perm is not None:
+                # The gather has been applied by every server on this step;
+                # later steps must not re-send it.
+                past_key_values.hypo_ids = None
+                pending_row_perm = None
 
             old_seq_lengths = seq_lengths.clone()
             valid_lengths, append_llm_token = _cap_valid_lengths_to_remaining(
                 valid_lengths=valid_lengths,
                 seq_lengths=seq_lengths,
                 initial_len=initial_seq_lengths,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=row_max_new,
             )
             # Active-row acceptance instrumentation (compaction Stage 0, metric-only).
             # The fixed-batch loop verifies all rows every round, so the aggregate
@@ -458,7 +523,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             # (e.g. vLLM) would report. See results/.../CODEX_COMPACTION_PLAN.md.
             try:
                 _active_mask = unfinished_sequences.bool() & (
-                    (seq_lengths - initial_seq_lengths) < max_new_tokens
+                    (seq_lengths - initial_seq_lengths) < row_max_new
                 )
                 _active_rows = int(_active_mask.sum().item())
                 if _active_rows > 0:
@@ -576,7 +641,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
 
             # 5. Check if finished
             unfinished_sequences = unfinished_sequences & (
-                (seq_lengths - initial_seq_lengths) < max_new_tokens
+                (seq_lengths - initial_seq_lengths) < row_max_new
             ).long()
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(current_input_ids, None)
             finished = unfinished_sequences.max() == 0
@@ -584,23 +649,90 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
             current_generations = seq_lengths - initial_seq_lengths
             for i in range(batch_size):
-                if (current_generations[i] >= max_new_tokens and not sample_finished[i]):
+                orig_i = row_origin[i]
+                if (current_generations[i] >= row_max_new[i] and not sample_finished[orig_i]):
                     finish_time = time.perf_counter() - t0
-                    sample_finish_times[i] = finish_time
-                    sample_finished[i] = True
-                    logger.info(f"step {step_idx} Sample {i} finished generation ({max_new_tokens} tokens) at {finish_time:.4f}s")
+                    sample_finish_times[orig_i] = finish_time
+                    sample_finished[orig_i] = True
+                    logger.info(f"step {step_idx} Sample {orig_i} finished generation ({int(row_max_new[i].item())} tokens) at {finish_time:.4f}s")
+
+            # ---- Active-row compaction: shrink the batch past finished rows ----
+            if compaction_enabled and not finished and int(unfinished_sequences.sum().item()) < batch_size:
+                active_idx = [i for i in range(batch_size) if int(unfinished_sequences[i].item()) == 1]
+                finished_idx = [i for i in range(batch_size) if int(unfinished_sequences[i].item()) == 0]
+                # Park finished rows' outputs (indexed by ORIGINAL batch row).
+                for i in finished_idx:
+                    orig_i = row_origin[i]
+                    done_rows[orig_i] = current_input_ids[i].detach().clone()
+                    done_lengths[orig_i] = int(seq_lengths[i].item())
+                sel = torch.tensor(active_idx, dtype=torch.long, device=device)
+                # KV row-gather for every server, sent as hypo_ids on the next
+                # step. When active rows are already the leading prefix this is
+                # arange(B_active): the server identity-check skips the copy and
+                # the shrink still happens through the smaller tensors.
+                pending_row_perm = sel.clone()
+                # Compact every per-row loop tensor to the surviving rows.
+                current_input_ids = current_input_ids.index_select(0, sel)
+                seq_lengths = seq_lengths.index_select(0, sel)
+                initial_seq_lengths = initial_seq_lengths.index_select(0, sel)
+                row_max_new = row_max_new.index_select(0, sel)
+                unfinished_sequences = unfinished_sequences.index_select(0, sel)
+                if llm_generated_token is not None:
+                    llm_generated_token = llm_generated_token.index_select(0, sel)
+                if prev_last_hidden is not None:
+                    prev_last_hidden = prev_last_hidden.index_select(0, sel)
+                if prev_last_token is not None:
+                    prev_last_token = prev_last_token.index_select(0, sel)
+                if eagle_prefix_hidden_states is not None:
+                    eagle_prefix_hidden_states = eagle_prefix_hidden_states.index_select(0, sel)
+                if past_key_values.kv_cache_position_ids is not None:
+                    past_key_values.set_kv_cache(
+                        past_key_values.kv_cache_position_ids.index_select(
+                            0, sel.to(past_key_values.kv_cache_position_ids.device)
+                        )
+                    )
+                if past_key_values.prefill_length is not None and torch.is_tensor(past_key_values.prefill_length):
+                    pf = past_key_values.prefill_length
+                    if pf.ndim >= 1 and pf.shape[0] == batch_size:
+                        past_key_values.set_prefill_length(pf.index_select(0, sel.to(pf.device)))
+                # Remap the drafter's per-row prefix caches to the new slots.
+                if hasattr(drafter, "reorder_prefix_states"):
+                    drafter.reorder_prefix_states(active_idx)
+                row_origin = [row_origin[i] for i in active_idx]
+                batch_size = len(active_idx)
+                logger.info(
+                    f"[ROW_COMPACT] step {step_idx}: parked {len(finished_idx)} finished rows, "
+                    f"active batch {batch_size} (orig rows {row_origin})"
+                )
             step_idx += 1
 
         if streamer is not None:
             streamer.end()
-            
+
         logger.info("====== Batch Generation Summary ======")
         for i, t in enumerate(sample_finish_times):
             if t is not None:
                 logger.info(f"Sample {i}: finished at {t:.4f}s")
             else:
                 logger.info(f"Sample {i}: did not reach max_new_tokens")
-        
+
+        if compaction_enabled and (done_rows or len(row_origin) != len(sample_finish_times)):
+            # Reassemble the full batch in ORIGINAL row order: surviving rows
+            # live in current_input_ids (compacted order), parked rows in
+            # done_rows. Right-pad everything to the widest row.
+            total_rows = len(sample_finish_times)
+            widths = [current_input_ids.shape[1]] + [t.shape[0] for t in done_rows.values()]
+            out_width = max(widths)
+            out = torch.full(
+                (total_rows, out_width), pad_token_id,
+                dtype=current_input_ids.dtype, device=current_input_ids.device,
+            )
+            for slot, orig_i in enumerate(row_origin):
+                out[orig_i, : current_input_ids.shape[1]] = current_input_ids[slot]
+            for orig_i, row in done_rows.items():
+                out[orig_i, : row.shape[0]] = row.to(out.device)
+            return out
+
         return current_input_ids
 
     def _update_eagle_prefix_hidden_states(

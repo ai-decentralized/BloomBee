@@ -79,7 +79,6 @@ _EAGLE_DEPTH_ENV = "BLOOMBEE_EAGLE_DEPTH"
 # (higher accept) wins. See results/.../budget_sweep_b32_e5 and CODEX_VLLM_ANALYSIS.
 _EAGLE_BANDWIDTH_MBPS_ENV = "BLOOMBEE_EAGLE_BANDWIDTH_MBPS"
 
-
 def select_bandwidth_adaptive_budget(bandwidth_mbps: Optional[float], default_budget: int) -> int:
     """Pick an EAGLE tree budget for the given S2S link bandwidth (Mbps).
 
@@ -624,6 +623,22 @@ class EAGLEDrafter:
         self._prefix_states: Dict[int, _PrefixCacheState] = {}
 
         self._load_eagle_weights(ea_model_path)
+
+    def reorder_prefix_states(self, perm: Sequence[int]) -> None:
+        """Remap per-row drafter prefix caches after active-row compaction.
+
+        ``perm`` lists the surviving original row indices in their new order
+        (new row i held what was row perm[i]). Rows not in ``perm`` are
+        finished; their cached state is dropped. Without this remap the next
+        build would validate the wrong row's cache and fall back to a full
+        (byte-identical but slow) prefix replay for every compacted row.
+        """
+        old = self._prefix_states
+        self._prefix_states = {}
+        for new_idx, old_idx in enumerate(perm):
+            state = old.get(int(old_idx))
+            if state is not None:
+                self._prefix_states[new_idx] = state
 
     def _load_eagle_weights(self, path: str) -> None:
         """Load yuhuili-style EAGLE weights into ``self.head``.

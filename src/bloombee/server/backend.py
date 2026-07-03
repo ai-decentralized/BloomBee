@@ -769,7 +769,24 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     _prof_wait = perf_counter() - _prof_wait_t0
                 else:
                     self.cache_manager.wait_for_pending_reorder()
-                
+
+                # Active-row compaction: a non-identity hypo_ids on the spec path is a
+                # KV batch-row permutation (active rows first). Apply it in place ONCE
+                # (slab is quiescent here: after wait_for_pending_reorder, inside
+                # use_cache), then treat downstream as identity. Subsequent smaller
+                # steps then read/write the contiguous first B_active rows.
+                row_perm_applied = False
+                if (
+                    hypo_ids is not None
+                    and not is_dummy(hypo_ids)
+                    and hypo_ids.ndim == 1
+                    and hypo_ids.numel() > 0
+                    and not self._is_identity_hypo_ids(hypo_ids)
+                ):
+                    self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
+                    hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
+                    row_perm_applied = True
+
                 logger.debug(f"[MB_DEBUG] backend.inference_step: uid={inference_info.uid}, "
                             f"batch_offset={inference_info.batch_offset}, "
                             f"micro_batch_size={inference_info.micro_batch_size}, "
@@ -796,6 +813,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         batch_offset=inference_info.batch_offset,
                         full_batch_size=inference_info.full_batch_size,
                         micro_batch_size=inference_info.micro_batch_size,
+                        requested_rows=batch_size,
                     )
                     cache_len = k_pkv.shape[2] if k_pkv is not None else 0
                 if self._step_profile_enabled:
@@ -824,6 +842,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         or self._is_spec_decoding
                         or (kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0)
                         or not self._is_identity_hypo_ids(hypo_ids)
+                        or row_perm_applied
                         or underflow
                     )
                     self.module.set_remote_cache_reuse_enabled(reuse_allowed)

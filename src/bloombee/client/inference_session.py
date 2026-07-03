@@ -70,6 +70,9 @@ class _ServerInferenceSession:
         self._position = 0
         self.history = None  # Used in case of server failures to regenerate attention caches on new servers
         self.next_session = None
+        # Session-open logical batch. Pinned on the first step so active-row
+        # compaction (smaller later steps) keeps server KV allocation stable.
+        self._session_full_batch: Optional[int] = None
 
     @classmethod
     async def create(
@@ -136,6 +139,12 @@ class _ServerInferenceSession:
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
+            if self.history.shape[0] != inputs.shape[0]:
+                # Active-row compaction: the step batch shrank (or was permuted)
+                # mid-session. The full history is only replayed on the first
+                # (un-stepped) request; past that point only the width matters,
+                # so keep the leading compacted rows.
+                self.history = self.history[: inputs.shape[0]]
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # 将当前输入的最后n_input_tokens个token拼接到历史记录中
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
@@ -172,6 +181,14 @@ class _ServerInferenceSession:
             _infer_batch_dim(tree_attention_mask),
             1,
         )
+        # Pin the logical batch to the session-open batch. Active-row compaction
+        # sends SMALLER tensors on later steps; letting full_batch_size collapse
+        # with them would make the server re-derive KV allocation for a shrunken
+        # batch. The first step records the true session batch.
+        if self._session_full_batch is None:
+            self._session_full_batch = int(logical_full_batch_size)
+        else:
+            logical_full_batch_size = max(logical_full_batch_size, self._session_full_batch)
         push_only_decode = (
             self.config.use_server_to_server
             and getattr(self.config, "push_only_downstream_decode", False)

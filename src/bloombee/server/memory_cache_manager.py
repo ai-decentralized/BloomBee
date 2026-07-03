@@ -611,6 +611,59 @@ class KVCacheManager:
                         f"target={l_acc_target}: {e}"
                     )
     
+    def permute_batch_rows(self, perm: torch.Tensor, cache_tensors: Sequence[torch.Tensor] = None) -> None:
+        """Gather KV cache batch rows to the front, in place: new row i <- old row perm[i].
+
+        Active-row compaction sends the surviving (active) row indices as
+        ``perm`` (len B_active <= B_cache), so that this and subsequent smaller
+        steps read/write the contiguous first B_active rows. Rows beyond
+        len(perm) become dead; nothing reads them afterwards. The slab layout
+        is (S_total, B*H, D): batch row b covers BH[b*H:(b+1)*H].
+
+        Caller must hold the slab quiescent (call after wait_for_pending_reorder,
+        inside use_cache). Applies to both K and V. MIXED-device (CPU-offload
+        segmented) caches are not supported — compaction is fail-closed there.
+        """
+        if cache_tensors is None:
+            assert self._active_cache_tensors_stack, "permute_batch_rows called outside of use_cache context"
+            cache_tensors = self._active_cache_tensors_stack[-1]
+        (k_cache, v_cache), = cache_tensors
+        if hasattr(k_cache, "device") and getattr(getattr(k_cache, "device", None), "device_type", None) == DeviceType.MIXED:
+            raise RuntimeError(
+                "[ROW_COMPACT] permute_batch_rows is not supported on MIXED-device (offloaded) caches; "
+                "run without KV offload or disable BLOOMBEE_ACTIVE_ROW_COMPACTION"
+            )
+        k_data = k_cache.data if hasattr(k_cache, "data") else k_cache
+        v_data = v_cache.data if hasattr(v_cache, "data") else v_cache
+        S_total, BH_full, _D = k_data.shape
+        H = getattr(self.block_config, "num_attention_heads", 1)
+        B_cache = BH_full // H
+        perm = perm.to(device=k_data.device, dtype=torch.long)
+        n = perm.numel()
+        assert 0 < n <= B_cache, (
+            f"[ROW_COMPACT] perm has {n} entries but cache holds {B_cache} rows"
+        )
+        # Expand batch indices to BH indices: bh_perm[i*H + h] = perm[i]*H + h.
+        # Advanced indexing materializes the RHS before assignment, so the
+        # in-place front-gather is safe even when src/dst overlap.
+        bh_perm = (perm * H).repeat_interleave(H) + torch.arange(H, device=k_data.device).repeat(n)
+        k_data[:, : n * H, :] = k_data[:, bh_perm, :]
+        v_data[:, : n * H, :] = v_data[:, bh_perm, :]
+        # Paged-KV bookkeeping (if enabled) keys per-row state by batch index —
+        # remap it with the same gather; entries for dead rows are dropped.
+        tables = self._paged_tables_for_active(cache_tensors)
+        perm_list = perm.tolist()
+        if tables:
+            for table in tables:
+                old_seqs = dict(table._seqs)
+                new_seqs = {}
+                for new_idx, old_idx in enumerate(perm_list):
+                    if old_idx in old_seqs:
+                        new_seqs[new_idx] = old_seqs[old_idx]
+                table._seqs.clear()
+                table._seqs.update(new_seqs)
+        logger.info(f"[ROW_COMPACT] gathered {B_cache}->{n} KV rows to front (H={H}): perm={perm_list}")
+
     def tokens_left(self) -> int:
         return self.cache.tokens_left
 
@@ -636,6 +689,7 @@ class KVCacheManager:
         full_batch_size: int = 0,
         micro_batch_size: int = 0,
         cache_tensors: Sequence[torch.Tensor] = None,
+        requested_rows: int = 0,
     ):
         """
         Return standard KV for computation
@@ -643,6 +697,9 @@ class KVCacheManager:
         Convention:
         - Internal cache is stored along dimension (S, B*H, D)
         - If mixed device (MIXED), segments will be merged on compute_dst and returned
+        - requested_rows: if >0 and in full-batch mode, clamp the read to the first
+          requested_rows batch rows (active-row compaction: a shrunken step reads
+          only the contiguous compacted-active prefix of the cache)
         
         Args:
             prefix_length: Length of prefix to read from cache
@@ -743,12 +800,17 @@ class KVCacheManager:
             # Full batch mode
             BH_offset_start = 0
             BH_offset_end = BH_full
-            BH = BH_full
+            # Active-row compaction: a shrunken step's hidden batch is smaller than
+            # the allocated cache batch; read only the first requested_rows rows so
+            # layer_past matches the incoming hidden batch.
+            if requested_rows > 0:
+                BH_offset_end = min(BH_offset_end, requested_rows * H)
+            BH = BH_offset_end - BH_offset_start
             self._log_kv_once(
                 ("kv_read_mode", "full"),
                 "[MBPIPE_KV_VERIFY] KV READ mode: FULL BATCH",
             )
-            self._log_kv_detail(f"[MBPIPE_KV_VERIFY] Mode: FULL BATCH - reading BH[0:{BH_full}]")
+            self._log_kv_detail(f"[MBPIPE_KV_VERIFY] Mode: FULL BATCH - reading BH[0:{BH_offset_end}]")
 
         # Target device for computation (CPU/GPU)
         compute_dst = self.attention_compute  # 统一在计算设备上物化
@@ -2476,7 +2538,9 @@ class KVCacheManager:
                 max_ext_position = extended_position_ids[ext_valid_mask].max().item()
                 cache_len = int(max_ext_position) + 1
 
-                # 直接调用现有的 select_cache
+                # 直接调用现有的 select_cache. requested_rows=B keeps the read
+                # aligned with this step's row count when the client has shrunk
+                # the batch (active-row compaction) below the allocated cache B.
                 k_pkv, v_pkv, _ = cache_manager.select_cache(
                     prefix_length=cache_len,
                     hypo_ids=None,
@@ -2485,6 +2549,7 @@ class KVCacheManager:
                     full_batch_size=full_batch_size,
                     micro_batch_size=micro_batch_size,
                     cache_tensors=cache_tensors,
+                    requested_rows=int(B),
                 )
 
                 if k_pkv is None:
