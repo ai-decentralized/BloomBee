@@ -310,6 +310,17 @@ outputs = model.generate(
 
 By default, EAGLE-2 auto-selection is conservative and only picks known LLaMA-family drafter checkpoints. Pass `ea_model_path` explicitly for a custom compatible checkpoint. Runtime generation uses a compact tree budget by default; pass `tree_budget=59, topk_per_step=10` to reproduce the paper's total-token=60 tree. In current benchmarks, EAGLE-2 shows positive throughput on 13B-class targets and is recommended most strongly for 33B-class and larger targets, where target verification cost amortizes the drafter/tree overhead better.
 
+> **Measuring acceptance correctly.** EAGLE drafters are trained on the target's
+> conversation distribution, so the **prompt format and domain dominate the
+> measured acceptance length.** Use the model's chat template (for Vicuna:
+> `"A chat between a curious user ... USER: {q} ASSISTANT:"`) with
+> instruction-style prompts. On Vicuna-13B + `EAGLE-Vicuna-13B-v1.3` we measure
+> steady-state accept length **5.3–5.8 on code/math prompts**, ~3.3 on free-form
+> chat, ~5.0 averaged (matching EAGLE-2's reported ≈4). Generic non-chat text
+> (e.g. `"Topic 1: ..."`) is out-of-distribution and collapses acceptance to
+> ~2.4, which silently understates speculative-decoding throughput. Always report
+> the prompt set used alongside acceptance numbers.
+
 Available auto classes:
 
 | Class | Use case |
