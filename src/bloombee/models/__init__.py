@@ -4,3 +4,4 @@ from bloombee.models.gemma4 import *
 from bloombee.models.llama import *
 from bloombee.models.mixtral import *
 from bloombee.models.qwen3 import *
+from bloombee.models.deepseekv3 import *
