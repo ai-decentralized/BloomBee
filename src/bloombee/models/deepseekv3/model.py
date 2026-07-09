@@ -141,6 +141,7 @@ class DistributedDeepseekV3Model(DefaultRevisionMixin, FromPretrainedMixin, PTun
 class DistributedDeepseekV3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, DeepseekV3ForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedDeepseekV3Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedDeepseekV3Model._keys_to_ignore_on_load_unexpected
+    _supports_cache_class = True
 
     config_class = DistributedDeepseekV3Config
 

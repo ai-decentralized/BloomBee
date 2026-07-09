@@ -5,6 +5,7 @@ from accelerate import init_empty_weights
 from transformers import PretrainedConfig, PreTrainedModel
 
 from bloombee.models.bloom.block import WrappedBloomBlock
+from bloombee.models.deepseekv3.block import WrappedDeepseekV3Block
 from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.gemma4.block import WrappedGemma4Block
 from bloombee.models.mixtral.block import WrappedMixtralBlock
@@ -112,6 +113,10 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0, 
         return config.block_class(config, layer_idx)
     elif config.block_class == WrappedGemma4Block:
         dprint('server/block_utils.py config.block_class == WrappedGemma4Block ')
+        config = _autoset_attn_impl(config)
+        return config.block_class(config, layer_idx)
+    elif config.block_class == WrappedDeepseekV3Block:
+        dprint('server/block_utils.py config.block_class == WrappedDeepseekV3Block ')
         config = _autoset_attn_impl(config)
         return config.block_class(config, layer_idx)
     # config.block_class == WrappedLlamaBlock in distributedllamaconfig in config.py
