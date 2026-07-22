@@ -13,6 +13,16 @@ from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache,
 
 class WrappedDeepseekV3Block(DeepseekV3DecoderLayer):
     def __init__(self, config: DeepseekV3Config, layer_idx: int):
+        # DeepseekV3MoE's expert dispatch reads config._experts_implementation at
+        # forward time and falls back to a *different, buggy* default kernel path
+        # when it's left as None (the transformers.integrations.moe warning calls
+        # this the "standalone module" case, which is exactly what a bare
+        # DecoderLayer is here -- BloomBee never builds the full DeepseekV3Model
+        # that would normally set this). Left unset, MoE layers emit inf/nan on
+        # single-token forward passes, i.e. every decode step after prefill.
+        if getattr(config, "_experts_implementation", None) is None:
+            config._experts_implementation = "eager"
+
         super().__init__(config, layer_idx)
 
         self._attn_implementation = config._attn_implementation
