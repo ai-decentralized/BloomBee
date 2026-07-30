@@ -51,20 +51,56 @@ def get_block_size(
         # it, the FlexGen llama path ran a full weight download + numpy
         # conversion (13 GB for llama-7b) into the dummy "/tmp" path just to
         # estimate block size.
-        block = get_model_block(config, env, policy, dummy_weight_home, "/tmp", skip_init_weights=True)
-        n_params = sum(param.numel() for param in block.parameters())
+        #
+        # Block param count can depend on layer_idx: e.g. DeepSeek-V3's
+        # first_k_dense_replace makes early layers a single dense MLP while
+        # later layers hold all routed+shared experts (~20x the params). A
+        # single-layer_idx sample (previously always layer_idx=0, i.e. always
+        # dense) would badly undercount the memory Server._choose_num_blocks
+        # reserves per block, risking OOM once a heavier block is assigned.
+        # Sample every layer position and keep the largest so capacity
+        # planning reflects the worst-case block this config can produce.
+        #
+        # Also track how many of those params live in DeepSeek-V3's batched
+        # expert tensors (block.mlp.experts.{gate_up_proj,down_proj}), since
+        # convert_block() quantizes only those to int8 -- everything else in
+        # the block (attention, router, dense MLP layers) stays at `dtype`.
+        n_params = 0
+        n_expert_params = 0
+        for layer_idx in range(getattr(config, "num_hidden_layers", 1)):
+            block = get_model_block(
+                config, env, policy, dummy_weight_home, "/tmp", layer_idx=layer_idx, skip_init_weights=True
+            )
+            total = sum(param.numel() for param in block.parameters())
+            if total < n_params:
+                continue
+            experts = getattr(getattr(block, "mlp", None), "experts", None)
+            expert_params = 0
+            if experts is not None and hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj"):
+                expert_params = experts.gate_up_proj.numel() + experts.down_proj.numel()
+            n_params, n_expert_params = total, expert_params
 
     if location == "memory":
-        # Note: quant_type is always NONE (quantization CLI removed)
-        if quant_type != QuantType.NONE:
-            raise ValueError(f"Quantization is not supported. quant_type must be NONE, got {quant_type}")
         dtype = resolve_block_dtype(config, dtype)
         bytes_per_value = get_size_in_bytes(dtype)
+        if quant_type == QuantType.NONE:
+            return round(n_params * bytes_per_value * (1 + eps))
+        if quant_type is not QuantType.INT8 or config.block_class is not WrappedDeepseekV3Block:
+            raise ValueError(
+                f"quant_type={quant_type} is not supported for block_class={config.block_class.__name__}; "
+                "only QuantType.INT8 for DeepSeek-V3 is implemented (see convert_block())."
+            )
+        # Quantized experts: ~1 byte/param (int8) plus the group scale table, which
+        # `eps` already accounts for at group_size=128 (~1/128 the tensor's element
+        # count, at 2-4 bytes each -- well under the 1% eps budget). Everything else
+        # in the block (attention, router, dense layers) stays at `bytes_per_value`.
+        non_expert_params = n_params - n_expert_params
+        quantized_bytes = n_expert_params * 1 + non_expert_params * bytes_per_value
+        return round(quantized_bytes * (1 + eps))
     elif location == "disk":
         dtype = resolve_block_dtype(config, "auto")
         bytes_per_value = get_size_in_bytes(dtype)
-
-    return round(n_params * bytes_per_value * (1 + eps))
+        return round(n_params * bytes_per_value * (1 + eps))
 
 
 def _autoset_attn_impl(config):

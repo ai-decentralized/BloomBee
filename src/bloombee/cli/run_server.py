@@ -10,6 +10,7 @@ from humanfriendly import parse_size
 
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 from bloombee.server.server import Server
+from bloombee.utils.convert_block import QuantType
 from bloombee.utils.version import validate_version
 
 logger = get_logger(__name__)
@@ -59,6 +60,10 @@ def main():
                         help='Timeout for the libp2p daemon connecting to initial peers')
 
     parser.add_argument('--compression', type=str, default='NONE', required=False, help='Tensor compression communication')
+
+    parser.add_argument('--quant_type', type=str, choices=['NONE', 'INT8'], default='NONE', required=False,
+                        help='Weight quantization type. Currently only INT8 is supported, and only for '
+                             "DeepSeek-V3's MoE expert weights (~98%% of its params) -- see convert_block().")
 
     parser.add_argument('--num_handlers', type=int, default=8, required=False,
                         help='server will use this many processes to handle incoming requests')
@@ -201,6 +206,8 @@ def main():
 
     compression_type = args.pop("compression").upper()
     compression = getattr(CompressionType, compression_type)
+
+    args["quant_type"] = QuantType[args.pop("quant_type").upper()]
 
     max_disk_space = args.pop("max_disk_space")
     if max_disk_space is not None:
