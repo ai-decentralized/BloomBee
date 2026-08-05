@@ -13,7 +13,7 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_CACHE` | `~/.cache/bloombee` | Cache directory for downloaded blocks and local BloomBee artifacts. |
 | `BLOOMBEE_LOGGING` | `True` | Set to `0` / `false` to disable BloomBee's logging initialization tweaks. |
 | `BLOOMBEE_ASYNCIO_LOGLEVEL` | `FATAL` (or `DEBUG` if Hivemind is already in debug mode) | Overrides the asyncio logger level. |
-| `BLOOMBEE_IGNORE_DEPENDENCY_VERSION` | unset | Skips the `transformers>=4.43.1,<4.44.0` version assertion. |
+| `BLOOMBEE_IGNORE_DEPENDENCY_VERSION` | unset | Skips the `transformers>=5.5.0` version assertion. |
 | `BLOOMBEE_MAX_RETRIES` | unset | Client-side retry limit before raising an exception. |
 | `BLOOMBEE_FAST_GENERATE` | `0` | Opt-in fast-path generation on the client. See `client/remote_generation.py` for the trade-offs (skips some safety checks for lower per-step overhead). |
 
@@ -52,6 +52,19 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_ENABLE_KV_WAIT_TIMING` | `1` | Enables KV wait timing counters and logs. |
 | `BLOOMBEE_VERBOSE_KV_LOGS` | `0` | Restores verbose KV allocation / offload / prefetch logs. Also turns on automatically if the KV debug group is enabled. |
 | `BLOOMBEE_PAGED_KV` | `0` | Opt-in Phase 2 paged-KV shim. Aliases per-handle PagedKVTable onto the same slab as the regular cache; only takes effect when set to `1`. |
+
+## Speculative Decoding and EAGLE-2
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BLOOMBEE_FAST_GENERATE` | `0` | Enables the client-side greedy generate fast path when the request is eligible. |
+| `BLOOMBEE_DRAFTER` | unset | Overrides the default SSM speculative drafter checkpoint. |
+| `BLOOMBEE_EAGLE_DRAFTER` | unset | Overrides EAGLE-2 drafter auto-selection with an explicit compatible checkpoint. |
+| `BLOOMBEE_EAGLE_TREE_BUDGET` | `10` | Default EAGLE-2 draft-node budget used by runtime generation. Set this to `59` to reproduce the paper's total-token=60 tree because BloomBee does not count the root token here. |
+| `BLOOMBEE_EAGLE_DEPTH` | `5` | Official EAGLE-2 dynamic-tree depth used when an explicit tree budget is active. |
+| `BLOOMBEE_EAGLE_TOPK_PER_STEP` | auto | Overrides EAGLE-2 per-layer expansion width. The automatic value keeps compact trees narrow and uses `10` for paper-style trees. |
+| `BLOOMBEE_DISABLE_LOCAL_TREE_MASK` | `0` | Disables the compact local EAGLE tree mask and sends the legacy dense `[batch, tree, cache+tree]` mask instead. |
+| `BLOOMBEE_DISABLE_COMPACT_SPEC_RESPONSE` | `0` | Disables compact speculative RPC responses. By default speculative stages return only hidden states and keep indices; downstream routing reuses the original request metadata. |
 
 ## Lossless Transport and Compression Profiling
 
@@ -122,5 +135,5 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 If you add a new switch later, this command is the quickest way to rescan the repository:
 
 ```bash
-rg -n -o "BLOOMBEE_[A-Z0-9_]+" README.md src benchmarks tests | sort -u
+rg -n -o "BLOOMBEE_[A-Z0-9_]+" README*.md src benchmarks tests | sort -u
 ```

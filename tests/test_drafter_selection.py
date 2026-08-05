@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import os
+from types import SimpleNamespace
 
 import pytest
+import torch
 
+from bloombee.models.llama.eagle_drafter import EAGLEDrafter, select_eagle_drafter_for_target
 from bloombee.models.llama.spec_decoding_drafter import (
     _DEFAULT_DRAFTER,
     select_drafter_for_target,
@@ -62,3 +64,75 @@ def test_llama3_disambiguation_by_path():
     assert src_l2 == "registry:llama"
     assert drafter_id_l3.startswith("meta-llama/Llama-3")
     assert src_l3 == "registry:llama3"
+
+
+@pytest.mark.parametrize(
+    "name,hidden,expected,source",
+    [
+        (
+            "NousResearch/Llama-2-13b-chat-hf",
+            5120,
+            "yuhuili/EAGLE-llama2-chat-13B",
+            "registry:llama2-chat",
+        ),
+        (
+            "lmsys/vicuna-33b-v1.3",
+            6656,
+            "yuhuili/EAGLE-Vicuna-33B-v1.3",
+            "registry:vicuna",
+        ),
+        (
+            "meta-llama/Llama-3-8B-Instruct",
+            4096,
+            "yuhuili/EAGLE-LLaMA3-Instruct-8B",
+            "registry:llama3",
+        ),
+    ],
+)
+def test_eagle_registry_picks_target_family_checkpoint(name, hidden, expected, source):
+    cfg = SimpleNamespace(model_type="llama", hidden_size=hidden, _name_or_path=name)
+    drafter_id, actual_source = select_eagle_drafter_for_target(cfg)
+    assert drafter_id == expected
+    assert actual_source == source
+
+
+def test_eagle_registry_fails_closed_for_unknown_llama():
+    cfg = SimpleNamespace(model_type="llama", hidden_size=4096, _name_or_path="huggyllama/llama-7b")
+    with pytest.raises(ValueError, match="Could not infer"):
+        select_eagle_drafter_for_target(cfg)
+
+
+def test_eagle_registry_rejects_non_llama_target():
+    cfg = SimpleNamespace(model_type="qwen3", hidden_size=4096, _name_or_path="Qwen/Qwen3-14B")
+    with pytest.raises(ValueError, match="LLaMA-family"):
+        select_eagle_drafter_for_target(cfg)
+
+
+def test_eagle_env_override_wins(monkeypatch):
+    monkeypatch.setenv("BLOOMBEE_EAGLE_DRAFTER", "myorg/my-eagle-head")
+    cfg = SimpleNamespace(model_type="qwen3", hidden_size=4096, _name_or_path="Qwen/Qwen3-14B")
+    drafter_id, source = select_eagle_drafter_for_target(cfg)
+    assert drafter_id == "myorg/my-eagle-head"
+    assert source == "env"
+
+
+def test_eagle_loads_local_drafter_directory(tmp_path):
+    ckpt = tmp_path / "pytorch_model.bin"
+    torch.save({"layers.0.self_attn.q_proj.weight": torch.ones(1)}, ckpt)
+
+    class FakeHead:
+        def __init__(self):
+            self.loaded = None
+
+        def load_state_dict(self, state_dict, strict=False):
+            self.loaded = (state_dict, strict)
+            return [], []
+
+    drafter = object.__new__(EAGLEDrafter)
+    drafter.head = FakeHead()
+
+    drafter._load_eagle_weights(str(tmp_path))
+
+    state_dict, strict = drafter.head.loaded
+    assert strict is False
+    assert "layer.self_attn.q_proj.weight" in state_dict

@@ -134,6 +134,9 @@ class _ServerInferenceSession:
         self._position = 0
         self.history = None  # Used in case of server failures to regenerate attention caches on new servers
         self.next_session = None
+        # Session-open logical batch. Pinned on the first step so active-row
+        # compaction (smaller later steps) keeps server KV allocation stable.
+        self._session_full_batch: Optional[int] = None
 
     @classmethod
     async def create(
@@ -195,14 +198,17 @@ class _ServerInferenceSession:
         """
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
-        if is_spec_dec:
-            n_input_tokens = 0 if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
-        else:
-            n_input_tokens = inputs.shape[1]
+        n_input_tokens = inputs.shape[1]
         # print('client step() n_input_tokens', n_input_tokens)
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
+            if self.history.shape[0] != inputs.shape[0]:
+                # Active-row compaction: the step batch shrank (or was permuted)
+                # mid-session. The full history is only replayed on the first
+                # (un-stepped) request; past that point only the width matters,
+                # so keep the leading compacted rows.
+                self.history = self.history[: inputs.shape[0]]
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
@@ -239,12 +245,19 @@ class _ServerInferenceSession:
             _infer_batch_dim(tree_attention_mask),
             1,
         )
+        # Pin the logical batch to the session-open batch. Active-row compaction
+        # sends SMALLER tensors on later steps; letting full_batch_size collapse
+        # with them would make the server re-derive KV allocation for a shrunken
+        # batch. The first step records the true session batch.
+        if self._session_full_batch is None:
+            self._session_full_batch = int(logical_full_batch_size)
+        else:
+            logical_full_batch_size = max(logical_full_batch_size, self._session_full_batch)
         push_only_decode = (
             self.config.use_server_to_server
             and getattr(self.config, "push_only_downstream_decode", False)
             and self.stepped
             and self.span.start > 0
-            and not is_spec_dec
         )
         transport_phase = "push_only_decode" if push_only_decode else (
             "spec_decode" if is_spec_dec else ("prefill" if not self.stepped else "decode")
@@ -269,9 +282,37 @@ class _ServerInferenceSession:
                 # carry control flags such as is_spec_dec.
                 use_compact_decode_layout = not is_spec_dec
                 if use_compact_decode_layout:
+                    has_attention_payload = tree_attention_mask is not None and not is_dummy(tree_attention_mask)
                     has_prompt_payload = prompts is not None and not is_dummy(prompts)
                     has_hypo_payload = hypo_ids is not None and not is_dummy(hypo_ids)
-                    if has_prompt_payload or has_hypo_payload:
+                    if has_attention_payload:
+                        # Non-spec prefill can still need a padding mask
+                        # (right-padded batches). Reuse the wide tensor layout
+                        # so the server receives tree_attention_mask, but keep
+                        # is_spec_dec unset in metadata so execution remains a
+                        # normal target-model forward.
+                        input_tensors = (
+                            inputs,
+                            normalize_arg(keep_indices),
+                            normalize_arg(tree_attention_mask),
+                            DUMMY_INT64,
+                            DUMMY_INT64,
+                            normalize_arg(prefill_length),
+                            prompts,
+                            hypo_ids,
+                        )
+                        tensor_debug_names = (
+                            "hidden_states",
+                            "keep_indices",
+                            "tree_attention_mask",
+                            "kv_cache_position_ids",
+                            "draft_tokens",
+                            "prefill_length",
+                            "prompts",
+                            "hypo_ids",
+                        )
+                        regular_layout_name = "spec_compact_v1"
+                    elif has_prompt_payload or has_hypo_payload:
                         input_tensors = (
                             inputs,
                             normalize_arg(keep_indices),
@@ -334,12 +375,12 @@ class _ServerInferenceSession:
                 request_metadata["inference_layout"] = (
                     regular_layout_name if use_compact_decode_layout else "spec_compact_v1"
                 )
-                if is_spec_dec:
-                    request_metadata["start_from_position"] = self._position + n_input_tokens
-                elif self._position is not None:
+                if self._position is not None:
                     request_metadata["start_from_position"] = self._position
-                # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER
-                # Speculative decoding keeps strict full-batch semantics; avoid cross-stage push.
+                # Enable server-to-server communication to trigger CROSS_GPU_TRANSFER.
+                # Speculative downstream stages use the same push-only receive
+                # path as normal decode; the server includes the current tree/KV
+                # payload whenever a spec step still has downstream stages.
                 if self.config.use_server_to_server:
                     next_servers = self._collect_next_servers()
                     if next_servers:
@@ -609,6 +650,7 @@ class InferenceSession:
         draft_tokens: Optional[torch.Tensor] = None,
         is_spec_decoding: Optional[torch.Tensor] = None,
         prefill_length: Optional[torch.Tensor] = None,
+        need_pruning: bool = False,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -648,7 +690,7 @@ class InferenceSession:
             batch_size = inputs.shape[0] if inputs.ndim >= 1 else 1
             mbpipe_log_path_entry(logger, "client.InferenceSession.step", batch_size=batch_size)
 
-        n_input_tokens = inputs.shape[1] if kv_cache_position_ids is None else kv_cache_position_ids[0].numel()
+        n_input_tokens = inputs.shape[1]
         if self._position + n_input_tokens > self._max_length:
             raise ValueError(
                 f"Maximum length exceeded: prefix {self._position} + current {n_input_tokens} exceeds pre-allocated maximum {self._max_length}"
@@ -672,7 +714,7 @@ class InferenceSession:
             is_spec_dec = bool(is_spec_decoding.detach().bool().any().item()) if is_spec_decoding.numel() > 0 else False
         else:
             is_spec_dec = bool(is_spec_decoding)
-        need_pruning = is_spec_dec
+        need_pruning = bool(need_pruning) and is_spec_dec
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
                 logger.debug(f"Inference: block {block_idx}, attempt {attempt_no}")

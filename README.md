@@ -60,6 +60,7 @@ Running an LLM across decentralized GPUs is bottlenecked by inter-node bandwidth
 - [Environment Switches](README.environment-switches.md)
 - [Logging Reference](README.logging.md)
 - [Python API](#python-api)
+  - [Speculative Decoding (EAGLE-2)](#speculative-decoding-eagle-2)
 - [Benchmarking](#benchmarking)
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
@@ -275,12 +276,13 @@ Loads and serves transformer blocks on a peer in the swarm.
 - KV cache and offload flags
 - lossless compression and profiling flags
 - debug groups and log-channel toggles
+- speculative decoding and EAGLE-2 flags
 - activation dumping and runtime helpers
 
 If you add a new switch later, the quickest rescan command is:
 
 ```bash
-rg -n -o "BLOOMBEE_[A-Z0-9_]+" README.md src benchmarks tests | sort -u
+rg -n -o "BLOOMBEE_[A-Z0-9_]+" README*.md src benchmarks tests | sort -u
 ```
 
 ---
@@ -311,6 +313,45 @@ with model.transformer.h.inference_session(max_length=512) as sess:
     for _ in range(20):
         outputs = model.generate(max_new_tokens=1, session=sess)
 ```
+
+### Speculative Decoding (EAGLE-2)
+
+EAGLE-2 speculative decoding is available for LLaMA-family targets through the speculative auto class and EAGLE drafter:
+
+```python
+from transformers import AutoTokenizer
+from bloombee import AutoDistributedSpeculativeModel
+from bloombee.models.llama.eagle_drafter import EAGLEDrafter
+
+model_name = "lmsys/vicuna-33b-v1.3"
+model = AutoDistributedSpeculativeModel.from_pretrained(
+    model_name,
+    initial_peers=["/ip4/YOUR_IP/tcp/31340/p2p/Qm..."],
+).to("cuda")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+drafter = EAGLEDrafter.for_target(model, device="cuda")
+
+input_ids = tokenizer("The quick brown fox", return_tensors="pt")["input_ids"].to("cuda")
+outputs = model.generate(
+    input_ids,
+    drafter=drafter,
+    max_new_tokens=128,
+    max_tree_depth=5,
+)
+```
+
+By default, EAGLE-2 auto-selection is conservative and only picks known LLaMA-family drafter checkpoints. Pass `ea_model_path` explicitly for a custom compatible checkpoint. Runtime generation uses a compact tree budget by default; pass `tree_budget=59, topk_per_step=10` to reproduce the paper's total-token=60 tree. In current benchmarks, EAGLE-2 shows positive throughput on 13B-class targets and is recommended most strongly for 33B-class and larger targets, where target verification cost amortizes the drafter/tree overhead better.
+
+> **Measuring acceptance correctly.** EAGLE drafters are trained on the target's
+> conversation distribution, so the **prompt format and domain dominate the
+> measured acceptance length.** Use the model's chat template (for Vicuna:
+> `"A chat between a curious user ... USER: {q} ASSISTANT:"`) with
+> instruction-style prompts. On Vicuna-13B + `EAGLE-Vicuna-13B-v1.3` we measure
+> steady-state accept length **5.3–5.8 on code/math prompts**, ~3.3 on free-form
+> chat, ~5.0 averaged (matching EAGLE-2's reported ≈4). Generic non-chat text
+> (e.g. `"Topic 1: ..."`) is out-of-distribution and collapses acceptance to
+> ~2.4, which silently understates speculative-decoding throughput. Always report
+> the prompt set used alongside acceptance numbers.
 
 Available auto classes:
 
@@ -378,13 +419,11 @@ Jupyter notebook examples are in the `examples/` directory:
 - Use a smaller `--max_batch_size`.
 
 **`transformers` version mismatch**
-- On `main`, BloomBee requires `transformers>=4.43.1,<4.44.0`:
+- Current source installs and checks for Transformers 5.x:
   ```bash
-  pip install "transformers>=4.43.1,<4.44.0"
-  ```
-- On `arch-reform-qwen3-4b` (Transformers 5.x + Qwen3), use:
-  ```bash
-  pip install "transformers>=5.5,<5.6"
+  pip install -e .
+  # or, if repairing an existing environment:
+  pip install "transformers>=5.5.0"
   ```
 
 **Slow inference / high latency**

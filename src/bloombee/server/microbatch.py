@@ -168,7 +168,11 @@ def build_cross_stage_push_metadata(
     push_timestamp_us: int,
     extra_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    push_metadata = dict(step_metadata or {})
+    push_metadata = {
+        key: value
+        for key, value in (step_metadata or {}).items()
+        if not str(key).startswith("_")
+    }
     push_metadata.update(
         {
             "micro_batch_idx": mb_idx,

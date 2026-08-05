@@ -16,6 +16,7 @@ from hivemind.utils.logging import get_logger, use_hivemind_log_handler
 from hivemind.utils.networking import log_visible_maddrs
 
 from bloombee.server.reachability import ReachabilityProtocol
+from bloombee.utils.p2p import get_default_p2p_max_msg_size
 
 use_hivemind_log_handler("in_root_logger")
 logger = get_logger(__name__)
@@ -80,6 +81,12 @@ def main():
     parser.add_argument(
         "--refresh_period", type=int, default=30, help="Period (in seconds) for fetching the keys from DHT"
     )
+    parser.add_argument(
+        "--p2p_max_msg_size",
+        type=int,
+        default=get_default_p2p_max_msg_size(),
+        help="Maximum libp2p persistent-connection message size in bytes",
+    )
 
     args = parser.parse_args()
 
@@ -92,6 +99,7 @@ def main():
         identity_path=args.identity_path,
         use_relay=args.use_relay,
         use_auto_relay=args.use_auto_relay,
+        persistent_conn_max_msg_size=args.p2p_max_msg_size,
     )
     log_visible_maddrs(dht.get_visible_maddrs(), only_p2p=args.use_ipfs)
 

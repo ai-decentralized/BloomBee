@@ -40,17 +40,21 @@ def should_split_batch(batch_size: int) -> bool:
 
 
 
-def compute_micro_batch_ranges(batch_size: int) -> List[Tuple[int, int]]:
+def compute_micro_batch_ranges(
+    batch_size: int,
+    micro_batch_size: Optional[int] = None,
+) -> List[Tuple[int, int]]:
     """
     Compute the (start, end) ranges for each micro-batch.
-    
+
     Args:
         batch_size: The total batch size.
-        
+
     Returns:
         A list of (start, end) tuples for each micro-batch.
     """
-    micro_batch_size = get_micro_batch_size()
+    if micro_batch_size is None:
+        micro_batch_size = get_micro_batch_size()
 
     if batch_size <= 0:
         return []
