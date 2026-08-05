@@ -217,11 +217,11 @@ def get_memory_stats() -> dict:
 def see_memory_usage(message: str, force: bool = True):
 	"""Print current memory usage with a message."""
 	stats = get_memory_stats()
-	logger = f"{message}\n"
-	logger += f"Nvidia-smi: {stats['nvidia_smi_used']:.2f} GB\n"
-	logger += f"Memory Allocated: {stats['torch_allocated']:.2f} GB\n"
-	logger += f"Max Memory Allocated: {stats['torch_max_allocated']:.2f} GB\n"
-	print(logger)
+	report = f"{message}\n"
+	report += f"Nvidia-smi: {stats['nvidia_smi_used']:.2f} GB\n"
+	report += f"Memory Allocated: {stats['torch_allocated']:.2f} GB\n"
+	report += f"Max Memory Allocated: {stats['torch_max_allocated']:.2f} GB\n"
+	print(report)
 
 def memlog_enabled() -> bool:
 	"""Return True if memory logging is enabled via env var BB_MEMLOG."""

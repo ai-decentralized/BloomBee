@@ -33,6 +33,20 @@ _MHA_GEN_DECODE_PROBE_EMITTED = False
 _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = False
 
 
+def _kv_cache_shape_from_descriptor(config, task, policy, descriptor=None):
+    num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+        config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
+        policy.gpu_batch_size)
+    if descriptor is not None and len(descriptor.shape) == 4:
+        _, desc_num_heads, desc_head_dim, _ = descriptor.shape
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
+        return shape, desc_num_heads
+
+    head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
+    shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
+    return shape, num_attention_heads
+
+
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device
     from bloombee.flexgen_utils import compression
@@ -260,9 +274,9 @@ class TorchTensor:
     def smart_copy(self, dst, src_indices=None):
         if self.device == dst:
             if src_indices is not None:
-                # 假设 self.data 是一个 torch.Tensor
+                # Assume self.data is a torch.Tensor
                 sliced_data = self.data[src_indices]
-                # 创建一个新的 wrapper 对象（类型和 self 一样）
+                # Create a new wrapper object of the same type as self
                 new_obj = self.create_from_torch(
                     sliced_data, device=self.device, name=self.name
                 )
@@ -468,9 +482,6 @@ class TorchDevice:
         return TorchTensor.create_from_torch(ids, self)
 
     def init_cache_one_gpu_batch(self, config, task, policy, descriptor=None):
-        num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
-            policy.gpu_batch_size)
         # A per-block TensorDescriptor, when supplied, is the source of truth
         # for (num_heads, head_dim). BloomBee's heterogeneous-layer families
         # (Gemma-4: sliding head_dim=256 vs full head_dim=512) need this
@@ -478,13 +489,9 @@ class TorchDevice:
         # it globally collapses full layers onto the sliding D and the KV
         # write path later asserts D mismatch. For uniform families (Llama,
         # Qwen3, Mixtral, Bloom, Falcon) no descriptor is passed and we fall
-        # back to the legacy config-driven shape.
-        if descriptor is not None and len(descriptor.shape) == 4:
-            _, desc_num_heads, desc_head_dim, _ = descriptor.shape
-            shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
-        else:
-            head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
-            shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
+        # back to the legacy config-driven shape. Memory-cache tests still
+        # pass 3D token descriptors, which are not per-block KV descriptors.
+        shape, _ = _kv_cache_shape_from_descriptor(config, task, policy, descriptor)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -677,6 +684,10 @@ class TorchDevice:
             f"q_proj rows={qkv_hidden_size} must be divisible by num_attention_heads={num_attention_heads}"
         )
         head_dim = qkv_hidden_size // num_attention_heads
+        # GQA/MQA: k/v projections may produce fewer heads than q. They are
+        # broadcast to num_attention_heads right after rotary, so the cache
+        # and everything below keeps the MHA layout.
+        num_kv_heads = w_k.shape[0] // head_dim
         
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
@@ -688,14 +699,18 @@ class TorchDevice:
         v = F.linear(hidden, w_v.data)
         
         q = q.view(bsz, q_len, num_attention_heads, head_dim)
-        k = k.view(bsz, q_len, num_attention_heads, head_dim)
-        v = v.view(bsz, q_len, num_attention_heads, head_dim)
+        k = k.view(bsz, q_len, num_kv_heads, head_dim)
+        v = v.view(bsz, q_len, num_kv_heads, head_dim)
         
         if rotary_position_ids is not None:
             freqs_slice = freq_cis
         else:
             freqs_slice = freq_cis[:q_len]
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
+        if num_kv_heads < num_attention_heads:
+            groups = num_attention_heads // num_kv_heads
+            k = k.repeat_interleave(groups, dim=2)
+            v = v.repeat_interleave(groups, dim=2)
         
         # (b * n_head, s, d), (b * n_head, d, s), (b * n_head, s, d)
         q = q.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
@@ -749,6 +764,9 @@ class TorchDevice:
             f"q_proj rows={qkv_hidden_size} must be divisible by n_head={n_head}"
         )
         head_dim = qkv_hidden_size // n_head
+        # GQA/MQA: see mha_llama; new k/v are broadcast to n_head below so the
+        # cache keeps its (s, b * n_head, head_dim) layout.
+        num_kv_heads = w_k.shape[0] // head_dim
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
 
@@ -761,10 +779,10 @@ class TorchDevice:
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
         
-        # shape: (b, 1, n_head, head_dim)
+        # shape: (b, 1, n_head, head_dim) for q; (b, 1, n_kv, head_dim) for k/v
         q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, n_head, head_dim)
-        v = v.view(b, tgt_s, n_head, head_dim)
+        k = k.view(b, tgt_s, num_kv_heads, head_dim)
+        v = v.view(b, tgt_s, num_kv_heads, head_dim)
         
         # logger.info(f"after projection, query_states: {q}")
         # logger.info(f"after projection, key_states: {k}")
@@ -782,9 +800,10 @@ class TorchDevice:
             freqs_slice = freq_cis[src_s - tgt_s: src_s]
         
         q, k = apply_rotary_emb(q, k, freqs_cis=freqs_slice)
-        
-        # logger.info(f"after rotary, query_states: {q}")
-        # logger.info(f"after rotary, key_states: {k}")
+        if num_kv_heads < n_head:
+            groups = n_head // num_kv_heads
+            k = k.repeat_interleave(groups, dim=2)
+            v = v.repeat_interleave(groups, dim=2)
         
         # shape: (b * n_head, 1, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
@@ -1154,15 +1173,7 @@ class TorchDisk:
             os.remove(tensor.data)
 
     def init_cache_one_gpu_batch(self, config, task, policy, descriptor=None):
-        num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
-            policy.gpu_batch_size)
-        if descriptor is not None and len(descriptor.shape) == 4:
-            _, desc_num_heads, desc_head_dim, _ = descriptor.shape
-            shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
-        else:
-            head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
-            shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
+        shape, _ = _kv_cache_shape_from_descriptor(config, task, policy, descriptor)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
@@ -1230,17 +1241,7 @@ class TorchMixedDevice:
                 x.delete()
 
     def init_cache_one_gpu_batch(self, config, task, policy, descriptor=None):
-        num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
-            policy.gpu_batch_size)
-        if descriptor is not None and len(descriptor.shape) == 4:
-            _, desc_num_heads, desc_head_dim, _ = descriptor.shape
-            num_heads_for_shape = desc_num_heads
-            shape = (prompt_len + gen_len - 1, gpu_batch_size * desc_num_heads, desc_head_dim)
-        else:
-            head_dim = getattr(config, "head_dim", None) or (hidden_size // num_attention_heads)
-            num_heads_for_shape = num_attention_heads
-            shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
+        shape, num_heads_for_shape = _kv_cache_shape_from_descriptor(config, task, policy, descriptor)
 
         # We have to round to a multiple of `num_head`
         if policy.cache_disk_percent == 0:

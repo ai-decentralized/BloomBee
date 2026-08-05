@@ -26,6 +26,7 @@ from bloombee.utils.lossless_transport import (
 )
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import normalize_arg
+from bloombee.utils.real_activation_dumper import capture_wire_activation
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -36,6 +37,69 @@ from bloombee.utils.microbatch_config import (
 )
 
 logger = get_logger(__name__)
+
+
+_FLOATING_WIRE_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+
+
+def _dtype_name(dtype: Optional[torch.dtype]) -> str:
+    return "" if dtype is None else str(dtype).replace("torch.", "")
+
+
+def _is_floating_wire_dtype(dtype: Optional[torch.dtype]) -> bool:
+    return dtype in _FLOATING_WIRE_DTYPES
+
+
+def _server_hidden_states_wire_dtype(server_side_inference_schema) -> Optional[torch.dtype]:
+    try:
+        dtype = server_side_inference_schema[0].dtype
+    except Exception:
+        return None
+    return dtype if _is_floating_wire_dtype(dtype) else None
+
+
+def _prepare_rpc_inference_tensor_for_wire(
+    tensor: torch.Tensor,
+    tensor_name: str,
+    compression: runtime_pb2.CompressionType,
+    server_hidden_states_dtype: Optional[torch.dtype],
+) -> Tuple[torch.Tensor, BatchTensorDescriptor, dict]:
+    original_dtype = tensor.dtype if torch.is_tensor(tensor) else None
+    schema_dtype = server_hidden_states_dtype if tensor_name == "hidden_states" else None
+    target_dtype = original_dtype
+    dtype_guard_applied = 0
+
+    if (
+        tensor_name == "hidden_states"
+        and torch.is_tensor(tensor)
+        and torch.is_floating_point(tensor)
+        and _is_floating_wire_dtype(schema_dtype)
+    ):
+        target_dtype = schema_dtype
+        dtype_guard_applied = int(original_dtype != target_dtype)
+
+    wire_tensor = tensor
+    if torch.is_tensor(wire_tensor):
+        if target_dtype is not None and wire_tensor.dtype != target_dtype:
+            wire_tensor = wire_tensor.to(target_dtype)
+        if not wire_tensor.is_contiguous():
+            wire_tensor = wire_tensor.contiguous()
+
+    proto = BatchTensorDescriptor.from_tensor(wire_tensor, compression)
+    debug_fields = {
+        "compute_dtype": _dtype_name(original_dtype),
+        "schema_dtype": _dtype_name(schema_dtype),
+        "wire_dtype": _dtype_name(wire_tensor.dtype if torch.is_tensor(wire_tensor) else None),
+        "dtype_guard_applied": dtype_guard_applied,
+        "upcast_suspect": int(
+            tensor_name == "hidden_states"
+            and original_dtype == torch.float32
+            and schema_dtype in (torch.float16, torch.bfloat16)
+        ),
+    }
+    if dtype_guard_applied:
+        debug_fields["wire_cast"] = f"{_dtype_name(original_dtype)}_to_{_dtype_name(target_dtype)}_server_schema"
+    return wire_tensor, proto, debug_fields
 
 
 class _ServerInferenceSession:
@@ -145,7 +209,7 @@ class _ServerInferenceSession:
                 # (un-stepped) request; past that point only the width matters,
                 # so keep the leading compacted rows.
                 self.history = self.history[: inputs.shape[0]]
-            self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # 将当前输入的最后n_input_tokens个token拼接到历史记录中
+            self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
         #     f"Broken input cache: span={self.span} shape={self.history.shape} "
@@ -325,15 +389,38 @@ class _ServerInferenceSession:
                 # TODO: make possible to use different compression method for different tensors
                 server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
                 compression = server_side_inference_schema[0].compression
-                inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
+                server_hidden_states_dtype = _server_hidden_states_wire_dtype(server_side_inference_schema)
+                prepared_inputs = [
+                    _prepare_rpc_inference_tensor_for_wire(
+                        tensor,
+                        tensor_debug_names[idx] if idx < len(tensor_debug_names) else f"arg_{idx}",
+                        compression,
+                        server_hidden_states_dtype,
+                    )
+                    for idx, tensor in enumerate(input_tensors)
+                ]
+                hidden_wire_tensor, _, hidden_dtype_debug = prepared_inputs[0]
+                capture_wire_activation(
+                    hidden_wire_tensor,
+                    source="client",
+                    channel="rpc_inference",
+                    direction="client_to_server",
+                    phase=transport_phase,
+                    blocks=f"{self.span.start}:{self.span.end}",
+                    compute_dtype=str(hidden_dtype_debug.get("compute_dtype", "")),
+                    schema_dtype=str(hidden_dtype_debug.get("schema_dtype", "")),
+                    wire_dtype=str(hidden_dtype_debug.get("wire_dtype", "")),
+                    batch_size=int(logical_full_batch_size),
+                    prompt_len=int(hidden_wire_tensor.shape[1]) if hidden_wire_tensor.ndim >= 2 else 1,
+                )
                 # [NETWORK_TIMING] Measure serialization time
                 serialize_start = time.perf_counter()
 
                 # Serialize and send data (debug output removed for performance)
-                # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
+                # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization.
                 serialized_tensors = [
                     serialize_torch_tensor(
-                        tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
+                        wire_tensor,
                         proto.compression,
                         debug_context={
                             "phase": transport_phase,
@@ -342,9 +429,10 @@ class _ServerInferenceSession:
                             "channel": "rpc_inference",
                             "blocks": f"{self.span.start}:{self.span.end}",
                             "batch": int(logical_full_batch_size),
+                            **dtype_debug,
                         },
                     )
-                    for idx, (tensor, proto) in enumerate(zip(input_tensors, inference_schema))
+                    for idx, (wire_tensor, proto, dtype_debug) in enumerate(prepared_inputs)
                 ]
                 serialized_metadata = MSGPackSerializer.dumps(request_metadata)
 
@@ -505,15 +593,16 @@ class InferenceSession:
     def position(self) -> int:
         return self._position
 
-    @position.setter 
-    def position(self, start_from_position: int) -> None: # 设置一个位置属性，并确保所有相关的会话对象都同步更新这个位置。
-        self._position = start_from_position # set a position attribute and ensure that all related session objects are updated to reflect this position synchronously.
+    @position.setter
+    def position(self, start_from_position: int) -> None:
+        # Set the position and keep all related session objects in sync.
+        self._position = start_from_position
         for session in self._server_sessions:
             assert isinstance(session, _ServerInferenceSession)
             session.position = start_from_position
 
     def _enter_server_sessions(self, chosen_spans: List[RemoteSpanInfo]) -> List[_ServerInferenceSession]:
-        server_sessions = [] # 创建一组服务器会话，并在发生错误时确保已创建的会话能够正确退出。
+        server_sessions = []  # build server sessions; on error, ensure already-created ones exit cleanly
         try:
             for span in chosen_spans:
                 span_uids = CHAIN_DELIMITER.join(self._sequence_manager.block_uids[span.start : span.end])
@@ -549,7 +638,9 @@ class InferenceSession:
         assert not self._closed and not self._server_sessions
         return self
 
-    def step(   # 执行一次推理步骤，处理输入数据和相应的提示与假设 ID，同时在可能出现错误的情况下进行重试。
+    # Execute one inference step over inputs / prompts / hypothesis IDs,
+    # retrying on transient errors.
+    def step(
         self,
         inputs: torch.Tensor,
         prompts: Optional[torch.Tensor] = None,
@@ -619,10 +710,10 @@ class InferenceSession:
             device=inputs.device
         ).unsqueeze(0).expand(inputs.shape[0], -1)
         self.keep_indices = keep_indices
-        if is_spec_decoding is not None and is_spec_decoding.item() == 1:
-            is_spec_dec = True
+        if torch.is_tensor(is_spec_decoding):
+            is_spec_dec = bool(is_spec_decoding.detach().bool().any().item()) if is_spec_decoding.numel() > 0 else False
         else:
-            is_spec_dec = False
+            is_spec_dec = bool(is_spec_decoding)
         need_pruning = bool(need_pruning) and is_spec_dec
         while block_idx < self.num_blocks:
             for attempt_no in itertools.count():
@@ -742,15 +833,15 @@ class InferenceSession:
         original_seq_len: int,
     ) -> torch.Tensor:
         """
-        将铺平的 hidden states 还原为 [B, original_seq_len, hidden_size]
-        
+        Restore flattened hidden states to [B, original_seq_len, hidden_size].
+
         Args:
-            flattened_hidden_states: [N_total_valid, hidden_size] 铺平后的有效 hidden states
-            keep_indices: [B, max_keep_len] 每个 batch 的 keep indices，padding 为 -1
-            original_seq_len: 原始序列长度
-        
+            flattened_hidden_states: [N_total_valid, hidden_size] flattened valid hidden states
+            keep_indices: [B, max_keep_len] per-batch keep indices, padded with -1
+            original_seq_len: original sequence length
+
         Returns:
-            restored_hidden_states: [B, original_seq_len, hidden_size]，无效位置用 0 填充
+            restored_hidden_states: [B, original_seq_len, hidden_size], invalid positions filled with 0
         """
         batch_size, max_keep_len = keep_indices.shape
         device = flattened_hidden_states.device
@@ -801,9 +892,9 @@ class InferenceSession:
                     flat_hidden_local = flat_hidden_local[:expected_valid]
             return flat_hidden_local
 
-        # 处理不同维度的输入
+        # Handle different input dimensions
         if flattened_hidden_states.ndim == 2:
-            # [N_total_valid, hidden_size] -> 直接使用
+            # [N_total_valid, hidden_size] -> use directly
             flat_hidden = flattened_hidden_states
             hidden_size = flattened_hidden_states.shape[-1]
         elif flattened_hidden_states.ndim == 3:
@@ -812,31 +903,31 @@ class InferenceSession:
         else:
             raise ValueError(f"Unexpected flattened_hidden_states dim: {flattened_hidden_states.ndim}")
         
-        # 创建输出 tensor，用 0 填充
+        # Build output tensor, zero-filled
         restored_hidden_states = torch.zeros(
             batch_size, original_seq_len, hidden_size,
             dtype=dtype, device=device
         )
-        
-        # 创建有效 mask: [B, max_keep_len]
+
+        # Valid mask: [B, max_keep_len]
         valid_mask = keep_indices >= 0
-        
-        # 创建 batch 索引: [B, max_keep_len]
+
+        # Batch index broadcast: [B, max_keep_len]
         batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(keep_indices)
-        
-        # 取出有效部分的索引
+
+        # Extract valid index pairs
         valid_batch_idx = batch_idx[valid_mask]      # [N_total_valid]
         valid_seq_idx = keep_indices[valid_mask]     # [N_total_valid]
-        
-        # 验证维度匹配
+
+        # Verify dimensions match
         n_total_valid = valid_mask.sum().item()
         if flat_hidden.shape[0] != n_total_valid:
             raise ValueError(
                 f"Dimension mismatch: flattened_hidden_states has {flat_hidden.shape[0]} elements, "
                 f"but keep_indices has {n_total_valid} valid entries"
             )
-        
-        # 写入还原位置
+
+        # Scatter the valid rows back into their original positions
         restored_hidden_states[valid_batch_idx, valid_seq_idx, :] = flat_hidden
         
         return restored_hidden_states

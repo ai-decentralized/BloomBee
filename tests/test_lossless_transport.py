@@ -1,4 +1,7 @@
+import zlib
+
 import numpy as np
+import pytest
 import torch
 from hivemind.proto import runtime_pb2
 
@@ -13,6 +16,9 @@ def _clear_transport_caches() -> None:
     lt._get_zipnn_compressor.cache_clear()
     lt._get_zipnn_decompressor.cache_clear()
     lt._zipnn_lossless_dtype_supported.cache_clear()
+    lt._get_zstd_dict.cache_clear()
+    lt._get_zstd_dict_compressor_cached.cache_clear()
+    lt._get_zstd_dict_decompressor_cached.cache_clear()
 
 
 def _make_split_friendly_fp16(shape=(64, 1, 1024)) -> torch.Tensor:
@@ -77,6 +83,49 @@ def test_serialize_torch_tensor_byte_split_roundtrip(monkeypatch):
 
     restored = lt.deserialize_torch_tensor(split_serialized)
     assert torch.equal(restored, tensor)
+
+
+def test_byte_split_single_path_skips_plain_candidate(monkeypatch):
+    tensor = _make_split_friendly_fp16().contiguous()
+    debug_context = {
+        "phase": "decode",
+        "tensor_name": "hidden_states",
+        "source": "client",
+        "channel": "rpc_inference",
+    }
+
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "zstd")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "byte_split")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_SINGLE_PATH", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT_TARGETS", "*:*:hidden_states")
+    _clear_transport_caches()
+
+    def fail_plain(_raw):
+        raise AssertionError("plain zstd candidate should not run in single-path byte_split mode")
+
+    monkeypatch.setattr(lt, "_build_plain_wrapper", fail_plain)
+
+    serialized = lt.serialize_torch_tensor(
+        tensor,
+        runtime_pb2.CompressionType.NONE,
+        debug_context=debug_context,
+    )
+    parsed = lt._parse_wrapper(serialized.buffer)
+    assert parsed is not None
+    assert parsed[0] == lt._ALGO_ZSTD_BYTE_SPLIT
+    assert torch.equal(lt.deserialize_torch_tensor(serialized), tensor)
+
+
+def test_zlib_wrapper_decompression_is_capped_to_declared_size():
+    raw = b"x" * 128
+    payload = zlib.compress(raw)
+
+    assert lt._decompress_with_algo(lt._ALGO_ZLIB, payload, len(raw)) == raw
+    with pytest.raises(ValueError, match="exceeds declared size"):
+        lt._decompress_with_algo(lt._ALGO_ZLIB, payload, 8)
 
 
 def test_zipnn_compare_candidate_fp16(monkeypatch):
@@ -144,3 +193,94 @@ def test_serialize_torch_tensor_zipnn_roundtrip(monkeypatch):
 
     restored = lt.deserialize_torch_tensor(serialized)
     assert torch.equal(restored, tensor)
+
+
+def test_adaptive_hybrid_routes_dict_only_for_first_prefill_stage(monkeypatch):
+    tensor = _make_split_friendly_fp16().contiguous()
+
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "adaptive_hybrid")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "byte_split")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT_TARGETS", "*:*:hidden_states")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS", "0:20")
+    _clear_transport_caches()
+
+    raw_size = tensor.numel() * tensor.element_size()
+
+    def fake_dict_wrapper(_raw, *, elem_size):
+        assert elem_size == tensor.element_size()
+        return lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZSTD_DICT_BYTE_SPLIT, raw_size) + b"d"
+
+    def fake_zipnn_wrapper(_raw, *, tensor):
+        return lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZIPNN, raw_size) + b"z"
+
+    monkeypatch.setattr(lt, "_build_zstd_dict_byte_split_wrapper", fake_dict_wrapper)
+    monkeypatch.setattr(lt, "_build_zipnn_wrapper", fake_zipnn_wrapper)
+    monkeypatch.setattr(lt, "_supports_zipnn_transport", lambda *args, **kwargs: True)
+
+    first_stage = {
+        "phase": "prefill",
+        "tensor_name": "hidden_states",
+        "source": "client",
+        "channel": "rpc_inference",
+        "blocks": "0:20",
+    }
+    serialized = lt.serialize_torch_tensor(
+        tensor,
+        runtime_pb2.CompressionType.NONE,
+        debug_context=first_stage,
+    )
+    parsed = lt._parse_wrapper(serialized.buffer)
+    assert parsed is not None
+    assert parsed[0] == lt._ALGO_ZSTD_DICT_BYTE_SPLIT
+
+    later_stage = dict(first_stage)
+    later_stage["blocks"] = "20:40"
+    serialized = lt.serialize_torch_tensor(
+        tensor,
+        runtime_pb2.CompressionType.NONE,
+        debug_context=later_stage,
+    )
+    parsed = lt._parse_wrapper(serialized.buffer)
+    assert parsed is not None
+    assert parsed[0] == lt._ALGO_ZIPNN
+
+
+def test_serialize_torch_tensor_byte_split_high_only_roundtrip(monkeypatch):
+    tensor = _make_split_friendly_fp16().contiguous()
+    debug_context = {
+        "phase": "decode",
+        "tensor_name": "hidden_states",
+        "source": "client",
+        "channel": "rpc_inference",
+    }
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "zstd")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "byte_split_high_only")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_SINGLE_PATH", "1")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
+    _clear_transport_caches()
+
+    serialized = lt.serialize_torch_tensor(
+        tensor, runtime_pb2.CompressionType.NONE, debug_context=debug_context
+    )
+    parsed = lt._parse_wrapper(serialized.buffer, strict=True)
+    assert parsed is not None, "high_only layout must produce a wrapped buffer"
+    algo_id, original_size, _ = parsed
+    assert algo_id == lt._ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY
+    assert original_size == tensor.numel() * tensor.element_size()
+
+    restored = lt.deserialize_torch_tensor(serialized)
+    assert torch.equal(restored, tensor)
+
+
+def test_unwrap_rejects_oversized_declared_size(monkeypatch):
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES", "1024")
+    payload = zlib.compress(b"x" * 64)
+    fake_buffer = lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZLIB, 1 << 40) + payload
+    serialized = runtime_pb2.Tensor(buffer=fake_buffer)
+    with pytest.raises(ValueError, match="MAX_DECODED_BYTES"):
+        lt.unwrap_serialized_tensor(serialized)

@@ -43,8 +43,11 @@ def main():
     else:
         args.n_processes = int(args.n_processes)
 
-    pipe_recv, pipe_send = mp.Pipe(duplex=False)
-    processes = [mp.Process(target=benchmark_inference, args=(i, args, pipe_send)) for i in range(args.n_processes)]
+    # Spawn (not fork): forking after torch/HF threads start deadlocks the
+    # child's hivemind DHT subprocess on an inherited import lock.
+    ctx = mp.get_context("spawn")
+    pipe_recv, pipe_send = ctx.Pipe(duplex=False)
+    processes = [ctx.Process(target=benchmark_inference, args=(i, args, pipe_send)) for i in range(args.n_processes)]
     for proc in processes:
         proc.start()
     for proc in processes:

@@ -95,22 +95,27 @@ class DistributedFalconModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         hidden_states = self.word_embeddings_layernorm(inputs_embeds)
         output_shape = input_shape + (hidden_states.size(-1),)
 
+        if past_key_values is None:
+            past_key_values = RemotePastKeyValues()
+
         hidden_states = self.h(
             hidden_states,
             prompts=intermediate_prompts,
-            hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
+            hypo_ids=past_key_values.hypo_ids,
         )
 
         # Remove prefix
         if use_prompts:
             hidden_states = hidden_states[:, self.pre_seq_len :]
 
+        past_key_values.update_seen(hidden_states.size(1))
+
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)
         hidden_states = hidden_states.view(output_shape)
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=RemotePastKeyValues(),
+            past_key_values=past_key_values,
             hidden_states=None,
             attentions=None,
         )

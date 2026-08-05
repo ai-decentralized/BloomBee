@@ -42,14 +42,14 @@ class SimpleProbabilityPruner(PrunerInterface):
         self.correct_prunes = 0
         
     def _get_parent_postion(self, i, mask, prefix):
-        """单个序列的 parent position 查找"""
+        """Parent-position lookup for a single sequence."""
         for j in range(i-1, -1, -1):
             if mask[i, j + prefix] == True:
                 return j
         return i
-    
+
     def _get_parent_postion_batched(self, i, mask, prefix, batch_idx):
-        """batch 版本的 parent position 查找"""
+        """Parent-position lookup for the batched case."""
         for j in range(i-1, -1, -1):
             if mask[batch_idx, i, j + prefix] == True:
                 return j
@@ -65,22 +65,22 @@ class SimpleProbabilityPruner(PrunerInterface):
         """
         Prune branches based on probability threshold
         Process nodes sequentially in depth-first order
-        
-        支持 batch 处理
-        
+
+        Supports batched input.
+
         Args:
             middle_hidden_states: [B, seq_len, hidden_size] - hidden states in depth-first order
-            draft_tokens: [B, seq_len] Token IDs in depth-first order  
+            draft_tokens: [B, seq_len] Token IDs in depth-first order
             tree_attention_mask: [B, seq_len, total_len] - encodes tree structure
-            
+
         Returns:
-            keep_indices: [B, max_keep_len] 保留的索引，padding 用 -1
-            其他元数据
+            keep_indices: [B, max_keep_len] kept indices, padded with -1
+            additional metadata
         """
-        
-        # 处理输入维度
+
+        # Normalize input dimensions
         if middle_hidden_states.dim() == 2:
-            # 单序列情况，扩展为 batch
+            # Single-sequence case, expand to batch
             middle_hidden_states = middle_hidden_states.unsqueeze(0)
             tree_attention_mask = tree_attention_mask.unsqueeze(0) if tree_attention_mask.dim() == 2 else tree_attention_mask
             if isinstance(draft_tokens, list):
@@ -97,7 +97,7 @@ class SimpleProbabilityPruner(PrunerInterface):
         # Get middle layer logits and probabilities: [B, seq_len, vocab_size]
         middle_logits = self.lm_head(middle_hidden_states)
         
-        # 转换 draft_tokens 为 tensor
+        # Convert draft_tokens to a tensor
         if isinstance(draft_tokens, list):
             if isinstance(draft_tokens[0], list):
                 # List of lists
@@ -106,7 +106,7 @@ class SimpleProbabilityPruner(PrunerInterface):
                 # Single list
                 draft_tokens = torch.tensor(draft_tokens, device=device).unsqueeze(0)
         
-        # 存储每个 batch 的结果
+        # Per-batch result accumulators
         batch_keep_indices = []
         batch_prune_indices = []
         batch_scores = []
@@ -141,14 +141,14 @@ class SimpleProbabilityPruner(PrunerInterface):
                 probs = F.softmax(logits_at_pos, dim=-1)
                 topk = 50
 
-                # 取 top-50 token ids
+                # Take the top-50 token ids
                 topk_ids = torch.topk(
                     probs,
                     k=min(topk, self.vocab_size),
                     dim=-1
                 ).indices
 
-                # 判断 draft token 是否在 topk
+                # Check whether the draft token is within top-k
                 draft_id = int(draft_tokens[b, i].item())
                 if draft_id < 0 or draft_id >= probs.shape[0]:
                     keep_mask[i] = False
@@ -213,15 +213,19 @@ class SimpleProbabilityPruner(PrunerInterface):
         stacked_scores = torch.stack(batch_scores, dim=0)  # [B, seq_len]
         stacked_keep_masks = torch.stack(batch_keep_masks, dim=0)  # [B, seq_len]
         
-        # 计算有效长度
+        # Compute valid lengths
         valid_lengths = (padded_keep_indices >= 0).sum(dim=1)  # [B]
         
+        # Update statistics
+        self.total_branches += seq_len * batch_size
+        self.pruned_branches += sum(len(indices) for indices in batch_prune_indices)
+
         return {
-            'keep_indices': padded_keep_indices,  # [B, max_keep_len]，padding 为 -1
-            'prune_indices': padded_prune_indices,  # [B, max_prune_len]，padding 为 -1
+            'keep_indices': padded_keep_indices,  # [B, max_keep_len], padded with -1
+            'prune_indices': padded_prune_indices,  # [B, max_prune_len], padded with -1
             'keep_probs': stacked_scores,  # [B, seq_len]
             'keep_mask': stacked_keep_masks,  # [B, seq_len]
-            'valid_lengths': valid_lengths,  # [B] 每个 batch 的有效 keep 数量
+            'valid_lengths': valid_lengths,  # [B] count of kept items per batch item
             'metadata': {
                 'middle_logits': middle_logits,
                 'avg_score': stacked_scores[stacked_keep_masks].mean().item() if stacked_keep_masks.any() else 0.0,

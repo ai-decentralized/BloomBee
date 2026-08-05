@@ -9,7 +9,7 @@ import pytest_asyncio  # make sure the module exists; otherwise the test will be
 import torch
 
 from types import SimpleNamespace
-from bloombee.flexgen_utils.pytorch_backend import TorchDevice
+from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchTensor
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.compression import CompressionConfig
@@ -55,6 +55,56 @@ def _make_kv_cache_manager(max_tokens: int, max_alloc_timeout=None):
     )
 
     return KVCacheManager(max_tokens, max_alloc_timeout, policy, env, block_config)
+
+
+def test_gqa_batched_kv_write_preserves_batch_head_stride():
+    manager = _make_kv_cache_manager(max_tokens=1024)
+    manager.block_config.num_attention_heads = 4
+    manager.block_config.num_key_value_heads = 2
+    manager.block_config.num_key_value_groups = 2
+
+    batch_size = 2
+    num_attention_heads = manager.block_config.num_attention_heads
+    num_key_value_heads = manager.block_config.num_key_value_heads
+    head_dim = 3
+    seq_len = 1
+    start_position = 1
+
+    k_cache_data = torch.zeros((4, batch_size * num_attention_heads, head_dim), dtype=torch.float32)
+    v_cache_data = torch.zeros_like(k_cache_data)
+    k_cache = TorchTensor.create_from_torch(k_cache_data, manager.attention_compute)
+    v_cache = TorchTensor.create_from_torch(v_cache_data, manager.attention_compute)
+
+    key = torch.arange(
+        1,
+        batch_size * num_key_value_heads * head_dim * seq_len + 1,
+        dtype=torch.float32,
+    ).reshape(batch_size * num_key_value_heads, head_dim, seq_len)
+    value = (100 + torch.arange(
+        1,
+        batch_size * num_key_value_heads * seq_len * head_dim + 1,
+        dtype=torch.float32,
+    )).reshape(batch_size * num_key_value_heads, seq_len, head_dim)
+
+    manager._write_kvs(
+        (key, value),
+        start_position=start_position,
+        batch_offset=0,
+        full_batch_size=batch_size,
+        micro_batch_size=batch_size,
+        cache_tensors=[(k_cache, v_cache)],
+    )
+
+    row = start_position
+    torch.testing.assert_close(k_cache_data[row, 0:2, :], key[0:2, :, 0])
+    torch.testing.assert_close(v_cache_data[row, 0:2, :], value[0:2, 0, :])
+    torch.testing.assert_close(k_cache_data[row, 4:6, :], key[2:4, :, 0])
+    torch.testing.assert_close(v_cache_data[row, 4:6, :], value[2:4, 0, :])
+
+    assert torch.count_nonzero(k_cache_data[row, 2:4, :]) == 0
+    assert torch.count_nonzero(v_cache_data[row, 2:4, :]) == 0
+    assert torch.count_nonzero(k_cache_data[row, 6:8, :]) == 0
+    assert torch.count_nonzero(v_cache_data[row, 6:8, :]) == 0
 
 
 @pytest.mark.asyncio

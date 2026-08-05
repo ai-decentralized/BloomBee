@@ -49,6 +49,7 @@ from bloombee.server.throughput import get_dtype_name, get_server_throughput
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.server.speculative_pruner.utils import PruningConfig, PruningMethod
 from bloombee.utils.auto_config import AutoDistributedConfig
+from bloombee.utils.cuda_compat import get_cuda_unavailable_diagnostic
 from bloombee.utils.convert_block import QuantType, check_device_balance, convert_block
 from bloombee.utils.dht import declare_active_modules, get_remote_module_infos
 from bloombee.utils.misc import get_size_in_bytes
@@ -115,6 +116,8 @@ class Server:
         inference_max_length: Optional[int] = None,
         min_batch_size: int = 1,
         max_batch_size: Optional[int] = None,
+        w_gpu_percent: int = 100,
+        cache_gpu_percent: int = 100,
         max_chunk_size_bytes: int = 256 * 1024 * 1024,
         max_alloc_timeout: float = 600,
         attn_cache_tokens: Optional[int] = None,
@@ -217,6 +220,9 @@ class Server:
             elif torch.backends.mps.is_available():
                 device = "mps"
             else:
+                cuda_diagnostic = get_cuda_unavailable_diagnostic()
+                if cuda_diagnostic:
+                    logger.warning(cuda_diagnostic)
                 device = "cpu"
         device = torch.device(device)
         if device.type == "cuda" and device.index is None:
@@ -277,7 +283,7 @@ class Server:
         self.adapters = adapters
 
         ##############################################################
-        self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
+        self.env = ExecutionEnv.create(os.path.expanduser("~/.cache/bloombee/flexgen_offload_dir"), device_type=device.type) ##########
 
         # Policy: keep weights, KV cache, and activations on GPU by default.
         #
@@ -308,10 +314,14 @@ class Server:
             gpu_batch_size = batch_size
             logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
 
+        if not 0 <= w_gpu_percent <= 100:
+            raise ValueError(f"--w_gpu_percent must be in [0, 100], got {w_gpu_percent}")
+        if not 0 <= cache_gpu_percent <= 100:
+            raise ValueError(f"--cache_gpu_percent must be in [0, 100], got {cache_gpu_percent}")
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
-            100, 0,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent, cache_cpu_percent
+            w_gpu_percent, 100 - w_gpu_percent,          # weights: GPU%, CPU%
+            cache_gpu_percent, 100 - cache_gpu_percent,  # KV cache: GPU%, CPU%
             100, 0,                   # act_gpu_percent, act_cpu_percent (mixed activation offload is unsupported)
             overlap=True, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
@@ -427,9 +437,11 @@ class Server:
         mbpipe_log_config(logger, context="Server.__init__")
 
     def _choose_num_blocks(self) -> int:
+        cuda_diagnostic = get_cuda_unavailable_diagnostic() or ""
         assert self.device.type in ("cuda", "mps"), (
             "GPU is not available. If you want to run a CPU-only server, please specify --num_blocks. "
             "CPU-only servers in the public swarm are discouraged since they are much slower"
+            + (f"\n\n{cuda_diagnostic}" if cuda_diagnostic else "")
         )
         num_devices = len(self.tensor_parallel_devices) if self.tensor_parallel_devices else 1
 

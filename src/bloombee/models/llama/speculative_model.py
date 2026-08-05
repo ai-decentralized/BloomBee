@@ -403,13 +403,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         seq_lengths = _seq_lengths_from_attention_mask(attention_mask, input_ids)
         initial_seq_lengths = seq_lengths.clone()
         past_key_values.set_prefill_length(seq_lengths)
-        
+
         pad_token_id = generation_config.pad_token_id if generation_config.pad_token_id is not None else 0
         logger.info(f"init input_ids: {input_ids}, seq_lengths: {seq_lengths}")
-        # 修改循环条件：基于每个序列自己的初始长度判断
-        # t0 = time.perf_counter()
-        t0 = time.perf_counter()  # 用于记录第一个达标的时间
-        has_printed_first_reach = False # 确保只打印一次
+        # Loop condition: judged per-row against each sequence's own initial length
+        t0 = time.perf_counter()  # used to record when the first sample reaches its quota
+        has_printed_first_reach = False  # ensure the first-reach log is printed only once
         sample_finish_times = [None] * batch_size
         sample_finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
@@ -446,7 +445,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             if hasattr(drafter, "reorder_prefix_states"):
                 drafter.reorder_prefix_states([])
         while not finished and bool(((seq_lengths - initial_seq_lengths) < row_max_new).any().item()):
-            # 1. Build speculative trees using SSM - 传入 seq_lengths
+            # 1. Build speculative trees using SSM - pass per-sample seq_lengths
             t1 = time.perf_counter()
             # Pass EAGLE-2-style tree-budget kwargs through to the drafter.
             # MultiSSMDrafter consumes them to do post-expansion budget pruning;
@@ -639,7 +638,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             # logger.info(f"current_input_ids: {current_input_ids}, seq_lengths: {seq_lengths}")
 
             if streamer is not None:
-                # Stream 时根据 valid_lengths 只输出有效 token
+                # When streaming, emit only the valid tokens determined by valid_lengths
                 for i in range(batch_size):
                     if unfinished_sequences[i]:
                         if verified_tokens is not None and valid_lengths[i] > 0:
@@ -807,11 +806,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         append_llm_token: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.LongTensor, torch.LongTensor]:
         """
-        更新 input_ids，处理不同序列验证通过的 token 数量不同的情况
-        
+        Update input_ids to accommodate per-sequence verification of different lengths.
+
         Returns:
-            updated_input_ids: 更新后的 input_ids，padding 对齐
-            updated_seq_lengths: 更新后的每个序列真实长度
+            updated_input_ids: padded so all sequences align
+            updated_seq_lengths: per-sequence real length after the update
         """
         batch_size = current_input_ids.shape[0]
         device = current_input_ids.device
@@ -820,36 +819,37 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             append_llm_token = torch.ones_like(valid_lengths, dtype=torch.long)
         else:
             append_llm_token = append_llm_token.to(device=device, dtype=torch.long)
-        
-        # 计算每个序列需要添加的 token 数（verified + optional llm token）
+
+        # Tokens to append per sequence (verified + optional LLM token)
         tokens_to_add = valid_lengths + append_llm_token  # [batch_size]
-        
-        # 计算新的序列长度
+
+        # New sequence lengths
         new_seq_lengths = seq_lengths + tokens_to_add
         new_max_len = new_seq_lengths.max().item()
-        
-        # 创建新的 input_ids tensor
+
+        # Allocate the new input_ids tensor
         new_input_ids = torch.full(
-            (batch_size, new_max_len), 
-            pad_token_id, 
-            dtype=torch.long, 
+            (batch_size, new_max_len),
+            pad_token_id,
+            dtype=torch.long,
             device=device
         )
-        
+
         for i in range(batch_size):
             old_len = seq_lengths[i].item()
-            
-            # 复制原有的有效 token
+
+            # Copy over the existing valid tokens
             new_input_ids[i, :old_len] = current_input_ids[i, :old_len]
-            
-            # 添加验证通过的 token
+
+            # Append the verified tokens
             v_len = valid_lengths[i].item()
             if v_len > 0 and verified_tokens is not None:
                 new_input_ids[i, old_len:old_len + v_len] = verified_tokens[i, :v_len]
 
             if append_llm_token[i].item():
+                # Append the LLM-generated token after the verified ones
                 new_input_ids[i, old_len + v_len] = llm_generated_token[i, 0]
-        
+
         return new_input_ids, new_seq_lengths
     
     def _verify_trees_with_forward(
@@ -879,11 +879,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         Verify speculative trees using standard forward() call within the active session context
         
         Returns:
-            verified_tokens: [batch_size, max_verified_len] 或 None
+            verified_tokens: [batch_size, max_verified_len] or None
             kv_cache_position_ids: [batch_size, max_pos_len]
-            past_key_values: 更新后的 past_key_values
+            past_key_values: updated past_key_values
             llm_generated_tokens: [batch_size, 1]
-            valid_lengths: [batch_size] 每个序列验证通过的 token 数
+            valid_lengths: [batch_size] number of tokens verified per sequence
         """
         # logger.info(f"input_ids: {input_ids}")
         # logger.info(f"seq_lengths: {seq_lengths}")
@@ -962,7 +962,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 
             elif is_first_iteration or past_key_values is None:
                 # First iteration: process full sequence to establish cache
-                # 需要根据 seq_lengths 构建正确的 full_sequence
+                # Build full_sequence according to per-sequence seq_lengths
                 max_seq_len = seq_lengths.max().item()
                 full_sequence = torch.cat([input_ids[:, :max_seq_len], tree_tokens], dim=-1)
                 
@@ -1323,7 +1323,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 final_positions = (seq_lengths - 1).to(device=device)
                 kv_cache_position_ids = final_positions[:, None]
             else:
-                # 获取每个序列最后一个有效 token; this root token has not yet
+                # Take the last valid token of each sequence; this root token has not yet
                 # been run through the target, so use the existing cache plus
                 # one regular decode step and sample the bonus from its logits.
                 last_tokens = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
@@ -1384,31 +1384,31 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         max_depth: int,
         seq_lengths: torch.LongTensor,
     ) -> List[SpeculativeTree]:
-        """Build speculative trees - 所有样本按 depth 批量处理"""
-        
+        """Build speculative trees - batch all samples per tree depth."""
+
         batch_size = input_ids.shape[0]
         device = input_ids.device
         pad_token_id = getattr(ssm.config, 'pad_token_id', 0)
-        
-        # 初始化所有 trees
+
+        # Initialize all trees
         trees = []
-        valid_inputs = []  # 每个样本的有效 input_ids
-        
+        valid_inputs = []  # valid input_ids per sample
+
         for batch_idx in range(batch_size):
             actual_len = seq_lengths[batch_idx].item()
             valid_input_ids = input_ids[batch_idx, :actual_len]
             valid_inputs.append(valid_input_ids)
-            
+
             root_token = valid_input_ids[-1].item()
             tree = SpeculativeTree(root_token, f"req_{batch_idx}")
             trees.append(tree)
-        
-        # 按 depth 循环，每层一次 SSM 调用
+
+        # Loop over depths; one SSM call per depth
         for depth in range(max_depth):
-            
-            # 收集所有样本在当前 depth 的 nodes 和 contexts
+
+            # Collect nodes and contexts for all samples at the current depth
             all_contexts = []
-            node_mapping = []  # (batch_idx, node) 用于结果拆分
+            node_mapping = []  # (batch_idx, node) used to demux results
             
             for batch_idx in range(batch_size):
                 tree = trees[batch_idx]
@@ -1426,11 +1426,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     all_contexts.append(context)
                     node_mapping.append((batch_idx, node))
             
-            # 如果没有 context，结束
+            # Stop if there's no context to expand
             if not all_contexts:
                 break
-            
-            # Padding 成统一长度
+
+            # Pad to a uniform length
             max_len = max(len(ctx) for ctx in all_contexts)
             padded_contexts = []
             attention_masks = []
@@ -1451,13 +1451,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             batch_contexts = torch.stack(padded_contexts)
             batch_masks = torch.stack(attention_masks)
             
-            # 一次 SSM forward 处理所有
+            # Run all samples through SSM in one forward
             with torch.no_grad():
                 outputs = ssm(batch_contexts, attention_mask=batch_masks, use_cache=False)
                 all_logits = outputs.logits[:, -1, :]  # (total_nodes, vocab_size)
-            
-            # 按样本分组处理结果
-            # 先按 batch_idx 分组
+
+            # Group results back per sample
+            # Group by batch_idx
             batch_node_results = {}  # batch_idx -> [(node, candidates), ...]
             
             for i, (batch_idx, node) in enumerate(node_mapping):
@@ -1475,7 +1475,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     batch_node_results[batch_idx] = []
                 batch_node_results[batch_idx].append((node, candidates))
             
-            # 更新每个 tree
+            # Update each tree
             any_new_nodes = False
             for batch_idx in range(batch_size):
                 if batch_idx not in batch_node_results:
@@ -1484,7 +1484,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 tree = trees[batch_idx]
                 node_candidates = batch_node_results[batch_idx]
                 
-                # 保持顺序：nodes 和 candidates_per_node 要对应
+                # Keep ordering consistent between nodes and candidates_per_node
                 nodes = [nc[0] for nc in node_candidates]
                 candidates_per_node = [nc[1] for nc in node_candidates]
                 
@@ -1664,10 +1664,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.LongTensor]:
         """
         Returns:
-            verified_tokens: [batch_size, max_verified_len] 或 None
+            verified_tokens: [batch_size, max_verified_len] or None
             kv_cache_position_ids: [batch_size, max_pos_len]
             llm_generated_tokens: [batch_size, 1]
-            valid_lengths: [batch_size] 每个序列验证通过的 token 数（不包括 llm token）
+            valid_lengths: [batch_size] number of tokens verified per sequence (excluding the LLM token)
         """
         batch_size = logits.shape[0]
         seq_len = logits.shape[1]
@@ -1699,7 +1699,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         else:
             predicted_tokens_cpu = [[] for _ in range(batch_size)]
 
-        # 存储结果
+        # Per-batch result accumulators
         verified_tokens_list = []
         positions_list = []
         llm_tokens_list = []
@@ -1762,7 +1762,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     best_verified = verified_tokens
                     best_positions = verified_positions
             
-            # 确定取 llm_token 的位置
+            # Pick the position from which to draw llm_token
             committed_pos: int  # index into logits/hidden time dim — committed endpoint
             if len(best_verified) > 0:
                 pos = best_positions[-1] - tree_root_position
@@ -1772,14 +1772,14 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 final_logits = logits[batch_idx, pos].unsqueeze(0)
                 final_logits = _ensure_non_empty_logits(final_logits, reason="best_verified")
 
-                # 检查是否全 0（被裁剪），需要回退
+                # If everything is zero (pruned), fall back
                 if torch.all(final_logits == 0):
-                    # 回退：最后一个 verified token 作为 llm_token
+                    # Fall back: reuse the last verified token as llm_token
                     llm_token = torch.tensor([best_verified[-1]], device=device)
                     best_verified = best_verified[:-1]
                     best_positions = best_positions[:-1]
                 else:
-                    # 正常：从 logits 采样
+                    # Normal path: sample from logits
                     processed_logits = final_logits.clone()
                     for processor in logits_processor:
                         processed_logits = processor(
@@ -1789,7 +1789,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     next_token = torch.argmax(processed_logits[0]).item()
                     llm_token = torch.tensor([next_token], device=device)
             else:
-                # fallback: 从 fallback_pos 采样
+                # Fallback: sample from fallback_pos
                 committed_pos = int(real_fallback_pos - 1)
                 final_logits = logits[batch_idx, real_fallback_pos - 1:real_fallback_pos]
                 final_logits = _ensure_non_empty_logits(final_logits, reason="fallback")
@@ -1803,11 +1803,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 llm_token = torch.tensor([next_token], device=device)
             final_positions_list.append(committed_pos)
             
-            # 构建 positions
+            # Build positions
             all_positions = [tree_root_position] + best_positions
             positions = torch.tensor(all_positions, device=device)
-            
-            # 构建 verified_tensor
+
+            # Build verified_tensor
             if len(best_verified) > 0:
                 verified_tensor = torch.tensor(best_verified, dtype=torch.long, device=device)
             else:
@@ -1818,7 +1818,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             llm_tokens_list.append(llm_token)
             valid_lengths_list.append(len(best_verified))
         
-        # 统一 padding 成 batch tensor
+        # Pad to a unified batch tensor
         
         # 1. llm_generated_tokens: [batch_size, 1]
         llm_generated_tokens = torch.stack(llm_tokens_list, dim=0)
@@ -1837,7 +1837,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         for i, pos in enumerate(positions_list):
             kv_cache_position_ids[i, :pos.shape[0]] = pos
         
-        # 4. verified_tokens: [batch_size, max_verified_len] 或 None
+        # 4. verified_tokens: [batch_size, max_verified_len] or None
         max_verified_len = max(v.shape[0] for v in verified_tokens_list) if verified_tokens_list else 0
         
         if max_verified_len > 0:

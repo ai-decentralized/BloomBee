@@ -46,7 +46,11 @@ def get_block_size(
 
     with init_empty_weights(include_buffers=False):
         dummy_weight_home = array_1d(2, ValueHolder)
-        block = get_model_block(config, env, policy, dummy_weight_home, "/tmp")
+        # skip_init_weights: this block exists only to count parameters. Without
+        # it, the FlexGen llama path ran a full weight download + numpy
+        # conversion (13 GB for llama-7b) into the dummy "/tmp" path just to
+        # estimate block size.
+        block = get_model_block(config, env, policy, dummy_weight_home, "/tmp", skip_init_weights=True)
         n_params = sum(param.numel() for param in block.parameters())
 
     if location == "memory":
@@ -84,7 +88,7 @@ def _autoset_attn_impl(config):
     return config
 
 
-def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
+def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0, skip_init_weights: bool = False):
     """
     The function to create a model block based on the block class.
     - Bloom:   takes (config) only, no layer_idx, no FlexGen args
@@ -112,6 +116,8 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
         return config.block_class(config, layer_idx)
     # config.block_class == WrappedLlamaBlock in distributedllamaconfig in config.py
     # print('server/block_utils.py get_model_block() : config', config)
-    res = config.block_class(config, layer_idx, env, policy, weight_home, path)  # go to block.py class OptimizedLlamaDecoderLayer
+    res = config.block_class(
+        config, layer_idx, env, policy, weight_home, path, skip_init_weights=skip_init_weights
+    )  # go to block.py class OptimizedLlamaDecoderLayer
     # print(' get_model_block res  ', res)
     return res  # res is only nn.module without weights

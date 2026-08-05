@@ -10,7 +10,7 @@ from hivemind.moe.expert_uid import ExpertUID
 
 from bloombee.utils.hivemind_compat import PeerID
 
-# 避免循环导入，使用TYPE_CHECKING
+# Use TYPE_CHECKING to avoid a circular import
 if TYPE_CHECKING:
     from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
 
@@ -114,7 +114,7 @@ class RemoteSpanInfo:
 
 RPCInfo = Dict[str, Any]
 
-# 定义Handle类型
+# Handle type for cache allocations
 Handle = int
 
 
@@ -122,7 +122,7 @@ Handle = int
 class InferenceMetadata:
     uid: ExpertUID
     prefix_length: int
-    cache_handles: Tuple["Handle", ...]  # 使用字符串类型注解避免循环导入
+    cache_handles: Tuple["Handle", ...]  # Forward-ref string to avoid a circular import
     active_adapter: Optional[str]
     tree_attention_mask: Optional[torch.Tensor] = None
     kv_cache_position_ids: Optional[torch.Tensor] = None

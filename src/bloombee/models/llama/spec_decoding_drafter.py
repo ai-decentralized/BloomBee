@@ -214,7 +214,7 @@ class MultiSSMDrafter:
                 for batch_idx, tree in results:
                     all_results[batch_idx] = tree
         
-        # 启动线程
+        # Start worker threads
         threads = []
         for worker_idx in range(self.num_workers):
             start = worker_idx * chunk_size
@@ -223,12 +223,12 @@ class MultiSSMDrafter:
                 t = threading.Thread(target=worker_fn, args=(worker_idx, list(range(start, end))))
                 threads.append(t)
                 t.start()
-        
-        # 等待所有线程完成
+
+        # Wait for all threads to complete
         for t in threads:
             t.join()
-        
-        # 同步所有 streams
+
+        # Synchronize all CUDA streams
         for stream in self.streams:
             stream.synchronize()
         
@@ -283,7 +283,7 @@ class MultiSSMDrafter:
             root_token = valid_input_ids[-1].item()
             trees[batch_idx] = SpeculativeTree(root_token, f"req_{batch_idx}")
         
-        # ========== 预计算 prefix cache ==========
+        # ========== Pre-compute the prefix cache ==========
         max_prefix_len = max(prefix_lengths.values())
         
         if max_prefix_len == 0:
@@ -326,7 +326,7 @@ class MultiSSMDrafter:
         
         idx_map = {batch_idx: i for i, batch_idx in enumerate(batch_indices)}
         
-        # ========== 按 depth 扩展 ==========
+        # ========== Expand the tree depth by depth ==========
         t1 = time.perf_counter()
         # logger.info(f"Prefix processing time: {t1 - t0:.4f}s")
         
@@ -359,11 +359,11 @@ class MultiSSMDrafter:
             max_pf_len = max(prefix_lengths[nm[0]] for nm in node_mapping)
             total_mask_len = max_pf_len + max_path_len
             
-            # 预分配
+            # Pre-allocate
             batch_paths = torch.full((num_nodes, max_path_len), pad_token_id, dtype=torch.long, device=self.device)
             batch_path_masks = torch.zeros((num_nodes, total_mask_len), dtype=torch.long, device=self.device)
-            
-            # 填充
+
+            # Fill in paths and masks
             for i, path in enumerate(all_paths):
                 path_len = len(path)
                 batch_paths[i, -path_len:] = path
@@ -406,7 +406,7 @@ class MultiSSMDrafter:
                 depth_width = int(beam_width)
             if depth_width <= 0:
                 break
-            # 批量 topk
+            # Batched top-k
             _, all_top_k_indices = torch.topk(all_logits, k=depth_width, dim=-1)
             all_probs = torch.softmax(all_logits, dim=-1)
             all_top_k_probs = torch.gather(all_probs, 1, all_top_k_indices)

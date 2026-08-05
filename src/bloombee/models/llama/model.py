@@ -19,7 +19,6 @@ logger = get_logger(__name__)
 
 
 class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
-    # DistributedLlamaModel 类，继承自 FromPretrainedMixin、PTuneMixin 和 LlamaModel
     """LlamaModel, but all transformer layers are hosted by the swarm"""
 
     _keys_to_ignore_on_load_missing = PTuneMixin._keys_to_ignore_on_load_missing

@@ -183,3 +183,6 @@ cache/
 
 # Local session artifacts (design notes, benchmark logs). Not shipped.
 .bloombee_local/
+
+# VS Code
+.vscode/

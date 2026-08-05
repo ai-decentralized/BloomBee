@@ -3,17 +3,22 @@
 """
 Generate model files (block.py, config.py, model.py) from templates and spec YAML.
 
-Usage:
-    python tools/gen_model.py --spec model_specs/llama.yaml --templates templates --out-root src/bloombee/models
-    python /home/twei11/new/BloomBee/src/bloombee/models/template/gen_block.py --spec /home/twei11/new/BloomBee/src/bloombee/models/template/llama.yaml --templates /home/twei11/new/BloomBee/src/bloombee/models/template --out-root /home/twei11/new/BloomBee/src/bloombee/models/template/test
+Usage (run from repo root):
+    python src/bloombee/models/template/gen_block.py \
+        --spec src/bloombee/models/template/llama.yaml \
+        --templates src/bloombee/models/template \
+        --out-root src/bloombee/models/template/test
+
     # Generate only specific files
-    python tools/gen_model.py --spec model_specs/llama.yaml --only block
-    python tools/gen_model.py --spec model_specs/llama.yaml --only config
-    python tools/gen_model.py --spec model_specs/llama.yaml --only model
+    python src/bloombee/models/template/gen_block.py --spec ... --only block
+    python src/bloombee/models/template/gen_block.py --spec ... --only config
+    python src/bloombee/models/template/gen_block.py --spec ... --only model
 """
 import argparse
-import yaml
 import pathlib
+from typing import Optional
+
+import yaml
 from jinja2 import Environment, FileSystemLoader
 
 # Required fields for each template
@@ -92,13 +97,20 @@ def validate_spec(spec: dict, template_type: str) -> None:
         raise ValueError(f"Missing required fields for {template_type}: {missing}")
 
 
-def load_snippet(spec: dict, key: str = "shared_impl_snippet") -> None:
-    """Load external snippet file if specified."""
+def load_snippet(spec: dict, key: str = "shared_impl_snippet", spec_dir: Optional[pathlib.Path] = None) -> None:
+    """Load external snippet file if specified.
+
+    If the snippet path is relative, it is resolved against spec_dir (the
+    directory containing the YAML spec file). This makes YAML specs portable
+    across users without hardcoded absolute paths.
+    """
     snippet_path = spec.get(key)
     if snippet_path:
         snippet_file = pathlib.Path(snippet_path)
+        if not snippet_file.is_absolute() and spec_dir is not None:
+            snippet_file = (spec_dir / snippet_file).resolve()
         if not snippet_file.exists():
-            raise FileNotFoundError(f"Snippet file not found: {snippet_path}")
+            raise FileNotFoundError(f"Snippet file not found: {snippet_file}")
         spec[key] = snippet_file.read_text(encoding="utf-8")
     else:
         spec[key] = None
@@ -150,7 +162,7 @@ def main():
     spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
     
     # Load snippets
-    load_snippet(spec, "shared_impl_snippet")
+    load_snippet(spec, "shared_impl_snippet", spec_dir=spec_path.parent.resolve())
     
     # Apply defaults
     apply_defaults(spec)

@@ -1,14 +1,25 @@
 import os
 
+import pytest
+
+# Swarm-dependent tests import this module for INITIAL_PEERS/MODEL_NAME.
+# Skip (not error) when the env is absent so a plain `pytest tests/` run
+# collects cleanly and only exercises the local unit tests.
 INITIAL_PEERS = os.environ.get("INITIAL_PEERS")
 if not INITIAL_PEERS:
-    raise RuntimeError("Must specify INITIAL_PEERS environment variable with one or more peer ids")
+    pytest.skip(
+        "Set INITIAL_PEERS (and MODEL_NAME) to run swarm-dependent tests",
+        allow_module_level=True,
+    )
 INITIAL_PEERS = INITIAL_PEERS.split()
 
 
 MODEL_NAME = os.environ.get("MODEL_NAME")
 if not MODEL_NAME:
-    raise RuntimeError("Must specify MODEL_NAME as an index of a transformer block to be tested")
+    pytest.skip(
+        "Set MODEL_NAME to run swarm-dependent tests",
+        allow_module_level=True,
+    )
 
 REF_NAME = os.environ.get("REF_NAME")
 

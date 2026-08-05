@@ -68,9 +68,15 @@ class OptimizedBloomAttention(BloomAttention):
 
         if use_cache:
             # BloomBee's memory_cache_manager expects kv in 3D layout:
-            #   key=[B*H, D, S]  (i.e., head_dim before seq), value=[B*H, S, D].
-            # We hand it ``present`` in exactly that shape so _write_kvs' assertion passes.
-            present = (key_layer_bhd, value_layer_bhd)
+            #   key=[B*H, D, s_new]  (head_dim before seq), value=[B*H, s_new, D],
+            # and update_cache() must receive only the NEW tokens (it writes at
+            # start_position); handing it the full past+new concat corrupts the
+            # write (see WrappedFalconBlock, which slices the same way).
+            past_len_for_present = key_layer_bhd.shape[-1] - q_length
+            present = (
+                key_layer_bhd[..., past_len_for_present:],
+                value_layer_bhd[:, past_len_for_present:, :],
+            )
 
         attention_scores = alibi.baddbmm(
             batch1=query_layer,

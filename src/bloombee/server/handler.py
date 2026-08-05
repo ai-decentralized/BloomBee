@@ -30,6 +30,8 @@ from bloombee.server.backend import TransformerBackend
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.microbatch import resolve_expected_num_microbatches
+from bloombee.server.s2s_flow import AdaptivePushConcurrency, S2SLinkTelemetry
+from bloombee.server.timing_summary import emit_session_timing_summary
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.utils.hivemind_compat import DHT, MSGPackSerializer, P2PContext, PeerID, nested_flatten, nested_pack
 from bloombee.utils.convert_block import QuantType
@@ -48,6 +50,7 @@ from bloombee.utils.s2s_activation_quant import (
     quantize_s2s_hidden_for_transport,
     s2s_activation_quant_enabled,
 )
+from bloombee.utils.real_activation_dumper import capture_wire_activation
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
@@ -216,272 +219,6 @@ class Event(Enum):
     SHUTDOWN = 3
 
 
-# [MBPIPE] File-based micro-batch accumulator that works across ALL processes
-# Uses filesystem for cross-process synchronization since multiprocessing.Manager
-# doesn't work across independently spawned processes (Hivemind workers)
-import threading
-import hashlib
-import pickle
-import fcntl
-import os
-import tempfile
-from dataclasses import dataclass, field
-@dataclass
-class S2SLinkTelemetry:
-    """
-    Rolling transport telemetry for one server-to-server link.
-
-    This is used to distinguish real throughput changes from network variance:
-    we log latency, bandwidth and jitter over a sliding window so experiments
-    can show whether the network stayed stable while throughput changed.
-    """
-
-    label: str
-    window_size: int
-    samples: int = 0
-    total_bytes: int = 0
-    clock_sync_samples: int = 0
-    last_latency_ms: Optional[float] = None
-    latency_ms_window: Deque[float] = field(init=False)
-    bandwidth_mbps_window: Deque[float] = field(init=False)
-    jitter_ms_window: Deque[float] = field(init=False)
-    raw_latency_ms_window: Deque[float] = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.latency_ms_window = deque(maxlen=self.window_size)
-        self.bandwidth_mbps_window = deque(maxlen=self.window_size)
-        self.jitter_ms_window = deque(maxlen=self.window_size)
-        self.raw_latency_ms_window = deque(maxlen=self.window_size)
-
-    def record(
-        self,
-        *,
-        latency_ms: float,
-        raw_latency_ms: float,
-        bandwidth_mbps: float,
-        total_bytes: int,
-        clock_sync_ok: bool,
-    ) -> float:
-        jitter_ms = 0.0
-        if self.last_latency_ms is not None:
-            jitter_ms = abs(float(latency_ms) - float(self.last_latency_ms))
-        self.last_latency_ms = float(latency_ms)
-
-        self.samples += 1
-        self.total_bytes += max(0, int(total_bytes))
-        if clock_sync_ok:
-            self.clock_sync_samples += 1
-        self.latency_ms_window.append(float(latency_ms))
-        self.bandwidth_mbps_window.append(float(bandwidth_mbps))
-        self.jitter_ms_window.append(float(jitter_ms))
-        self.raw_latency_ms_window.append(float(raw_latency_ms))
-        return jitter_ms
-
-# Directory for storing micro-batch accumulator data
-_MB_ACCUMULATOR_DIR = os.path.join(tempfile.gettempdir(), "bloombee_mb_accumulator")
-
-def _get_mb_file_path(acc_key: str, mb_idx: int) -> str:
-    """Get file path for a micro-batch."""
-    # Use hash to create a safe filename
-    key_hash = hashlib.md5(acc_key.encode()).hexdigest()[:16]
-    return os.path.join(_MB_ACCUMULATOR_DIR, f"{key_hash}_mb{mb_idx}.pkl")
-
-def _get_mb_lock_path(acc_key: str) -> str:
-    """Get lock file path for a step."""
-    key_hash = hashlib.md5(acc_key.encode()).hexdigest()[:16]
-    return os.path.join(_MB_ACCUMULATOR_DIR, f"{key_hash}.lock")
-
-def _store_microbatch_to_file(acc_key: str, mb_idx: int, tensor_bytes: list, metadata: dict) -> int:
-    """
-    Store a micro-batch to file and return the count of micro-batches for this step.
-    Uses file locking for cross-process safety.
-    """
-    os.makedirs(_MB_ACCUMULATOR_DIR, exist_ok=True)
-    
-    lock_path = _get_mb_lock_path(acc_key)
-    file_path = _get_mb_file_path(acc_key, mb_idx)
-    
-    # Use file locking for cross-process synchronization
-    with open(lock_path, 'w') as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            # Store this micro-batch
-            with open(file_path, 'wb') as f:
-                pickle.dump({
-                    'tensor_bytes': tensor_bytes,
-                    'metadata': metadata
-                }, f)
-            
-            # Count how many micro-batches exist for this step
-            key_hash = hashlib.md5(acc_key.encode()).hexdigest()[:16]
-            count = sum(
-                1 for fname in os.listdir(_MB_ACCUMULATOR_DIR)
-                if fname.startswith(key_hash) and fname.endswith('.pkl')
-            )
-            return count
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-def _load_all_microbatches_from_files(acc_key: str, expected_num: int) -> dict:
-    """
-    Load all micro-batches for a step from files.
-    Returns dict mapping mb_idx to (tensor_bytes, metadata).
-    """
-    lock_path = _get_mb_lock_path(acc_key)
-    
-    with open(lock_path, 'w') as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            result = {}
-            for mb_idx in range(expected_num):
-                file_path = _get_mb_file_path(acc_key, mb_idx)
-                if os.path.exists(file_path):
-                    with open(file_path, 'rb') as f:
-                        data = pickle.load(f)
-                        result[mb_idx] = (data['tensor_bytes'], data['metadata'])
-            return result
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-def _cleanup_microbatch_files(acc_key: str, expected_num: int) -> None:
-    """Remove all micro-batch files for a step."""
-    lock_path = _get_mb_lock_path(acc_key)
-    
-    try:
-        with open(lock_path, 'w') as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                for mb_idx in range(expected_num):
-                    file_path = _get_mb_file_path(acc_key, mb_idx)
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        # Also remove lock file
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-    except Exception as e:
-        logger.debug(f"{MBPIPE_LOG_PREFIX} Failed to cleanup files: {e}")
-
-
-class AdaptivePushConcurrency:
-    """
-    Self-tuning limiter for cross-stage micro-batch pushes.
-
-    The limiter adjusts in-flight push concurrency from runtime signals:
-    - acquire wait (queue pressure inside sender)
-    - RPC send duration (network pressure)
-    - send failures (stability signal)
-
-    No external tuning knobs are required; limits are bounded to keep behavior stable.
-    """
-
-    def __init__(
-        self,
-        *,
-        logger_: logging.Logger,
-        name: str,
-        initial_limit: int = 4,
-        min_limit: int = 2,
-        max_limit: int = 12,
-        ewma_alpha: float = 0.2,
-        decision_interval: int = 8,
-    ):
-        self._logger = logger_
-        self._name = name
-        self._limit = max(min_limit, min(max_limit, int(initial_limit)))
-        self._min_limit = int(min_limit)
-        self._max_limit = int(max_limit)
-        self._ewma_alpha = float(ewma_alpha)
-        self._decision_interval = max(1, int(decision_interval))
-
-        self._in_flight = 0
-        self._cond = asyncio.Condition()
-
-        self._ewma_wait_ms = 0.0
-        self._ewma_send_ms = 0.0
-        self._release_events = 0
-        self._recent_failures = 0
-        self._consecutive_failures = 0
-
-    @property
-    def limit(self) -> int:
-        return self._limit
-
-    @property
-    def in_flight(self) -> int:
-        return self._in_flight
-
-    def _update_ewma(self, prev: float, sample: float) -> float:
-        if prev <= 0.0:
-            return sample
-        a = self._ewma_alpha
-        return prev * (1.0 - a) + sample * a
-
-    async def acquire(self) -> float:
-        wait_start = perf_counter()
-        async with self._cond:
-            while self._in_flight >= self._limit:
-                await self._cond.wait()
-            self._in_flight += 1
-        wait_ms = (perf_counter() - wait_start) * 1000.0
-        self._ewma_wait_ms = self._update_ewma(self._ewma_wait_ms, wait_ms)
-        return wait_ms
-
-    async def release(self, *, send_time_ms: float, success: bool) -> None:
-        change_log = None
-        async with self._cond:
-            self._in_flight = max(0, self._in_flight - 1)
-            self._ewma_send_ms = self._update_ewma(self._ewma_send_ms, max(0.0, float(send_time_ms)))
-
-            if success:
-                self._consecutive_failures = 0
-                self._recent_failures = max(0, self._recent_failures - 1)
-            else:
-                self._consecutive_failures += 1
-                self._recent_failures = min(16, self._recent_failures + 1)
-
-            self._release_events += 1
-            if self._release_events % self._decision_interval == 0:
-                old_limit = self._limit
-                reason = None
-
-                # Stability first: back off quickly on repeated failures.
-                if self._consecutive_failures >= 2 or self._recent_failures >= 3:
-                    self._limit = max(self._min_limit, self._limit - 1)
-                    self._consecutive_failures = 0
-                    reason = "send_failures"
-                # If local wait is non-trivial while network send remains moderate,
-                # increase concurrency to reduce sender-side queue pressure.
-                elif self._ewma_wait_ms > 8.0 and self._ewma_send_ms < 220.0 and self._in_flight >= max(1, self._limit - 1):
-                    self._limit = min(self._max_limit, self._limit + 1)
-                    reason = "queue_pressure"
-                # If network send slows down a lot, decrease concurrency to avoid congestion collapse.
-                elif self._ewma_send_ms > 320.0 and self._ewma_wait_ms < 2.0:
-                    self._limit = max(self._min_limit, self._limit - 1)
-                    reason = "network_backpressure"
-
-                if self._limit != old_limit:
-                    change_log = (
-                        old_limit,
-                        self._limit,
-                        reason or "unspecified",
-                        self._ewma_wait_ms,
-                        self._ewma_send_ms,
-                        self._in_flight,
-                    )
-
-            self._cond.notify_all()
-
-        if change_log is not None:
-            old_limit, new_limit, reason, ewma_wait_ms, ewma_send_ms, in_flight = change_log
-            self._logger.info(
-                f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] adaptive_limit[{self._name}] "
-                f"{old_limit}->{new_limit} reason={reason} "
-                f"ewma_wait={ewma_wait_ms:.1f}ms ewma_send={ewma_send_ms:.1f}ms in_flight={in_flight}"
-            )
-
-
 class TransformerConnectionHandler(ConnectionHandler):
     """Handles three request types: forward, backward and forward-incremental (inference)"""
 
@@ -520,32 +257,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._session_comm_timing: Dict[str, Dict[str, Dict[str, float]]] = {}
         self._session_background_push_tasks: Dict[str, set] = {}
         self._p2p_max_msg_size = p2p_max_msg_size or get_default_p2p_max_msg_size()
-        # [MBPIPE] Cross-stage pipeline: micro-batch queues for immediate processing
-        # Key: (session_id, step_id) -> Queue holding individual micro-batches
-        self._mb_queues: Dict[tuple, asyncio.Queue] = {}
+        # [MBPIPE] Cross-stage pipeline tracking (immediate mode pushes straight
+        # into the session queue; only counters are kept per (session_id, step_id))
         # Key: (session_id, step_id) -> expected number of micro-batches
         self._mb_expected: Dict[tuple, int] = {}
         # Key: (session_id, step_id) -> count of received micro-batches
         self._mb_received: Dict[tuple, int] = {}
         # Key: (session_id, step_id) -> set of (mb_idx) already processed (idempotency)
         self._mb_processed: Dict[tuple, set] = {}
-        # Feature flag for immediate queuing - ENABLED for cross-stage pipeline overlap
-        self._enable_immediate_mb_queue = os.environ.get(
-            "BLOOMBEE_ENABLE_IMMEDIATE_MB_QUEUE", "1"
-        ) == "1"
-        # Optional compatibility mode: also write MB payloads to filesystem in immediate mode.
-        # Disabled by default to reduce first-micro-batch latency.
-        self._store_mb_files_in_immediate = os.environ.get(
-            "BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE", "0"
-        ) == "1"
-        
-        logger.info(f"{MBPIPE_LOG_PREFIX} Immediate micro-batch queuing: {'ENABLED' if self._enable_immediate_mb_queue else 'disabled'}")
-        logger.info(
-            f"{MBPIPE_LOG_PREFIX} Immediate-mode file store: "
-            f"{'ENABLED' if self._store_mb_files_in_immediate else 'disabled'} "
-            f"(set BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE=1 for legacy behavior)"
-        )
-        
+        self._mb_processed_timestamps: Dict[tuple, float] = {}
+        self._MB_PROCESSED_TTL = 120  # seconds
+
         # [CLOCK_SYNC] Per-peer clock offset estimator for cross-machine strict overlap.
         # offset_us is "remote_clock - local_clock" for the target peer.
         self._clock_sync_state: Dict[str, Dict[str, float]] = {}
@@ -732,10 +454,6 @@ class TransformerConnectionHandler(ConnectionHandler):
         record["wire_bytes"] += float(wire_bytes)
         record["samples"] += 1
 
-    @staticmethod
-    def _emit_unconditional_summary(message: str) -> None:
-        print(message, flush=True)
-
     def _track_session_push_task(self, session_id: Optional[str], task: asyncio.Task) -> None:
         if not session_id:
             return
@@ -831,15 +549,16 @@ class TransformerConnectionHandler(ConnectionHandler):
             clock_sync_ok=clock_sync_ok,
         )
 
-        logger.info(
-            f"[S2S_NET] link={link_key} samples={telemetry.samples} "
-            f"latency_ms={effective_latency_ms:.3f} "
-            f"bandwidth_mbps={bandwidth_mbps:.3f} "
-            f"jitter_ms={jitter_ms:.3f} "
-            f"payload_kb={payload_bytes / 1024.0:.2f} "
-            f"metadata_b={metadata_bytes} "
-            f"clock_sync={int(clock_sync_ok)}"
-        )
+        if is_log_channel_enabled("s2s_wire_logs"):
+            logger.info(
+                f"[S2S_NET] link={link_key} samples={telemetry.samples} "
+                f"latency_ms={effective_latency_ms:.3f} "
+                f"bandwidth_mbps={bandwidth_mbps:.3f} "
+                f"jitter_ms={jitter_ms:.3f} "
+                f"payload_kb={payload_bytes / 1024.0:.2f} "
+                f"metadata_b={metadata_bytes} "
+                f"clock_sync={int(clock_sync_ok)}"
+            )
 
         if telemetry.samples <= 3 or telemetry.samples % self._s2s_stats_log_every == 0:
             latency_mean_ms, latency_std_ms, latency_p50_ms, latency_p95_ms = self._window_stats(
@@ -935,18 +654,24 @@ class TransformerConnectionHandler(ConnectionHandler):
             total_request_size = sum(request_tensor_sizes) + request_metadata_size
             recv_time_ms = (recv_end - recv_start) * 1000
             
-            logger.info(f"[NETWORK_RX] SERVER_RECV | "
-                       f"tensor_size={sum(request_tensor_sizes)/1024:.2f}KB | "
-                       f"metadata_size={request_metadata_size}B | "
-                       f"total={total_request_size/1024:.2f}KB | "
-                       f"recv_time={recv_time_ms:.2f}ms")
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(f"[NETWORK_RX] SERVER_RECV | "
+                           f"tensor_size={sum(request_tensor_sizes)/1024:.2f}KB | "
+                           f"metadata_size={request_metadata_size}B | "
+                           f"total={total_request_size/1024:.2f}KB | "
+                           f"recv_time={recv_time_ms:.2f}ms")
             
 
             requested_uids = self._check_uids(request.uid)
             self._log_request("rpc_inference.open", requested_uids, context)
+            # Initialized before the try block: the finally clause below references
+            # these even when metadata parsing or backend lookup raises early.
+            requested_backends: Tuple[TransformerBackend, ...] = ()
+            session_id = None
+            background_tasks: set = set()
             try:
                 start_time = perf_counter()
-                
+
                 metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
                 end_msg_serial_time = perf_counter()
                 # print_time_now('')
@@ -1358,7 +1083,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         cache_manager = requested_backends[0].cache_manager
                         if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
                             cache_manager.clear_offload_state()
-                            logger.info(f"[MBPIPE_FIX] Cleared offload state after request completion")
+                            logger.debug(f"[MBPIPE_FIX] Cleared offload state after request completion")
                 except Exception as e:
                     logger.warning(f"[MBPIPE_FIX] Failed to clear offload state: {e}")
 
@@ -1395,333 +1120,9 @@ class TransformerConnectionHandler(ConnectionHandler):
     def _emit_timing_summary(self, session_id: str, requested_uids) -> None:
         records = self._session_timing.pop(session_id, [])
         comm_records = self._session_comm_timing.pop(session_id, {})
-        if not records:
-            return
-
-        warmup = 1
-        decode_records = records[warmup:] if len(records) > warmup else records
-        if not decode_records:
-            return
-
-        blocks_desc = self._uids_to_block_span_label(requested_uids)
-        compute_arr = np.array([r["compute_ms"] for r in decode_records], dtype=np.float64)
-        gpu2cpu_arr = np.array([r["t_gpu2cpu_ms"] for r in decode_records], dtype=np.float64)
-        step_arr = np.array([r["step_total_ms"] for r in decode_records], dtype=np.float64)
-        queue_arr = np.array([r["queue_wait_ms"] for r in decode_records], dtype=np.float64)
-        data_arr = np.array([r["data_bytes"] for r in decode_records], dtype=np.float64)
-        nic2cpu_arr = np.array([r["t_nic2cpu_ms"] for r in decode_records], dtype=np.float64)
-        cpu2gpu_arr = np.array([r["t_cpu2gpu_ms"] for r in decode_records], dtype=np.float64)
-        gpu2gpu_arr = np.array([r.get("t_gpu2gpu_ms", 0.0) for r in decode_records], dtype=np.float64)
-        gpu2gpu_bytes_arr = np.array([r.get("gpu2gpu_bytes", 0.0) for r in decode_records], dtype=np.float64)
-        cpu_serialize_arr = np.array([r.get("cpu_serialize_ms", 0.0) for r in decode_records], dtype=np.float64)
-        batch_arr = np.array([r.get("batch_size", 1) for r in decode_records], dtype=np.float64)
-        token_arr = np.array([r.get("token_increment", 1) for r in decode_records], dtype=np.float64)
-
-        total_compute = float(compute_arr.sum())
-        total_step = float(step_arr.sum())
-        total_nic2cpu = float(nic2cpu_arr.sum())
-        total_cpu2gpu = float(cpu2gpu_arr.sum())
-        total_gpu2cpu = float(gpu2cpu_arr.sum())
-        total_host_io = total_nic2cpu + total_cpu2gpu + total_gpu2cpu
-        compute_ratio = (total_compute / total_step * 100.0) if total_step > 0 else 0.0
-        host_io_ratio = (total_host_io / total_step * 100.0) if total_step > 0 else 0.0
-        gpu2cpu_ratio = (total_gpu2cpu / total_step * 100.0) if total_step > 0 else 0.0
-        avg_bw = (data_arr.mean() / (gpu2cpu_arr.mean() / 1000.0) / 1e9) if gpu2cpu_arr.mean() > 0 else 0.0
-        total_tokens = float(np.sum(batch_arr * token_arr))
-        throughput_tok_s = (total_tokens / (total_step / 1000.0)) if total_step > 0 else 0.0
-        inference_latency_ms = float(step_arr.mean()) if len(step_arr) > 0 else 0.0
-
-        comm_summary = "\n  s2s_comm : no downstream push samples"
-        cpu2nic_mean = 0.0
-        nic2nic_mean = 0.0
-        push_e2e_mean = 0.0
-        avg_nic_bw = 0.0
-        avg_nic_bw_gbps = 0.0
-        comm_volume_kb = data_arr.mean() / 1024.0 if len(data_arr) > 0 else 0.0
-        comm_volume_bytes = data_arr.mean() if len(data_arr) > 0 else 0.0
-        total_cpu2nic = 0.0
-        total_nic2nic = 0.0
-        wire_arr = np.array([], dtype=np.float64)
-        matched_comm_records = [comm_records[r["step_id"]] for r in decode_records if r.get("step_id") in comm_records]
-        if matched_comm_records:
-            cpu2nic_arr = np.array([r["t_cpu2nic_ms"] for r in matched_comm_records], dtype=np.float64)
-            nic2nic_arr = np.array([r["t_nic2nic_ms"] for r in matched_comm_records], dtype=np.float64)
-            push_e2e_arr = np.array([r["push_e2e_ms"] for r in matched_comm_records], dtype=np.float64)
-            receiver_proc_arr = np.array([r["receiver_processing_ms"] for r in matched_comm_records], dtype=np.float64)
-            wire_arr = np.array([r["wire_bytes"] for r in matched_comm_records], dtype=np.float64)
-
-            total_cpu2nic = float(cpu2nic_arr.sum())
-            total_nic2nic = float(nic2nic_arr.sum())
-            total_comm = total_gpu2cpu + total_cpu2nic + total_nic2nic
-            gpu2cpu_comm_ratio = (total_gpu2cpu / total_comm * 100.0) if total_comm > 0 else 0.0
-            cpu2nic_ratio = (total_cpu2nic / total_comm * 100.0) if total_comm > 0 else 0.0
-            nic2nic_ratio = (total_nic2nic / total_comm * 100.0) if total_comm > 0 else 0.0
-            cpu2nic_mean = float(cpu2nic_arr.mean())
-            nic2nic_mean = float(nic2nic_arr.mean())
-            push_e2e_mean = float(push_e2e_arr.mean())
-            avg_nic_bw = (wire_arr.mean() / (nic2nic_arr.mean() / 1000.0) / 1e6) if nic2nic_arr.mean() > 0 else 0.0
-            avg_nic_bw_gbps = (wire_arr.mean() * 8.0 / (nic2nic_arr.mean() / 1000.0) / 1e9) if nic2nic_arr.mean() > 0 else 0.0
-            comm_volume_kb = wire_arr.mean() / 1024.0 if len(wire_arr) > 0 else comm_volume_kb
-            comm_volume_bytes = wire_arr.mean() if len(wire_arr) > 0 else comm_volume_bytes
-
-            comm_summary = (
-                f"\n  cpu2nic : mean={cpu2nic_arr.mean():.2f}ms  median={np.median(cpu2nic_arr):.2f}ms  "
-                f"p95={np.percentile(cpu2nic_arr,95):.2f}ms  max={cpu2nic_arr.max():.2f}ms"
-                f"\n  nic2nic : mean={nic2nic_arr.mean():.2f}ms  median={np.median(nic2nic_arr):.2f}ms  "
-                f"p95={np.percentile(nic2nic_arr,95):.2f}ms  max={nic2nic_arr.max():.2f}ms"
-                f"\n  push_e2e: mean={push_e2e_arr.mean():.2f}ms  median={np.median(push_e2e_arr):.2f}ms  "
-                f"p95={np.percentile(push_e2e_arr,95):.2f}ms  max={push_e2e_arr.max():.2f}ms"
-                f"\n  recv_proc: mean={receiver_proc_arr.mean():.2f}ms  median={np.median(receiver_proc_arr):.2f}ms  "
-                f"p95={np.percentile(receiver_proc_arr,95):.2f}ms  max={receiver_proc_arr.max():.2f}ms"
-                f"\n  s2s_ratio: gpu2cpu={gpu2cpu_comm_ratio:.1f}%  cpu2nic={cpu2nic_ratio:.1f}%  "
-                f"nic2nic={nic2nic_ratio:.1f}%  avg_bw(nic)={avg_nic_bw:.1f}MB/s  wire_per_push={wire_arr.mean()/1024.0:.1f}KB"
-            )
-
-        pipeline_gpu2gpu_samples = []
-        pipeline_gpu2gpu_bytes = []
-        for rec in decode_records:
-            sender_gpu2cpu_ms = float(rec.get("upstream_sender_gpu2cpu_ms", 0.0))
-            sender_cpu2nic_ms = float(rec.get("upstream_sender_cpu2nic_ms", 0.0))
-            upstream_wire_ms = float(rec.get("upstream_wire_ms", 0.0))
-            if sender_gpu2cpu_ms <= 0.0 and sender_cpu2nic_ms <= 0.0 and upstream_wire_ms <= 0.0:
-                continue
-            pipeline_gpu2gpu_samples.append(
-                sender_gpu2cpu_ms
-                + sender_cpu2nic_ms
-                + upstream_wire_ms
-                + float(rec["t_nic2cpu_ms"])
-                + float(rec["t_cpu2gpu_ms"])
-            )
-            pipeline_gpu2gpu_bytes.append(float(rec.get("upstream_payload_bytes", 0)))
-
-        pipeline_gpu2gpu_arr = np.array(pipeline_gpu2gpu_samples, dtype=np.float64)
-        pipeline_gpu2gpu_bytes_arr = np.array(pipeline_gpu2gpu_bytes, dtype=np.float64)
-        pipeline_gpu2gpu_mean = float(pipeline_gpu2gpu_arr.mean()) if len(pipeline_gpu2gpu_arr) > 0 else 0.0
-        pure_gpu2gpu_mean = float(gpu2gpu_arr.mean()) if len(gpu2gpu_arr) > 0 else 0.0
-        pure_gpu2gpu_bw_mbps = (
-            gpu2gpu_bytes_arr.mean() * 8.0 / (pure_gpu2gpu_mean / 1000.0) / 1e6
-            if pure_gpu2gpu_mean > 0 and len(gpu2gpu_bytes_arr) > 0 and gpu2gpu_bytes_arr.mean() > 0
-            else 0.0
+        emit_session_timing_summary(
+            records, comm_records, blocks_desc=self._uids_to_block_span_label(requested_uids)
         )
-        local_gpu_staging_mean = float((gpu2cpu_arr + cpu2gpu_arr).mean()) if len(gpu2cpu_arr) > 0 else 0.0
-        pure_gpu_compute_mean = float(compute_arr.mean()) if len(compute_arr) > 0 else 0.0
-        pipeline_bw_mbps = (
-            pipeline_gpu2gpu_bytes_arr.mean() * 8.0 / (pipeline_gpu2gpu_mean / 1000.0) / 1e6
-            if pipeline_gpu2gpu_mean > 0 and len(pipeline_gpu2gpu_bytes_arr) > 0 and pipeline_gpu2gpu_bytes_arr.mean() > 0
-            else 0.0
-        )
-        comm_volume_kb_runtime = float(comm_volume_bytes) / 1024.0 if comm_volume_bytes > 0 else 0.0
-        upstream_sender_gpu2cpu_arr = np.array(
-            [r.get("upstream_sender_gpu2cpu_ms", 0.0) for r in decode_records if r.get("upstream_sender_gpu2cpu_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        upstream_sender_cpu2nic_arr = np.array(
-            [r.get("upstream_sender_cpu2nic_ms", 0.0) for r in decode_records if r.get("upstream_sender_cpu2nic_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        upstream_wire_arr = np.array(
-            [r.get("upstream_wire_ms", 0.0) for r in decode_records if r.get("upstream_wire_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        upstream_payload_bytes_arr = np.array(
-            [r.get("upstream_payload_bytes", 0.0) for r in decode_records if r.get("upstream_payload_bytes", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        paper_gpu2cpu_mean = (
-            float(upstream_sender_gpu2cpu_arr.mean()) if len(upstream_sender_gpu2cpu_arr) > 0 else float(gpu2cpu_arr.mean())
-        )
-        paper_cpu2nic_mean = (
-            float(upstream_sender_cpu2nic_arr.mean()) if len(upstream_sender_cpu2nic_arr) > 0 else cpu2nic_mean
-        )
-        paper_nic2nic_mean = float(upstream_wire_arr.mean()) if len(upstream_wire_arr) > 0 else nic2nic_mean
-        paper_comm_volume_bytes = (
-            float(upstream_payload_bytes_arr.mean()) if len(upstream_payload_bytes_arr) > 0 else float(comm_volume_bytes)
-        )
-        paper_comm_volume_kb = paper_comm_volume_bytes / 1024.0 if paper_comm_volume_bytes > 0 else 0.0
-        paper_net_latency_ms = push_e2e_mean if push_e2e_mean > 0 else paper_nic2nic_mean
-        paper_net_bw_mbps = (
-            paper_comm_volume_bytes * 8.0 / (paper_nic2nic_mean / 1000.0) / 1e6
-            if paper_nic2nic_mean > 0 and paper_comm_volume_bytes > 0
-            else 0.0
-        )
-        exposed_ready_count = sum(int(r.get("pipeline_overlap_breakdown_ready", 0)) for r in decode_records)
-        critical_path_exposed_arr = np.array(
-            [r.get("critical_path_exposed_ms", 0.0) for r in decode_records if r.get("critical_path_exposed_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        sender_gpu2cpu_exposed_arr = np.array(
-            [r.get("sender_gpu2cpu_exposed_ms", 0.0) for r in decode_records if r.get("sender_gpu2cpu_exposed_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        sender_cpu2nic_exposed_arr = np.array(
-            [r.get("sender_cpu2nic_exposed_ms", 0.0) for r in decode_records if r.get("sender_cpu2nic_exposed_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        nic2nic_exposed_arr = np.array(
-            [r.get("nic2nic_exposed_ms", 0.0) for r in decode_records if r.get("nic2nic_exposed_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        receiver_nic2cpu_exposed_arr = np.array(
-            [r.get("receiver_nic2cpu_exposed_ms", 0.0) for r in decode_records if r.get("receiver_nic2cpu_exposed_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        receiver_cpu2gpu_exposed_arr = np.array(
-            [r.get("receiver_cpu2gpu_exposed_ms", 0.0) for r in decode_records if r.get("receiver_cpu2gpu_exposed_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        sender_post_compute_exposed_arr = np.array(
-            [r.get("sender_post_compute_exposed_ms", 0.0) for r in decode_records if r.get("sender_post_compute_exposed_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        receiver_dispatch_exposed_arr = np.array(
-            [r.get("receiver_dispatch_exposed_ms", 0.0) for r in decode_records if r.get("receiver_dispatch_exposed_ms", 0.0) > 0.0],
-            dtype=np.float64,
-        )
-        critical_path_exposed_mean = (
-            float(critical_path_exposed_arr.mean()) if len(critical_path_exposed_arr) > 0 else float(inference_latency_ms)
-        )
-        sender_gpu2cpu_exposed_mean = (
-            float(sender_gpu2cpu_exposed_arr.mean()) if len(sender_gpu2cpu_exposed_arr) > 0 else paper_gpu2cpu_mean
-        )
-        sender_cpu2nic_exposed_mean = (
-            float(sender_cpu2nic_exposed_arr.mean()) if len(sender_cpu2nic_exposed_arr) > 0 else paper_cpu2nic_mean
-        )
-        nic2nic_exposed_mean = (
-            float(nic2nic_exposed_arr.mean()) if len(nic2nic_exposed_arr) > 0 else paper_nic2nic_mean
-        )
-        receiver_nic2cpu_exposed_mean = (
-            float(receiver_nic2cpu_exposed_arr.mean()) if len(receiver_nic2cpu_exposed_arr) > 0 else float(nic2cpu_arr.mean())
-        )
-        receiver_cpu2gpu_exposed_mean = (
-            float(receiver_cpu2gpu_exposed_arr.mean()) if len(receiver_cpu2gpu_exposed_arr) > 0 else float(cpu2gpu_arr.mean())
-        )
-        sender_post_compute_exposed_mean = (
-            float(sender_post_compute_exposed_arr.mean()) if len(sender_post_compute_exposed_arr) > 0 else 0.0
-        )
-        receiver_dispatch_exposed_mean = (
-            float(receiver_dispatch_exposed_arr.mean()) if len(receiver_dispatch_exposed_arr) > 0 else 0.0
-        )
-
-        n = len(decode_records)
-        summary_message = (
-            f"[TIMING_SUMMARY] blocks={blocks_desc} steps={n} (excl {warmup} warmup)\n"
-            f"  nic2cpu : mean={nic2cpu_arr.mean():.2f}ms  median={np.median(nic2cpu_arr):.2f}ms  "
-            f"p95={np.percentile(nic2cpu_arr,95):.2f}ms  max={nic2cpu_arr.max():.2f}ms\n"
-            f"  cpu2gpu : mean={cpu2gpu_arr.mean():.2f}ms  median={np.median(cpu2gpu_arr):.2f}ms  "
-            f"p95={np.percentile(cpu2gpu_arr,95):.2f}ms  max={cpu2gpu_arr.max():.2f}ms\n"
-            f"  compute : mean={compute_arr.mean():.1f}ms  median={np.median(compute_arr):.1f}ms  "
-            f"p95={np.percentile(compute_arr,95):.1f}ms  min={compute_arr.min():.1f}ms  max={compute_arr.max():.1f}ms\n"
-            f"  gpu2cpu : mean={gpu2cpu_arr.mean():.2f}ms  median={np.median(gpu2cpu_arr):.2f}ms  "
-            f"p95={np.percentile(gpu2cpu_arr,95):.2f}ms  max={gpu2cpu_arr.max():.2f}ms\n"
-            f"  step_total: mean={step_arr.mean():.1f}ms  median={np.median(step_arr):.1f}ms  "
-            f"p95={np.percentile(step_arr,95):.1f}ms  min={step_arr.min():.1f}ms  max={step_arr.max():.1f}ms\n"
-            f"  queue_wait: mean={queue_arr.mean():.1f}ms  median={np.median(queue_arr):.1f}ms  "
-            f"p95={np.percentile(queue_arr,95):.1f}ms  max={queue_arr.max():.1f}ms\n"
-            f"  summary: inference_latency={inference_latency_ms:.2f}ms  throughput={throughput_tok_s:.2f}tok/s  "
-            f"comm_volume={comm_volume_kb:.1f}KB  net_latency={push_e2e_mean:.2f}ms  net_bw={avg_nic_bw:.1f}MB/s\n"
-            f"  ratio: compute={compute_ratio:.1f}%  host_io={host_io_ratio:.1f}%  gpu2cpu={gpu2cpu_ratio:.1f}%  "
-            f"avg_bw(gpu2cpu)={avg_bw:.2f}GB/s  data_per_step={data_arr.mean()/1024:.1f}KB"
-            f"{comm_summary}"
-        )
-        logger.info(summary_message)
-
-        timing_table_line = (
-            f"[TIMING_TABLE] blocks={blocks_desc} steps={n} "
-            f"T_GPU->CPU={gpu2cpu_arr.mean():.2f}ms "
-            f"T_CPU->NIC={cpu2nic_mean:.2f}ms "
-            f"T_NIC->NIC={nic2nic_mean:.2f}ms "
-            f"T_NIC->CPU={nic2cpu_arr.mean():.2f}ms "
-            f"T_CPU->GPU={cpu2gpu_arr.mean():.2f}ms "
-            f"InferenceLatency={inference_latency_ms:.2f}ms "
-            f"Throughput={throughput_tok_s:.2f}tok/s "
-            f"CommunicateVolume={comm_volume_kb:.1f}KB "
-            f"T_GPU_Compute={compute_arr.mean():.2f}ms "
-            f"NetLatency={push_e2e_mean:.2f}ms "
-            f"NetBandwidth={avg_nic_bw:.2f}MB/s"
-        )
-        logger.info(timing_table_line)
-        self._emit_unconditional_summary(timing_table_line)
-
-        paper_timing_table_line = (
-            f"[PAPER_TIMING_TABLE] blocks={blocks_desc} steps={n} "
-            f"T_GPU->CPU={paper_gpu2cpu_mean:.2f}ms "
-            f"T_CPU->NIC={paper_cpu2nic_mean:.2f}ms "
-            f"T_NIC->NIC={paper_nic2nic_mean:.2f}ms "
-            f"T_NIC->CPU={nic2cpu_arr.mean():.2f}ms "
-            f"T_CPU->GPU={cpu2gpu_arr.mean():.2f}ms "
-            f"InferenceLatency={inference_latency_ms:.2f}ms "
-            f"Throughput={throughput_tok_s:.2f}tok/s "
-            f"CommunicationVolume={paper_comm_volume_kb:.1f}KB "
-            f"T_GPU_Compute={compute_arr.mean():.2f}ms "
-            f"NetworkLatency={paper_net_latency_ms:.2f}ms "
-            f"NetworkBandwidth={paper_net_bw_mbps:.2f}Mbps"
-        )
-        logger.info(paper_timing_table_line)
-        self._emit_unconditional_summary(paper_timing_table_line)
-
-        component_scope_line = (
-            f"[PIPELINE_COMPONENT_VIEW] blocks={blocks_desc} steps={n} "
-            f"sender_T_GPU->CPU_RAW={paper_gpu2cpu_mean:.2f}ms "
-            f"sender_T_CPU->NIC_RAW={paper_cpu2nic_mean:.2f}ms "
-            f"link_T_NIC->NIC_RAW={paper_nic2nic_mean:.2f}ms "
-            f"receiver_T_NIC->CPU_RAW={nic2cpu_arr.mean():.2f}ms "
-            f"receiver_T_CPU->GPU_RAW={cpu2gpu_arr.mean():.2f}ms "
-            f"pipeline_overlap_affects_component_visibility=1"
-        )
-        logger.info(component_scope_line)
-        self._emit_unconditional_summary(component_scope_line)
-
-        exposed_component_line = (
-            f"[PIPELINE_EXPOSED_VIEW] blocks={blocks_desc} steps={n} "
-            f"EndToEndCriticalPathExposed={critical_path_exposed_mean:.2f}ms "
-            f"sender_T_GPU->CPU_EXPOSED={sender_gpu2cpu_exposed_mean:.2f}ms "
-            f"sender_T_CPU->NIC_EXPOSED={sender_cpu2nic_exposed_mean:.2f}ms "
-            f"link_T_NIC->NIC_EXPOSED={nic2nic_exposed_mean:.2f}ms "
-            f"receiver_T_NIC->CPU_EXPOSED={receiver_nic2cpu_exposed_mean:.2f}ms "
-            f"receiver_T_CPU->GPU_EXPOSED={receiver_cpu2gpu_exposed_mean:.2f}ms "
-            f"sender_post_compute_gap_EXPOSED={sender_post_compute_exposed_mean:.2f}ms "
-            f"receiver_dispatch_EXPOSED={receiver_dispatch_exposed_mean:.2f}ms "
-            f"overlap_breakdown_coverage={exposed_ready_count}/{n}"
-        )
-        logger.info(exposed_component_line)
-        self._emit_unconditional_summary(exposed_component_line)
-
-        pipeline_gpu_line = (
-            f"[PIPELINE_GPU2GPU] blocks={blocks_desc} steps={n} "
-            f"T_GPU->GPU_PIPE={pipeline_gpu2gpu_mean:.2f}ms "
-            f"BW_GPU->GPU_PIPE={pipeline_bw_mbps:.2f}Mbps "
-            f"T_GPU->GPU_PURE={pure_gpu2gpu_mean:.2f}ms "
-            f"BW_GPU->GPU_PURE={pure_gpu2gpu_bw_mbps:.2f}Mbps "
-            f"T_GPU_LOCAL_STAGING={local_gpu_staging_mean:.2f}ms "
-            f"T_GPU_PURE_COMPUTE={pure_gpu_compute_mean:.2f}ms "
-            f"T_CPU_SERIALIZE={cpu_serialize_arr.mean():.2f}ms "
-            f"samples={len(pipeline_gpu2gpu_arr)}"
-        )
-        logger.info(pipeline_gpu_line)
-        self._emit_unconditional_summary(pipeline_gpu_line)
-
-        timing_note_line = (
-            f"[TIMING_NOTE] blocks={blocks_desc} "
-            f"T_GPU->GPU_PIPE=sender(T_GPU->CPU+T_CPU->NIC+wire)+receiver(T_NIC->CPU+T_CPU->GPU); "
-            f"PAPER_TIMING_TABLE prefers upstream sender+wire fields on downstream stages when available; "
-            f"T_GPU->GPU_PURE is same-host cuda->cuda transfer time collected inside task_pool .to(device); "
-            f"T_GPU->CPU happens on sender after compute; T_CPU->NIC happens on sender before rpc_push; "
-            f"T_NIC->NIC is one-hop wire time; T_NIC->CPU happens on receiver during deserialize/unpack; "
-            f"T_CPU->GPU happens on receiver when runtime moves tensors to cuda; "
-            f"component fields are raw local segment durations and may be overlapped by pipeline; "
-            f"they are not additive to end-to-end latency; "
-            f"PIPELINE_EXPOSED_VIEW reports the downstream critical-path-visible portion of each segment; "
-            f"with full-batch PP (no micro-batching), EXPOSED is reported from observed per-step segments and coverage should be n/n; "
-            f"with micro-batch PP, EXPOSED uses overlap attribution when available and otherwise falls back to RAW means; "
-            f"T_NIC->CPU includes deserialize/unpack; "
-            f"T_CPU->NIC includes request packing and pre-send prep; "
-            f"InferenceLatency/Throughput are stage-local means; "
-            f"CommunicationVolume is mean payload per decode step in KB; "
-            f"NetworkLatency=push_e2e(send->ack), while T_NIC->NIC subtracts receiver processing; "
-            f"NetworkBandwidth=payload_bits/T_NIC->NIC in Mbps."
-        )
-        logger.info(timing_note_line)
-        self._emit_unconditional_summary(timing_note_line)
 
     def _extract_rpc_push_timing(
         self,
@@ -1961,8 +1362,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                         anext_task.cancel()
                         get_push_task.cancel()
                         return
-        except Exception:
-            raise
         finally:
             for pending_task in (anext_task, get_push_task):
                 if pending_task is not None and not pending_task.done():
@@ -2004,13 +1403,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                 wire_ms = max(0.0, (receive_us - sender_send_local_us) / 1000.0)
             payload_bytes = sum(len(t.buffer) for t in request.tensors)
             metadata_bytes = len(request.metadata) if request.metadata else 0
-            logger.info(
-                f"[S2S_WIRE] step_id={metadata.get('step_id')} channel=full_batch "
-                f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
-                f"payload_kb={payload_bytes / 1024.0:.2f} metadata_b={metadata_bytes} "
-                f"raw_transfer_ms={raw_transfer_ms:.3f} wire_ms={wire_ms:.3f} "
-                f"clock_sync={int(clock_sync_ok)}"
-            )
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[S2S_WIRE] step_id={metadata.get('step_id')} channel=full_batch "
+                    f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
+                    f"payload_kb={payload_bytes / 1024.0:.2f} metadata_b={metadata_bytes} "
+                    f"raw_transfer_ms={raw_transfer_ms:.3f} wire_ms={wire_ms:.3f} "
+                    f"clock_sync={int(clock_sync_ok)}"
+                )
             self._record_s2s_network_sample(
                 channel="full_batch",
                 sender_blocks=sender_blocks,
@@ -2084,6 +1484,14 @@ class TransformerConnectionHandler(ConnectionHandler):
         # [MBPIPE] Idempotency check - skip if already processed
         if mb_key not in self._mb_processed:
             self._mb_processed[mb_key] = set()
+            self._mb_processed_timestamps[mb_key] = time.monotonic()
+            # TTL cleanup: remove stale entries
+            now = time.monotonic()
+            stale_keys = [k for k, t in self._mb_processed_timestamps.items()
+                          if now - t > self._MB_PROCESSED_TTL]
+            for k in stale_keys:
+                self._mb_processed.pop(k, None)
+                self._mb_processed_timestamps.pop(k, None)
         
         if mb_idx in self._mb_processed[mb_key]:
             logger.info(
@@ -2163,8 +1571,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         logical_payload_bytes = int(metadata.get("_s2s_logical_tensor_bytes", payload_bytes))
         s2s_transport = str(metadata.get("_s2s_transport", "rpc"))
         metadata_bytes = len(request.metadata) if request.metadata else 0
-        logger.info(
-            f"[S2S_WIRE] step_id={step_id} mb_idx={int(mb_idx)} "
+        if is_log_channel_enabled("s2s_wire_logs"):
+            logger.info(
+                f"[S2S_WIRE] step_id={step_id} mb_idx={int(mb_idx)} "
             f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
             f"batch={int(mb_size)} transport={s2s_transport} "
             f"payload_kb={payload_bytes/1024.0:.2f} rpc_payload_kb={rpc_payload_bytes/1024.0:.2f} "
@@ -2200,15 +1609,15 @@ class TransformerConnectionHandler(ConnectionHandler):
         metadata["_s2s_payload_bytes"] = int(rpc_payload_bytes)
         metadata["_s2s_logical_payload_bytes"] = int(logical_payload_bytes)
         
-        # Initialize tracking for this (session, step) if not exists
-        if mb_key not in self._mb_queues:
-            self._mb_queues[mb_key] = asyncio.Queue()
+        # Initialize tracking for this (session, step) if not exists.
+        # (No per-step asyncio.Queue here: in immediate mode micro-batches go
+        # straight into the session queue, so allocating one was pure waste.)
+        if mb_key not in self._mb_expected:
             self._mb_expected[mb_key] = expected_num_mb
             self._mb_received[mb_key] = 0
             logger.info(
                 f"{MBPIPE_LOG_PREFIX} rpc_push: created tracking for step={step_id}, "
-                f"expecting {expected_num_mb} micro-batches, "
-                f"immediate_queue={'enabled' if self._enable_immediate_mb_queue else 'disabled'}"
+                f"expecting {expected_num_mb} micro-batches"
             )
         
         self._mb_received[mb_key] = self._mb_received.get(mb_key, 0) + 1
@@ -2219,166 +1628,42 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"start_from_position={start_from_position}, received={received_count}/{expected_num_mb}"
         )
         
-        acc_key = f"{session_id}|{step_id}"
-        file_received_count = 0
-        wrote_file = False
-        if (not self._enable_immediate_mb_queue) or self._store_mb_files_in_immediate:
-            # Legacy fallback: keep file-based storage for reconstruction/diagnostics.
-            tensor_bytes = [t.SerializeToString() for t in request.tensors]
-            file_received_count = _store_microbatch_to_file(acc_key, mb_idx, tensor_bytes, metadata.copy())
-            wrote_file = True
-        
-        if self._enable_immediate_mb_queue:
-            # ========== IMMEDIATE QUEUING PATH (Step A) ==========
-            # Put each micro-batch directly into session queue as a queue item
-            metadata["s2s_receiver_queue_put_us"] = int(self._now_us())
-            
-            mb_queue_item = create_microbatch_queue_item(
-                request_id=session_id,
-                step_id=step_id,
-                mb_idx=mb_idx,
-                expected_num_mb=expected_num_mb,
-                payload=request,
-                metadata=metadata.copy(),
-                offset=mb_offset,
-                size=mb_size,
-                full_batch_size=full_batch_size,
-            )
-            
-            # Put into session queue immediately (wrapped in dict to distinguish from regular requests)
-            self._put_into_session_queue(session_id, mb_queue_item)
-            
-            logger.debug(
-                f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} IMMEDIATELY queued to session "
-                f"(received={received_count}/{expected_num_mb})"
-            )
-            
-            # Cleanup tracking when all micro-batches for this step are queued.
-            if received_count >= expected_num_mb:
-                if wrote_file:
-                    logger.info(
-                        f"{MBPIPE_LOG_PREFIX} rpc_push: all {expected_num_mb} micro-batches queued, "
-                        f"cleaning up file storage"
-                    )
-                    _cleanup_microbatch_files(acc_key, expected_num_mb)
-                # Cleanup tracking data
-                self._mb_queues.pop(mb_key, None)
-                self._mb_expected.pop(mb_key, None)
-                self._mb_received.pop(mb_key, None)
-                self._mb_processed.pop(mb_key, None)
-        else:
-            # ========== LEGACY PATH (wait-all-then-assemble) ==========
-            logger.info(
-                f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} stored to file "
-                f"(file_count={file_received_count}/{expected_num_mb})"
-            )
-            
-            if file_received_count >= expected_num_mb:
-                logger.info(
-                    f"{MBPIPE_LOG_PREFIX} rpc_push: all {expected_num_mb} micro-batches received, "
-                    f"assembling and forwarding to session"
-                )
-                try:
-                    assembled_request = await self._assemble_microbatches(
-                        acc_key, expected_num_mb, requested_uids
-                    )
-                    self._put_into_session_queue(session_id, assembled_request)
-                finally:
-                    _cleanup_microbatch_files(acc_key, expected_num_mb)
-                    # Cleanup tracking data
-                    self._mb_queues.pop(mb_key, None)
-                    self._mb_expected.pop(mb_key, None)
-                    self._mb_received.pop(mb_key, None)
-                    self._mb_processed.pop(mb_key, None)
-        
+        # Each micro-batch goes straight into the session queue as a queue item;
+        # the consume side (_iterate_inference_steps) detects and processes them
+        # individually for pipeline overlap. (The old wait-all-then-assemble
+        # fallback stored pickles under a shared /tmp dir and was removed: it was
+        # both a local-privilege-escalation vector and dead weight.)
+        metadata["s2s_receiver_queue_put_us"] = int(self._now_us())
+
+        mb_queue_item = create_microbatch_queue_item(
+            request_id=session_id,
+            step_id=step_id,
+            mb_idx=mb_idx,
+            expected_num_mb=expected_num_mb,
+            payload=request,
+            metadata=metadata.copy(),
+            offset=mb_offset,
+            size=mb_size,
+            full_batch_size=full_batch_size,
+        )
+
+        self._put_into_session_queue(session_id, mb_queue_item)
+
+        logger.debug(
+            f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} queued to session "
+            f"(received={received_count}/{expected_num_mb})"
+        )
+
+        # Cleanup tracking when all micro-batches for this step are queued.
+        if received_count >= expected_num_mb:
+            self._mb_expected.pop(mb_key, None)
+            self._mb_received.pop(mb_key, None)
+            self._mb_processed.pop(mb_key, None)
+            self._mb_processed_timestamps.pop(mb_key, None)
+
         return runtime_pb2.ExpertResponse()
 
     
-    async def _assemble_microbatches(
-        self,
-        acc_key: str,
-        expected_num_mb: int,
-        requested_uids: Sequence[str],
-    ) -> runtime_pb2.ExpertRequest:
-        """
-        [MBPIPE] Assemble accumulated micro-batches into a single request.
-        
-        This reconstructs the original full batch from multiple micro-batch pushes
-        stored in files.
-        """
-        # Load all micro-batches from files
-        accumulated_raw = _load_all_microbatches_from_files(acc_key, expected_num_mb)
-        
-        # Deserialize protobuf tensors
-        accumulated = {
-            k: (
-                [runtime_pb2.Tensor.FromString(t) for t in v[0]],  # Deserialize from bytes
-                v[1].copy()
-            )
-            for k, v in accumulated_raw.items()
-        }
-        
-        # Sort by micro-batch index to maintain order
-        sorted_mb_indices = sorted(accumulated.keys())
-        
-        if len(sorted_mb_indices) != expected_num_mb:
-            raise ValueError(
-                f"{MBPIPE_LOG_PREFIX} Micro-batch count mismatch: "
-                f"expected {expected_num_mb}, got {len(sorted_mb_indices)}"
-            )
-        
-        # Collect tensors from each micro-batch
-        # Assume each micro-batch has same number of tensors (hidden_states, keep_indices)
-        first_tensors, first_metadata = accumulated[sorted_mb_indices[0]]
-        num_tensor_types = len(first_tensors)
-        
-        # Deserialize and concatenate tensors
-        assembled_tensors = []
-        for tensor_idx in range(num_tensor_types):
-            tensor_parts = []
-            for mb_idx in sorted_mb_indices:
-                tensors, _ = accumulated[mb_idx]
-                if tensor_idx < len(tensors):
-                    # Deserialize tensor
-                    tensor = deserialize_torch_tensor(tensors[tensor_idx])
-                    tensor_parts.append(tensor)
-            
-            if tensor_parts:
-                # Concatenate along batch dimension
-                if len(tensor_parts) > 1:
-                    assembled = torch.cat(tensor_parts, dim=0)
-                else:
-                    assembled = tensor_parts[0]
-                
-                # Re-serialize for the ExpertRequest
-                # Get compression settings from original tensor proto
-                original_proto = first_tensors[tensor_idx]
-                assembled_proto = serialize_torch_tensor(
-                    assembled, original_proto.compression, allow_inplace=True
-                )
-                assembled_tensors.append(assembled_proto)
-        
-        # Build assembled metadata (use first micro-batch's metadata as base)
-        assembled_metadata = first_metadata.copy()
-        # Remove micro-batch specific fields
-        assembled_metadata.pop("is_microbatch_push", None)
-        assembled_metadata.pop("micro_batch_idx", None)
-        assembled_metadata.pop("micro_batch_offset", None)
-        assembled_metadata.pop("micro_batch_size", None)
-        assembled_metadata.pop("full_batch_size", None)
-        
-        logger.info(
-            f"{MBPIPE_LOG_PREFIX} Assembled {len(sorted_mb_indices)} micro-batches: "
-            f"{[t.size for t in assembled_tensors if hasattr(t, 'size')]}"
-        )
-        
-        # Create assembled request
-        return runtime_pb2.ExpertRequest(
-            uid=CHAIN_DELIMITER.join(requested_uids),
-            tensors=assembled_tensors,
-            metadata=MSGPackSerializer.dumps(assembled_metadata),
-        )
-
     async def _push_outputs(
         self,
         request: runtime_pb2.ExpertRequest,
@@ -2526,6 +1811,25 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_metadata["s2s_sender_gpu2cpu_ms"] = float(t_gpu2cpu_ms)
 
             stub = self.get_stub(self._p2p, next_peer_id)
+            if os.environ.get("BLOOMBEE_DUMP_WIRE_ACTIVATIONS", "0") == "1" and next_tensors:
+                try:
+                    push_hidden = deserialize_torch_tensor(next_tensors[0])
+                    push_hidden_dtype = str(push_hidden.dtype).replace("torch.", "") if torch.is_tensor(push_hidden) else ""
+                    capture_wire_activation(
+                        push_hidden,
+                        source="server",
+                        channel="rpc_push_full_batch",
+                        direction="server_to_server",
+                        phase=str(metadata.get("phase", "decode" if getattr(push_hidden, "ndim", 0) >= 2 and int(push_hidden.shape[1]) == 1 else "prefill")),
+                        blocks=f"{sender_blocks}->{next_start}:{next_end}",
+                        compute_dtype=push_hidden_dtype,
+                        schema_dtype=push_hidden_dtype,
+                        wire_dtype=push_hidden_dtype,
+                        batch_size=int(metadata.get("full_batch_size", push_hidden.shape[0] if torch.is_tensor(push_hidden) and push_hidden.ndim >= 1 else 1)),
+                        prompt_len=int(push_hidden.shape[1]) if torch.is_tensor(push_hidden) and push_hidden.ndim >= 2 else 1,
+                    )
+                except Exception:
+                    pass
             is_spec_push = bool(metadata.get("is_spec_dec", False))
             if (
                 next_tensors
@@ -2646,8 +1950,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 receiver_processing_ms=receiver_processing_ms,
                 wire_bytes=push_tensor_bytes,
             )
-            logger.info(
-                f"[COMM_BREAKDOWN] step_id={step_id} "
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[COMM_BREAKDOWN] step_id={step_id} "
                 f"to_blocks={next_start}:{next_end} "
                 f"T(GPU→CPU)={t_gpu2cpu_ms:.2f}ms({gpu2cpu_pct:.1f}%) "
                 f"T(CPU→NIC)={t_cpu2nic_ms:.2f}ms({cpu2nic_pct:.1f}%) "
@@ -2661,12 +1966,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"wire_bytes={push_tensor_bytes}"
             )
 
-            logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "
-                       f"from_blocks={sender_blocks} | to_blocks={next_start}:{next_end} | "
-                       f"tensor_size={push_tensor_bytes/1024:.2f}KB | "
-                       f"metadata_size={push_metadata_bytes}B | "
-                       f"transfer_time={transfer_time_ms:.2f}ms | "
-                       f"approx_bw={transfer_bw_mbps:.2f}Mbps")
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(f"[NETWORK_S2S] PUSH_COMPLETE | "
+                           f"from_blocks={sender_blocks} | to_blocks={next_start}:{next_end} | "
+                           f"tensor_size={push_tensor_bytes/1024:.2f}KB | "
+                           f"metadata_size={push_metadata_bytes}B | "
+                           f"transfer_time={transfer_time_ms:.2f}ms | "
+                           f"approx_bw={transfer_bw_mbps:.2f}Mbps")
             
         except Exception:
             logger.warning(
@@ -2696,7 +2002,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             metadata: Contains next_servers, micro_batch_idx, etc.
             requested_backends: Backends for serialization schema
         """
-        import os
         # [MBPIPE] Feature flag for cross-stage micro-batch push
         # Default: enabled ("1") since Step 4.2 added Server2 support for receiving micro-batches
         # Set BLOOMBEE_ENABLE_CROSS_STAGE_PUSH=0 to disable
@@ -2753,10 +2058,26 @@ class TransformerConnectionHandler(ConnectionHandler):
             sender_blocks_str = str(metadata.get("sender_blocks", "unknown"))
             sender_blocks = sender_blocks_str
             push_blocks = f"{sender_blocks_str}->{next_start}:{next_end}"
+            hidden_wire = mb_hidden.to(outputs_schema[0].dtype)
+            hidden_compute_dtype = str(mb_hidden.dtype).replace("torch.", "")
+            hidden_schema_dtype = str(outputs_schema[0].dtype).replace("torch.", "")
+            hidden_wire_dtype = str(hidden_wire.dtype).replace("torch.", "")
+            capture_wire_activation(
+                hidden_wire,
+                source="server",
+                channel="rpc_push_microbatch",
+                direction="server_to_server",
+                phase=transport_phase,
+                blocks=push_blocks,
+                compute_dtype=hidden_compute_dtype,
+                schema_dtype=hidden_schema_dtype,
+                wire_dtype=hidden_wire_dtype,
+                batch_size=int(mb_size),
+                prompt_len=int(mb_hidden.shape[1]) if mb_hidden.ndim >= 2 else 1,
+            )
             with transport_profile_scope() as push_transport_profile:
-                hidden_to_send = mb_hidden.to(outputs_schema[0].dtype)
                 hidden_to_send, scale_tensor, quant_meta = quantize_s2s_hidden_for_transport(
-                    hidden_to_send,
+                    hidden_wire,
                     is_spec_dec=is_spec_push,
                     logger=logger,
                     context=f"micro_batch:{sender_blocks}->{next_start}:{next_end}",
@@ -2772,6 +2093,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                         "channel": "rpc_push_microbatch",
                         "blocks": push_blocks,
                         "batch": int(mb_size),
+                        "compute_dtype": hidden_compute_dtype,
+                        "schema_dtype": hidden_schema_dtype,
+                        "wire_dtype": hidden_wire_dtype,
+                        "upcast_suspect": int(
+                            mb_hidden.dtype in (torch.float16, torch.bfloat16)
+                            and outputs_schema[0].dtype == torch.float32
+                        ),
                     },
                 )
                 if mb_keep_indices is not None:
@@ -2898,8 +2226,9 @@ class TransformerConnectionHandler(ConnectionHandler):
             kv_to_activation_ratio = (
                 (kv_pcie_bytes / activation_wire_bytes) if activation_wire_bytes > 0 else 0.0
             )
-            logger.info(
-                f"[ACTIVATION_XFER_CHECK] step_id={metadata.get('step_id', 'unknown')} "
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[ACTIVATION_XFER_CHECK] step_id={metadata.get('step_id', 'unknown')} "
                 f"mb_idx={int(mb_idx)} blocks={sender_blocks}->{next_start}:{next_end} "
                 f"batch={int(mb_size)} activation_raw_bytes={activation_raw_bytes} "
                 f"activation_wire_bytes={activation_wire_bytes} activation_ratio={activation_ratio:.6f} "
@@ -2991,10 +2320,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             # [ASYNC_PUSH] Fire-and-forget: don't await RPC response
             # This allows Stage 1 compute to continue immediately while data is sent in background.
             # These timestamps are used on the receiver to isolate pure wire latency.
+            # Metadata is serialized exactly once, inside _do_rpc_push_async right
+            # before the send, so the send timestamp is accurate without a
+            # loads/dumps round-trip per micro-batch.
             push_metadata["s2s_sender_sem_wait_ms"] = float(sem_wait_time)
             push_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
-            push_metadata["clock_sync_sender_send_us"] = int(push_metadata["s2s_sender_enqueue_us"])
-
             tensor_messages = [serialized_hidden, serialized_keep, *serialized_spec_tensors]
             if quant_meta is not None:
                 tensor_messages.append(serialized_scale)
@@ -3018,22 +2348,18 @@ class TransformerConnectionHandler(ConnectionHandler):
                         exc_info=True,
                     )
 
-            rpc_request = runtime_pb2.ExpertRequest(
-                uid=next_uid,
-                tensors=tensor_messages,
-                metadata=MSGPackSerializer.dumps(push_metadata),
-            )
             t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
             push_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
             push_tensor_bytes = sum(len(tensor.buffer) for tensor in tensor_messages)
             push_metadata["_s2s_rpc_tensor_bytes"] = int(push_tensor_bytes)
-            rpc_request.metadata = MSGPackSerializer.dumps(push_metadata)
-            
+
             # Create task for background sending - don't await
             send_task = asyncio.create_task(
                 self._do_rpc_push_async(
                     stub,
-                    rpc_request,
+                    next_uid,
+                    tensor_messages,
+                    push_metadata,
                     mb_idx,
                     push_start_time,
                     next_peer_id_str,
@@ -3046,8 +2372,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                     release_slot=acquired_slot,
                 )
             )
-            logger.info(
-                f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
                 f"mb_idx={int(mb_idx)} sender_blocks={sender_blocks} receiver_blocks={next_start}:{next_end} "
                 f"compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
                 f"serialize_ms={sender_serialize_ms:.3f} "
@@ -3074,7 +2401,9 @@ class TransformerConnectionHandler(ConnectionHandler):
     async def _do_rpc_push_async(
         self,
         stub,
-        request: runtime_pb2.ExpertRequest,
+        next_uid: str,
+        serialized_tensors: List[runtime_pb2.Tensor],
+        push_metadata: dict,
         mb_idx: int,
         queue_start_time: float,
         peer_id: str,
@@ -3089,7 +2418,7 @@ class TransformerConnectionHandler(ConnectionHandler):
     ) -> None:
         """
         [ASYNC_PUSH] Actually perform the RPC push in background.
-        
+
         This runs as a fire-and-forget task, allowing the main compute loop
         to continue without waiting for the network round-trip.
         """
@@ -3098,20 +2427,16 @@ class TransformerConnectionHandler(ConnectionHandler):
         success = False
         request_metadata = None
         try:
+            sender_send_us = self._now_us()
+            push_metadata["clock_sync_sender_send_us"] = sender_send_us
+            request = runtime_pb2.ExpertRequest(
+                uid=next_uid,
+                tensors=serialized_tensors,
+                metadata=MSGPackSerializer.dumps(push_metadata),
+            )
             payload_bytes = sum(len(t.buffer) for t in request.tensors)
             metadata_bytes = len(request.metadata) if request.metadata else 0
-            sender_send_us = self._now_us()
-            if request.metadata:
-                try:
-                    request_metadata = MSGPackSerializer.loads(request.metadata)
-                    if isinstance(request_metadata, dict):
-                        request_metadata["clock_sync_sender_send_us"] = sender_send_us
-                        request.metadata = MSGPackSerializer.dumps(request_metadata)
-                except Exception:
-                    request_metadata = None
-                    pass
-
-            metadata_bytes = len(request.metadata) if request.metadata else 0
+            request_metadata = push_metadata
             synthetic_delay_ms = _synthetic_s2s_delay_ms(payload_bytes + metadata_bytes)
             if synthetic_delay_ms > 0.0:
                 if isinstance(request_metadata, dict):
@@ -3163,8 +2488,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms, "
                 f"payload_kb={payload_bytes / 1024.0:.2f}, approx_bw={approx_bw_mbps:.2f}Mbps"
             )
-            logger.info(
-                f"[COMM_BREAKDOWN_MB] step_id={step_id or 'unknown'} mb_idx={mb_idx} "
+            if is_log_channel_enabled("s2s_wire_logs"):
+                logger.info(
+                    f"[COMM_BREAKDOWN_MB] step_id={step_id or 'unknown'} mb_idx={mb_idx} "
                 f"to_blocks={to_blocks} "
                 f"T(GPU→CPU)={t_gpu2cpu_ms:.2f}ms "
                 f"T(CPU→NIC)={t_cpu2nic_ms:.2f}ms "
@@ -3206,11 +2532,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points, (float, int)
             ), f"rpc_forward should have number of points as number or None, got {points}"
 
-            # Log server processing start
-            logger.info(f"[SERVER_PROCESSING_START] Server processing request with {len(requested_uids)} backends")
-            
-            # Measure network transfer time for S1->S2 communication
-            network_start_time = perf_counter()
+            forward_start_time = perf_counter()
             hidden_states = await run_rpc_forward(
                 *flat_inputs,
                 requested_backends=requested_backends,
@@ -3218,19 +2540,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                 active_adapter=active_adapter,
                 points=points,
             )
-            network_end_time = perf_counter()
-            network_transfer_time = (network_end_time - network_start_time) * 1000
-            
-            # Calculate server processing latency
-            server_end_time = perf_counter()
-            server_processing_latency = (server_end_time - server_start_time) * 1000
-            
-            logger.info(f"[NETWORK_TRANSFER_LATENCY] S1->S2 Transfer: {network_transfer_time:.2f}ms | "
-                       f"Backends: {len(requested_backends)} | "
-                       f"Output Shape: {hidden_states.shape}")
-            logger.info(f"[SERVER_PROCESSING_LATENCY] Total: {server_processing_latency:.2f}ms | "
-                       f"Backends: {len(requested_backends)} | "
-                       f"Output Shape: {hidden_states.shape}")
+            forward_compute_ms = (perf_counter() - forward_start_time) * 1000
+
+            server_processing_latency = (perf_counter() - server_start_time) * 1000
+
+            if is_log_channel_enabled("handler_step_timing_logs"):
+                logger.info(f"[FORWARD_COMPUTE_LATENCY] run_rpc_forward: {forward_compute_ms:.2f}ms | "
+                           f"Backends: {len(requested_backends)} | "
+                           f"Output Shape: {hidden_states.shape}")
+                logger.info(f"[SERVER_PROCESSING_LATENCY] Total: {server_processing_latency:.2f}ms | "
+                           f"Backends: {len(requested_backends)} | "
+                           f"Output Shape: {hidden_states.shape}")
             
             return runtime_pb2.ExpertResponse(
                 tensors=self._serialize_outputs(hidden_states, requested_backends, metadata)

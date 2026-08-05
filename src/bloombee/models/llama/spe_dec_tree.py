@@ -201,12 +201,12 @@ def prepare_incremental_tree_batch(
     pad_token_id: int = 0,
     seq_lengths: Optional[torch.LongTensor] = None,
     is_prefill: bool = False,
-    kv_cache_position_ids: Optional[torch.Tensor] = None,  # (B, max_pos_len), -1 是 padding
+    kv_cache_position_ids: Optional[torch.Tensor] = None,  # (B, max_pos_len), -1 is padding
     return_local_tree_mask: bool = False,
     return_node_paths: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
     """
-    准备增量 tree batch，支持不同序列长度
+    Build an incremental tree batch supporting variable sequence lengths.
     """
     batch_size = len(trees)
 
@@ -215,7 +215,7 @@ def prepare_incremental_tree_batch(
 
     max_tree_size = max(tree.total_nodes - 1 for tree in trees if tree.total_nodes > 1)
     
-    # Generation 阶段：server compacts the accepted sparse slots into a
+    # Generation phase: the server compacts the accepted sparse slots into a
     # contiguous prefix before running the next tree. The local mask must match
     # that compacted layout, not the old sparse physical slot range.
     cache_len = 0
@@ -244,11 +244,11 @@ def prepare_incremental_tree_batch(
         padded_tokens = tree_token_ids + [pad_token_id] * (max_tree_size - len(tree_token_ids))
         batch_tree_tokens.append(padded_tokens)
 
-        tree_len = len(tree_token_ids)  # 不包含 root
+        tree_len = len(tree_token_ids)  # does not include the root
         inputs_len = tree_len + 1  # root + tree tokens
         
         if is_prefill:
-            # ============ Prefill 阶段（不变） ============
+            # ============ Prefill phase (unchanged) ============
             past_len = input_ids.shape[1]
             total_len = past_len + tree_len
             mask = torch.zeros(1, total_len, total_len, dtype=torch.bool, device=device)
@@ -306,31 +306,31 @@ def prepare_incremental_tree_batch(
             # avoid NaNs, matching the old dense generation mask.
 
         else:
-            # ============ Generation 阶段 ============
-            # 总长度 = cache + 本轮输入
+            # ============ Generation phase ============
+            # total_len = cache + current-round inputs
             total_len = cache_len + inputs_len
-            
+
             mask = torch.zeros(1, inputs_len, total_len, dtype=torch.bool, device=device)
-            
-            # 计算 cache 中的有效位置
+
+            # Compute valid positions within the cache
             cache_valid_mask = _compute_single_cache_valid_mask(
                 kv_cache_position_ids[i], cache_len, device
             )
-            
-            # 1. Root attend to cache + 自己
+
+            # 1. Root attends to cache + itself
             mask[0, 0, :cache_len] = cache_valid_mask
-            mask[0, 0, cache_len] = True  # root attend 自己
-            
+            mask[0, 0, cache_len] = True  # root attends to itself
+
             # 2. Tree tokens attend to cache + root
             if tree_len > 0:
                 mask[0, 1:inputs_len, :cache_len] = cache_valid_mask.unsqueeze(0).expand(tree_len, cache_len)
                 mask[0, 1:inputs_len, cache_len] = True  # tree tokens attend to root
-            
-            # 3. Tree tokens 之间
+
+            # 3. Tree tokens attend to each other
             if tree_len > 0:
                 tree_mask = build_tree_attention_mask_with_root(tree_len, parent_indices, device)
                 mask[0, 1:inputs_len, cache_len + 1:total_len] = tree_mask
-            
+
             # Padding
             max_inputs_len = max_tree_size + 1
             if inputs_len < max_inputs_len:
@@ -338,7 +338,7 @@ def prepare_incremental_tree_batch(
                 total_padded_len = cache_len + max_inputs_len
                 padded_mask = torch.zeros(1, max_inputs_len, total_padded_len, dtype=torch.bool, device=device)
                 padded_mask[0, :inputs_len, :total_len] = mask[0]
-                # Padding 行 attend to cache（避免 NaN）
+                # Padding rows attend to cache (avoid NaN)
                 padded_mask[0, inputs_len:, :cache_len] = cache_valid_mask.unsqueeze(0).expand(pad_len, cache_len)
                 mask = padded_mask
 
@@ -361,29 +361,29 @@ def prepare_incremental_tree_batch(
 
 
 def _compute_single_cache_valid_mask(
-    kv_cache_position_ids_single: torch.Tensor,  # (max_pos_len,) 单个 batch
+    kv_cache_position_ids_single: torch.Tensor,  # (max_pos_len,) for a single batch item
     cache_len: int,
     device: torch.device,
 ) -> torch.Tensor:
     """
-    计算单个 batch 的 cache 有效位置 mask
-    
-    Cache 布局：
-    [已整理好的 cache: 0 到 root_pos-1] [上一轮被接受的 root/path: root_pos 起连续排列]
-    
+    Compute the cache-valid-position mask for a single batch item.
+
+    Cache layout (after server-side compaction):
+    [committed cache: 0 .. root_pos-1] [previous round's accepted root/path: contiguous from root_pos]
+
     Returns:
-        cache_valid_mask: (cache_len,) - True 表示有效位置
+        cache_valid_mask: (cache_len,) - True marks valid positions.
     """
     kv_cache_position_ids_single = kv_cache_position_ids_single.to(device)
-    
+
     valid_mask = kv_cache_position_ids_single >= 0
-    
+
     cache_valid_mask = torch.zeros(cache_len, dtype=torch.bool, device=device)
-    
-    # 1. 找到 root_position（第一个有效值）
+
+    # 1. Find root_position (first valid value)
     first_valid_idx = valid_mask.int().argmax().item()
     root_position = kv_cache_position_ids_single[first_valid_idx].item()
-    
+
     valid_count = int(valid_mask.sum().item())
     compact_len = min(cache_len, root_position + valid_count)
     cache_valid_mask[:compact_len] = True
@@ -397,7 +397,7 @@ def build_tree_attention_mask_with_root(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    构建 tree tokens 之间的 attention mask（不包含 root）
+    Build the attention mask between tree tokens (root excluded).
     """
     mask = torch.zeros(tree_len, tree_len, dtype=torch.bool, device=device)
     

@@ -20,27 +20,6 @@ T = 1e12
 
 
 
-# @dataclasses.dataclass(frozen=True)
-# class ExecutionEnv:
-#     """Hardware environment."""
-#     gpu: Any = None
-#     cpu: Any = None
-#     disk: Any = None
-#     mixed: Any = None
-
-#     @classmethod
-#     def create(cls, offload_dir):
-#         # fix recursive import
-#         from petals.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-#         gpu = TorchDevice("cuda:0")
-#         print('gpu ', gpu)
-#         cpu = TorchDevice("cpu")
-#         disk = TorchDisk(offload_dir)
-#         return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-
-#     def close_copy_threads(self):
-#         self.disk.close_copy_threads()
-
 
 @dataclasses.dataclass(frozen=True)
 class BenchmarkResult:
@@ -169,10 +148,8 @@ class ValueHolder:
         # self.val = val
         if self.val is None: ####
             self.val = val ######
-            # print('valueholder store a val')
         else : ####
             self.val = val ######
-            # print('valueholder update new val')
         
 
     def pop(self):
@@ -256,8 +233,6 @@ def project_decode_latency(costs, prompt_len, gen_len):
         #ys_pred = [curve(x) for x in range(gen_len-1)]
         #decode_latency = sum(ys_pred)
 
-        #print([round(x, 4) for x in decode_costs])
-        #print([round(x, 4) for x in ys_pred])
 
     return decode_latency
 
