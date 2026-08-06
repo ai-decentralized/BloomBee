@@ -7,7 +7,9 @@ If necessary, one can rewrite this to implement a different behavior, such as:
 
 """
 import json
+import re
 import time
+from collections import defaultdict
 from contextlib import suppress
 from typing import Dict, Optional, Sequence, Union
 
@@ -147,6 +149,69 @@ def load_pretrained_block(
     return block
 
 
+_DEEPSEEKV3_LEGACY_EXPERT_KEY_RE = re.compile(r"^(.*mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+
+
+def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
+    """Merge DeepSeek-V3's legacy per-expert weight layout into the batched
+    gate_up_proj/down_proj tensors that the installed transformers' DeepseekV3Experts
+    module actually has as parameters.
+
+    Some DeepSeek-V3 checkpoints (e.g. unsloth/DeepSeek-V3-bf16) still ship each routed
+    expert as three separate nn.Linear-style tensors:
+        mlp.experts.{i}.gate_proj.weight  [intermediate, hidden]
+        mlp.experts.{i}.up_proj.weight    [intermediate, hidden]
+        mlp.experts.{i}.down_proj.weight  [hidden, intermediate]
+    but transformers' DeepseekV3Experts module (built by WrappedDeepseekV3Block) stores
+    all experts as two 3D tensors instead:
+        mlp.experts.gate_up_proj  [num_experts, 2*intermediate, hidden]
+        mlp.experts.down_proj     [num_experts, hidden, intermediate]
+    Feeding the old-format keys straight into `block.load_state_dict(..., strict=False)`
+    silently no-ops on the name mismatch, leaving gate_up_proj/down_proj at their
+    uninitialized values -- i.e. the routed experts (>95% of the model's parameters)
+    never receive their trained weights while every other tensor loads fine.
+
+    The merge order (gate then up, concatenated along the output-feature dim; experts
+    stacked in index order) mirrors transformers' own conversion_mapping.py entry for
+    "qwen2_moe", which deepseek_v3 is aliased to, so this matches upstream exactly.
+
+    No-ops (returns state_dict unchanged) if no legacy per-expert keys are present --
+    i.e. dense blocks, and checkpoints that already ship the batched format.
+    """
+    per_expert = defaultdict(dict)  # {(prefix, expert_idx): {"gate_proj": t, "up_proj": t, "down_proj": t}}
+    for key in list(state_dict.keys()):
+        m = _DEEPSEEKV3_LEGACY_EXPERT_KEY_RE.match(key)
+        if m is None:
+            continue
+        prefix, expert_idx, proj = m.group(1), int(m.group(2)), m.group(3)
+        per_expert[(prefix, expert_idx)][proj] = state_dict.pop(key)
+
+    if not per_expert:
+        return state_dict
+
+    by_prefix = defaultdict(dict)
+    for (prefix, expert_idx), tensors in per_expert.items():
+        by_prefix[prefix][expert_idx] = tensors
+
+    for prefix, experts_by_idx in by_prefix.items():
+        num_experts = max(experts_by_idx) + 1
+        missing = [i for i in range(num_experts) if i not in experts_by_idx]
+        if missing:
+            raise ValueError(
+                f"{prefix}: missing expert indices {missing} while remapping legacy weight layout "
+                f"(found {sorted(experts_by_idx)})"
+            )
+
+        gate_stack = torch.stack([experts_by_idx[i]["gate_proj"] for i in range(num_experts)], dim=0)
+        up_stack = torch.stack([experts_by_idx[i]["up_proj"] for i in range(num_experts)], dim=0)
+        down_stack = torch.stack([experts_by_idx[i]["down_proj"] for i in range(num_experts)], dim=0)
+
+        state_dict[f"{prefix}.gate_up_proj"] = torch.cat([gate_stack, up_stack], dim=1)
+        state_dict[f"{prefix}.down_proj"] = down_stack
+
+    return state_dict
+
+
 def _load_hf_block_weights(
     block: nn.Module,
     model_name: str,
@@ -169,7 +234,17 @@ def _load_hf_block_weights(
         max_disk_space=max_disk_space,
     )
     # state_dict keys already have block_prefix stripped, e.g. "self_attention.query_key_value.weight"
-    block.load_state_dict(state_dict, strict=False)
+    if isinstance(block, WrappedDeepseekV3Block):
+        state_dict = _remap_deepseekv3_expert_state_dict(state_dict)
+        result = block.load_state_dict(state_dict, strict=False)
+        if result.missing_keys or result.unexpected_keys:
+            logger.warning(
+                f"{block_prefix}: state_dict load left {len(result.missing_keys)} missing and "
+                f"{len(result.unexpected_keys)} unexpected key(s) -- weights may be incomplete. "
+                f"missing={result.missing_keys[:10]} unexpected={result.unexpected_keys[:10]}"
+            )
+    else:
+        block.load_state_dict(state_dict, strict=False)
     return block.to(dtype=torch_dtype)
 
 
