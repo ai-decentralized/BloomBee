@@ -177,6 +177,14 @@ def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
 
     No-ops (returns state_dict unchanged) if no legacy per-expert keys are present --
     i.e. dense blocks, and checkpoints that already ship the batched format.
+
+    Memory note: this fills the output gate_up_proj/down_proj tensors in place, one
+    expert at a time, dropping each source tensor as soon as it's copied in (rather
+    than `torch.stack`-ing all experts into intermediate tensors and `torch.cat`-ing
+    those). With 256 experts per MoE layer, materializing gate_stack/up_stack/down_stack
+    *and* the original per-expert tensors *and* the final concatenated result all at
+    once roughly triples peak memory for that layer; this keeps peak at ~1x the raw
+    expert-weight size instead.
     """
     per_expert = defaultdict(dict)  # {(prefix, expert_idx): {"gate_proj": t, "up_proj": t, "down_proj": t}}
     for key in list(state_dict.keys()):
@@ -192,6 +200,8 @@ def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
     by_prefix = defaultdict(dict)
     for (prefix, expert_idx), tensors in per_expert.items():
         by_prefix[prefix][expert_idx] = tensors
+    per_expert.clear()  # drop the flat view's refs -- by_prefix now owns the only ones,
+    # so popping an expert out of experts_by_idx below actually frees its tensors.
 
     for prefix, experts_by_idx in by_prefix.items():
         num_experts = max(experts_by_idx) + 1
@@ -202,12 +212,23 @@ def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
                 f"(found {sorted(experts_by_idx)})"
             )
 
-        gate_stack = torch.stack([experts_by_idx[i]["gate_proj"] for i in range(num_experts)], dim=0)
-        up_stack = torch.stack([experts_by_idx[i]["up_proj"] for i in range(num_experts)], dim=0)
-        down_stack = torch.stack([experts_by_idx[i]["down_proj"] for i in range(num_experts)], dim=0)
+        sample_gate = experts_by_idx[0]["gate_proj"]
+        intermediate, hidden = sample_gate.shape
+        dtype = sample_gate.dtype
+        gate_up_proj = torch.empty((num_experts, 2 * intermediate, hidden), dtype=dtype)
+        down_proj = torch.empty((num_experts, hidden, intermediate), dtype=dtype)
 
-        state_dict[f"{prefix}.gate_up_proj"] = torch.cat([gate_stack, up_stack], dim=1)
-        state_dict[f"{prefix}.down_proj"] = down_stack
+        for i in range(num_experts):
+            tensors = experts_by_idx.pop(i)  # last ref to this expert's raw tensors
+            gate_up_proj[i, :intermediate] = tensors.pop("gate_proj")
+            gate_up_proj[i, intermediate:] = tensors.pop("up_proj")
+            down_proj[i] = tensors.pop("down_proj")
+            # `tensors` is now empty and falls out of scope here, so each expert's
+            # three source tensors are freed immediately after being copied in,
+            # instead of staying alive until the whole layer is done.
+
+        state_dict[f"{prefix}.gate_up_proj"] = gate_up_proj
+        state_dict[f"{prefix}.down_proj"] = down_proj
 
     return state_dict
 
