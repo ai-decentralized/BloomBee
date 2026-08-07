@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 
 import configargparse
 import torch
@@ -224,6 +225,23 @@ def main():
     if not torch.backends.openmp.is_available():
         # Necessary to prevent the server from freezing after forks
         torch.set_num_threads(1)
+    else:
+        # Server() below forks one runtime process plus `num_handlers` connection-
+        # handler processes (default 8), each an independent Python process. Left
+        # alone, each one calls PyTorch's own thread-count heuristic, which defaults
+        # to roughly the host's full core count -- so N sibling processes end up
+        # scheduling ~N x cpu_count() threads onto only cpu_count() real cores.
+        # Most of the time there's enough slack that this goes unnoticed, but any
+        # time several of those processes are busy at once (e.g. a client retry
+        # replaying several tokens' worth of history while another handler is mid
+        # decode step), the OS has far more runnable threads than cores and has to
+        # thrash between them -- turning what should be a ~10s forward pass into a
+        # multi-minute stall that trips the client's request_timeout. Cap each
+        # process to a fair share of the machine instead of letting them all
+        # independently assume they own every core.
+        num_worker_processes = max(1, int(args.get("num_handlers", 8) or 8)) + 1  # +1 for the runtime process
+        threads_per_process = max(1, (os.cpu_count() or 1) // num_worker_processes)
+        torch.set_num_threads(threads_per_process)
 
     server = Server(
         **args,

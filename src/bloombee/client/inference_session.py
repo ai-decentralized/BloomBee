@@ -702,9 +702,32 @@ class InferenceSession:
                     )
                     if is_spec_dec and need_pruning:
                         self.keep_indices = keep_indices
-                    
+
                     need_pruning = False  # only need to prune on the first server
-                    
+
+                    # A retried server session resends its full known history to rebuild
+                    # its remote attention cache (see _update_sequence()), so this hop can
+                    # legitimately return hidden states for the whole replayed prefix
+                    # instead of just this step's n_input_tokens. Trim back down right here,
+                    # per hop, before forwarding to the next hop -- otherwise an upstream
+                    # retry's replay keeps getting passed downstream as `inputs`, inflating
+                    # the apparent token count (and the pre-allocated-cache check) for every
+                    # later hop in the chain, compounding until some hop's budget overflows.
+                    if (
+                        not is_spec_dec
+                        and torch.is_tensor(inputs)
+                        and inputs.ndim == 3
+                        and n_input_tokens > 0
+                        and inputs.shape[1] > n_input_tokens
+                    ):
+                        logger.warning(
+                            f"Server session for blocks {server_session.span.start}:{server_session.span.end} "
+                            f"returned full-history hidden states after session recovery; slicing seq_len "
+                            f"from {inputs.shape[1]} to current_step_tokens={n_input_tokens} before forwarding "
+                            f"to the next hop"
+                        )
+                        inputs = inputs[:, -n_input_tokens:, :]
+
                     # 🔍 CLIENT DEBUG: Log server span processing end
                     span_end_time = time.perf_counter()
                     span_duration = (span_end_time - span_start_time) * 1000  # ms
