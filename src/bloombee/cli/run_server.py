@@ -12,6 +12,7 @@ from humanfriendly import parse_size
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 from bloombee.server.server import Server
 from bloombee.utils.convert_block import QuantType
+from bloombee.utils.p2p import get_default_p2p_max_msg_size
 from bloombee.utils.version import validate_version
 
 logger = get_logger(__name__)
@@ -59,6 +60,12 @@ def main():
 
     parser.add_argument('--daemon_startup_timeout', type=float, default=60,
                         help='Timeout for the libp2p daemon connecting to initial peers')
+    parser.add_argument(
+        '--p2p_max_msg_size',
+        type=int,
+        default=get_default_p2p_max_msg_size(),
+        help='Maximum libp2p persistent-connection message size in bytes',
+    )
 
     parser.add_argument('--compression', type=str, default='NONE', required=False, help='Tensor compression communication')
 
@@ -199,6 +206,7 @@ def main():
         announce_maddrs = [f"/ip4/{public_ip}/tcp/{port}"]
 
     args["startup_timeout"] = args.pop("daemon_startup_timeout")
+    args["persistent_conn_max_msg_size"] = args.pop("p2p_max_msg_size")
 
     file_limit = args.pop("increase_file_limit")
     if file_limit:

@@ -105,7 +105,14 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
 
         if past_key_values is None:
             past_key_values = RemotePastKeyValues()
-        past_key_values.update_seen(hidden_states.size(1))
+        # HF GenerationMixin uses Cache.get_seq_length() to decide how many
+        # input ids are already represented in KV cache. The remote cache lives
+        # in InferenceSession, so record the session's cumulative position
+        # rather than the length of the current hidden-state window. During
+        # decode that window is usually 1; resetting seen_tokens to 1 makes HF
+        # resend old tokens and corrupts target-only greedy decoding.
+        session_position = getattr(self.layers, "position", 0)
+        past_key_values.update_seen(int(session_position) if session_position else hidden_states.size(1))
 
         # Remove prefix
         if use_prompts:

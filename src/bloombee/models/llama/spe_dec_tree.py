@@ -202,6 +202,8 @@ def prepare_incremental_tree_batch(
     seq_lengths: Optional[torch.LongTensor] = None,
     is_prefill: bool = False,
     kv_cache_position_ids: Optional[torch.Tensor] = None,  # (B, max_pos_len), -1 is padding
+    return_local_tree_mask: bool = False,
+    return_node_paths: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
     """
     Build an incremental tree batch supporting variable sequence lengths.
@@ -213,13 +215,18 @@ def prepare_incremental_tree_batch(
 
     max_tree_size = max(tree.total_nodes - 1 for tree in trees if tree.total_nodes > 1)
     
-    # Generation phase: compute a unified cache_len (max valid position across batch + 1)
+    # Generation phase: the server compacts the accepted sparse slots into a
+    # contiguous prefix before running the next tree. The local mask must match
+    # that compacted layout, not the old sparse physical slot range.
     cache_len = 0
     if not is_prefill and kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
         valid_mask = kv_cache_position_ids >= 0
         if valid_mask.any():
-            max_position = kv_cache_position_ids[valid_mask].max().item()
-            cache_len = int(max_position) + 1
+            first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+            batch_idx = torch.arange(kv_cache_position_ids.shape[0], device=kv_cache_position_ids.device)
+            root_positions = kv_cache_position_ids[batch_idx, first_valid_idx]
+            valid_counts = valid_mask.to(torch.long).sum(dim=1)
+            cache_len = int((root_positions + valid_counts).max().item())
 
     batch_tree_tokens = []
     batch_attention_masks = []
@@ -276,6 +283,28 @@ def prepare_incremental_tree_batch(
                     padded_mask[0, total_len:, :curr_seq_len] = True
                 mask = padded_mask
         
+        elif return_local_tree_mask:
+            # ============ Generation 阶段：vLLM-style local tree mask ============
+            # The prefix/cache attention pattern can be reconstructed on each
+            # target stage from kv_cache_position_ids + cache_len. Sending only
+            # the local root/tree adjacency avoids carrying a dense
+            # [B, seq, cache+seq] mask through every stage.
+            max_inputs_len = max_tree_size + 1
+            mask = torch.zeros(1, max_inputs_len, max_inputs_len, dtype=torch.bool, device=device)
+
+            # Root attends to itself.
+            mask[0, 0, 0] = True
+
+            if tree_len > 0:
+                # Real tree tokens attend to root plus their ancestor path and self.
+                mask[0, 1:inputs_len, 0] = True
+                tree_mask = build_tree_attention_mask_with_root(tree_len, parent_indices, device)
+                mask[0, 1:inputs_len, 1:inputs_len] = tree_mask
+
+            # Padding rows stay all-false locally. The server-side expander will
+            # still allow them to attend to the valid compact cache prefix to
+            # avoid NaNs, matching the old dense generation mask.
+
         else:
             # ============ Generation phase ============
             # total_len = cache + current-round inputs
@@ -314,7 +343,12 @@ def prepare_incremental_tree_batch(
                 mask = padded_mask
 
         batch_attention_masks.append(mask)
-        batch_node_paths.append(tree.root.get_all_leaf_node_paths())
+        # Leaf-path DFS is only consumed by the sampling verifier; skip it for
+        # greedy decode (return_node_paths=False) to avoid the recursive Python walk.
+        if return_node_paths:
+            batch_node_paths.append(tree.root.get_all_leaf_node_paths())
+        else:
+            batch_node_paths.append([])
 
     tree_tokens = torch.tensor(batch_tree_tokens, device=device)
 
@@ -334,8 +368,8 @@ def _compute_single_cache_valid_mask(
     """
     Compute the cache-valid-position mask for a single batch item.
 
-    Cache layout:
-    [committed cache: 0 .. root_pos-1] [previous round's tree (with gaps): root_pos .. cache_len-1]
+    Cache layout (after server-side compaction):
+    [committed cache: 0 .. root_pos-1] [previous round's accepted root/path: contiguous from root_pos]
 
     Returns:
         cache_valid_mask: (cache_len,) - True marks valid positions.
@@ -350,13 +384,9 @@ def _compute_single_cache_valid_mask(
     first_valid_idx = valid_mask.int().argmax().item()
     root_position = kv_cache_position_ids_single[first_valid_idx].item()
 
-    # [0, root_position) is always valid (the committed portion)
-    cache_valid_mask[:root_position] = True
-
-    # 2. Mark positions kept from the previous round (the accepted tokens)
-    valid_positions = kv_cache_position_ids_single[valid_mask]
-    valid_positions = valid_positions.clamp(0, cache_len - 1)
-    cache_valid_mask[valid_positions] = True
+    valid_count = int(valid_mask.sum().item())
+    compact_len = min(cache_len, root_position + valid_count)
+    cache_valid_mask[:compact_len] = True
     
     return cache_valid_mask
 

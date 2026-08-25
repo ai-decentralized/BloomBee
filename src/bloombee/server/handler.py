@@ -5,6 +5,7 @@ import contextlib
 import multiprocessing as mp
 import os
 import sys
+import uuid
 from collections import deque
 from enum import Enum
 from itertools import chain
@@ -45,6 +46,10 @@ from bloombee.utils.lossless_transport import (
     tensor_nnz_ratio,
     tensor_raw_nbytes,
 )
+from bloombee.utils.s2s_activation_quant import (
+    quantize_s2s_hidden_for_transport,
+    s2s_activation_quant_enabled,
+)
 from bloombee.utils.real_activation_dumper import capture_wire_activation
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -60,6 +65,7 @@ from bloombee.utils.microbatch_schema import (
     is_microbatch_queue_item,
     MBPIPE_SCHEMA_PREFIX,
 )
+from bloombee.utils.p2p import apply_p2p_max_msg_size, get_default_p2p_max_msg_size
 
 logger = get_logger(__name__)
 
@@ -76,6 +82,112 @@ if _s2s_output_compression_name:
 
 if TYPE_CHECKING:
     from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
+
+
+def _local_shm_s2s_enabled() -> bool:
+    return os.environ.get("BLOOMBEE_ENABLE_LOCAL_SHM_S2S", "0") == "1"
+
+
+def _local_shm_s2s_dir() -> str:
+    configured = os.environ.get("BLOOMBEE_LOCAL_SHM_S2S_DIR", "").strip()
+    if configured:
+        return configured
+    return "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+
+
+def _write_s2s_tensors_to_local_shm(
+    tensors: Sequence[runtime_pb2.Tensor],
+) -> Tuple[List[Dict[str, Union[str, int]]], int]:
+    shm_dir = _local_shm_s2s_dir()
+    os.makedirs(shm_dir, exist_ok=True)
+
+    refs: List[Dict[str, Union[str, int]]] = []
+    total_bytes = 0
+    try:
+        for index, tensor in enumerate(tensors):
+            payload = tensor.SerializeToString()
+            name = f"bloombee_s2s_{os.getpid()}_{time.time_ns()}_{index}_{uuid.uuid4().hex}.pb"
+            path = os.path.join(shm_dir, name)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+            refs.append({"path": path, "size": len(payload)})
+            total_bytes += len(payload)
+    except Exception:
+        _cleanup_s2s_local_shm_refs(refs)
+        raise
+
+    return refs, total_bytes
+
+
+def _cleanup_s2s_local_shm_refs(refs: Any) -> None:
+    if not isinstance(refs, (list, tuple)):
+        return
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        path = ref.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def _read_s2s_tensors_from_local_shm(refs: Any) -> List[runtime_pb2.Tensor]:
+    if not isinstance(refs, (list, tuple)):
+        raise ValueError("Invalid local shm tensor refs")
+
+    shm_root = os.path.realpath(_local_shm_s2s_dir())
+    tensors: List[runtime_pb2.Tensor] = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            raise ValueError(f"Invalid local shm tensor ref: {ref!r}")
+        path = ref.get("path")
+        size = int(ref.get("size", 0))
+        if not isinstance(path, str) or size <= 0:
+            raise ValueError(f"Invalid local shm tensor ref: {ref!r}")
+
+        real_path = os.path.realpath(path)
+        if not real_path.startswith(shm_root + os.sep):
+            raise ValueError(f"Refusing to read local shm tensor outside {shm_root}: {real_path}")
+
+        with open(real_path, "rb") as handle:
+            payload = handle.read(size)
+        if len(payload) != size:
+            raise ValueError(f"Local shm tensor size mismatch for {real_path}: got {len(payload)}, expected {size}")
+
+        tensor = runtime_pb2.Tensor()
+        tensor.ParseFromString(payload)
+        tensors.append(tensor)
+
+    return tensors
+
+
+def _synthetic_s2s_delay_ms(payload_bytes: int) -> float:
+    bandwidth_value = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BANDWIDTH_MBPS")
+    latency_value = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BASE_LATENCY_MS")
+    if bandwidth_value is None and latency_value is None:
+        return 0.0
+
+    delay_ms = 0.0
+    if latency_value is not None:
+        try:
+            delay_ms += max(0.0, float(latency_value))
+        except Exception:
+            pass
+    if bandwidth_value is not None:
+        try:
+            bandwidth_mbps = float(bandwidth_value)
+        except Exception:
+            bandwidth_mbps = 0.0
+        if bandwidth_mbps > 0.0 and payload_bytes > 0:
+            delay_ms += (float(payload_bytes) * 8.0) / (bandwidth_mbps * 1_000_000.0) * 1000.0
+    return delay_ms
 
 
 # Create dedicated offloading debug logger
@@ -128,6 +240,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         task_prioritizer: TaskPrioritizerBase = DummyTaskPrioritizer(),
         quant_type: QuantType,
         pruner_manager: Optional[SpeculativePrunerManager],
+        p2p_max_msg_size: Optional[int] = None,
     ):
         super().__init__(dht, module_backends)
         for module_backend in self.module_backends.values():
@@ -143,6 +256,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._session_timing: Dict[str, list] = {}
         self._session_comm_timing: Dict[str, Dict[str, Dict[str, float]]] = {}
         self._session_background_push_tasks: Dict[str, set] = {}
+        self._p2p_max_msg_size = p2p_max_msg_size or get_default_p2p_max_msg_size()
         # [MBPIPE] Cross-stage pipeline tracking (immediate mode pushes straight
         # into the session queue; only counters are kept per (session_id, step_id))
         # Key: (session_id, step_id) -> expected number of micro-batches
@@ -480,6 +594,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         if self._listener_task is None:
             # Start listening to our own event queue before we accept any requests
             self._listener_task = asyncio.create_task(self._listen_to_event_queue())
+        if args:
+            apply_p2p_max_msg_size(args[0], self._p2p_max_msg_size)
         await super().add_p2p_handlers(*args, **kwargs)
 
     def shutdown(self):
@@ -791,18 +907,21 @@ class TransformerConnectionHandler(ConnectionHandler):
                     
                     # [MBPIPE] Cross-stage streaming push callback (for micro-batch level streaming)
                     # This enables Server2 to start processing micro-batch N while Server1 computes N+1
-                    cross_stage_push_microbatch = None
-                    
-                    if is_microbatch_enabled():
-                        # Create the cross-stage push function that captures required context
-                        async def _cross_stage_push_wrapper(mb_hidden, mb_keep, push_metadata):
-                            """Wrapper that calls _push_microbatch with required backends."""
-                            await self._push_microbatch(
-                                mb_hidden, mb_keep, push_metadata, requested_backends
-                            )
-                        
-                        cross_stage_push_microbatch = _cross_stage_push_wrapper
-                        logger.info(f"{MBPIPE_LOG_PREFIX} Cross-stage micro-batch push enabled")
+                    async def _cross_stage_push_wrapper(mb_hidden, mb_keep, push_metadata, spec_tensors=None):
+                        """Wrapper that calls _push_microbatch with required backends."""
+                        await self._push_microbatch(
+                            mb_hidden,
+                            mb_keep,
+                            push_metadata,
+                            requested_backends,
+                            spec_tensors=spec_tensors,
+                        )
+
+                    # Always pass the callback down. The runtime path itself
+                    # decides whether to split into micro-batches; providing the
+                    # callback here prevents handler/runtime config skew from
+                    # silently disabling cross-stage overlap.
+                    cross_stage_push_microbatch = _cross_stage_push_wrapper
                     
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
@@ -1161,7 +1280,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                                 f"mb_idx={mb_item.get('mb_idx')} for immediate processing"
                             )
                             
-                            yield mb_item.get("payload"), mb_metadata
+                            mb_payload = mb_item.get("payload")
+                            mb_metadata["_source_request"] = mb_payload
+                            yield mb_payload, mb_metadata
                             
                             # Continue to next item from queue
                             request = None
@@ -1200,6 +1321,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             metadata["_queue_source"] = queue_source
                             metadata["_queue_wait_start_us"] = int(queue_wait_start_us)
                             metadata["_queue_wait_end_us"] = int(queue_wait_end_us)
+                            metadata["_source_request"] = request
                             yield request, metadata
                             if step_id is not None:
                                 processed_step_ids.add(step_id)
@@ -1335,6 +1457,21 @@ class TransformerConnectionHandler(ConnectionHandler):
         full_batch_size = metadata.get("full_batch_size", mb_size)
         start_from_position = metadata.get("start_from_position", None)
         receive_us = self._now_us()
+
+        shm_refs = metadata.get("_s2s_local_shm_refs")
+        if shm_refs:
+            shm_load_start = perf_counter()
+            loaded_tensors = _read_s2s_tensors_from_local_shm(shm_refs)
+            request.ClearField("tensors")
+            request.tensors.extend(loaded_tensors)
+            _cleanup_s2s_local_shm_refs(shm_refs)
+            metadata["_s2s_local_shm_load_ms"] = (perf_counter() - shm_load_start) * 1000.0
+            logger.info(
+                f"{MBPIPE_LOG_PREFIX} Local shm S2S payload loaded: "
+                f"step_id={step_id} mb_idx={int(mb_idx)} tensors={len(loaded_tensors)} "
+                f"logical_bytes={metadata.get('_s2s_logical_tensor_bytes', 0)} "
+                f"load_ms={metadata['_s2s_local_shm_load_ms']:.3f}"
+            )
         
         # Use total_micro_batches from metadata if available, otherwise calculate
         expected_num_mb = resolve_expected_num_microbatches(
@@ -1430,12 +1567,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                 e2e_from_serialize_end_ms = max(0.0, (receive_us - sender_ser_end_local_us) / 1000.0)
 
         payload_bytes = sum(len(t.buffer) for t in request.tensors)
+        rpc_payload_bytes = int(metadata.get("_s2s_rpc_tensor_bytes", payload_bytes))
+        logical_payload_bytes = int(metadata.get("_s2s_logical_tensor_bytes", payload_bytes))
+        s2s_transport = str(metadata.get("_s2s_transport", "rpc"))
         metadata_bytes = len(request.metadata) if request.metadata else 0
         if is_log_channel_enabled("s2s_wire_logs"):
             logger.info(
                 f"[S2S_WIRE] step_id={step_id} mb_idx={int(mb_idx)} "
             f"sender_blocks={sender_blocks} receiver_blocks={receiver_blocks} "
-            f"batch={int(mb_size)} payload_kb={payload_bytes/1024.0:.2f} metadata_b={metadata_bytes} "
+            f"batch={int(mb_size)} transport={s2s_transport} "
+            f"payload_kb={payload_bytes/1024.0:.2f} rpc_payload_kb={rpc_payload_bytes/1024.0:.2f} "
+            f"logical_payload_kb={logical_payload_bytes/1024.0:.2f} metadata_b={metadata_bytes} "
             f"raw_transfer_ms={raw_transfer_ms:.3f} "
             f"sender_compute_to_serialize_start_ms={sender_compute_to_serialize_start_ms:.3f} "
             f"sender_serialize_ms={sender_serialize_ms:.3f} "
@@ -1453,7 +1595,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             channel="micro_batch",
             sender_blocks=sender_blocks,
             receiver_blocks=receiver_blocks,
-            payload_bytes=payload_bytes,
+            payload_bytes=rpc_payload_bytes,
             metadata_bytes=metadata_bytes,
             raw_transfer_ms=raw_transfer_ms,
             wire_ms=wire_ms,
@@ -1464,7 +1606,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         metadata["_s2s_sender_cpu2nic_ms"] = float(metadata.get("s2s_sender_cpu2nic_ms", sender_prep_ms if sender_prep_ms >= 0.0 else 0.0))
         metadata["_s2s_wire_ms"] = float(wire_ms if wire_ms >= 0.0 else raw_transfer_ms if raw_transfer_ms >= 0.0 else 0.0)
-        metadata["_s2s_payload_bytes"] = int(payload_bytes)
+        metadata["_s2s_payload_bytes"] = int(rpc_payload_bytes)
+        metadata["_s2s_logical_payload_bytes"] = int(logical_payload_bytes)
         
         # Initialize tracking for this (session, step) if not exists.
         # (No per-step asyncio.Queue here: in immediate mode micro-batches go
@@ -1528,6 +1671,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         metadata: dict,
         raise_on_error: bool = False,
     ) -> None:
+        source_request = metadata.get("_source_request") if isinstance(metadata, dict) else None
+        if isinstance(source_request, runtime_pb2.ExpertRequest):
+            request = source_request
         # print('_push_outputs metadata ', metadata)
         push_start_time = perf_counter()
         next_peer_id = None
@@ -1562,7 +1708,14 @@ class TransformerConnectionHandler(ConnectionHandler):
             # metadata when possible.
             normalized_outputs = self._normalize_serialized_tensors(serialized_outputs)
             next_need_pruning = None
-            if len(normalized_outputs) == 2:
+            output_scale_tensor = None
+            output_quant_meta = metadata.get("s2s_hidden_quant") if isinstance(metadata, dict) else None
+            output_has_quant_scale = isinstance(output_quant_meta, dict)
+            if len(normalized_outputs) in (2, 3):
+                if len(normalized_outputs) == 3:
+                    if not output_has_quant_scale:
+                        raise ValueError("Received 3 routing tensors without S2S activation quantization metadata")
+                    output_scale_tensor = normalized_outputs[2]
                 inference_layout = metadata.get("inference_layout")
                 if inference_layout in {"decode_minimal_v2", "decode_compact_v2"}:
                     if inference_layout == "decode_minimal_v2":
@@ -1578,8 +1731,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                             *list(request.tensors[2:]),
                         ]
                 else:
-                    next_tensors = normalized_outputs + list(request.tensors[2:])
-            elif len(normalized_outputs) == 6:
+                    next_tensors = list(normalized_outputs[:2]) + list(request.tensors[2:])
+            elif len(normalized_outputs) in (6, 7):
+                if len(normalized_outputs) == 7:
+                    if not output_has_quant_scale:
+                        raise ValueError("Received 7 routing tensors without S2S activation quantization metadata")
+                    output_scale_tensor = normalized_outputs[6]
                 inference_layout = metadata.get("inference_layout")
                 if inference_layout == "spec_compact_v1":
                     need_pruning_next = deserialize_torch_tensor(normalized_outputs[2])
@@ -1598,7 +1755,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         request.tensors[7],
                     ]
                 else:
-                    next_tensors = normalized_outputs + list(request.tensors[6:])
+                    next_tensors = list(normalized_outputs[:6]) + list(request.tensors[6:])
             else:
                 raise ValueError(
                     f"Unexpected routing tensor count from upstream stage: {len(normalized_outputs)}"
@@ -1628,11 +1785,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                 if key in metadata:
                     next_metadata[key] = metadata[key]
             if (
-                len(normalized_outputs) == 6
+                len(normalized_outputs) in (6, 7)
                 and metadata.get("inference_layout") == "spec_compact_v1"
                 and next_need_pruning
             ):
                 next_metadata["need_pruning"] = next_need_pruning
+            if output_scale_tensor is not None:
+                next_tensors = list(next_tensors)
+                quant_meta = dict(output_quant_meta)
+                quant_meta["scale_tensor_index"] = int(len(next_tensors))
+                next_tensors.append(output_scale_tensor)
+                next_metadata["s2s_hidden_quant"] = quant_meta
             next_metadata["sender_blocks"] = sender_blocks
             next_metadata["receiver_blocks"] = f"{next_start}:{next_end}"
             next_metadata["s2s_channel"] = "full_batch"
@@ -1667,14 +1830,77 @@ class TransformerConnectionHandler(ConnectionHandler):
                     )
                 except Exception:
                     pass
+            is_spec_push = bool(metadata.get("is_spec_dec", False))
+            if (
+                next_tensors
+                and "s2s_hidden_quant" not in next_metadata
+                and s2s_activation_quant_enabled(is_spec_dec=is_spec_push)
+            ):
+                hidden_for_quant = deserialize_torch_tensor(next_tensors[0])
+                quantized_hidden, scale_tensor, quant_meta = quantize_s2s_hidden_for_transport(
+                    hidden_for_quant,
+                    is_spec_dec=is_spec_push,
+                    logger=logger,
+                    context=f"full_batch:{sender_blocks}->{next_start}:{next_end}",
+                )
+                if quant_meta is not None:
+                    next_tensors = list(next_tensors)
+                    scale_tensor_index = len(next_tensors)
+                    quant_meta["scale_tensor_index"] = int(scale_tensor_index)
+                    next_tensors[0] = serialize_torch_tensor(
+                        quantized_hidden,
+                        runtime_pb2.CompressionType.NONE,
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": "spec_verify" if is_spec_push else "decode",
+                            "tensor_name": "hidden_states_int8",
+                            "source": "server",
+                            "channel": "rpc_push_full_batch",
+                            "blocks": f"{sender_blocks}->{next_start}:{next_end}",
+                            "batch": int(quantized_hidden.shape[0]) if quantized_hidden.ndim >= 1 else 1,
+                        },
+                    )
+                    if scale_tensor is None:
+                        raise ValueError("S2S activation quantization produced metadata without a scale tensor")
+                    next_tensors.append(
+                        serialize_torch_tensor(
+                            scale_tensor,
+                            runtime_pb2.CompressionType.NONE,
+                            allow_inplace=True,
+                            debug_context={
+                                "phase": "spec_verify" if is_spec_push else "decode",
+                                "tensor_name": "hidden_states_int8_scale",
+                                "source": "server",
+                                "channel": "rpc_push_full_batch",
+                                "blocks": f"{sender_blocks}->{next_start}:{next_end}",
+                                "batch": int(scale_tensor.shape[0]) if scale_tensor.ndim >= 1 else 1,
+                            },
+                        )
+                    )
+                    next_metadata["s2s_hidden_quant"] = quant_meta
             push_tensor_bytes = sum(len(t.buffer) for t in next_tensors)
             cpu2nic_prep_end = perf_counter()
             t_cpu2nic_ms = max(0.0, (cpu2nic_prep_end - push_start_time) * 1000.0)
             next_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
             serialized_next_metadata = MSGPackSerializer.dumps(next_metadata)
             push_metadata_bytes = len(serialized_next_metadata)
+            synthetic_delay_ms = _synthetic_s2s_delay_ms(push_tensor_bytes + push_metadata_bytes)
+            if synthetic_delay_ms > 0.0:
+                next_metadata["s2s_synthetic_delay_ms"] = float(synthetic_delay_ms)
+                serialized_next_metadata = MSGPackSerializer.dumps(next_metadata)
+                push_metadata_bytes = len(serialized_next_metadata)
             rpc_request = runtime_pb2.ExpertRequest(uid=next_uid, tensors=next_tensors, metadata=serialized_next_metadata)
 
+            if synthetic_delay_ms > 0.0:
+                logger.debug(
+                    "[S2S_SYNTHETIC_DELAY] channel=full_batch blocks=%s->%s:%s payload_kb=%.2f delay_ms=%.2f",
+                    sender_blocks,
+                    next_start,
+                    next_end,
+                    (push_tensor_bytes + push_metadata_bytes) / 1024.0,
+                    synthetic_delay_ms,
+                )
+                await asyncio.sleep(synthetic_delay_ms / 1000.0)
             nic2nic_start = perf_counter()
             response = await stub.rpc_push(rpc_request, timeout=self.request_timeout)
             nic2nic_end = perf_counter()
@@ -1762,6 +1988,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         mb_keep_indices: Optional[torch.Tensor],
         metadata: dict,
         requested_backends: Sequence[TransformerBackend],
+        spec_tensors: Optional[dict] = None,
     ) -> None:
         """
         [MBPIPE] Push a single micro-batch to the next server for cross-stage overlap.
@@ -1793,12 +2020,12 @@ class TransformerConnectionHandler(ConnectionHandler):
             full_batch_size = metadata.get("full_batch_size", mb_size)
             is_spec_push = bool(metadata.get("is_spec_dec", False))
 
-            # Speculative decoding requires strict full-batch context (tree/draft/kv alignment).
-            # Do not use cross-stage micro-batch push for this mode.
-            if is_spec_push:
+            enable_spec_push = os.environ.get("BLOOMBEE_ENABLE_SPEC_CROSS_STAGE_PUSH", "1") == "1"
+            if is_spec_push and (not enable_spec_push or not spec_tensors):
+                reason = "disabled" if not enable_spec_push else "missing spec payload"
                 logger.info(
                     f"{MBPIPE_LOG_PREFIX} Cross-stage push skipped for speculative decoding "
-                    f"(step_id={metadata.get('step_id')}, mb_idx={mb_idx})"
+                    f"(reason={reason}, step_id={metadata.get('step_id')}, mb_idx={mb_idx})"
                 )
                 return
             
@@ -1823,7 +2050,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             outputs_schema = requested_backends[-1].decode_outputs_schema
             sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
             serialize_start_us = self._now_us()
-            transport_phase = "prefill" if mb_hidden.ndim >= 2 and int(mb_hidden.shape[1]) > 1 else "decode"
+            transport_phase = (
+                "spec_verify"
+                if is_spec_push
+                else ("prefill" if mb_hidden.ndim >= 2 and int(mb_hidden.shape[1]) > 1 else "decode")
+            )
             sender_blocks_str = str(metadata.get("sender_blocks", "unknown"))
             sender_blocks = sender_blocks_str
             push_blocks = f"{sender_blocks_str}->{next_start}:{next_end}"
@@ -1845,13 +2076,19 @@ class TransformerConnectionHandler(ConnectionHandler):
                 prompt_len=int(mb_hidden.shape[1]) if mb_hidden.ndim >= 2 else 1,
             )
             with transport_profile_scope() as push_transport_profile:
-                serialized_hidden = serialize_torch_tensor(
+                hidden_to_send, scale_tensor, quant_meta = quantize_s2s_hidden_for_transport(
                     hidden_wire,
+                    is_spec_dec=is_spec_push,
+                    logger=logger,
+                    context=f"micro_batch:{sender_blocks}->{next_start}:{next_end}",
+                )
+                serialized_hidden = serialize_torch_tensor(
+                    hidden_to_send,
                     _s2s_output_compression if _s2s_output_compression is not None else outputs_schema[0].compression,
                     allow_inplace=True,
                     debug_context={
                         "phase": transport_phase,
-                        "tensor_name": "hidden_states",
+                        "tensor_name": "hidden_states_int8" if quant_meta is not None else "hidden_states",
                         "source": "server",
                         "channel": "rpc_push_microbatch",
                         "blocks": push_blocks,
@@ -1887,6 +2124,51 @@ class TransformerConnectionHandler(ConnectionHandler):
                         debug_context={
                             "phase": transport_phase,
                             "tensor_name": "keep_indices",
+                            "source": "server",
+                            "channel": "rpc_push_microbatch",
+                            "blocks": push_blocks,
+                            "batch": int(mb_size),
+                        },
+                    )
+                serialized_spec_tensors = []
+                if is_spec_push and spec_tensors:
+                    for tensor_name in (
+                        "tree_attention_mask",
+                        "kv_cache_position_ids",
+                        "draft_tokens",
+                        "prefill_length",
+                    ):
+                        value = spec_tensors.get(tensor_name)
+                        if value is None:
+                            value = torch.empty(0, dtype=torch.int64)
+                        elif not torch.is_tensor(value):
+                            value = torch.as_tensor(value)
+                        serialized_spec_tensors.append(
+                            serialize_torch_tensor(
+                                value,
+                                runtime_pb2.CompressionType.NONE,
+                                allow_inplace=True,
+                                debug_context={
+                                    "phase": transport_phase,
+                                    "tensor_name": tensor_name,
+                                    "source": "server",
+                                    "channel": "rpc_push_microbatch",
+                                    "blocks": push_blocks,
+                                    "batch": int(mb_size),
+                                },
+                            )
+                        )
+                serialized_scale = None
+                if quant_meta is not None:
+                    if scale_tensor is None:
+                        raise ValueError("S2S activation quantization produced metadata without a scale tensor")
+                    serialized_scale = serialize_torch_tensor(
+                        scale_tensor,
+                        runtime_pb2.CompressionType.NONE,
+                        allow_inplace=True,
+                        debug_context={
+                            "phase": transport_phase,
+                            "tensor_name": "hidden_states_int8_scale",
                             "source": "server",
                             "channel": "rpc_push_microbatch",
                             "blocks": push_blocks,
@@ -1982,6 +2264,10 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "s2s_sender_compute_to_serialize_start_ms": float(sender_compute_to_serialize_start_ms),
                 "s2s_sender_gpu2cpu_ms": float(t_gpu2cpu_ms),
             }
+            if quant_meta is not None:
+                scale_tensor_index = 2 + len(serialized_spec_tensors)
+                quant_meta["scale_tensor_index"] = int(scale_tensor_index)
+                push_metadata["s2s_hidden_quant"] = quant_meta
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
             # on downstream stage: downstream_local_time ~= upstream_time + offset_us.
@@ -2039,16 +2325,40 @@ class TransformerConnectionHandler(ConnectionHandler):
             # loads/dumps round-trip per micro-batch.
             push_metadata["s2s_sender_sem_wait_ms"] = float(sem_wait_time)
             push_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
+            tensor_messages = [serialized_hidden, serialized_keep, *serialized_spec_tensors]
+            if quant_meta is not None:
+                tensor_messages.append(serialized_scale)
+            logical_push_tensor_bytes = sum(len(tensor.buffer) for tensor in tensor_messages)
+            if _local_shm_s2s_enabled() and tensor_messages:
+                try:
+                    shm_refs, shm_payload_bytes = _write_s2s_tensors_to_local_shm(tensor_messages)
+                    push_metadata["_s2s_local_shm_refs"] = shm_refs
+                    push_metadata["_s2s_local_shm_payload_bytes"] = int(shm_payload_bytes)
+                    push_metadata["_s2s_logical_tensor_bytes"] = int(logical_push_tensor_bytes)
+                    push_metadata["_s2s_transport"] = "local_shm"
+                    tensor_messages = []
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} Local shm S2S payload enabled: "
+                        f"step_id={metadata.get('step_id', 'unknown')} mb_idx={int(mb_idx)} "
+                        f"logical_bytes={logical_push_tensor_bytes} refs={len(shm_refs)}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"{MBPIPE_LOG_PREFIX} Local shm S2S payload failed; falling back to RPC payload: {e}",
+                        exc_info=True,
+                    )
+
             t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
             push_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
-            push_tensor_bytes = len(serialized_hidden.buffer) + len(serialized_keep.buffer)
+            push_tensor_bytes = sum(len(tensor.buffer) for tensor in tensor_messages)
+            push_metadata["_s2s_rpc_tensor_bytes"] = int(push_tensor_bytes)
 
             # Create task for background sending - don't await
             send_task = asyncio.create_task(
                 self._do_rpc_push_async(
                     stub,
                     next_uid,
-                    [serialized_hidden, serialized_keep],
+                    tensor_messages,
                     push_metadata,
                     mb_idx,
                     push_start_time,
@@ -2115,6 +2425,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         send_start = perf_counter()
         send_time = 0.0
         success = False
+        request_metadata = None
         try:
             sender_send_us = self._now_us()
             push_metadata["clock_sync_sender_send_us"] = sender_send_us
@@ -2125,6 +2436,21 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
             payload_bytes = sum(len(t.buffer) for t in request.tensors)
             metadata_bytes = len(request.metadata) if request.metadata else 0
+            request_metadata = push_metadata
+            synthetic_delay_ms = _synthetic_s2s_delay_ms(payload_bytes + metadata_bytes)
+            if synthetic_delay_ms > 0.0:
+                if isinstance(request_metadata, dict):
+                    request_metadata["s2s_synthetic_delay_ms"] = float(synthetic_delay_ms)
+                    request.metadata = MSGPackSerializer.dumps(request_metadata)
+                    metadata_bytes = len(request.metadata) if request.metadata else 0
+                logger.debug(
+                    "[S2S_SYNTHETIC_DELAY] channel=micro_batch mb_idx=%s to_blocks=%s payload_kb=%.2f delay_ms=%.2f",
+                    mb_idx,
+                    to_blocks,
+                    (payload_bytes + metadata_bytes) / 1024.0,
+                    synthetic_delay_ms,
+                )
+                await asyncio.sleep(synthetic_delay_ms / 1000.0)
 
             response = await stub.rpc_push(request, timeout=self.request_timeout)
             sender_ack_us = self._now_us()
@@ -2181,6 +2507,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send failed: {e}"
             )
         finally:
+            if isinstance(request_metadata, dict):
+                _cleanup_s2s_local_shm_refs(request_metadata.get("_s2s_local_shm_refs"))
             # Release slot and feed metrics to adaptive limiter.
             if release_slot and hasattr(self, "_push_limiter"):
                 measured_send_ms = send_time if send_time > 0 else (perf_counter() - send_start) * 1000.0

@@ -8,8 +8,10 @@ shapes BloomBee uses (depth-3/4 speculation trees up to width 8).
 import torch
 
 from bloombee.models.llama.spe_dec_tree import (
+    SpeculativeTree,
     build_ancestor_matrix_optimized,
     build_incremental_tree_attention_mask,
+    prepare_incremental_tree_batch,
 )
 
 
@@ -84,3 +86,51 @@ def test_tree_attention_mask_has_self_attention():
     # Diagonal must be True (each node attends to itself).
     diag = torch.diagonal(mask[0])
     assert diag.all()
+
+
+def test_incremental_tree_mask_uses_compacted_cache_length_for_sparse_positions():
+    tree = SpeculativeTree(root_token=10, request_id="row0")
+    tree.add_layer([tree.root], [[(20, 1.0)]])
+
+    tree_tokens, attention_mask, _ = prepare_incremental_tree_batch(
+        [tree],
+        input_ids=torch.tensor([[1, 10]]),
+        device=torch.device("cpu"),
+        seq_lengths=torch.tensor([2]),
+        is_prefill=False,
+        kv_cache_position_ids=torch.tensor([[5, 9, 11]], dtype=torch.long),
+    )
+
+    assert tree_tokens.tolist() == [[20]]
+    # root=5 plus three valid ids => compact cache length 8, then root+one child.
+    assert attention_mask.shape == (1, 2, 10)
+    assert attention_mask[0, 0, :8].all()
+    assert attention_mask[0, 0, 8].item()
+    assert not attention_mask[0, 0, 9].item()
+    assert attention_mask[0, 1, :8].all()
+    assert attention_mask[0, 1, 8].item()
+    assert attention_mask[0, 1, 9].item()
+
+
+def test_incremental_tree_batch_can_return_local_tree_mask():
+    tree = SpeculativeTree(root_token=10, request_id="row0")
+    child = tree.add_layer([tree.root], [[(20, 1.0)]])[0]
+    tree.add_layer([child], [[(30, 1.0)]])
+
+    tree_tokens, local_mask, _ = prepare_incremental_tree_batch(
+        [tree],
+        input_ids=torch.tensor([[1, 10]]),
+        device=torch.device("cpu"),
+        seq_lengths=torch.tensor([2]),
+        is_prefill=False,
+        kv_cache_position_ids=torch.tensor([[5, 9, 11]], dtype=torch.long),
+        return_local_tree_mask=True,
+    )
+
+    assert tree_tokens.tolist() == [[20, 30]]
+    assert local_mask.shape == (1, 3, 3)
+    assert local_mask[0].tolist() == [
+        [True, False, False],
+        [True, True, False],
+        [True, True, True],
+    ]

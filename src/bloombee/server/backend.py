@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 from time import perf_counter
 
 import os
@@ -352,6 +352,98 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         output_hidden_states_chunk, new_kvs = forward_result
         return output_hidden_states_chunk, new_kvs
 
+    @staticmethod
+    def _kv_to_llama_layout(
+        kvs: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        batch_size: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if kvs is None:
+            return None
+        key, value = kvs
+        if key.dim() == 4 and value.dim() == 4:
+            return key, value
+        if key.dim() != 3 or value.dim() != 3:
+            return key, value
+
+        bh = int(key.shape[0])
+        if batch_size <= 0 or bh % int(batch_size) != 0:
+            return key, value
+        num_heads = bh // int(batch_size)
+        seq_len = int(value.shape[1])
+        head_dim = int(value.shape[2])
+
+        if key.shape[1] == head_dim and key.shape[2] == seq_len:
+            key_bhsd = key.permute(0, 2, 1).contiguous()
+        elif key.shape[1] == seq_len and key.shape[2] == head_dim:
+            key_bhsd = key.contiguous()
+        else:
+            return key, value
+
+        value_bhsd = value.contiguous()
+        return (
+            key_bhsd.view(batch_size, num_heads, seq_len, head_dim),
+            value_bhsd.view(batch_size, num_heads, seq_len, head_dim),
+        )
+
+    @staticmethod
+    def _kv_to_bloom_layout(
+        kvs: Tuple[torch.Tensor, torch.Tensor],
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key, value = kvs
+        if key.dim() == 3 and value.dim() == 3:
+            return key, value
+        if key.dim() != 4 or value.dim() != 4:
+            return key, value
+
+        bsz, num_heads, seq_len, head_dim = key.shape
+        key_bloom = key.reshape(bsz * num_heads, seq_len, head_dim).permute(0, 2, 1).contiguous()
+        value_bloom = value.reshape(bsz * num_heads, seq_len, head_dim).contiguous()
+        return key_bloom, value_bloom
+
+    @staticmethod
+    def _concat_llama_kvs(
+        left: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        right: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if left is None:
+            return right
+        if right is None:
+            return left
+        left_key, left_value = left
+        right_key, right_value = right
+        if left_key.dim() == 4 and right_key.dim() == 4:
+            return (
+                torch.cat([left_key, right_key], dim=2),
+                torch.cat([left_value, right_value], dim=2),
+            )
+        if left_key.dim() == 3 and right_key.dim() == 3:
+            return (
+                torch.cat([left_key, right_key], dim=2),
+                torch.cat([left_value, right_value], dim=1),
+            )
+        return right
+
+    @staticmethod
+    def _concat_bloom_kv_chunks(
+        chunks: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return chunks[0]
+        keys, values = zip(*chunks)
+        first_key = keys[0]
+        if first_key.dim() == 4:
+            return (
+                torch.cat(list(keys), dim=2),
+                torch.cat(list(values), dim=2),
+            )
+        return (
+            torch.cat(list(keys), dim=2),
+            torch.cat(list(values), dim=1),
+        )
+
     def _finalize_cache_update(
         self,
         new_kvs: Tuple[torch.Tensor, ...],
@@ -417,6 +509,143 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # logger.info(f"keep_indices: {keep_indices}")
         self.pruner_manager.middle_keep_indices = keep_indices
         return keep_indices
+
+    def _is_local_tree_attention_mask(
+        self,
+        tree_attention_mask: Optional[torch.Tensor],
+        *,
+        seq_len: int,
+        cache_len: int,
+    ) -> bool:
+        """Detect compact speculative masks that contain only root/tree columns."""
+        return (
+            torch.is_tensor(tree_attention_mask)
+            and tree_attention_mask.ndim == 3
+            and int(cache_len) > 0
+            and int(tree_attention_mask.shape[-2]) == int(seq_len)
+            and int(tree_attention_mask.shape[-1]) == int(seq_len)
+        )
+
+    def _spec_cache_valid_mask(
+        self,
+        *,
+        kv_cache_position_ids: Optional[torch.Tensor],
+        batch_size: int,
+        cache_len: int,
+        batch_offset: int,
+        full_batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if cache_len <= 0:
+            return torch.empty(batch_size, 0, dtype=torch.bool, device=device)
+        if kv_cache_position_ids is None or is_dummy(kv_cache_position_ids):
+            return torch.ones(batch_size, cache_len, dtype=torch.bool, device=device)
+
+        ids = kv_cache_position_ids
+        if not torch.is_tensor(ids):
+            ids = torch.as_tensor(ids)
+        ids = ids.to(device=device, dtype=torch.long)
+        if ids.ndim == 1:
+            ids = ids.unsqueeze(0)
+        if ids.ndim >= 2 and ids.shape[0] != batch_size:
+            ids = self._slice_batch_aligned(
+                ids,
+                batch_offset,
+                batch_offset + batch_size,
+                full_batch_size if full_batch_size > 0 else ids.shape[0],
+            )
+        if ids.ndim >= 2 and ids.shape[0] == 1 and batch_size > 1:
+            ids = ids.expand(batch_size, -1)
+        if ids.ndim < 2 or ids.shape[0] != batch_size:
+            logger.warning(
+                "[SPEC_LOCAL_MASK] kv_cache_position_ids batch mismatch: got=%s expected=%s; "
+                "falling back to all-prefix-valid cache mask",
+                tuple(ids.shape) if torch.is_tensor(ids) else None,
+                batch_size,
+            )
+            return torch.ones(batch_size, cache_len, dtype=torch.bool, device=device)
+
+        valid_mask = ids >= 0
+        has_valid = valid_mask.any(dim=1)
+        if not bool(has_valid.any().item()):
+            return torch.zeros(batch_size, cache_len, dtype=torch.bool, device=device)
+
+        first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+        batch_idx = torch.arange(batch_size, device=device)
+        root_positions = torch.where(
+            has_valid,
+            ids[batch_idx, first_valid_idx],
+            torch.zeros_like(first_valid_idx),
+        )
+        valid_counts = valid_mask.to(torch.long).sum(dim=1)
+        compact_lengths = torch.clamp(root_positions + valid_counts, min=0, max=int(cache_len))
+        positions = torch.arange(cache_len, device=device, dtype=torch.long)
+        return positions.unsqueeze(0) < compact_lengths.unsqueeze(1)
+
+    def _expand_local_tree_attention_mask(
+        self,
+        local_tree_mask: torch.Tensor,
+        *,
+        kv_cache_position_ids: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        cache_len: int,
+        batch_offset: int,
+        full_batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Expand a vLLM-style local root/tree mask into BloomBee's full mask.
+
+        The compact mask carries only the query-query tree bias. The prefix
+        side is reconstructed from the compacted cache layout for this stage.
+        """
+        mask = local_tree_mask
+        if mask.ndim >= 3 and mask.shape[0] != batch_size:
+            mask = self._slice_batch_aligned(
+                mask,
+                batch_offset,
+                batch_offset + batch_size,
+                full_batch_size if full_batch_size > 0 else mask.shape[0],
+            )
+        if mask.ndim >= 3 and mask.shape[0] == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, -1, -1)
+        if mask.shape[0] != batch_size:
+            raise RuntimeError(
+                "Local speculative tree mask batch mismatch after slicing: "
+                f"mask={tuple(mask.shape)}, batch_size={batch_size}"
+            )
+
+        mask = mask.to(device=device, dtype=torch.bool)
+        if mask.shape[-2] != seq_len or mask.shape[-1] != seq_len:
+            fixed = torch.zeros(batch_size, seq_len, seq_len, dtype=torch.bool, device=device)
+            rows = min(seq_len, int(mask.shape[-2]))
+            cols = min(seq_len, int(mask.shape[-1]))
+            fixed[:, :rows, :cols] = mask[:, :rows, :cols]
+            mask = fixed
+
+        full_mask = torch.zeros(
+            batch_size,
+            seq_len,
+            int(cache_len) + seq_len,
+            dtype=torch.bool,
+            device=device,
+        )
+        if cache_len > 0:
+            cache_valid = self._spec_cache_valid_mask(
+                kv_cache_position_ids=kv_cache_position_ids,
+                batch_size=batch_size,
+                cache_len=int(cache_len),
+                batch_offset=batch_offset,
+                full_batch_size=full_batch_size,
+                device=device,
+            )
+            full_mask[:, :, :int(cache_len)] = cache_valid.unsqueeze(1).expand(
+                batch_size,
+                seq_len,
+                int(cache_len),
+            )
+        full_mask[:, :, int(cache_len): int(cache_len) + seq_len] = mask
+        return full_mask
 
     def forward(self, *inputs: Union[torch.Tensor, str]) -> Tuple[torch.Tensor, ...]:
         *inputs, active_adapter = inputs
@@ -542,7 +771,31 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # Centralized select: aggregate + reorder + slice
                 # [MERGED] Speculative decoding flow with micro-batch support
                 kv_cache_position_ids = inference_info.kv_cache_position_ids
-                
+                _prof_wait = 0.0
+                if self._step_profile_enabled:
+                    _prof_wait_t0 = perf_counter()
+                    self.cache_manager.wait_for_pending_reorder()
+                    _prof_wait = perf_counter() - _prof_wait_t0
+                else:
+                    self.cache_manager.wait_for_pending_reorder()
+
+                # Active-row compaction: a non-identity hypo_ids on the spec path is a
+                # KV batch-row permutation (active rows first). Apply it in place ONCE
+                # (slab is quiescent here: after wait_for_pending_reorder, inside
+                # use_cache), then treat downstream as identity. Subsequent smaller
+                # steps then read/write the contiguous first B_active rows.
+                row_perm_applied = False
+                if (
+                    hypo_ids is not None
+                    and not is_dummy(hypo_ids)
+                    and hypo_ids.ndim == 1
+                    and hypo_ids.numel() > 0
+                    and not self._is_identity_hypo_ids(hypo_ids)
+                ):
+                    self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
+                    hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
+                    row_perm_applied = True
+
                 logger.debug(f"[MB_DEBUG] backend.inference_step: uid={inference_info.uid}, "
                             f"batch_offset={inference_info.batch_offset}, "
                             f"micro_batch_size={inference_info.micro_batch_size}, "
@@ -569,6 +822,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         batch_offset=inference_info.batch_offset,
                         full_batch_size=inference_info.full_batch_size,
                         micro_batch_size=inference_info.micro_batch_size,
+                        requested_rows=batch_size,
                     )
                     cache_len = k_pkv.shape[2] if k_pkv is not None else 0
                 if self._step_profile_enabled:
@@ -597,6 +851,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         or self._is_spec_decoding
                         or (kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0)
                         or not self._is_identity_hypo_ids(hypo_ids)
+                        or row_perm_applied
                         or underflow
                     )
                     self.module.set_remote_cache_reuse_enabled(reuse_allowed)
@@ -605,8 +860,24 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 device = hidden_states.device
                 
                 if self._is_spec_decoding:
-                    full_mask = inference_info.tree_attention_mask.to(device)
+                    raw_tree_mask = inference_info.tree_attention_mask
+                    full_mask = raw_tree_mask.to(device) if raw_tree_mask is not None else None
                     if full_mask is not None:
+                        if self._is_local_tree_attention_mask(
+                            full_mask,
+                            seq_len=seq_len,
+                            cache_len=cache_len,
+                        ):
+                            full_mask = self._expand_local_tree_attention_mask(
+                                full_mask,
+                                kv_cache_position_ids=kv_cache_position_ids,
+                                batch_size=batch_size,
+                                seq_len=seq_len,
+                                cache_len=cache_len,
+                                batch_offset=inference_info.batch_offset,
+                                full_batch_size=inference_info.full_batch_size,
+                                device=device,
+                            )
                         expected_rows = seq_len
                         expected_cols = cache_len + seq_len
                         if full_mask.ndim == 3:
@@ -633,6 +904,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                                     expected_rows,
                                     expected_cols,
                                 )
+                        # Use the same additive-mask representation as the
+                        # target-only cached path. The bool full_mask is still
+                        # kept for tree-depth RoPE positions below.
                         attention_mask = self.convert_mask_to_scores(full_mask)
                     else:
                         attention_mask = None
@@ -643,7 +917,37 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # (B, 1, cache_len+1). Cache it per (B, src_len, device)
                     # so the common decode loop avoids a per-step alloc of
                     # both the bool mask and the -inf scores tensor.
-                    if seq_len == 1 and cache_len >= 0 and not self._is_spec_decoding:
+                    request_attention_mask = inference_info.tree_attention_mask
+                    if (
+                        request_attention_mask is not None
+                        and torch.is_tensor(request_attention_mask)
+                        and request_attention_mask.ndim == 2
+                    ):
+                        request_attention_mask = self._slice_batch_aligned(
+                            request_attention_mask,
+                            inference_info.batch_offset,
+                            inference_info.batch_offset + batch_size,
+                            inference_info.full_batch_size,
+                        ).to(device=device, dtype=torch.bool)
+                        causal_mask = self._create_causal_attention_mask(
+                            batch_size, (seq_len + cache_len), cache_len, hidden_states.device
+                        )
+                        if causal_mask is None:
+                            attention_mask = None
+                        else:
+                            src_len = causal_mask.shape[-1]
+                            if request_attention_mask.shape[1] < src_len:
+                                pad = torch.ones(
+                                    batch_size,
+                                    src_len - request_attention_mask.shape[1],
+                                    dtype=torch.bool,
+                                    device=device,
+                                )
+                                request_attention_mask = torch.cat([pad, request_attention_mask], dim=1)
+                            key_mask = request_attention_mask[:, -src_len:]
+                            full_mask = causal_mask & key_mask.unsqueeze(1)
+                            attention_mask = self.convert_mask_to_scores(full_mask)
+                    elif seq_len == 1 and cache_len >= 0 and not self._is_spec_decoding:
                         src_len = cache_len + 1
                         cache_key = (batch_size, src_len, hidden_states.device)
                         attention_mask = self._decode_mask_scores_cache.get(cache_key)
@@ -664,12 +968,26 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     _prof_fwd_t0 = perf_counter()
+                chunk_layer_past = layer_past
+                chunk_new_kvs: List[Tuple[torch.Tensor, torch.Tensor]] = []
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
                     # print('transformer backend inference step() offset ', offset )
                     # print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
                     
                     chunk_length = min(max_chunk_length, seq_len - offset)
+                    attention_mask_chunk = attention_mask
+                    if (
+                        attention_mask is not None
+                        and attention_mask.ndim >= 3
+                        and attention_mask.shape[-2] == seq_len
+                        and attention_mask.shape[-1] == cache_len + seq_len
+                    ):
+                        attention_mask_chunk = attention_mask[
+                            :,
+                            offset : offset + chunk_length,
+                            : cache_len + offset + chunk_length,
+                        ]
                     cache_key = (chunk_length, batch_size, hidden_states.device)
                     if cache_key not in self._position_ids_cache:
                         base_ids = torch.arange(0, chunk_length, device=hidden_states.device, dtype=torch.long)
@@ -684,30 +1002,46 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             prefill_length=inference_info.prefill_length - 1,
                             kv_cache_position_ids=kv_cache_position_ids,
                             batch_offset=inference_info.batch_offset,
-                            device="cuda",
-                            target_seq_len=seq_len)
+                            device=hidden_states.device,
+                            target_seq_len=seq_len,
+                            tree_attention_mask=full_mask,
+                            cache_len=cache_len,
+                        )
+                        rotary_position_ids = rotary_position_ids[:, offset : offset + chunk_length]
                     else:
                         rotary_position_ids = None
                     
                     try:
                         step_result = self._run_block_forward(
                             hidden_states_chunk,
-                            layer_past=layer_past,
-                            attention_mask=attention_mask,
+                            layer_past=chunk_layer_past,
+                            attention_mask=attention_mask_chunk,
                             position_ids=position_ids,
                             rotary_position_ids=rotary_position_ids,
                         )
                         if step_result is None:
-                            return (hidden_states, None)
+                            raise RuntimeError("module.forward returned None")
                         output_hidden_states_chunk, new_kvs = step_result
                     except Exception as e:
                         logger.exception("ERROR in module.forward: %s: %s", type(e).__name__, e)
                         raise
 
                     if seq_len > max_chunk_length:
-                        output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
+                        output_hidden_states[:, offset : offset + chunk_length] = output_hidden_states_chunk
                     else:
                         output_hidden_states = output_hidden_states_chunk
+
+                    if seq_len > max_chunk_length:
+                        new_kvs_bloom = self._kv_to_bloom_layout(new_kvs, batch_size)
+                        chunk_new_kvs.append(new_kvs_bloom)
+                        new_kvs_llama = self._kv_to_llama_layout(new_kvs_bloom, batch_size)
+                        chunk_layer_past_llama = self._kv_to_llama_layout(chunk_layer_past, batch_size)
+                        chunk_layer_past = self._concat_llama_kvs(chunk_layer_past_llama, new_kvs_llama)
+
+                if seq_len > max_chunk_length:
+                    concatenated_kvs = self._concat_bloom_kv_chunks(chunk_new_kvs)
+                    if concatenated_kvs is not None:
+                        new_kvs = concatenated_kvs
 
                 if self._step_profile_enabled:
                     if torch.cuda.is_available():
@@ -729,6 +1063,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     _prof_update = perf_counter() - _prof_upd_t0
                     _prof_total = perf_counter() - _prof_t0
                     buf = self._step_profile_buf
+                    buf.setdefault("wait", []).append(_prof_wait)
                     buf["select"].append(_prof_select)
                     buf["forward"].append(_prof_forward)
                     buf["update"].append(_prof_update)
@@ -749,9 +1084,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             )
                         logger.info(
                             "[STEP_PROFILE] %s B=%s seq=%s cache=%s | "
-                            "select: %s | forward: %s | update: %s | total: %s",
+                            "wait: %s | select: %s | forward: %s | update: %s | total: %s",
                             self.name, batch_size, seq_len, cache_len,
-                            _summary("select"), _summary("forward"),
+                            _summary("wait"), _summary("select"), _summary("forward"),
                             _summary("update"), _summary("total"),
                         )
                         for k in buf:
@@ -959,6 +1294,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         batch_offset,
         device: torch.device,
         target_seq_len: Optional[int] = None,  # target sequence length (length of hidden_states)
+        tree_attention_mask: Optional[torch.Tensor] = None,
+        cache_len: Optional[int] = None,
     ) -> torch.Tensor:
         B = prefill_length.shape[0]
         
@@ -1023,17 +1360,35 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 )
             valid_mask = kv_cache_position_ids >= 0  # (B, max_pos_len)
 
-            # kv_cache_position_ids stores the positions that are already present in
-            # cache after the previous speculative verification step. The next tree
-            # should therefore start right after the largest valid cached position.
-            # Using root_position + valid_count underestimates the base when previous
-            # accepted positions are sparse after pruning.
-            max_positions = torch.where(
-                valid_mask,
-                kv_cache_position_ids,
-                torch.full_like(kv_cache_position_ids, -1),
-            ).max(dim=1).values
-            base_positions = max_positions + 1
+            has_valid = valid_mask.any(dim=1)
+            first_valid_idx = valid_mask.to(torch.long).argmax(dim=1)
+            batch_idx = torch.arange(B, device=device)
+            root_positions = torch.where(
+                has_valid,
+                kv_cache_position_ids[batch_idx, first_valid_idx],
+                prefill_length.to(device),
+            )
+            accepted_counts = valid_mask.to(torch.long).sum(dim=1)
+            # The cache ids name physical slots in the previous tree, but the
+            # cache manager compacts those accepted slots before this forward.
+            # RoPE positions are logical sequence positions, so the next root
+            # starts after root + accepted draft tokens, not after the largest
+            # sparse slot.
+            base_positions = root_positions + accepted_counts
+
+            if tree_attention_mask is not None and cache_len is not None and target_seq_len is not None:
+                tree_attention_mask = tree_attention_mask.to(device)
+                if tree_attention_mask.ndim >= 3 and tree_attention_mask.shape[0] != B:
+                    tree_attention_mask = self._slice_batch_aligned(
+                        tree_attention_mask,
+                        batch_offset,
+                        batch_offset + B,
+                        tree_attention_mask.shape[0],
+                    )
+                local_end = int(cache_len) + int(target_seq_len)
+                local_tree_mask = tree_attention_mask[:, :target_seq_len, int(cache_len):local_end]
+                tree_position_ids = local_tree_mask.to(torch.long).sum(dim=-1).sub_(1).clamp_min_(0)
+                return base_positions.unsqueeze(1) + tree_position_ids
             
             # Build position_ids
             # Use target_seq_len when given, otherwise tree_len
@@ -1393,6 +1748,7 @@ class _MergedInferenceStep:
             mbpipe_log_path_entry(logger, "backend._MergedInferenceStep", batch_size=batch_size)
         
         kv_timing_before = self._snapshot_kv_timing()
+        _pool_inner_t0 = perf_counter()
 
         # Process all blocks for this micro-batch
         for inference_info, optional_prompt in zip(inference_infos, optional_prompts):
@@ -1404,5 +1760,6 @@ class _MergedInferenceStep:
 
         kv_timing_after = self._snapshot_kv_timing()
         kv_timing_delta = self._compute_kv_timing_delta(kv_timing_before, kv_timing_after)
+        kv_timing_delta["pool_inner_ms"] = (perf_counter() - _pool_inner_t0) * 1000.0
 
         return (hidden_states, keep_indices, kv_timing_delta)

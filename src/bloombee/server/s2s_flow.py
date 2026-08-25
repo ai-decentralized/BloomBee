@@ -18,6 +18,7 @@ from typing import Deque, Optional
 from bloombee.utils.microbatch_config import MBPIPE_LOG_PREFIX
 
 
+@dataclass
 class S2SLinkTelemetry:
     """
     Rolling transport telemetry for one server-to-server link.
