@@ -2008,6 +2008,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         enable_actual_push = os.environ.get("BLOOMBEE_ENABLE_CROSS_STAGE_PUSH", "1") == "1"
         
         push_start_time = perf_counter()
+        acquired_slot = False
+        release_slot_handed_off = False
         
         try:
             next_servers = metadata.get("next_servers")
@@ -2372,6 +2374,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     release_slot=acquired_slot,
                 )
             )
+            release_slot_handed_off = True
             if is_log_channel_enabled("s2s_wire_logs"):
                 logger.info(
                     f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
@@ -2397,6 +2400,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"{MBPIPE_LOG_PREFIX} Failed to push micro-batch: {e}",
                 exc_info=True
             )
+        finally:
+            if acquired_slot and not release_slot_handed_off:
+                await self._push_limiter.release(
+                    send_time_ms=(perf_counter() - push_start_time) * 1000.0,
+                    success=False,
+                )
 
     async def _do_rpc_push_async(
         self,

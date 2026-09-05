@@ -954,9 +954,10 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
         key_states, value_states = key_value
-        # If already in [B, H, S, D], return as-is
+        # Slabs use full attention-head stride; only KV heads contain GQA data.
         if key_states.dim() == 4 and value_states.dim() == 4:
-            return key_states, value_states
+            nkv = self._num_key_value_heads()
+            return key_states[:, :nkv, :, :], value_states[:, :nkv, :, :]
         # Otherwise, expect Bloom-style packed heads: key [B*H, D, S] or [B*H, S, D], value [B*H, S, D] or [B*H, D, S]
         if key_states.dim() == 3:
             bh, d1, d2 = key_states.shape

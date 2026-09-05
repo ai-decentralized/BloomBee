@@ -110,7 +110,7 @@ class DistributedQwen3Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixi
 
         if not isinstance(past_key_values, RemotePastKeyValues):
             past_key_values = RemotePastKeyValues()
-        past_key_values.update_seen(hidden_states.size(1))
+        past_key_values.advance_seen(hidden_states.size(1))
 
         hidden_states = self.layers(
             hidden_states,

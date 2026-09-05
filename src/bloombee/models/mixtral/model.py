@@ -101,7 +101,7 @@ class DistributedMixtralModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMi
 
         if past_key_values is None:
             past_key_values = RemotePastKeyValues()
-        past_key_values.update_seen(hidden_states.size(1))
+        past_key_values.advance_seen(hidden_states.size(1))
 
         hidden_states = self.layers(
             hidden_states,

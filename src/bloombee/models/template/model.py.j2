@@ -96,7 +96,7 @@ class Distributed{{ M }}Model(FromPretrainedMixin, PTuneMixin, {{ hf_model_class
 
         if past_key_values is None:
             past_key_values = RemotePastKeyValues()
-        past_key_values.update_seen(hidden_states.size(1))
+        past_key_values.advance_seen(hidden_states.size(1))
 
         # Remove prefix
         if use_prompts:

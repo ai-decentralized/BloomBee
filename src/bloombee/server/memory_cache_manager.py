@@ -680,13 +680,20 @@ class KVCacheManager:
         k_data = k_cache.data if hasattr(k_cache, "data") else k_cache
         v_data = v_cache.data if hasattr(v_cache, "data") else v_cache
         S_total, BH_full, _D = k_data.shape
-        H = getattr(self.block_config, "num_attention_heads", 1)
+        H = int(getattr(self.block_config, "num_attention_heads", 1))
+        if H <= 0 or BH_full % H:
+            raise RuntimeError(f"[ROW_COMPACT] invalid cache head layout: BH={BH_full}, H={H}")
         B_cache = BH_full // H
+        if perm.ndim != 1 or perm.dtype not in (torch.int32, torch.int64):
+            raise ValueError("[ROW_COMPACT] perm must be a one-dimensional integer tensor")
         perm = perm.to(device=k_data.device, dtype=torch.long)
         n = perm.numel()
-        assert 0 < n <= B_cache, (
-            f"[ROW_COMPACT] perm has {n} entries but cache holds {B_cache} rows"
-        )
+        if not 0 < n <= B_cache:
+            raise ValueError(f"[ROW_COMPACT] perm has {n} entries but cache holds {B_cache} rows")
+        if bool(((perm < 0) | (perm >= B_cache)).any().item()):
+            raise ValueError(f"[ROW_COMPACT] out-of-range row indices for cache size {B_cache}")
+        if perm.unique().numel() != n:
+            raise ValueError("[ROW_COMPACT] duplicate row indices")
         # Expand batch indices to BH indices: bh_perm[i*H + h] = perm[i]*H + h.
         # Advanced indexing materializes the RHS before assignment, so the
         # in-place front-gather is safe even when src/dst overlap.
@@ -2241,8 +2248,9 @@ class KVCacheManager:
         cache_manager = self
 
         self.wait_for_pending_reorder()
-        future = self._reorder_executor.submit(
-            self._do_reorder_task,
+        # The cache context may be released as soon as inference_step returns.
+        # Finish compaction on the caller's stream before handing back the slab.
+        self._do_reorder_task(
             new_kvs,
             kv_cache_position_ids,
             cache_tensors,
@@ -2251,8 +2259,6 @@ class KVCacheManager:
             micro_batch_size,
             cache_manager,
         )
-        with self._pending_reorder_lock:
-            self._pending_reorder = future
 
     @staticmethod
     def _plain_tensor_or_none(value):

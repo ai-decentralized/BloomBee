@@ -203,12 +203,21 @@ class _ServerInferenceSession:
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
-            if self.history.shape[0] != inputs.shape[0]:
-                # Active-row compaction: the step batch shrank (or was permuted)
-                # mid-session. The full history is only replayed on the first
-                # (un-stepped) request; past that point only the width matters,
-                # so keep the leading compacted rows.
-                self.history = self.history[: inputs.shape[0]]
+            if hypo_ids is not None and not is_dummy(hypo_ids):
+                # Recovery must replay the same rows as the server KV gather,
+                # including same-sized permutations and non-prefix survivors.
+                if hypo_ids.ndim != 1 or hypo_ids.numel() != inputs.shape[0]:
+                    raise ValueError("Invalid active-row gather shape for session history")
+                if hypo_ids.dtype not in (torch.int32, torch.int64):
+                    raise ValueError("Session history row indices must be integers")
+                indices = hypo_ids.to(device=self.history.device, dtype=torch.long)
+                if bool(((indices < 0) | (indices >= self.history.shape[0])).any().item()):
+                    raise ValueError("Out-of-range active-row gather for session history")
+                if indices.unique().numel() != indices.numel():
+                    raise ValueError("Duplicate active-row gather for session history")
+                self.history = self.history.index_select(0, indices)
+            elif self.history.shape[0] != inputs.shape[0]:
+                raise RuntimeError("Session history batch changed without active-row gather metadata")
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,

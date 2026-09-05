@@ -71,11 +71,17 @@ def dequantize_s2s_hidden_from_transport(
     context: str = "",
 ) -> torch.Tensor:
     if not isinstance(metadata, dict):
+        if hidden_states.dtype == torch.int8:
+            raise ValueError("Received int8 S2S hidden states without quantization metadata")
         return hidden_states
     quant_meta = metadata.get("s2s_hidden_quant")
     if not isinstance(quant_meta, dict):
+        if hidden_states.dtype == torch.int8:
+            raise ValueError("Received int8 S2S hidden states without quantization metadata")
         return hidden_states
     if quant_meta.get("scheme") != "int8_per_token":
+        if hidden_states.dtype == torch.int8:
+            raise ValueError(f"Unsupported S2S activation quantization scheme: {quant_meta.get('scheme')!r}")
         return hidden_states
     if hidden_states.dtype != torch.int8:
         return hidden_states
