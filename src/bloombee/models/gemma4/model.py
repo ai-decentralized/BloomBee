@@ -17,11 +17,11 @@ import torch.nn as nn
 from hivemind import DHT
 from hivemind.utils.logging import get_logger
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4ForCausalLM as _BaseCausalLM,
     Gemma4PreTrainedModel as _BasePreTrained,
     Gemma4TextModel as _BaseTextModel,
+    Gemma4TextModelOutputWithPast,
 )
 
 from bloombee.client.from_pretrained import FromPretrainedMixin
@@ -126,6 +126,7 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        per_layer_inputs: Optional[torch.Tensor] = None,
     ):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -136,6 +137,12 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
             input_shape = inputs_embeds.size()[:-1]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        if per_layer_inputs is not None:
+            raise ValueError(
+                "Distributed Gemma-4 does not support per-layer inputs; "
+                "use a checkpoint with hidden_size_per_layer_input=0"
+            )
 
         assert (
             attention_mask is None or (attention_mask == 1).all()
@@ -184,11 +191,12 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
 
         hidden_states = self.norm(hidden_states)
         hidden_states = hidden_states.view(output_shape)
-        return BaseModelOutputWithPast(
+        return Gemma4TextModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=None,
             attentions=None,
+            shared_kv_states=None,
         )
 
     @property

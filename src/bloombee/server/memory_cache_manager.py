@@ -212,14 +212,28 @@ class KVCacheManager:
         attention_heads = max(1, int(attention_heads))
         source_bh = int(source_bh)
 
-        if full_batch_size > 0 and micro_batch_size > 0:
-            runtime_batch = int(micro_batch_size)
+        for runtime_batch in (micro_batch_size, full_batch_size):
+            runtime_batch = int(runtime_batch)
             if runtime_batch > 0 and source_bh % runtime_batch == 0:
                 heads = source_bh // runtime_batch
                 if 0 < heads <= attention_heads:
                     return int(heads)
 
-        kv_heads = getattr(self.block_config, "num_key_value_heads", None)
+        per_layer_configs = getattr(self.block_config, "per_layer_config", None)
+        if per_layer_configs:
+            candidates = {
+                int(layer_config.num_key_value_heads)
+                for layer_config in per_layer_configs
+                if getattr(layer_config, "num_key_value_heads", None) is not None
+            }
+            if source_bh in candidates:
+                return source_bh
+            matching = [
+                heads for heads in candidates if 0 < heads <= attention_heads and source_bh % heads == 0
+            ]
+            kv_heads = max(matching) if matching else None
+        else:
+            kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
             try:

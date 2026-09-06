@@ -291,10 +291,18 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
     def _head_dim_for_this_block(self) -> int:
         """Pick the right head_dim for this backend's layer.
 
-        Defaults to ``config.head_dim`` (or ``hidden_size // num_attention_heads``).
-        For Gemma-4 full_attention layers we must use ``global_head_dim``
-        instead; sliding layers stay on ``head_dim``.
+        Recent Transformers versions expose heterogeneous attention values
+        through ``per_layer_config`` and reject ambiguous global reads. Prefer
+        the concrete layer config when it is available, while retaining the
+        legacy named-field fallback for older and uniform configurations.
         """
+        per_layer_configs = getattr(self.config, "per_layer_config", None)
+        if per_layer_configs:
+            block_index = self.block_index
+            if block_index is not None and 0 <= block_index < len(per_layer_configs):
+                return int(per_layer_configs[block_index].head_dim)
+            return int(per_layer_configs[0].head_dim)
+
         default_hd = getattr(self.config, "head_dim", None) or (
             self.config.hidden_size // self.config.num_attention_heads
         )

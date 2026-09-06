@@ -95,23 +95,17 @@ class WrappedGemma4Block(_BaseDecoderLayer):
         # BloomBee's backend assumes `self_attn.num_heads` and `num_key_value_heads`
         # are valid; Gemma-4's attention derives them differently on full vs
         # sliding layers. Expose them here to match the backend's contract.
+        #
+        # Recent Transformers versions model these values as per-layer config
+        # attributes and deliberately reject ambiguous reads from the global
+        # config. Older versions do not expose `per_layer_config`, so retain the
+        # global config as a compatibility fallback.
+        per_layer_configs = getattr(config, "per_layer_config", None)
+        layer_config = per_layer_configs[layer_idx] if per_layer_configs is not None else config
         if not hasattr(self.self_attn, "num_heads"):
-            self.self_attn.num_heads = config.num_attention_heads
+            self.self_attn.num_heads = layer_config.num_attention_heads
         if not hasattr(self.self_attn, "num_key_value_heads"):
-            # Gemma-4: sliding uses config.num_key_value_heads, full uses
-            # config.num_global_key_value_heads. The HF attention instance
-            # already knows the right value; we read it back when available.
-            kv = getattr(
-                self.self_attn,
-                "num_key_value_heads",
-                (
-                    getattr(config, "num_global_key_value_heads", None)
-                    if not self.is_sliding
-                    else None
-                )
-                or config.num_key_value_heads,
-            )
-            self.self_attn.num_key_value_heads = kv
+            self.self_attn.num_key_value_heads = layer_config.num_key_value_heads
 
     def _apply(self, fn, recurse=True):
         # Same fp16/bf16 rotary buffer guard as Qwen3: keep inv_freq buffers
