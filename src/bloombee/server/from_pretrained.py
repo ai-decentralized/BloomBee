@@ -119,7 +119,7 @@ def load_pretrained_block(
                 path,
                 skip_init_weights=True,
             )
-    elif _is_hf_model:
+    elif _is_hf_model or config.model_type == "gpt_oss":
         # For HF-based models: create block normally (weights on CPU) then load state dict
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
         block = _load_hf_block_weights(
@@ -171,6 +171,8 @@ def _load_hf_block_weights(
         max_disk_space=max_disk_space,
     )
     # state_dict keys already have block_prefix stripped, e.g. "self_attention.query_key_value.weight"
+    if config.model_type == "gpt_oss":
+        return block.load_checkpoint_state(state_dict, torch_dtype)
     block.load_state_dict(state_dict, strict=False)
     return block.to(dtype=torch_dtype)
 

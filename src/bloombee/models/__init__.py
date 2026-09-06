@@ -4,6 +4,12 @@ from bloombee.models.llama import *
 from bloombee.models.mixtral import *
 
 try:
+    from bloombee.models.gpt_oss import *
+except ModuleNotFoundError as exc:
+    if not str(exc.name).startswith("transformers.models.gpt_oss"):
+        raise
+
+try:
     from bloombee.models.gemma4 import *
 except ModuleNotFoundError as exc:
     if not str(exc.name).startswith("transformers.models.gemma4"):

@@ -96,6 +96,8 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0, 
     - Falcon:  takes (config) only, no layer_idx, no FlexGen args
     - Llama:   takes (config, layer_idx, env, policy, weight_home, path) — FlexGen-based
     """
+    if config.model_type == "gpt_oss":
+        return config.block_class(_autoset_attn_impl(config), layer_idx)
     if config.block_class == WrappedBloomBlock:
         dprint('server/block_utils.py config.block_class == WrappedBloomBlock ')
         return config.block_class(config, layer_idx)
