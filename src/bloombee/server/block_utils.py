@@ -66,19 +66,22 @@ def get_block_size(
         # convert_block() quantizes only those to int8 -- everything else in
         # the block (attention, router, dense MLP layers) stays at `dtype`.
         n_params = 0
-        n_expert_params = 0
+        layer_sizes = []
         for layer_idx in range(getattr(config, "num_hidden_layers", 1)):
             block = get_model_block(
                 config, env, policy, dummy_weight_home, "/tmp", layer_idx=layer_idx, skip_init_weights=True
             )
             total = sum(param.numel() for param in block.parameters())
-            if total < n_params:
-                continue
             experts = getattr(getattr(block, "mlp", None), "experts", None)
             expert_params = 0
+            expert_scales = 0
             if experts is not None and hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj"):
                 expert_params = experts.gate_up_proj.numel() + experts.down_proj.numel()
-            n_params, n_expert_params = total, expert_params
+                for weight in (experts.gate_up_proj, experts.down_proj):
+                    group_size = 128 if weight.shape[-1] % 128 == 0 else weight.shape[-1]
+                    expert_scales += weight.numel() // group_size
+            n_params = max(n_params, total)
+            layer_sizes.append((total, expert_params, expert_scales))
 
     if location == "memory":
         dtype = resolve_block_dtype(config, dtype)
@@ -90,12 +93,13 @@ def get_block_size(
                 f"quant_type={quant_type} is not supported for block_class={config.block_class.__name__}; "
                 "only QuantType.INT8 for DeepSeek-V3 is implemented (see convert_block())."
             )
-        # Quantized experts: ~1 byte/param (int8) plus the group scale table, which
-        # `eps` already accounts for at group_size=128 (~1/128 the tensor's element
-        # count, at 2-4 bytes each -- well under the 1% eps budget). Everything else
-        # in the block (attention, router, dense layers) stays at `bytes_per_value`.
-        non_expert_params = n_params - n_expert_params
-        quantized_bytes = n_expert_params * 1 + non_expert_params * bytes_per_value
+        # Count float32 scales explicitly, including whole-row fallback groups.
+        # Quantizing MoE layers can make a dense layer the largest resident block.
+        quantized_bytes = max(
+            (experts + scales * 4 + (total - experts) * bytes_per_value
+             for total, experts, scales in layer_sizes),
+            default=0,
+        )
         return round(quantized_bytes * (1 + eps))
     elif location == "disk":
         dtype = resolve_block_dtype(config, "auto")
@@ -133,6 +137,8 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0, 
     - Falcon:  takes (config) only, no layer_idx, no FlexGen args
     - Llama:   takes (config, layer_idx, env, policy, weight_home, path) — FlexGen-based
     """
+    if config.model_type == "gpt_oss":
+        return config.block_class(_autoset_attn_impl(config), layer_idx)
     if config.block_class == WrappedBloomBlock:
         dprint('server/block_utils.py config.block_class == WrappedBloomBlock ')
         return config.block_class(config, layer_idx)

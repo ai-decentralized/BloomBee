@@ -38,6 +38,14 @@ class QuantizedDeepseekV3Experts(nn.Module):
         self.register_buffer("down_scale", down_scale)
         self.down_group_size = down_group_size
 
+    def _apply(self, fn, recurse=True):
+        # Preserve scale precision even when a parent module calls .half()/.to(dtype).
+        scales = {name: self._buffers[name] for name in ("gate_up_scale", "down_scale")}
+        result = super()._apply(fn, recurse=recurse)
+        for name, scale in scales.items():
+            self._buffers[name] = scale.to(device=self._buffers[name].device, dtype=torch.float32)
+        return result
+
     def forward(
         self,
         hidden_states: torch.Tensor,

@@ -201,6 +201,7 @@ class KVCacheManager:
         source_bh: int,
         full_batch_size: int = 0,
         micro_batch_size: int = 0,
+        source_head_dim: int = 0,
     ) -> int:
         """Infer how many source KV rows belong to each batch item.
 
@@ -208,18 +209,49 @@ class KVCacheManager:
         return only num_key_value_heads rows per batch. Batched writes must
         preserve that per-batch stride instead of treating the source rows as
         one contiguous attention-head block.
+
+        For heterogeneous attention, match the source head dimension before
+        inferring batch stride: BH=16 can mean four full-attention sequences
+        with four KV heads each or one sliding-attention sequence with 16 heads.
         """
         attention_heads = max(1, int(attention_heads))
         source_bh = int(source_bh)
 
-        if full_batch_size > 0 and micro_batch_size > 0:
-            runtime_batch = int(micro_batch_size)
+        cache_heads = getattr(self.block_config, "cache_num_key_value_heads", None)
+        if cache_heads is not None and 0 < int(cache_heads) <= attention_heads and source_bh % int(cache_heads) == 0:
+            return int(cache_heads)
+
+        for runtime_batch in (micro_batch_size, full_batch_size):
+            runtime_batch = int(runtime_batch)
             if runtime_batch > 0 and source_bh % runtime_batch == 0:
                 heads = source_bh // runtime_batch
                 if 0 < heads <= attention_heads:
                     return int(heads)
 
-        kv_heads = getattr(self.block_config, "num_key_value_heads", None)
+        per_layer_configs = getattr(self.block_config, "per_layer_config", None)
+        if per_layer_configs:
+            matching_layers = [
+                layer_config
+                for layer_config in per_layer_configs
+                if source_head_dim > 0 and getattr(layer_config, "head_dim", None) == source_head_dim
+            ]
+            candidates = {
+                int(layer_config.num_key_value_heads)
+                for layer_config in (matching_layers or per_layer_configs)
+                if getattr(layer_config, "num_key_value_heads", None) is not None
+            }
+            if source_bh in candidates:
+                return source_bh
+            matching = [
+                heads for heads in candidates if 0 < heads <= attention_heads and source_bh % heads == 0
+            ]
+            kv_heads = max(matching) if matching else None
+        else:
+            kv_heads = None
+            if source_head_dim > 0 and source_head_dim == getattr(self.block_config, "global_head_dim", None):
+                kv_heads = getattr(self.block_config, "num_global_key_value_heads", None)
+            if kv_heads is None:
+                kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
             try:
@@ -548,9 +580,9 @@ class KVCacheManager:
             key_data = key.data if hasattr(key, "data") else key
             if key_data.ndim != 3:
                 return [], 0
-            BH, _D, s_new = key_data.shape
+            BH, source_head_dim, s_new = key_data.shape
             H = getattr(self.block_config, "num_attention_heads", 32) or 32
-            source_heads = self._source_heads_per_batch(H, BH)
+            source_heads = self._source_heads_per_batch(H, BH, source_head_dim=int(source_head_dim))
             if source_heads <= 0 or BH % source_heads != 0:
                 return [], 0
             B = BH // source_heads
@@ -680,13 +712,20 @@ class KVCacheManager:
         k_data = k_cache.data if hasattr(k_cache, "data") else k_cache
         v_data = v_cache.data if hasattr(v_cache, "data") else v_cache
         S_total, BH_full, _D = k_data.shape
-        H = getattr(self.block_config, "num_attention_heads", 1)
+        H = int(getattr(self.block_config, "num_attention_heads", 1))
+        if H <= 0 or BH_full % H:
+            raise RuntimeError(f"[ROW_COMPACT] invalid cache head layout: BH={BH_full}, H={H}")
         B_cache = BH_full // H
+        if perm.ndim != 1 or perm.dtype not in (torch.int32, torch.int64):
+            raise ValueError("[ROW_COMPACT] perm must be a one-dimensional integer tensor")
         perm = perm.to(device=k_data.device, dtype=torch.long)
         n = perm.numel()
-        assert 0 < n <= B_cache, (
-            f"[ROW_COMPACT] perm has {n} entries but cache holds {B_cache} rows"
-        )
+        if not 0 < n <= B_cache:
+            raise ValueError(f"[ROW_COMPACT] perm has {n} entries but cache holds {B_cache} rows")
+        if bool(((perm < 0) | (perm >= B_cache)).any().item()):
+            raise ValueError(f"[ROW_COMPACT] out-of-range row indices for cache size {B_cache}")
+        if perm.unique().numel() != n:
+            raise ValueError("[ROW_COMPACT] duplicate row indices")
         # Expand batch indices to BH indices: bh_perm[i*H + h] = perm[i]*H + h.
         # Advanced indexing materializes the RHS before assignment, so the
         # in-place front-gather is safe even when src/dst overlap.
@@ -1591,7 +1630,9 @@ class KVCacheManager:
         BH_src, D_src, s_new = key_t.shape
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
-        source_heads = self._source_heads_per_batch(H, BH_src, full_batch_size, micro_batch_size)
+        source_heads = self._source_heads_per_batch(
+            H, BH_src, full_batch_size, micro_batch_size, source_head_dim=int(D_src)
+        )
         assert BH_src % source_heads == 0, (
             f"BH_src={BH_src} not divisible by source_heads={source_heads}"
         )
@@ -2241,8 +2282,9 @@ class KVCacheManager:
         cache_manager = self
 
         self.wait_for_pending_reorder()
-        future = self._reorder_executor.submit(
-            self._do_reorder_task,
+        # The cache context may be released as soon as inference_step returns.
+        # Finish compaction on the caller's stream before handing back the slab.
+        self._do_reorder_task(
             new_kvs,
             kv_cache_position_ids,
             cache_tensors,
@@ -2251,8 +2293,6 @@ class KVCacheManager:
             micro_batch_size,
             cache_manager,
         )
-        with self._pending_reorder_lock:
-            self._pending_reorder = future
 
     @staticmethod
     def _plain_tensor_or_none(value):

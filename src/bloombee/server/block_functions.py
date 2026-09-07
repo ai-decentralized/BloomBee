@@ -1035,6 +1035,11 @@ async def iterate_rpc_inference(
             batch_size = mb_size
             length_increment = hidden_states.shape[1]
             token_increment = _effective_token_increment(hidden_states, kv_cache_position_ids, is_spec_dec)
+            if prefix_length + token_increment > max_length:
+                raise ValueError(
+                    f"Maximum length exceeded: prefix_length={prefix_length} + "
+                    f"token_increment={token_increment} exceeds max_length={max_length}"
+                )
             
             # Cast to backend dtype
             hidden_states = hidden_states.to(requested_backends[0].dtype)
@@ -1341,14 +1346,13 @@ async def iterate_rpc_inference(
                 # Sort by mb_idx and merge
                 sorted_indices = sorted(accum['results'].keys())
                 expected_indices = list(range(int(accum.get('expected', len(sorted_indices)))))
+                layout_issues = []
                 if sorted_indices != expected_indices:
-                    logger.warning(
-                        f"{MBPIPE_LOG_PREFIX} Non-contiguous micro-batch indices for step_id={step_id}: "
-                        f"got={sorted_indices}, expected={expected_indices}"
+                    layout_issues.append(
+                        f"non-contiguous micro-batch indices: got={sorted_indices}, expected={expected_indices}"
                     )
 
                 # Validate merged layout coverage (offset continuity + full-batch size coverage)
-                layout_issues = []
                 expected_next_offset = 0
                 observed_total = 0
                 for idx in sorted_indices:
@@ -1369,10 +1373,13 @@ async def iterate_rpc_inference(
                 if layout_issues:
                     preview = "; ".join(layout_issues[:3])
                     suffix = " ..." if len(layout_issues) > 3 else ""
-                    logger.warning(
+                    message = (
                         f"{MBPIPE_LOG_PREFIX} Micro-batch merge layout check failed for step_id={step_id}: "
                         f"{preview}{suffix}"
                     )
+                    _drop_mb_step_state(mb_accum_key, accum=True)
+                    _drop_mb_step_state(overlap_tracking_key, overlap=True)
+                    raise ValueError(message)
                 elif log_mb_detail:
                     logger.info(
                         f"{MBPIPE_LOG_PREFIX} Merge layout validated for step_id={step_id}: "

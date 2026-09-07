@@ -97,7 +97,7 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
 
         if past_key_values is None:
             past_key_values = RemotePastKeyValues()
-        past_key_values.update_seen(hidden_states.size(1))
+        past_key_values.advance_seen(hidden_states.size(1))
 
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)

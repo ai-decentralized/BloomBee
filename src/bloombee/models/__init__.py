@@ -5,9 +5,15 @@ from bloombee.models.mixtral import *
 from bloombee.models.deepseekv3 import *
 
 try:
-    from bloombee.models.gamma4 import *
+    from bloombee.models.gpt_oss import *
 except ModuleNotFoundError as exc:
-    if not str(exc.name).startswith("transformers.models.gamma4"):
+    if not str(exc.name).startswith("transformers.models.gpt_oss"):
+        raise
+
+try:
+    from bloombee.models.gemma4 import *
+except ModuleNotFoundError as exc:
+    if not str(exc.name).startswith("transformers.models.gemma4"):
         raise
 
 try:

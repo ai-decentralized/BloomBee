@@ -78,10 +78,10 @@ def test_prefill_shape_and_kv_contract(layer_idx, seq_len):
     assert torch.isfinite(out).all()
 
     pk, pv = kv
-    qk_d = block.self_attn.qk_head_dim
+    qk_d = cfg.cache_head_dim
     # BloomBee's 3D cache contract: key [B*H, qk_head_dim, S], value [B*H, S, qk_head_dim] (zero-padded)
-    assert pk.shape == (cfg.num_attention_heads, qk_d, seq_len)
-    assert pv.shape == (cfg.num_attention_heads, seq_len, qk_d)
+    assert pk.shape == (cfg.cache_num_key_value_heads, qk_d, seq_len)
+    assert pv.shape == (cfg.cache_num_key_value_heads, seq_len, qk_d)
 
 
 @pytest.mark.parametrize("layer_idx", [0, 1])

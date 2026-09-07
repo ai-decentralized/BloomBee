@@ -2078,16 +2078,22 @@ def _build_zstd_dict_byte_split_decode_wrapper(raw: bytes, *, elem_size: int) ->
     )
 
 
+def _validate_byte_split_elem_size(elem_size: int, original_size: int) -> None:
+    if elem_size not in (2, 4):
+        raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
+    if original_size < 0 or original_size % elem_size:
+        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+
+
 def _decode_dict_byte_split_with(decompressor, payload: bytes, original_size: int, *, label: str) -> bytes:
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError(f"{label} byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size, original_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
         raise ValueError(f"{label} byte-split payload extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
@@ -2120,6 +2126,7 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("Byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size, original_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
@@ -2127,8 +2134,6 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
 
     extracted_raw_size = original_size // elem_size
     remaining_raw_size = original_size - extracted_raw_size
@@ -2165,14 +2170,11 @@ def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("byte_split_high_only payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size, original_size)
     start = _BYTE_SPLIT_PAYLOAD_SIZE
     end = start + int(extracted_comp_size)
     if end > len(payload):
         raise ValueError("byte_split_high_only extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(
-            f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}"
-        )
 
     extracted_comp = payload[start:end]
     remaining_raw = bytes(payload[end:])

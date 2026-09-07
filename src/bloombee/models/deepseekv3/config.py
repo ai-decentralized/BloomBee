@@ -24,6 +24,9 @@ class DistributedDeepseekV3Config(DeepseekV3Config, ClientConfig, PTuneConfig, L
 
     @property
     def cache_head_dim(self):
+        # Compressed MLA caches latent KV and rotary keys with unequal widths.
+        if hasattr(DeepseekV3Attention, "expand_kv"):
+            return max(self.kv_lora_rank, self.qk_rope_head_dim)
         # DeepSeek-V3's MLA gives keys width qk_head_dim (qk_nope_head_dim +
         # qk_rope_head_dim) and values width v_head_dim, which usually differ.
         # `config.head_dim` is already claimed by upstream transformers for the
@@ -33,6 +36,10 @@ class DistributedDeepseekV3Config(DeepseekV3Config, ClientConfig, PTuneConfig, L
         # per-block cache tensor at qk_head_dim (the wider of the two); the
         # block wrapper zero-pads/truncates values to match on write/read.
         return self.qk_head_dim
+
+    @property
+    def cache_num_key_value_heads(self):
+        return 1 if hasattr(DeepseekV3Attention, "expand_kv") else self.num_attention_heads
 
     @classmethod
     def from_pretrained(

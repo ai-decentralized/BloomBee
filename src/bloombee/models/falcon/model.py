@@ -108,7 +108,7 @@ class DistributedFalconModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         if use_prompts:
             hidden_states = hidden_states[:, self.pre_seq_len :]
 
-        past_key_values.update_seen(hidden_states.size(1))
+        past_key_values.advance_seen(hidden_states.size(1))
 
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)

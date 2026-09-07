@@ -28,6 +28,11 @@ class WrappedDeepseekV3Block(DeepseekV3DecoderLayer):
         self._attn_implementation = config._attn_implementation
         self.layer_idx = layer_idx
         self._rotary_emb = DeepseekV3RotaryEmbedding(config)
+        self._compressed_cache = hasattr(self.self_attn, "expand_kv")
+        self._cache_key_dim = config.kv_lora_rank if self._compressed_cache else self.self_attn.qk_head_dim
+        self._cache_value_dim = config.qk_rope_head_dim if self._compressed_cache else self.self_attn.v_head_dim
+        self._cache_heads = 1 if self._compressed_cache else config.num_attention_heads
+        self._cache_width = max(self._cache_key_dim, self._cache_value_dim)
 
         # BloomBee's backend accesses self_attn.num_heads / num_key_value_heads
         if not hasattr(self.self_attn, "num_heads"):
@@ -140,45 +145,31 @@ class WrappedDeepseekV3Block(DeepseekV3DecoderLayer):
     ) -> Tuple[torch.Tensor]:
         """Convert BloomBee's stored KV back into DeepSeek-V3's native shapes.
 
-        DeepSeek-V3's MLA gives keys and values different per-head widths
-        (self_attn.qk_head_dim vs self_attn.v_head_dim), but BloomBee's cache
-        allocator (server/backend.py::_head_dim_for_this_block) only supports one
-        shared head_dim per block. DistributedDeepseekV3Config.cache_head_dim
-        makes that shared width equal to qk_head_dim (the larger of the two), so
-        stored values are zero-padded out to qk_head_dim; strip the padding here.
+        Recent Transformers stores single-head compressed KV and rotary keys;
+        older versions store expanded multi-head K/V. Both use a shared padded
+        width in BloomBee. Restore the native head count and remove padding.
         """
         key_states, value_states = key_value
-        qk_d = self.self_attn.qk_head_dim
-        v_d = self.self_attn.v_head_dim
-        num_heads = self.self_attn.num_heads
-
         if key_states.dim() == 4:
-            value_states = value_states[..., :v_d]
-            return (key_states, value_states)
+            return (
+                key_states[:, :self._cache_heads, :, :self._cache_key_dim],
+                value_states[:, :self._cache_heads, :, :self._cache_value_dim],
+            )
 
-        # 3D case: key is [B*H, qk_d, S], value is [B*H, S, qk_d] (zero-padded)
+        # 3D case: key is [B*H, D, S], value is [B*H, S, D].
         key_states = key_states.permute(0, 2, 1)
-        key_states = key_states.view(batch_size, num_heads, seq_length, qk_d)
-        value_states = value_states.view(batch_size, num_heads, seq_length, qk_d)
-        value_states = value_states[..., :v_d]
-        return (key_states, value_states)
+        key_states = key_states.reshape(batch_size, self._cache_heads, seq_length, self._cache_width)
+        value_states = value_states.reshape(batch_size, self._cache_heads, seq_length, self._cache_width)
+        return (key_states[..., :self._cache_key_dim], value_states[..., :self._cache_value_dim])
 
     def _reorder_cache_to_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
-        """Zero-pad values back out to qk_head_dim before writing into BloomBee's
-        shared-shape cache tensor (mirrors the same pad HF applies internally for
-        flash-attention when qk_head_dim != v_head_dim, see modeling_deepseek_v3.py).
-        """
+        """Pad both native cache tensors to the shared BloomBee storage width."""
         key_states, value_states = key_value
-        qk_d = self.self_attn.qk_head_dim
-        v_d = self.self_attn.v_head_dim
-        num_heads = self.self_attn.num_heads
-
-        if value_states.shape[-1] != qk_d:
-            value_states = F.pad(value_states, [0, qk_d - v_d])
-
-        value_states = value_states.reshape(batch_size * num_heads, seq_length, qk_d)
-        key_states = key_states.reshape(batch_size * num_heads, seq_length, qk_d)
+        key_states = F.pad(key_states, [0, self._cache_width - key_states.shape[-1]])
+        value_states = F.pad(value_states, [0, self._cache_width - value_states.shape[-1]])
+        value_states = value_states.reshape(batch_size * self._cache_heads, seq_length, self._cache_width)
+        key_states = key_states.reshape(batch_size * self._cache_heads, seq_length, self._cache_width)
         key_states = key_states.permute(0, 2, 1)
         return (key_states, value_states)

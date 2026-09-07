@@ -98,9 +98,9 @@ class DistributedDeepseekV3Model(DefaultRevisionMixin, FromPretrainedMixin, PTun
             hidden_states = inputs_embeds
             output_shape = input_shape + (hidden_states.size(-1),)
 
-            if past_key_values is None:
+            if not isinstance(past_key_values, RemotePastKeyValues):
                 past_key_values = RemotePastKeyValues()
-            past_key_values.update_seen(hidden_states.size(1))
+            past_key_values.advance_seen(hidden_states.size(1))
 
             hidden_states = self.layers(
                 hidden_states,
@@ -188,4 +188,3 @@ class DistributedDeepseekV3ForSequenceClassification(FromPretrainedMixin, Deepse
     @property
     def transformer(self) -> DistributedDeepseekV3Model:  # For compatibility with RemoteGenerationMixin
         return self.model
-

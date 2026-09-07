@@ -57,9 +57,25 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations handle causal masking internally when
-        # attention_mask=None. No need for the deprecated _prepare_4d_causal_* helpers.
-        attention_mask = None
+        # Bare layers do not receive the parent model's causal mask automatically.
+        # Backend masks can describe speculative trees, so preserve their topology.
+        if attention_mask is None:
+            total_len = past_key_values_length + seq_length
+            attention_mask = torch.triu(
+                torch.full(
+                    (seq_length, total_len), torch.finfo(hidden_states.dtype).min,
+                    dtype=hidden_states.dtype, device=hidden_states.device,
+                ),
+                diagonal=past_key_values_length + 1,
+            )[None, None]
+        else:
+            if attention_mask.dtype == torch.bool:
+                attention_mask = torch.zeros_like(attention_mask, dtype=hidden_states.dtype).masked_fill(
+                    ~attention_mask, torch.finfo(hidden_states.dtype).min
+                )
+            attention_mask = attention_mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            if attention_mask.ndim == 3:
+                attention_mask = attention_mask.unsqueeze(1)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:

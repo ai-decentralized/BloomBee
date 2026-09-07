@@ -291,19 +291,22 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
     def _head_dim_for_this_block(self) -> int:
         """Pick the right head_dim for this backend's layer.
 
-        Defaults to ``config.head_dim`` (or ``hidden_size // num_attention_heads``).
-        For Gemma-4 full_attention layers we must use ``global_head_dim``
-        instead; sliding layers stay on ``head_dim``.
-
-        ``cache_head_dim`` takes priority over both when present: models whose
-        K and V per-head widths differ (e.g. DeepSeek-V3's MLA, where
-        ``config.head_dim`` is already claimed by the rotary embedding's
-        frequency dimension) expose this to size the shared cache tensor at the
-        wider of the two; the block wrapper pads/truncates the narrower one.
+        Recent Transformers versions expose heterogeneous attention values
+        through ``per_layer_config`` and reject ambiguous global reads. Prefer
+        the concrete layer config when it is available, while retaining the
+        legacy named-field fallback for older and uniform configurations.
+        An explicit cache_head_dim overrides attention widths for MLA models.
         """
         cache_hd = getattr(self.config, "cache_head_dim", None)
         if cache_hd:
             return int(cache_hd)
+        per_layer_configs = getattr(self.config, "per_layer_config", None)
+        if per_layer_configs:
+            block_index = self.block_index
+            if block_index is not None and 0 <= block_index < len(per_layer_configs):
+                return int(per_layer_configs[block_index].head_dim)
+            return int(per_layer_configs[0].head_dim)
+
         default_hd = getattr(self.config, "head_dim", None) or (
             self.config.hidden_size // self.config.num_attention_heads
         )
@@ -332,10 +335,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         rotary_position_ids: Optional[torch.Tensor],
-    ) -> Optional[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """One transformer block forward pass on a (chunked) hidden-states slice.
 
-        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs) or None
+        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs) or raises
         on failure.
         """
         forward_result = self.module.forward(
@@ -347,8 +350,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             rotary_position_ids=rotary_position_ids,
         )
         if forward_result is None:
-            logger.info(" ERROR: module.forward returned None!")
-            return None
+            raise RuntimeError("module.forward returned None")
         output_hidden_states_chunk, new_kvs = forward_result
         return output_hidden_states_chunk, new_kvs
 
@@ -539,7 +541,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if cache_len <= 0:
             return torch.empty(batch_size, 0, dtype=torch.bool, device=device)
         if kv_cache_position_ids is None or is_dummy(kv_cache_position_ids):
-            return torch.ones(batch_size, cache_len, dtype=torch.bool, device=device)
+            raise RuntimeError("[SPEC_LOCAL_MASK] missing kv_cache_position_ids for a nonempty cache")
 
         ids = kv_cache_position_ids
         if not torch.is_tensor(ids):
@@ -556,14 +558,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             )
         if ids.ndim >= 2 and ids.shape[0] == 1 and batch_size > 1:
             ids = ids.expand(batch_size, -1)
-        if ids.ndim < 2 or ids.shape[0] != batch_size:
-            logger.warning(
-                "[SPEC_LOCAL_MASK] kv_cache_position_ids batch mismatch: got=%s expected=%s; "
-                "falling back to all-prefix-valid cache mask",
-                tuple(ids.shape) if torch.is_tensor(ids) else None,
-                batch_size,
+        if ids.ndim != 2 or ids.shape[0] != batch_size or ids.shape[1] == 0:
+            raise RuntimeError(
+                "[SPEC_LOCAL_MASK] invalid kv_cache_position_ids shape: "
+                f"got={tuple(ids.shape)} expected=({batch_size}, nonempty)"
             )
-            return torch.ones(batch_size, cache_len, dtype=torch.bool, device=device)
 
         valid_mask = ids >= 0
         has_valid = valid_mask.any(dim=1)

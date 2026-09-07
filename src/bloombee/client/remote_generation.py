@@ -87,6 +87,11 @@ class RemotePastKeyValues(Cache):
 
     def reorder_cache(self, beam_idx):
         raise NotImplementedError("Beam search reordering is not implemented yet")
+
+    def advance_seen(self, token_count: int) -> None:
+        """Advance ordinary decoding; update_seen assigns an absolute spec/session position."""
+        previous = self._seen_tokens if self._seen_tokens is not None else 0
+        self.update_seen(previous + token_count)
     
     def set_kv_cache(self, position_ids: Optional[torch.LongTensor]):
         self.kv_cache_position_ids = position_ids
