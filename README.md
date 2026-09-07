@@ -105,6 +105,7 @@ A **Distributed Hash Table (DHT)** keeps track of which server hosts which layer
 | **Qwen3** | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3-14B` |
 | **Gemma-4** | `google/gemma-4-31B-it` |
 | **GPT-OSS** | `openai/gpt-oss-20b` |
+| **DeepSeek V3** | `unsloth/DeepSeek-V3-bf16` |
 
 Any HuggingFace model with a matching architecture can be served. Use `AutoDistributedModelForCausalLM` to load a model automatically.
 
