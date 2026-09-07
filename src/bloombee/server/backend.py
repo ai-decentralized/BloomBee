@@ -294,7 +294,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         Defaults to ``config.head_dim`` (or ``hidden_size // num_attention_heads``).
         For Gemma-4 full_attention layers we must use ``global_head_dim``
         instead; sliding layers stay on ``head_dim``.
+
+        ``cache_head_dim`` takes priority over both when present: models whose
+        K and V per-head widths differ (e.g. DeepSeek-V3's MLA, where
+        ``config.head_dim`` is already claimed by the rotary embedding's
+        frequency dimension) expose this to size the shared cache tensor at the
+        wider of the two; the block wrapper pads/truncates the narrower one.
         """
+        cache_hd = getattr(self.config, "cache_head_dim", None)
+        if cache_hd:
+            return int(cache_hd)
         default_hd = getattr(self.config, "head_dim", None) or (
             self.config.hidden_size // self.config.num_attention_heads
         )

@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 
 import configargparse
 import torch
@@ -10,6 +11,7 @@ from humanfriendly import parse_size
 
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 from bloombee.server.server import Server
+from bloombee.utils.convert_block import QuantType
 from bloombee.utils.p2p import get_default_p2p_max_msg_size
 from bloombee.utils.version import validate_version
 
@@ -66,6 +68,10 @@ def main():
     )
 
     parser.add_argument('--compression', type=str, default='NONE', required=False, help='Tensor compression communication')
+
+    parser.add_argument('--quant_type', type=str, choices=['NONE', 'INT8'], default='NONE', required=False,
+                        help='Weight quantization type. Currently only INT8 is supported, and only for '
+                             "DeepSeek-V3's MoE expert weights (~98%% of its params) -- see convert_block().")
 
     parser.add_argument('--num_handlers', type=int, default=8, required=False,
                         help='server will use this many processes to handle incoming requests')
@@ -210,6 +216,8 @@ def main():
     compression_type = args.pop("compression").upper()
     compression = getattr(CompressionType, compression_type)
 
+    args["quant_type"] = QuantType[args.pop("quant_type").upper()]
+
     max_disk_space = args.pop("max_disk_space")
     if max_disk_space is not None:
         max_disk_space = parse_size(max_disk_space)
@@ -225,6 +233,23 @@ def main():
     if not torch.backends.openmp.is_available():
         # Necessary to prevent the server from freezing after forks
         torch.set_num_threads(1)
+    else:
+        # Server() below forks one runtime process plus `num_handlers` connection-
+        # handler processes (default 8), each an independent Python process. Left
+        # alone, each one calls PyTorch's own thread-count heuristic, which defaults
+        # to roughly the host's full core count -- so N sibling processes end up
+        # scheduling ~N x cpu_count() threads onto only cpu_count() real cores.
+        # Most of the time there's enough slack that this goes unnoticed, but any
+        # time several of those processes are busy at once (e.g. a client retry
+        # replaying several tokens' worth of history while another handler is mid
+        # decode step), the OS has far more runnable threads than cores and has to
+        # thrash between them -- turning what should be a ~10s forward pass into a
+        # multi-minute stall that trips the client's request_timeout. Cap each
+        # process to a fair share of the machine instead of letting them all
+        # independently assume they own every core.
+        num_worker_processes = max(1, int(args.get("num_handlers", 8) or 8)) + 1  # +1 for the runtime process
+        threads_per_process = max(1, (os.cpu_count() or 1) // num_worker_processes)
+        torch.set_num_threads(threads_per_process)
 
     server = Server(
         **args,

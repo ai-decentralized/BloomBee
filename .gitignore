@@ -178,6 +178,9 @@ cython_debug/
 bloombee-env/*
 bootstrap*
 
+# P2P identity keys (private keys -- never commit these)
+*.id
+
 # local caches
 cache/
 

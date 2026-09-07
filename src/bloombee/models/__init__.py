@@ -2,11 +2,12 @@ from bloombee.models.bloom import *
 from bloombee.models.falcon import *
 from bloombee.models.llama import *
 from bloombee.models.mixtral import *
+from bloombee.models.deepseekv3 import *
 
 try:
-    from bloombee.models.gemma4 import *
+    from bloombee.models.gamma4 import *
 except ModuleNotFoundError as exc:
-    if not str(exc.name).startswith("transformers.models.gemma4"):
+    if not str(exc.name).startswith("transformers.models.gamma4"):
         raise
 
 try:

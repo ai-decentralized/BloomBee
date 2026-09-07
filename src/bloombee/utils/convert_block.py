@@ -99,9 +99,13 @@ def convert_block(
 ) -> tp.TensorParallel:
     """
     Optimize a transformer block for use in a Petals server with FlexGen.
-    
-    Note: Quantization is handled by FlexGen's weight loading system, not here.
-    The quant_type parameter is passed through but not used in this function.
+
+    Note: For FlexGen-managed models (Llama), quantization is handled by FlexGen's
+    weight loading system, not here. For DeepSeek-V3, QuantType.INT8 is applied here
+    by replacing the block's batched expert weight tensors with an int8 quantized
+    equivalent (see bloombee.models.deepseekv3.quantized_experts) -- DeepSeek-V3's
+    experts are raw 3D nn.Parameter tensors, not nn.Linear submodules, so
+    bitsandbytes-style module replacement doesn't apply to them.
 
     :note: some optimizations will modify the input block in-place!
     :param block: a single transformer block, either pre-trained or newly initialized
@@ -109,13 +113,35 @@ def convert_block(
     :param tensor_parallel_devices: if specified, use tensor parallelism to split the model between these devices
     :note: if there is only a single device, model wil still be wrapped with TensorParallel (for uniformity)
     :param output_device: if tensor_parallel_devices is True, output
-    :param quant_type: quantization type (used by FlexGen compression, not applied here)
+    :param quant_type: quantization type; only QuantType.NONE and QuantType.INT8 (DeepSeek-V3 only) are supported
     :param freeze: if True (default), make all module parameters non-trainable
     :return: a module that acts like the original block, but runs with all specified optimizations
 
     """
     if freeze:
         block.requires_grad_(False)
+
+    if quant_type != QuantType.NONE:
+        # Imported lazily: bloombee.models.* pulls in bloombee.client.*, and this
+        # module is imported early in bloombee/__init__.py's chain (via
+        # server.block_functions), so a top-level import here would circular-import.
+        from bloombee.models.deepseekv3.block import WrappedDeepseekV3Block
+        from bloombee.models.deepseekv3.quantized_experts import QuantizedDeepseekV3Experts
+
+        if config.block_class is not WrappedDeepseekV3Block:
+            raise NotImplementedError(
+                f"quant_type={quant_type} is only implemented for DeepSeek-V3 "
+                f"(got block_class={config.block_class.__name__}); pass QuantType.NONE for other models."
+            )
+        if quant_type is not QuantType.INT8:
+            raise NotImplementedError(f"DeepSeek-V3 quantization only supports QuantType.INT8, got {quant_type}")
+        if hasattr(block.mlp, "experts"):
+            # Dense layers (block_index < first_k_dense_replace) use a plain
+            # DeepseekV3MLP with no `.experts` -- nothing to quantize there, and
+            # they're <0.2% of the model's parameters, so skip them silently.
+            block.mlp.experts = QuantizedDeepseekV3Experts(block.mlp.experts)
+            logger.info(f"[convert_block:{block_index}] quantized MoE expert weights to int8")
+
     if len(tensor_parallel_devices) > 1 and config.model_type == "llama":
         return make_tensor_parallel(
             block,
