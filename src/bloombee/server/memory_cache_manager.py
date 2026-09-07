@@ -217,6 +217,10 @@ class KVCacheManager:
         attention_heads = max(1, int(attention_heads))
         source_bh = int(source_bh)
 
+        cache_heads = getattr(self.block_config, "cache_num_key_value_heads", None)
+        if cache_heads is not None and 0 < int(cache_heads) <= attention_heads and source_bh % int(cache_heads) == 0:
+            return int(cache_heads)
+
         for runtime_batch in (micro_batch_size, full_batch_size):
             runtime_batch = int(runtime_batch)
             if runtime_batch > 0 and source_bh % runtime_batch == 0:

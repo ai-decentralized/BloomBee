@@ -71,6 +71,14 @@ def main():
         action="store_true",
         help="Log generated tokens for every decode step (high-volume logs)",
     )
+    parser.add_argument(
+        "--use_server_to_server",
+        type=lambda s: s.strip().lower() not in {"0", "false", "no", "off"},
+        default=True,
+        help="Let servers forward activations directly to the next server in the chain (default: True). "
+             "Set to False to have the client mediate every hop itself instead — useful when a "
+             "server-to-server relay hop is broken or unreachable even though client<->server works.",
+    )
     args = parser.parse_args()
 
     if args.n_processes == "n_gpus":
@@ -111,7 +119,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     model_kwargs = dict(
         initial_peers=args.initial_peers,
         torch_dtype=DTYPE_MAP[args.torch_dtype],
-        use_server_to_server=True,  # Explicitly enable server-to-server communication
+        use_server_to_server=args.use_server_to_server,
     )
     if args.dht_prefix is not None:
         model_kwargs["dht_prefix"] = args.dht_prefix

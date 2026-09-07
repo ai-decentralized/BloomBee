@@ -295,7 +295,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         through ``per_layer_config`` and reject ambiguous global reads. Prefer
         the concrete layer config when it is available, while retaining the
         legacy named-field fallback for older and uniform configurations.
+        An explicit cache_head_dim overrides attention widths for MLA models.
         """
+        cache_hd = getattr(self.config, "cache_head_dim", None)
+        if cache_hd:
+            return int(cache_hd)
         per_layer_configs = getattr(self.config, "per_layer_config", None)
         if per_layer_configs:
             block_index = self.block_index
