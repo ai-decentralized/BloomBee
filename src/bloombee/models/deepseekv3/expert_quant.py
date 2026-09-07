@@ -34,18 +34,23 @@ def quantize_expert_weight(weight: torch.Tensor, group_size: int = 128) -> Tuple
     :param group_size: number of input channels sharing one scale factor
     :return: (data, scale, effective_group_size)
         data:  int8 tensor, same shape as `weight`
-        scale: tensor of shape [num_experts, out_features, num_groups], same dtype/device as `weight`
+        scale: float32 tensor [num_experts, out_features, num_groups], on the weight device
     """
     num_experts, out_features, in_features = weight.shape
     eff_group_size = _effective_group_size(in_features, group_size)
     num_groups = in_features // eff_group_size
 
     grouped = weight.detach().reshape(num_experts, out_features, num_groups, eff_group_size)
-    amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-    scale = amax / 127.0
-    data = (grouped / scale).round().clamp_(-127, 127).to(torch.int8)
+    data = torch.empty_like(grouped, dtype=torch.int8)
+    scale = torch.empty((num_experts, out_features, num_groups), device=weight.device, dtype=torch.float32)
+    # Work one expert at a time to avoid a full-model-sized float32 temporary.
+    for index in range(num_experts):
+        values = grouped[index].float()
+        expert_scale = values.abs().amax(dim=-1).clamp_min(1e-8) / 127.0
+        scale[index].copy_(expert_scale)
+        data[index].copy_((values / expert_scale.unsqueeze(-1)).round().clamp_(-127, 127))
 
-    return data.reshape(num_experts, out_features, in_features).contiguous(), scale.squeeze(-1).contiguous(), eff_group_size
+    return data.reshape(num_experts, out_features, in_features).contiguous(), scale, eff_group_size
 
 
 def dequantize_expert_weight(
@@ -69,6 +74,6 @@ def dequantize_expert_weight(
     out_features, in_features = d.shape
     num_groups = s.shape[-1]
 
-    d = d.reshape(out_features, num_groups, group_size).to(dtype)
-    d = d * s.unsqueeze(-1).to(dtype)
-    return d.reshape(out_features, in_features)
+    d = d.reshape(out_features, num_groups, group_size).float()
+    d = d * s.unsqueeze(-1).float()
+    return d.reshape(out_features, in_features).to(dtype)
