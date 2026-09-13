@@ -274,15 +274,10 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         if kwargs.get("return_dict_in_generate"):
             return False
         if kwargs.get("generation_config") is not None:
-            gen_cfg = kwargs["generation_config"]
-            if bool(getattr(gen_cfg, "do_sample", False)):
-                return False
-            if int(getattr(gen_cfg, "num_beams", 1) or 1) != 1:
-                return False
-            if int(getattr(gen_cfg, "num_return_sequences", 1) or 1) != 1:
-                return False
-            if getattr(gen_cfg, "constraints", None):
-                return False
+            # Fast greedy does not merge generation_config into eos/pad/processors.
+            # Accepting a greedy config here would silently drop eos_token_id,
+            # repetition_penalty, min_new_tokens, and similar fields.
+            return False
         # Unknown kwargs → legacy path.
         unknown = set(kwargs) - self._FAST_GENERATE_KNOWN_KWARGS - {"generation_config"}
         if unknown:
