@@ -23,6 +23,10 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 
 ## News
 
+- `2026/09/06`: Support GPT-OSS and Gemma 4 compatibility (PR [#64](...) by @JiuChen0).
+- `2026/08/30`: Add DeepSeek-V3 support for BloomBee (PR [#63](...) by @syj-7).
+- `2026/08/04`: Add the EAGLE-2 speculative drafter runtime (PR [#57](...) by @XinRanZh).
+- `2026/06/27`: Add GQA model support (PR [#61](...) by @JiuChen0).
 - `2026/04/22` : Released our [paper](https://arxiv.org/abs/2604.21072) on arXiv.
 - `2026/02/23` : Improve documentation, CI, and developer tooling (PR [#41](../../pull/41) by @dadaism).
 - `2026/02/19` : Support micro batching and lossless compression (PR [#39](../../pull/39) by @JiuChen0).
