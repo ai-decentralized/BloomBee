@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from itertools import chain
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 from time import perf_counter
 
@@ -58,6 +59,12 @@ def _flag_to_bool(value) -> bool:
 
 _STEP_PROFILE_ENABLED = os.environ.get("BLOOMBEE_STEP_PROFILE", "0") == "1"
 _STEP_PROFILE_INTERVAL = int(os.environ.get("BLOOMBEE_STEP_PROFILE_INTERVAL", "32"))
+
+@dataclass(frozen=True)
+class MambaStateDescriptor(TensorDescriptor):
+    """Marker descriptor for Nemotron-H fixed Mamba state."""
+    cache_kind: str = "mamba"
+
 
 class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Module
     """A wrapper for a transformer block that can process requests for forward, backward and inference"""
@@ -126,17 +133,51 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
-        provided_shard_num_heads = getattr(self.module, "shard_num_heads", None)
-        if provided_shard_num_heads is not None:
-            self.shard_num_heads = list(provided_shard_num_heads)
+        layer_type = self._layer_type_for_this_block()
+
+        if layer_type in ("linear_attention", "moe", "mlp"):
+            # Nemotron-H Mamba/MoE/MLP blocks do not contain a
+            # NemotronHAttention module. Keep one placeholder per device so
+            # generic backend bookkeeping remains well-formed, but do not
+            # pretend these blocks own KV attention heads.
+            self.shard_num_heads = [0] * len(self.module.devices)
         else:
-            self.shard_num_heads = []
-            for shard in self.module.module_shards:
-                for submodule in shard.modules():
-                    if isinstance(submodule, config.attn_class):
-                        self.shard_num_heads.append(submodule.num_heads)
-        assert len(self.shard_num_heads) == len(self.module.devices)
-        assert sum(self.shard_num_heads) == config.num_attention_heads
+            provided_shard_num_heads = getattr(
+                self.module, "shard_num_heads", None
+            )
+            if provided_shard_num_heads is not None:
+                self.shard_num_heads = list(provided_shard_num_heads)
+            else:
+                self.shard_num_heads = []
+
+                # Most BloomBee/Hivemind transformer configs expose
+                # config.attn_class. Nemotron-H does not; its attention
+                # implementation is NemotronHAttention.
+                attn_class = getattr(config, "attn_class", None)
+
+                if attn_class is None and getattr(config, "model_type", None) == "nemotron_h":
+                    from transformers.models.nemotron_h.modeling_nemotron_h import (
+                        NemotronHAttention,
+                    )
+                    attn_class = NemotronHAttention
+
+                if attn_class is not None:
+                    for shard in self.module.module_shards:
+                        for submodule in shard.modules():
+                            if isinstance(submodule, attn_class):
+                                # Nemotron-H attention exposes its head count
+                                # through the config rather than submodule.num_heads.
+                                num_heads = getattr(submodule, "num_heads", None)
+                                if num_heads is None:
+                                    num_heads = getattr(
+                                        config, "num_attention_heads"
+                                    )
+                                self.shard_num_heads.append(int(num_heads))
+
+                # A heterogeneous block that claims to be attention must
+                # still expose exactly one head count per TP device.
+                assert len(self.shard_num_heads) == len(self.module.devices)
+                assert sum(self.shard_num_heads) == config.num_attention_heads
 
         self.inference_schema = (
             (
@@ -176,7 +217,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self._position_ids_cache = {}
         # Compute-once hoist (②): per-step work that depended only on static
         # backend state. Each of these used to run on every inference_step.
-        self._max_shard_num_heads = max(self.shard_num_heads)
+        self._max_shard_num_heads = (
+            max(self.shard_num_heads) if self.shard_num_heads else 0
+        )
         # Static portion of the "can we reuse server-side KV cache?" gate —
         # depends only on the offloading policy decided at server init.
         policy = cache_manager.offloading_policy
@@ -261,9 +304,47 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         its K/V update shapes. Downscaling to num_kv_heads would break
         that contract. Memory waste here is the GQA ratio (Qwen3: 5x).
         """
+        layer_type = self._layer_type_for_this_block()
+
+        # Nemotron-H MoE/MLP blocks are stateless between decoding steps.
+        if layer_type in ("moe", "mlp"):
+            return []
+
+        # Nemotron-H linear-attention blocks keep fixed Mamba state rather
+        # than an append-only KV cache. The descriptor acts as a marker;
+        # MemoryCache allocates the actual conv + recurrent state shapes.
+        if layer_type == "linear_attention":
+            cache_tensors = []
+            for device in self.module.devices:
+                state = MambaStateDescriptor(
+                    (batch_size, 1, 1, max_length),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                cache_tensors.append(state)
+            return cache_tensors
+
         head_dim = self._head_dim_for_this_block()
+
+        # Nemotron-H uses GQA: 32 query heads but only 2 KV heads.
+        # Keep shard_num_heads at the query-head count for the generic
+        # backend contract, but allocate the physical KV cache using
+        # num_key_value_heads.
+        if getattr(self.config, "model_type", None) == "nemotron_h":
+            cache_num_heads = int(
+                getattr(
+                    self.config,
+                    "num_key_value_heads",
+                    self.config.num_attention_heads,
+                )
+            )
+        else:
+            cache_num_heads = None
+
         cache_tensors = []
         for device, num_heads in zip(self.module.devices, self.shard_num_heads):
+            if cache_num_heads is not None:
+                num_heads = cache_num_heads
             keys = TensorDescriptor(
                 (batch_size, num_heads, head_dim, max_length),
                 dtype=self.dtype, device=device,
@@ -351,7 +432,30 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         )
         if forward_result is None:
             raise RuntimeError("module.forward returned None")
-        output_hidden_states_chunk, new_kvs = forward_result
+
+        # BloomBee expects every block to expose a uniform
+        # (hidden_states, cache) interface. Nemotron-H MLP/MoE and
+        # some HF linear-attention paths may return only the hidden
+        # state because they do not use a conventional KV cache.
+        if torch.is_tensor(forward_result):
+            output_hidden_states_chunk = forward_result
+            new_kvs = None
+        elif isinstance(forward_result, (tuple, list)):
+            if len(forward_result) == 1:
+                output_hidden_states_chunk = forward_result[0]
+                new_kvs = None
+            elif len(forward_result) >= 2:
+                output_hidden_states_chunk = forward_result[0]
+                new_kvs = forward_result[1]
+            else:
+                raise RuntimeError(
+                    "module.forward returned an empty tuple/list"
+                )
+        else:
+            raise RuntimeError(
+                f"module.forward returned unsupported type: "
+                f"{type(forward_result).__name__}"
+            )
         return output_hidden_states_chunk, new_kvs
 
     @staticmethod
@@ -460,6 +564,31 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         with paged-KV writes; Phase 3 adds per-page rollback on rejected
         speculative tokens without changing callers.
         """
+        layer_type = self._layer_type_for_this_block()
+
+        # Nemotron-H MoE/MLP blocks are stateless between inference steps.
+        if layer_type in ("moe", "mlp"):
+            return
+
+        # Nemotron-H linear-attention uses fixed-size Mamba state rather than
+        # append-only KV. Replace the persistent conv/recurrent state and stop
+        # before any KV-specific speculative or paged-cache logic.
+        if layer_type == "linear_attention":
+            if self._is_spec_decoding:
+                raise NotImplementedError(
+                    "Speculative decoding is not yet supported for "
+                    "Nemotron-H linear-attention blocks"
+                )
+
+            self.cache_manager.update_mamba_state(
+                new_kvs,
+                batch_offset=inference_info.batch_offset,
+                full_batch_size=inference_info.full_batch_size,
+                micro_batch_size=inference_info.micro_batch_size,
+                cache_tensors=cache_tensors,
+            )
+            return
+
         if self._is_spec_decoding:
             self.cache_manager.update_cache_and_async_reorder(
                 new_kvs,
@@ -790,6 +919,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     and hypo_ids.ndim == 1
                     and hypo_ids.numel() > 0
                     and not self._is_identity_hypo_ids(hypo_ids)
+                    and self._layer_type_for_this_block()
+                    not in ("linear_attention", "moe", "mlp")
                 ):
                     self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
                     hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
@@ -804,7 +935,37 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     _prof_t0 = perf_counter()
-                if kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
+                layer_type = self._layer_type_for_this_block()
+                mamba_layer_past = None
+
+                if layer_type in ("moe", "mlp"):
+                    # Nemotron-H MoE/MLP blocks have no persistent decoding state.
+                    k_pkv = None
+                    v_pkv = None
+                    cache_len = 0
+
+                elif layer_type == "linear_attention":
+                    # Nemotron-H Mamba state is fixed-size and has no sequence
+                    # axis. On initial prefill there is no previous state, so
+                    # pass layer_past=None. After prefill, read the persistent
+                    # conv + recurrent state from MemoryCache.
+                    cache_len = int(inference_info.prefix_length)
+
+                    if cache_len > 0:
+                        conv_state, recurrent_state = self.cache_manager.select_mamba_state(
+                            batch_offset=inference_info.batch_offset,
+                            micro_batch_size=inference_info.micro_batch_size,
+                            requested_rows=batch_size,
+                            cache_tensors=cache_tensors,
+                        )
+                        mamba_layer_past = (conv_state, recurrent_state)
+                    else:
+                        mamba_layer_past = None
+
+                    k_pkv = None
+                    v_pkv = None
+
+                elif kv_cache_position_ids is not None and kv_cache_position_ids.numel() > 0:
                     k_pkv, v_pkv, cache_len = self.cache_manager.select_cache_without_reorder(
                         kv_cache_position_ids,
                         batch_offset=inference_info.batch_offset,
@@ -832,7 +993,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # t2 = time.perf_counter()
                 # logger.info(f"inference_step: cache reorder (if needed) and selection took {t2 - t1:.4f} seconds")
 
-                layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
+                if layer_type == "linear_attention":
+                    layer_past = mamba_layer_past
+                else:
+                    layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
                 if self._has_set_remote_cache_reuse:
                     # Compute-once hoist (②): _static_reuse_blocker folds in
                     # the 5 policy fields that are frozen at server init.
@@ -975,9 +1139,18 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
                     
                     chunk_length = min(max_chunk_length, seq_len - offset)
-                    attention_mask_chunk = attention_mask
+                    # Nemotron-H Mamba/linear-attention expects a 2-D
+                    # padding mask [batch, seq], not BloomBee's additive
+                    # attention scores [batch, query, key]. Mamba itself
+                    # handles its recurrent/causal state internally.
+                    if layer_type == "linear_attention":
+                        attention_mask_chunk = None
+                    else:
+                        attention_mask_chunk = attention_mask
+
                     if (
-                        attention_mask is not None
+                        layer_type != "linear_attention"
+                        and attention_mask is not None
                         and attention_mask.ndim >= 3
                         and attention_mask.shape[-2] == seq_len
                         and attention_mask.shape[-1] == cache_len + seq_len
@@ -1182,6 +1355,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         return keep_indices
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:
+        # Nemotron-H linear-attention blocks carry fixed Mamba state
+        # (conv_state + recurrent_state), not append-only KV.
+        # Until Mamba-aware chunk propagation is implemented, process
+        # the whole request in one chunk.
+        layer_type = self._layer_type_for_this_block()
+        if layer_type in ("linear_attention", "moe", "mlp"):
+            return hidden_states.shape[1]
+
         # We assume that attention logit matrices are the main thing that consumes memory, given that
         # the model uses multi-query attention
         batch_size, seq_length, hidden_size = hidden_states.shape

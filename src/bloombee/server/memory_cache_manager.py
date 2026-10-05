@@ -497,14 +497,65 @@ class KVCacheManager:
             self.cache._free(allocation_tokens, alloc_task)
             
             
-    @staticmethod
-    def get_allocation_size_tokens(*descriptors: TensorDescriptor) -> int:
+    def get_allocation_size_tokens(
+        self, *descriptors: TensorDescriptor
+    ) -> int:
+        """
+        Return cache allocation in BloomBee token-accounting units.
+
+        Standard KV descriptors remain sequence-length based.
+
+        Nemotron-H Mamba descriptors represent fixed-size FP32 state, so
+        convert the actual state byte size into equivalent KV-token units.
+        """
         allocation_tokens_num = 0
+        kv_bytes_per_token = self.size_per_token()
+
         for descr in descriptors:
-            allocation_tokens_num = max(descr.shape[-1], allocation_tokens_num) 
+            if getattr(descr, "cache_kind", None) == "mamba":
+                config = self.block_config
+                batch_size = int(descr.shape[0])
+
+                mamba_num_heads = int(config.mamba_num_heads)
+                mamba_head_dim = int(config.mamba_head_dim)
+                n_groups = int(config.n_groups)
+                ssm_state_size = int(config.ssm_state_size)
+                conv_kernel = int(config.conv_kernel)
+
+                conv_channels = (
+                    mamba_num_heads * mamba_head_dim
+                    + 2 * n_groups * ssm_state_size
+                )
+
+                values_per_batch = (
+                    conv_channels * conv_kernel
+                    + mamba_num_heads
+                    * mamba_head_dim
+                    * ssm_state_size
+                )
+
+                # Persistent Mamba state is FP32.
+                mamba_bytes = batch_size * values_per_batch * 4
+
+                # Convert bytes to BloomBee's existing KV-token accounting
+                # units, rounding upward so we never under-account.
+                equivalent_tokens = (
+                    mamba_bytes + kv_bytes_per_token - 1
+                ) // kv_bytes_per_token
+
+                allocation_tokens_num = max(
+                    allocation_tokens_num,
+                    int(equivalent_tokens),
+                )
+            else:
+                allocation_tokens_num = max(
+                    allocation_tokens_num,
+                    int(descr.shape[-1]),
+                )
+
         return allocation_tokens_num
-        
-    
+
+
     def add_cache(self, kvs: AdaptedKVCache, start_position: int):
         self._write_kvs(kvs, start_position)
         self._track_paged_write(kvs, start_position, commit=True)
@@ -760,9 +811,88 @@ class KVCacheManager:
     
     def size_per_token(self) -> int:
         cache_values_per_block = 2 * self.block_config.hidden_size
-        cache_values_per_block //= self.block_config.num_key_value_groups
+
+        num_key_value_groups = getattr(
+            self.block_config,
+            "num_key_value_groups",
+            None,
+        )
+        if num_key_value_groups is None:
+            num_attention_heads = int(self.block_config.num_attention_heads)
+            num_key_value_heads = int(self.block_config.num_key_value_heads)
+            num_key_value_groups = num_attention_heads // num_key_value_heads
+
+        cache_values_per_block //= num_key_value_groups
         return cache_values_per_block * get_size_in_bytes(torch.float16)
     
+    def select_mamba_state(
+        self,
+        *,
+        batch_offset: int = 0,
+        micro_batch_size: int = 0,
+        requested_rows: int = 0,
+        cache_tensors=None,
+    ):
+        """
+        Read Nemotron-H fixed Mamba state onto the attention compute device.
+
+        Stored state per handle:
+            conv_state       [B, channels, conv_kernel]
+            recurrent_state  [B, heads, head_dim, state_size]
+
+        Unlike KV cache, this state has no sequence dimension.
+        """
+        if cache_tensors is None:
+            assert self._active_cache_tensors_stack, (
+                "select_mamba_state called outside of use_cache"
+            )
+            cache_tensors = self._active_cache_tensors_stack[-1]
+
+        (conv_cache, recurrent_cache), = cache_tensors
+
+        total_batch = int(conv_cache.shape[0])
+
+        if micro_batch_size > 0:
+            start = int(batch_offset)
+            rows = int(micro_batch_size)
+        elif requested_rows > 0:
+            start = 0
+            rows = int(requested_rows)
+        else:
+            start = 0
+            rows = total_batch
+
+        end = min(start + rows, total_batch)
+
+        if start < 0 or start >= total_batch or end <= start:
+            raise ValueError(
+                f"Invalid Mamba batch slice: start={start}, end={end}, "
+                f"total_batch={total_batch}"
+            )
+
+        conv_sel, _ = conv_cache.smart_copy(
+            self.attention_compute,
+            (slice(start, end), slice(None), slice(None)),
+        )
+        recurrent_sel, _ = recurrent_cache.smart_copy(
+            self.attention_compute,
+            (
+                slice(start, end),
+                slice(None),
+                slice(None),
+                slice(None),
+            ),
+        )
+
+        conv_state = conv_sel.data if hasattr(conv_sel, "data") else conv_sel
+        recurrent_state = (
+            recurrent_sel.data
+            if hasattr(recurrent_sel, "data")
+            else recurrent_sel
+        )
+
+        return conv_state, recurrent_state
+
     def select_cache(
         self,
         prefix_length: int,
@@ -808,7 +938,7 @@ class KVCacheManager:
                     f"batch_offset={batch_offset}, full_batch_size={full_batch_size}, micro_batch_size={micro_batch_size}")
         
         # Micro-batch support: compute BH slice
-        H = getattr(self.block_config, "num_attention_heads", BH_full)
+        H = getattr(self.block_config, "num_key_value_heads", getattr(self.block_config, "num_attention_heads", BH_full)) if getattr(self.block_config, "model_type", None) == "nemotron_h" else getattr(self.block_config, "num_attention_heads", BH_full)
         full_batch_in_cache = BH_full // H  # Actual batch size in allocated cache
         
         # [MBPIPE_KV_VERIFY] High-frequency per-layer read diagnostics
@@ -1000,7 +1130,20 @@ class KVCacheManager:
             k_buf, v_buf = compute_dst.next_attention_compute_workspace()
             general_copy(k_buf, idx_all, k_cache, idx_all)
             general_copy(v_buf, idx_all, v_cache, idx_all)
-            k_sbh, v_sbh = _as_torch(k_buf), _as_torch(v_buf)
+            # The CPU workspace is sized for the model's query heads.
+            # GQA models such as Nemotron-H may store fewer KV heads.
+            # Return only the sequence rows and BH columns actually copied
+            # from the physical KV cache, not the unused workspace capacity.
+            k_sbh = _as_torch(k_buf)[
+                :prefix_length,
+                BH_offset_start:BH_offset_end,
+                :,
+            ]
+            v_sbh = _as_torch(v_buf)[
+                :prefix_length,
+                BH_offset_start:BH_offset_end,
+                :,
+            ]
 
         else:  # path == 2, MIXED: GPU segment + other segments merged to compute_dst
             gpu_k_part = k_cache.data[0][0][:prefix_length]  # (S, BH_gpu, D)
@@ -1035,7 +1178,7 @@ class KVCacheManager:
 
         def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:
             # (S, BH, D) -> (S, B, H, D) -> (B, H, S, D)
-            return x_sbh.view(prefix_length, B, H, D).permute(1, 2, 0, 3)
+            return x_sbh[:prefix_length].view(prefix_length, B, H, D).permute(1, 2, 0, 3)
 
         k_pkv = _to_pkv(k_sbh)
         v_pkv = _to_pkv(v_sbh)
@@ -1517,6 +1660,112 @@ class KVCacheManager:
         if num_cleared > 0:
             logger.info(f"[KVCACHE_OFFLOAD] Cleared offload state: {num_cleared} staged micro-batches")
     
+    def update_mamba_state(
+        self,
+        new_state,
+        *,
+        batch_offset: int = 0,
+        full_batch_size: int = 0,
+        micro_batch_size: int = 0,
+        cache_tensors=None,
+    ) -> None:
+        """
+        Replace Nemotron-H fixed Mamba state for the active batch rows.
+
+        new_state:
+            conv_state       [B, channels, conv_kernel]
+            recurrent_state  [B, heads, head_dim, state_size]
+        """
+        if cache_tensors is None:
+            assert self._active_cache_tensors_stack, (
+                "update_mamba_state called outside of use_cache"
+            )
+            cache_tensors = self._active_cache_tensors_stack[-1]
+
+        if new_state is None:
+            return
+
+        (conv_cache, recurrent_cache), = cache_tensors
+        new_conv, new_recurrent = new_state
+
+        # Unwrap FlexGen objects if necessary.
+        new_conv = getattr(new_conv, "data", new_conv)
+        new_recurrent = getattr(new_recurrent, "data", new_recurrent)
+
+        if not torch.is_tensor(new_conv) or not torch.is_tensor(new_recurrent):
+            raise TypeError(
+                "Mamba state must contain torch.Tensor values, got "
+                f"{type(new_conv).__name__}, {type(new_recurrent).__name__}"
+            )
+
+        rows = int(new_conv.shape[0])
+        if int(new_recurrent.shape[0]) != rows:
+            raise ValueError(
+                "Mamba conv/recurrent batch mismatch: "
+                f"{new_conv.shape[0]} vs {new_recurrent.shape[0]}"
+            )
+
+        # Mamba GPU multiplexing is not supported by the initial integration.
+        # In normal/full-cache mode, batch_offset identifies the persistent
+        # rows that correspond to this micro-batch.
+        start = int(batch_offset) if full_batch_size > 0 else 0
+        end = start + rows
+
+        total_batch = int(conv_cache.shape[0])
+        if start < 0 or end > total_batch:
+            raise RuntimeError(
+                "Mamba state write exceeds allocated batch capacity: "
+                f"rows=[{start}:{end}], capacity={total_batch}, "
+                f"full_batch_size={full_batch_size}, "
+                f"micro_batch_size={micro_batch_size}"
+            )
+
+        if new_conv.dtype != conv_cache.dtype:
+            new_conv = new_conv.to(dtype=conv_cache.dtype)
+        if new_recurrent.dtype != recurrent_cache.dtype:
+            new_recurrent = new_recurrent.to(dtype=recurrent_cache.dtype)
+
+        conv_src = TorchTensor.create_from_torch(
+            new_conv, self.attention_compute
+        )
+        recurrent_src = TorchTensor.create_from_torch(
+            new_recurrent, self.attention_compute
+        )
+
+        conv_dst_idx = (
+            slice(start, end),
+            slice(None),
+            slice(None),
+        )
+        recurrent_dst_idx = (
+            slice(start, end),
+            slice(None),
+            slice(None),
+            slice(None),
+        )
+
+        general_copy(
+            conv_cache,
+            conv_dst_idx,
+            conv_src,
+            None,
+        )
+        general_copy(
+            recurrent_cache,
+            recurrent_dst_idx,
+            recurrent_src,
+            None,
+        )
+
+        logger.debug(
+            "[MAMBA_CACHE] state updated: rows=[%s:%s], "
+            "conv=%s recurrent=%s",
+            start,
+            end,
+            tuple(new_conv.shape),
+            tuple(new_recurrent.shape),
+        )
+
     def _write_kvs(self, kvs, start_position: int, batch_offset: int = 0, full_batch_size: int = 0, micro_batch_size: int = 0, cache_tensors: Sequence[torch.Tensor] = None) -> None:
         """
         Write new_kvs to current active cache:
@@ -1536,7 +1785,20 @@ class KVCacheManager:
         S_total, BH_dst, D_dst = k_cache.shape
         
         # [MBPIPE_WRITE_DEBUG] Log the cache shape and write parameters
-        H = getattr(self.block_config, "num_attention_heads", 32)
+        # KV-cache storage is indexed by physical KV heads, not query heads.
+        # Nemotron-H uses GQA (32 query heads, 2 KV heads), so using
+        # num_attention_heads here produces incorrect BH strides and writes.
+        if getattr(self.block_config, "model_type", None) == "nemotron_h":
+            H = int(
+                getattr(
+                    self.block_config,
+                    "num_key_value_heads",
+                    getattr(self.block_config, "num_attention_heads", 32),
+                )
+            )
+        else:
+            H = int(getattr(self.block_config, "num_attention_heads", 32))
+
         cache_batch_size = BH_dst // H
         
         # [MBPIPE_MULTIPLEX] Detect GPU multiplexing mode by actual cache capacity.
@@ -2046,7 +2308,7 @@ class KVCacheManager:
         v_sbh = _as_torch(v_sel)
         
         def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:
-            return x_sbh.view(prefix_length, B, H, D).permute(1, 2, 0, 3)
+            return x_sbh[:prefix_length].view(prefix_length, B, H, D).permute(1, 2, 0, 3)
         
         k_pkv = _to_pkv(k_sbh)
         v_pkv = _to_pkv(v_sbh)

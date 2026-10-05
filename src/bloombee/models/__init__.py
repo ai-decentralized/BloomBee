@@ -10,6 +10,8 @@ except ModuleNotFoundError as exc:
     if not str(exc.name).startswith("transformers.models.gpt_oss"):
         raise
 
+from bloombee.models.nemotron_h import *
+
 try:
     from bloombee.models.gemma4 import *
 except ModuleNotFoundError as exc:

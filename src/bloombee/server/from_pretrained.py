@@ -29,6 +29,7 @@ from bloombee.constants import DTYPE_MAP
 from bloombee.models.bloom.block import WrappedBloomBlock
 from bloombee.models.deepseekv3.block import WrappedDeepseekV3Block
 from bloombee.models.mixtral import WrappedMixtralBlock
+from bloombee.models.nemotron_h.block import WrappedNemotronHBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.gemma4.block import WrappedGemma4Block
 from bloombee.models.qwen3.block import WrappedQwen3Block
@@ -105,6 +106,7 @@ def load_pretrained_block(
         WrappedQwen3Block,
         WrappedGemma4Block,
         WrappedDeepseekV3Block,
+        WrappedNemotronHBlock,
     )
 
     if use_native_flexgen_llama_tp:

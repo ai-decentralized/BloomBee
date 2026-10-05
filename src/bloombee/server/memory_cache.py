@@ -416,22 +416,79 @@ class MemoryCache:
                         except Exception as e:
                             logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
                     
-                    # Pass the per-block descriptor through so the device
-                    # backend can honor heterogeneous-layer shapes (Gemma-4's
-                    # sliding head_dim=256 vs full head_dim=512). For uniform
-                    # families the descriptor still matches config.head_dim
-                    # so this is a no-op.
-                    allocated_cache = self.device.init_cache_one_gpu_batch(
-                        self.block_config, self.mocked_task, override_policy,
-                        descriptor=descr,
-                    )
-                    self._emit_cache_home_probe(
-                        allocated_cache,
-                        override_policy,
-                        handle=handle,
-                        batch_size=descr_batch_size,
-                        seq_len=seq_len,
-                    )
+                    is_mamba_state = getattr(descr, "cache_kind", None) == "mamba"
+
+                    if is_mamba_state:
+                        # Nemotron-H linear-attention blocks use two fixed-size
+                        # persistent states instead of append-only KV:
+                        #
+                        # conv_state:
+                        #   [B, Hm * Dm + 2 * G * N, conv_kernel]
+                        #
+                        # recurrent_state:
+                        #   [B, Hm, Dm, N]
+                        #
+                        # Keep this first implementation on a single cache
+                        # device. Mixed-device Mamba sharding needs separate
+                        # placement semantics because FlexGen's mixed allocator
+                        # always splits dimension 1 using KV head assumptions.
+                        if self.device.device_type == DeviceType.MIXED:
+                            raise NotImplementedError(
+                                "Nemotron-H Mamba state does not yet support "
+                                "mixed GPU/CPU/disk cache placement"
+                            )
+
+                        config = self.block_config
+                        mamba_num_heads = config.mamba_num_heads
+                        mamba_head_dim = config.mamba_head_dim
+                        n_groups = config.n_groups
+                        ssm_state_size = config.ssm_state_size
+                        conv_kernel = config.conv_kernel
+
+                        conv_channels = (
+                            mamba_num_heads * mamba_head_dim
+                            + 2 * n_groups * ssm_state_size
+                        )
+
+                        conv_shape = (
+                            descr_batch_size,
+                            conv_channels,
+                            conv_kernel,
+                        )
+                        recurrent_shape = (
+                            descr_batch_size,
+                            mamba_num_heads,
+                            mamba_head_dim,
+                            ssm_state_size,
+                        )
+
+                        allocated_cache = (
+                            self.device.allocate(conv_shape, np.float32),
+                            self.device.allocate(recurrent_shape, np.float32),
+                        )
+
+                        kv_alloc_log(
+                            f"[MAMBA_CACHE] handle={handle} "
+                            f"conv_shape={conv_shape} "
+                            f"recurrent_shape={recurrent_shape} "
+                            f"dtype=float32"
+                        )
+
+                    else:
+                        # Pass the per-block descriptor through so the device
+                        # backend can honor heterogeneous-layer shapes
+                        # (Gemma-4's sliding head_dim=256 vs full head_dim=512).
+                        allocated_cache = self.device.init_cache_one_gpu_batch(
+                            self.block_config, self.mocked_task, override_policy,
+                            descriptor=descr,
+                        )
+                        self._emit_cache_home_probe(
+                            allocated_cache,
+                            override_policy,
+                            handle=handle,
+                            batch_size=descr_batch_size,
+                            seq_len=seq_len,
+                        )
                     
                     # [MBPIPE_DEBUG] Log the allocated cache shape (handle different structures)
                     try:
@@ -476,7 +533,7 @@ class MemoryCache:
                     
                     self._allocated_tensors[handle] = allocated_cache
 
-                    if _is_paged_kv_enabled():
+                    if _is_paged_kv_enabled() and not is_mamba_state:
                         self._register_paged_view(handle, allocated_cache)
 
             else:  # delete tensors by handle
