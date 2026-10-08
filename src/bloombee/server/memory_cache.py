@@ -416,9 +416,47 @@ class MemoryCache:
                         except Exception as e:
                             logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
                     
-                    is_mamba_state = getattr(descr, "cache_kind", None) == "mamba"
+                    cache_kind = getattr(descr, "cache_kind", None)
+                    is_mamba_state = cache_kind == "mamba"
+                    is_mla_state = cache_kind == "mla"
 
-                    if is_mamba_state:
+                    if is_mla_state:
+                        if self.device.device_type == DeviceType.MIXED:
+                            raise NotImplementedError(
+                                "GLM MLA cache does not yet support mixed "
+                                "GPU/CPU/disk placement"
+                            )
+
+                        config = self.block_config
+
+                        kv_nope_shape = (
+                            descr_batch_size,
+                            1,
+                            seq_len,
+                            int(config.kv_lora_rank),
+                        )
+
+                        k_rot_shape = (
+                            descr_batch_size,
+                            1,
+                            seq_len,
+                            int(config.qk_rope_head_dim),
+                        )
+
+                        # Keep persistent compressed MLA state in FP32.
+                        # Compute-side wrapper casts it to BF16/FP16 as needed.
+                        allocated_cache = (
+                            self.device.allocate(kv_nope_shape, np.float32),
+                            self.device.allocate(k_rot_shape, np.float32),
+                        )
+
+                        kv_alloc_log(
+                            f"[MLA_CACHE] handle={handle} "
+                            f"kv_nope_shape={kv_nope_shape} "
+                            f"k_rot_shape={k_rot_shape} dtype=float32"
+                        )
+
+                    elif is_mamba_state:
                         # Nemotron-H linear-attention blocks use two fixed-size
                         # persistent states instead of append-only KV:
                         #

@@ -32,6 +32,7 @@ from bloombee.models.mixtral import WrappedMixtralBlock
 from bloombee.models.nemotron_h.block import WrappedNemotronHBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.gemma4.block import WrappedGemma4Block
+from bloombee.models.glm4_moe_lite.block import WrappedGlm4MoeLiteBlock
 from bloombee.models.qwen3.block import WrappedQwen3Block
 from bloombee.server.block_utils import get_model_block, resolve_block_dtype
 from bloombee.utils.auto_config import AutoDistributedConfig
@@ -107,6 +108,7 @@ def load_pretrained_block(
         WrappedGemma4Block,
         WrappedDeepseekV3Block,
         WrappedNemotronHBlock,
+        WrappedGlm4MoeLiteBlock,
     )
 
     if use_native_flexgen_llama_tp:

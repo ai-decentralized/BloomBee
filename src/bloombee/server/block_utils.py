@@ -8,6 +8,7 @@ from bloombee.models.bloom.block import WrappedBloomBlock
 from bloombee.models.deepseekv3.block import WrappedDeepseekV3Block
 from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.gemma4.block import WrappedGemma4Block
+from bloombee.models.glm4_moe_lite.block import WrappedGlm4MoeLiteBlock
 from bloombee.models.mixtral.block import WrappedMixtralBlock
 from bloombee.models.nemotron_h.block import WrappedNemotronHBlock
 from bloombee.models.qwen3.block import WrappedQwen3Block
@@ -152,6 +153,10 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0, 
         return config.block_class(config)
     elif config.block_class == WrappedQwen3Block:
         dprint('server/block_utils.py config.block_class == WrappedQwen3Block ')
+        config = _autoset_attn_impl(config)
+        return config.block_class(config, layer_idx)
+    elif config.block_class == WrappedGlm4MoeLiteBlock:
+        dprint('server/block_utils.py config.block_class == WrappedGlm4MoeLiteBlock ')
         config = _autoset_attn_impl(config)
         return config.block_class(config, layer_idx)
     elif config.block_class == WrappedNemotronHBlock:

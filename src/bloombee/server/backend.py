@@ -66,6 +66,12 @@ class MambaStateDescriptor(TensorDescriptor):
     cache_kind: str = "mamba"
 
 
+@dataclass(frozen=True)
+class MLAStateDescriptor(TensorDescriptor):
+    """Marker descriptor for GLM-4 MoE Lite compressed MLA cache."""
+    cache_kind: str = "mla"
+
+
 class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Module
     """A wrapper for a transformer block that can process requests for forward, backward and inference"""
 
@@ -305,6 +311,24 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         that contract. Memory waste here is the GQA ratio (Qwen3: 5x).
         """
         layer_type = self._layer_type_for_this_block()
+
+        # GLM-4 MoE Lite stores compressed MLA latents rather than
+        # conventional expanded K/V tensors.
+        if getattr(self.config, "model_type", None) == "glm4_moe_lite":
+            cache_tensors = []
+            latent_width = int(
+                self.config.kv_lora_rank
+                + self.config.qk_rope_head_dim
+            )
+            for device in self.module.devices:
+                cache_tensors.append(
+                    MLAStateDescriptor(
+                        (batch_size, 1, latent_width, max_length),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                )
+            return cache_tensors
 
         # Nemotron-H MoE/MLP blocks are stateless between decoding steps.
         if layer_type in ("moe", "mlp"):
@@ -565,6 +589,22 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         speculative tokens without changing callers.
         """
         layer_type = self._layer_type_for_this_block()
+
+        if getattr(self.config, "model_type", None) == "glm4_moe_lite":
+            if self._is_spec_decoding:
+                raise NotImplementedError(
+                    "Speculative decoding is not yet supported for GLM MLA cache"
+                )
+
+            self.cache_manager.update_mla_cache(
+                new_kvs,
+                start_position=cache_len,
+                batch_offset=inference_info.batch_offset,
+                full_batch_size=inference_info.full_batch_size,
+                micro_batch_size=inference_info.micro_batch_size,
+                cache_tensors=cache_tensors,
+            )
+            return
 
         # Nemotron-H MoE/MLP blocks are stateless between inference steps.
         if layer_type in ("moe", "mlp"):
@@ -937,9 +977,35 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     _prof_t0 = perf_counter()
                 layer_type = self._layer_type_for_this_block()
                 mamba_layer_past = None
+                mla_layer_past = None
+                is_glm_mla = (
+                    getattr(self.config, "model_type", None)
+                    == "glm4_moe_lite"
+                )
 
-                if layer_type in ("moe", "mlp"):
-                    # Nemotron-H MoE/MLP blocks have no persistent decoding state.
+                if is_glm_mla:
+                    # GLM-4 MoE Lite uses MLA attention on every decoder layer,
+                    # including layers whose feed-forward component is reported
+                    # as "mlp" or "moe". Therefore MLA cache handling must take
+                    # precedence over the Nemotron stateless MoE/MLP shortcut.
+                    cache_len = int(inference_info.prefix_length)
+
+                    if cache_len > 0:
+                        mla_layer_past = self.cache_manager.select_mla_cache(
+                            prefix_length=cache_len,
+                            batch_offset=inference_info.batch_offset,
+                            micro_batch_size=inference_info.micro_batch_size,
+                            requested_rows=batch_size,
+                            cache_tensors=cache_tensors,
+                        )
+                    else:
+                        mla_layer_past = None
+
+                    k_pkv = None
+                    v_pkv = None
+
+                elif layer_type in ("moe", "mlp"):
+                    # Nemotron-H MoE/MLP blocks are stateless between decoding steps.
                     k_pkv = None
                     v_pkv = None
                     cache_len = 0
@@ -995,6 +1061,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
                 if layer_type == "linear_attention":
                     layer_past = mamba_layer_past
+                elif is_glm_mla:
+                    layer_past = mla_layer_past
                 else:
                     layer_past = (k_pkv, v_pkv) if k_pkv is not None else None
                 if self._has_set_remote_cache_reuse:

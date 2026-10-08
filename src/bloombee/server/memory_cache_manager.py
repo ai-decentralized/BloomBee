@@ -512,7 +512,33 @@ class KVCacheManager:
         kv_bytes_per_token = self.size_per_token()
 
         for descr in descriptors:
-            if getattr(descr, "cache_kind", None) == "mamba":
+            if getattr(descr, "cache_kind", None) == "mla":
+                config = self.block_config
+                batch_size = int(descr.shape[0])
+                max_length = int(descr.shape[-1])
+
+                values = (
+                    batch_size
+                    * max_length
+                    * (
+                        int(config.kv_lora_rank)
+                        + int(config.qk_rope_head_dim)
+                    )
+                )
+
+                # Initial implementation stores persistent MLA cache in FP32.
+                mla_bytes = values * 4
+
+                equivalent_tokens = (
+                    mla_bytes + kv_bytes_per_token - 1
+                ) // kv_bytes_per_token
+
+                allocation_tokens_num = max(
+                    allocation_tokens_num,
+                    int(equivalent_tokens),
+                )
+
+            elif getattr(descr, "cache_kind", None) == "mamba":
                 config = self.block_config
                 batch_size = int(descr.shape[0])
 
@@ -892,6 +918,160 @@ class KVCacheManager:
         )
 
         return conv_state, recurrent_state
+
+    def select_mla_cache(
+        self,
+        prefix_length: int,
+        *,
+        batch_offset: int = 0,
+        micro_batch_size: int = 0,
+        requested_rows: int = 0,
+        cache_tensors=None,
+    ):
+        """Read GLM compressed MLA cache onto the attention compute device."""
+        if cache_tensors is None:
+            assert self._active_cache_tensors_stack
+            cache_tensors = self._active_cache_tensors_stack[-1]
+
+        (kv_nope_cache, k_rot_cache), = cache_tensors
+
+        total_batch = int(kv_nope_cache.shape[0])
+
+        if micro_batch_size > 0:
+            start = int(batch_offset)
+            rows = int(micro_batch_size)
+        elif requested_rows > 0:
+            start = 0
+            rows = int(requested_rows)
+        else:
+            start = 0
+            rows = total_batch
+
+        end = min(start + rows, total_batch)
+
+        if start < 0 or end <= start:
+            raise ValueError(
+                f"Invalid MLA batch slice: start={start}, end={end}, "
+                f"total_batch={total_batch}"
+            )
+
+        kv_sel, _ = kv_nope_cache.smart_copy(
+            self.attention_compute,
+            (
+                slice(start, end),
+                slice(None),
+                slice(0, prefix_length),
+                slice(None),
+            ),
+        )
+
+        rot_sel, _ = k_rot_cache.smart_copy(
+            self.attention_compute,
+            (
+                slice(start, end),
+                slice(None),
+                slice(0, prefix_length),
+                slice(None),
+            ),
+        )
+
+        kv_nope = kv_sel.data if hasattr(kv_sel, "data") else kv_sel
+        k_rot = rot_sel.data if hasattr(rot_sel, "data") else rot_sel
+
+        return kv_nope, k_rot
+
+
+    def update_mla_cache(
+        self,
+        new_state,
+        *,
+        start_position: int,
+        batch_offset: int = 0,
+        full_batch_size: int = 0,
+        micro_batch_size: int = 0,
+        cache_tensors=None,
+    ) -> None:
+        """Append GLM compressed MLA cache for newly processed tokens."""
+        if new_state is None:
+            return
+
+        if cache_tensors is None:
+            assert self._active_cache_tensors_stack
+            cache_tensors = self._active_cache_tensors_stack[-1]
+
+        (kv_nope_cache, k_rot_cache), = cache_tensors
+        new_kv_nope, new_k_rot = new_state
+
+        new_kv_nope = getattr(new_kv_nope, "data", new_kv_nope)
+        new_k_rot = getattr(new_k_rot, "data", new_k_rot)
+
+        if not torch.is_tensor(new_kv_nope) or not torch.is_tensor(new_k_rot):
+            raise TypeError("GLM MLA cache values must be torch.Tensor")
+
+        rows = int(new_kv_nope.shape[0])
+        tokens = int(new_kv_nope.shape[2])
+
+        if int(new_k_rot.shape[0]) != rows:
+            raise ValueError("MLA cache batch dimensions do not match")
+
+        if int(new_k_rot.shape[2]) != tokens:
+            raise ValueError("MLA cache sequence dimensions do not match")
+
+        start_batch = int(batch_offset) if full_batch_size > 0 else 0
+        end_batch = start_batch + rows
+
+        seq_start = int(start_position)
+        seq_end = seq_start + tokens
+
+        if end_batch > int(kv_nope_cache.shape[0]):
+            raise RuntimeError("MLA cache write exceeds batch capacity")
+
+        if seq_end > int(kv_nope_cache.shape[2]):
+            raise RuntimeError(
+                f"MLA cache write exceeds sequence capacity: "
+                f"{seq_end} > {kv_nope_cache.shape[2]}"
+            )
+
+        if new_kv_nope.dtype != torch.float32:
+            new_kv_nope = new_kv_nope.float()
+
+        if new_k_rot.dtype != torch.float32:
+            new_k_rot = new_k_rot.float()
+
+        kv_src = TorchTensor.create_from_torch(
+            new_kv_nope,
+            self.attention_compute,
+        )
+
+        rot_src = TorchTensor.create_from_torch(
+            new_k_rot,
+            self.attention_compute,
+        )
+
+        general_copy(
+            kv_nope_cache,
+            (
+                slice(start_batch, end_batch),
+                slice(None),
+                slice(seq_start, seq_end),
+                slice(None),
+            ),
+            kv_src,
+            None,
+        )
+
+        general_copy(
+            k_rot_cache,
+            (
+                slice(start_batch, end_batch),
+                slice(None),
+                slice(seq_start, seq_end),
+                slice(None),
+            ),
+            rot_src,
+            None,
+        )
+
 
     def select_cache(
         self,
