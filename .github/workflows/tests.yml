@@ -57,6 +57,9 @@ jobs:
         run: |
           pytest -v \
             tests/test_cache.py \
+            tests/test_serving_cache_regressions.py \
+            tests/test_llama_kv_head_compat.py \
+            tests/test_spec_cache_reorder_sync.py \
             tests/test_review_p1_fixes.py \
             tests/test_debug_config.py \
             tests/test_lossless_transport.py \

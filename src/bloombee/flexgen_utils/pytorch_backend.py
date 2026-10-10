@@ -31,6 +31,14 @@ global_disk_device = None
 logger = get_logger(__name__)
 _MHA_GEN_DECODE_PROBE_EMITTED = False
 _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED = False
+# Legacy sequential RoPE table length. Callers that pass position_ids ignore this;
+# callers that do not must still cover the actual sequence, or apply_rotary_emb
+# reshapes an empty/short table and crashes past Llama-2's 4k window.
+_DEFAULT_ROPE_TABLE_LEN = 2048 * 2
+
+
+def _rope_table_len(needed_len: int) -> int:
+    return max(_DEFAULT_ROPE_TABLE_LEN, int(needed_len))
 
 
 def _kv_cache_shape_from_descriptor(config, task, policy, descriptor=None):
@@ -689,7 +697,12 @@ class TorchDevice:
         # and everything below keeps the MHA layout.
         num_kv_heads = w_k.shape[0] // head_dim
         
-        freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
+        freq_cis = precompute_freqs_cis(
+            head_dim,
+            _rope_table_len(q_len),
+            rotary_emb_inv_freq.data,
+            position_ids=rotary_position_ids,
+        )
         scaling = head_dim ** -0.5
         
         hidden = rms_norm(hidden_states.data, input_layernorm.data, variance_epsilon=rms_norm_eps)
@@ -767,7 +780,12 @@ class TorchDevice:
         # GQA/MQA: see mha_llama; new k/v are broadcast to n_head below so the
         # cache keeps its (s, b * n_head, head_dim) layout.
         num_kv_heads = w_k.shape[0] // head_dim
-        freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
+        freq_cis = precompute_freqs_cis(
+            head_dim,
+            _rope_table_len(src_s),
+            rotary_emb_inv_freq.data,
+            position_ids=rotary_position_ids,
+        )
         scaling = head_dim ** -0.5
 
         hidden = rms_norm(inputs.data, input_layernorm.data, variance_epsilon=rms_norm_eps)

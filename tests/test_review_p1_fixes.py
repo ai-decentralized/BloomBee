@@ -487,3 +487,29 @@ def test_llama_math_matches_independent_hf_kernels():
     q_bb, k_bb = apply_rotary_emb(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), freqs)
     torch.testing.assert_close(q_bb.permute(0, 2, 1, 3), q_hf, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(k_bb.permute(0, 2, 1, 3), k_hf, rtol=1e-4, atol=1e-4)
+
+
+def test_flexgen_rope_position_ids_cover_past_default_table():
+    from bloombee.flexgen_utils.pytorch_backend import (
+        _DEFAULT_ROPE_TABLE_LEN,
+        apply_rotary_emb,
+        precompute_freqs_cis,
+    )
+
+    head_dim = 8
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    pos = _DEFAULT_ROPE_TABLE_LEN + 17
+    q = torch.randn(1, 1, 2, head_dim)
+    k = torch.randn(1, 1, 2, head_dim)
+    with_ids = precompute_freqs_cis(
+        head_dim, _DEFAULT_ROPE_TABLE_LEN, inv_freq, position_ids=torch.tensor([[pos]])
+    )
+    q_out, k_out = apply_rotary_emb(q, k, with_ids)
+    assert q_out.shape == q.shape
+    assert k_out.shape == k.shape
+
+    table = precompute_freqs_cis(head_dim, _DEFAULT_ROPE_TABLE_LEN, inv_freq, position_ids=None)
+    empty = table[pos : pos + 1]
+    assert empty.shape[0] == 0
+    with pytest.raises(RuntimeError):
+        apply_rotary_emb(q, k, empty)

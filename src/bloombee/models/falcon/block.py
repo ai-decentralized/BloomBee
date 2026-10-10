@@ -27,6 +27,26 @@ KVCache = Tuple[torch.Tensor, torch.Tensor]
 INFERENCE_MAX_LENGTH = 8192
 
 
+def _falcon_packed_kv_heads(config: FalconConfig, allocated_heads: int) -> int:
+    """Count valid KV rows in a [B, allocated_heads, S, D] cache slab.
+
+    BloomBee allocates Falcon slabs at ``num_attention_heads``. Packed GQA
+    (``new_decoder_architecture``) writes ``num_kv_heads``; Falcon-7B MQA
+    writes a single head. The 4D reorder must slice to that packed count
+    *before* ``_expand_states`` broadcasts back to attention-head stride.
+    """
+    allocated_heads = max(1, int(allocated_heads))
+    if getattr(config, "new_decoder_architecture", False):
+        kv_heads = getattr(config, "num_kv_heads", None)
+        if kv_heads is not None:
+            kv_heads = int(kv_heads)
+            if 0 < kv_heads <= allocated_heads:
+                return kv_heads
+    if getattr(config, "multi_query", False):
+        return 1
+    return allocated_heads
+
+
 def apply_rotary(query, key, cos, sin):
     return (query * cos) + (rotate_half(query) * sin), (key * cos) + (rotate_half(key) * sin)
 
@@ -468,12 +488,14 @@ class WrappedFalconBlock(OptimizedFalconDecoderLayer):
         key_states, value_states = key_value
 
         if key_states.dim() == 4:
-            # cache_manager.select_cache() returns [B, H, S, D] standard HF format
-            # H here is num_attention_heads (cache allocation), but for MQA/GQA models
-            # (e.g. Falcon-7b multi_query=True) only num_kv_heads per batch were written.
-            # Slice to the actual KV heads before reshaping.
+            # cache_manager.select_cache() returns [B, H, S, D]. Slabs are sized at
+            # num_attention_heads, but packed GQA/MQA writes only fill the first
+            # num_kv_heads slots (Falcon-40B/180B: 8 of 128; Falcon-7B MQA: 1).
+            # Taking all H rows here makes _expand_states treat the slab as
+            # packed n_kv of (H/n_kv) fake batches, so decode cat()s a 2048-row
+            # past against 128-row new keys and crashes.
             B, H, S, D = key_states.shape
-            num_kv_heads = 1 if (not self.config.new_decoder_architecture and getattr(self.config, 'multi_query', False)) else H
+            num_kv_heads = _falcon_packed_kv_heads(self.config, H)
             key_states = key_states[:, :num_kv_heads, :, :].reshape(B * num_kv_heads, S, D)
             value_states = value_states[:, :num_kv_heads, :, :].reshape(B * num_kv_heads, S, D)
         else:
