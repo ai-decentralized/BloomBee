@@ -51,6 +51,13 @@ def apply_rotary(query, key, cos, sin):
     return (query * cos) + (rotate_half(query) * sin), (key * cos) + (rotate_half(key) * sin)
 
 
+def _graph_inputs_match(static_inputs, inputs):
+    return static_inputs is not None and len(static_inputs) == len(inputs) and all(
+        static.shape == current.shape and static.dtype == current.dtype and static.device == current.device
+        for static, current in zip(static_inputs, inputs)
+    )
+
+
 class OptimizedFalconRotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, base=10000):
         super().__init__()
@@ -79,9 +86,12 @@ class OptimizedFalconRotaryEmbedding(nn.Module):
         return out
 
     def _optimized_apply_rotary(self, query, key, cos, sin):
-        if self.cuda_graph is None:
+        inputs = (query, key, cos, sin)
+        if self.cuda_graph is None or not _graph_inputs_match(self.input_surface, inputs):
             self.cuda_graph = torch.cuda.CUDAGraph()
-            self.input_surface = (query, key, cos, sin)
+            # Own graph inputs: cos/sin are views into the shared position table.
+            # Replaying a later position must never overwrite that table.
+            self.input_surface = tuple(tensor.clone() for tensor in inputs)
 
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
@@ -93,7 +103,6 @@ class OptimizedFalconRotaryEmbedding(nn.Module):
             with torch.cuda.graph(self.cuda_graph):
                 self.static_outputs = apply_rotary(*self.input_surface)
 
-        inputs = (query, key, cos, sin)
         for static_input, data in zip(self.input_surface, inputs):
             static_input.copy_(data)
         self.cuda_graph.replay()
@@ -188,15 +197,15 @@ class OptimizedFalconAttention(FalconAttention):
             self.static_outputs = None
 
     def _optimized_split_heads(self, fused_qkv):
-        if self.split_graph is None:
+        if self.split_graph is None or not _graph_inputs_match((self.input_surface,), (fused_qkv,)):
             self.split_graph = torch.cuda.CUDAGraph()
-            self.input_surface = fused_qkv
+            self.input_surface = fused_qkv.clone()
 
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 for _ in range(3):
-                    self._split_heads(fused_qkv)
+                    self._split_heads(self.input_surface)
             torch.cuda.current_stream().wait_stream(s)
 
             with torch.cuda.graph(self.split_graph):
@@ -350,21 +359,21 @@ class OptimizedFalconDecoderLayer(FalconDecoderLayer):
             self.static_outputs = None
 
     def _optimized_apply_ln(self, hidden_states):
-        if self.ln_graph is None:
+        if self.ln_graph is None or not _graph_inputs_match((self.static_input,), (hidden_states,)):
             self.ln_graph = torch.cuda.CUDAGraph()
-            self.static_input = hidden_states
+            self.static_input = hidden_states.clone()
 
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 for _ in range(3):
-                    self.ln_attn(hidden_states)
-                    self.ln_mlp(hidden_states)
+                    self.ln_attn(self.static_input)
+                    self.ln_mlp(self.static_input)
             torch.cuda.current_stream().wait_stream(s)
 
             with torch.cuda.graph(self.ln_graph):
-                ln_attn_output = self.ln_attn(hidden_states)
-                ln_mlp_output = self.ln_mlp(hidden_states)
+                ln_attn_output = self.ln_attn(self.static_input)
+                ln_mlp_output = self.ln_mlp(self.static_input)
                 self.static_outputs = (ln_attn_output, ln_mlp_output)
 
         self.static_input.copy_(hidden_states)

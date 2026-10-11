@@ -42,11 +42,18 @@ def _default_llama_inv_freq(head_dim: int, rope_theta: float) -> torch.Tensor:
     return 1.0 / (float(rope_theta) ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
 
 
-def _llama_rope_type(config) -> str:
+def _llama_rope_parameters(config) -> dict:
+    # Transformers 5 moves the legacy theta/scaling fields into this mapping.
+    parameters = getattr(config, "rope_parameters", None)
+    if isinstance(parameters, dict) and ("rope_type" in parameters or "rope_theta" in parameters):
+        return parameters
     rope_scaling = getattr(config, "rope_scaling", None) or {}
-    if isinstance(rope_scaling, dict):
-        return str(rope_scaling.get("rope_type") or rope_scaling.get("type") or "default")
-    return "default"
+    return rope_scaling if isinstance(rope_scaling, dict) else {}
+
+
+def _llama_rope_type(config) -> str:
+    parameters = _llama_rope_parameters(config)
+    return str(parameters.get("rope_type") or parameters.get("type") or "default")
 
 
 def compute_llama_inv_freq(config, head_dim: int) -> torch.Tensor:
@@ -56,9 +63,9 @@ def compute_llama_inv_freq(config, head_dim: int) -> torch.Tensor:
     ``1/factor``, so a successful HF init still has to bake that factor into the
     stored frequencies for this kernel.
     """
-    rope_theta = float(getattr(config, "rope_theta", 10000.0))
+    rope_scaling = _llama_rope_parameters(config)
+    rope_theta = float(rope_scaling.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
     rope_type = _llama_rope_type(config)
-    rope_scaling = getattr(config, "rope_scaling", None) or {}
     inv_freq = None
 
     try:
