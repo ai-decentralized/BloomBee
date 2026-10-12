@@ -27,8 +27,35 @@ KVCache = Tuple[torch.Tensor, torch.Tensor]
 INFERENCE_MAX_LENGTH = 8192
 
 
+def _falcon_packed_kv_heads(config: FalconConfig, allocated_heads: int) -> int:
+    """Count valid KV rows in a [B, allocated_heads, S, D] cache slab.
+
+    BloomBee allocates Falcon slabs at ``num_attention_heads``. Packed GQA
+    (``new_decoder_architecture``) writes ``num_kv_heads``; Falcon-7B MQA
+    writes a single head. The 4D reorder must slice to that packed count
+    *before* ``_expand_states`` broadcasts back to attention-head stride.
+    """
+    allocated_heads = max(1, int(allocated_heads))
+    if getattr(config, "new_decoder_architecture", False):
+        kv_heads = getattr(config, "num_kv_heads", None)
+        if kv_heads is not None:
+            kv_heads = int(kv_heads)
+            if 0 < kv_heads <= allocated_heads:
+                return kv_heads
+    if getattr(config, "multi_query", False):
+        return 1
+    return allocated_heads
+
+
 def apply_rotary(query, key, cos, sin):
     return (query * cos) + (rotate_half(query) * sin), (key * cos) + (rotate_half(key) * sin)
+
+
+def _graph_inputs_match(static_inputs, inputs):
+    return static_inputs is not None and len(static_inputs) == len(inputs) and all(
+        static.shape == current.shape and static.dtype == current.dtype and static.device == current.device
+        for static, current in zip(static_inputs, inputs)
+    )
 
 
 class OptimizedFalconRotaryEmbedding(nn.Module):
@@ -43,10 +70,28 @@ class OptimizedFalconRotaryEmbedding(nn.Module):
         self.input_surface = None
         self.static_outputs = None
 
+    def _apply(self, fn, recurse=True):
+        # cos_sin() builds frequencies as t * inv_freq in inv_freq.dtype.
+        # _load_hf_block_weights ends in block.to(dtype=fp16/bf16), which
+        # would downcast this buffer; later emb.float() cannot recover the
+        # lost mantissa bits, so long-context RoPE drifts.
+        inv_freq = self.inv_freq if self.inv_freq is not None and self.inv_freq.is_floating_point() else None
+        out = super()._apply(fn, recurse=recurse)
+        if inv_freq is not None:
+            self.register_buffer(
+                "inv_freq",
+                inv_freq.to(device=self.inv_freq.device, dtype=torch.float32),
+                persistent=False,
+            )
+        return out
+
     def _optimized_apply_rotary(self, query, key, cos, sin):
-        if self.cuda_graph is None:
+        inputs = (query, key, cos, sin)
+        if self.cuda_graph is None or not _graph_inputs_match(self.input_surface, inputs):
             self.cuda_graph = torch.cuda.CUDAGraph()
-            self.input_surface = (query, key, cos, sin)
+            # Own graph inputs: cos/sin are views into the shared position table.
+            # Replaying a later position must never overwrite that table.
+            self.input_surface = tuple(tensor.clone() for tensor in inputs)
 
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
@@ -58,7 +103,6 @@ class OptimizedFalconRotaryEmbedding(nn.Module):
             with torch.cuda.graph(self.cuda_graph):
                 self.static_outputs = apply_rotary(*self.input_surface)
 
-        inputs = (query, key, cos, sin)
         for static_input, data in zip(self.input_surface, inputs):
             static_input.copy_(data)
         self.cuda_graph.replay()
@@ -153,15 +197,15 @@ class OptimizedFalconAttention(FalconAttention):
             self.static_outputs = None
 
     def _optimized_split_heads(self, fused_qkv):
-        if self.split_graph is None:
+        if self.split_graph is None or not _graph_inputs_match((self.input_surface,), (fused_qkv,)):
             self.split_graph = torch.cuda.CUDAGraph()
-            self.input_surface = fused_qkv
+            self.input_surface = fused_qkv.clone()
 
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 for _ in range(3):
-                    self._split_heads(fused_qkv)
+                    self._split_heads(self.input_surface)
             torch.cuda.current_stream().wait_stream(s)
 
             with torch.cuda.graph(self.split_graph):
@@ -315,21 +359,21 @@ class OptimizedFalconDecoderLayer(FalconDecoderLayer):
             self.static_outputs = None
 
     def _optimized_apply_ln(self, hidden_states):
-        if self.ln_graph is None:
+        if self.ln_graph is None or not _graph_inputs_match((self.static_input,), (hidden_states,)):
             self.ln_graph = torch.cuda.CUDAGraph()
-            self.static_input = hidden_states
+            self.static_input = hidden_states.clone()
 
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 for _ in range(3):
-                    self.ln_attn(hidden_states)
-                    self.ln_mlp(hidden_states)
+                    self.ln_attn(self.static_input)
+                    self.ln_mlp(self.static_input)
             torch.cuda.current_stream().wait_stream(s)
 
             with torch.cuda.graph(self.ln_graph):
-                ln_attn_output = self.ln_attn(hidden_states)
-                ln_mlp_output = self.ln_mlp(hidden_states)
+                ln_attn_output = self.ln_attn(self.static_input)
+                ln_mlp_output = self.ln_mlp(self.static_input)
                 self.static_outputs = (ln_attn_output, ln_mlp_output)
 
         self.static_input.copy_(hidden_states)
@@ -453,12 +497,14 @@ class WrappedFalconBlock(OptimizedFalconDecoderLayer):
         key_states, value_states = key_value
 
         if key_states.dim() == 4:
-            # cache_manager.select_cache() returns [B, H, S, D] standard HF format
-            # H here is num_attention_heads (cache allocation), but for MQA/GQA models
-            # (e.g. Falcon-7b multi_query=True) only num_kv_heads per batch were written.
-            # Slice to the actual KV heads before reshaping.
+            # cache_manager.select_cache() returns [B, H, S, D]. Slabs are sized at
+            # num_attention_heads, but packed GQA/MQA writes only fill the first
+            # num_kv_heads slots (Falcon-40B/180B: 8 of 128; Falcon-7B MQA: 1).
+            # Taking all H rows here makes _expand_states treat the slab as
+            # packed n_kv of (H/n_kv) fake batches, so decode cat()s a 2048-row
+            # past against 128-row new keys and crashes.
             B, H, S, D = key_states.shape
-            num_kv_heads = 1 if (not self.config.new_decoder_architecture and getattr(self.config, 'multi_query', False)) else H
+            num_kv_heads = _falcon_packed_kv_heads(self.config, H)
             key_states = key_states[:, :num_kv_heads, :, :].reshape(B * num_kv_heads, S, D)
             value_states = value_states[:, :num_kv_heads, :, :].reshape(B * num_kv_heads, S, D)
         else:

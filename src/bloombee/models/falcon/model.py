@@ -39,7 +39,7 @@ class DistributedFalconModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
 
         # Force CPU context: TF 5.x from_pretrained may wrap __init__ in a cuda device context,
         # which hijacks hivemind's torch.empty() calls and breaks share_memory_().
-        with torch.device('cpu'):
+        with torch.device("cpu"):
             self.h = RemoteSequential(config, dht=dht)
 
         self.requires_grad_(False)  # Forbid accumulate grads for embeddings and layernorm
@@ -162,15 +162,22 @@ class DistributedFalconForCausalLM(DefaultRevisionMixin, FromPretrainedMixin, Re
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
 
-            if input_ids.shape[1] > past_length:
-                remove_prefix_length = past_length
+            if isinstance(past_length, torch.Tensor):
+                past_length = int(past_length.reshape(-1)[0].item())
             else:
-                remove_prefix_length = input_ids.shape[1] - 1
+                past_length = int(past_length)
 
-            input_ids = input_ids[:, remove_prefix_length:]
+            # Generation may already supply an uncached suffix (including
+            # prefill chunks), while the mask still covers the full history.
+            # Preserve every new token instead of cropping that suffix again.
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
 
             if (
                 max_cache_length is not None
+                and max_cache_length > 0
                 and attention_mask is not None
                 and cache_length + input_ids.shape[1] > max_cache_length
             ):
@@ -181,8 +188,8 @@ class DistributedFalconForCausalLM(DefaultRevisionMixin, FromPretrainedMixin, Re
         if not self.transformer.use_alibi and attention_mask is not None and position_ids is None:
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
+        if position_ids is not None and past_key_values is not None:
+            position_ids = position_ids[:, -input_ids.shape[1] :]
 
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}

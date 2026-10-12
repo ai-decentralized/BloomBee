@@ -954,10 +954,13 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
         key_states, value_states = key_value
-        # Slabs use full attention-head stride; only KV heads contain GQA data.
+        # FlexGen GQA repeat_interleaves KV onto num_attention_heads before the
+        # cache write. Chunked prefill concatenates that H-broadcast past as
+        # [B, H, S, D], and mha_gen_llama expects (S, B*H, D). Slicing to n_kv
+        # would drop the broadcast heads and crash the next chunk on a BH
+        # mismatch. Packed n_kv past is already H==n_kv and is returned as-is.
         if key_states.dim() == 4 and value_states.dim() == 4:
-            nkv = self._num_key_value_heads()
-            return key_states[:, :nkv, :, :], value_states[:, :nkv, :, :]
+            return key_states, value_states
         # Otherwise, expect Bloom-style packed heads: key [B*H, D, S] or [B*H, S, D], value [B*H, S, D] or [B*H, D, S]
         if key_states.dim() == 3:
             bh, d1, d2 = key_states.shape

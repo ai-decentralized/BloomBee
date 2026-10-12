@@ -2263,7 +2263,10 @@ async def iterate_rpc_inference(
                     log_microbatch_merge(logger, len(micro_ranges), hidden_states.shape[0], "iterate_rpc_inference.merged_pools")
                 else:
                     execution_mode = "merged_fullbatch"
-                    # Legacy path: process entire batch at once
+                    # Legacy path: process entire batch at once.
+                    # KV writes need the runtime batch so GQA source-head
+                    # inference can tell FlexGen's broadcast B*H layout from
+                    # packed B*n_kv rows. Omitting it makes Llama-3 crash.
                     inference_infos = build_inference_metadata_batch(
                         requested_uids,
                         cache_handles,
@@ -2276,6 +2279,9 @@ async def iterate_rpc_inference(
                         keep_indices=keep_indices,
                         need_pruning=need_pruning,
                         is_spec_dec=is_spec_dec,
+                        batch_offset=0,
+                        full_batch_size=batch_size,
+                        micro_batch_size=batch_size,
                     )
                     submit_result = await requested_backends[0].inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
@@ -2479,6 +2485,9 @@ async def iterate_rpc_inference(
                             keep_indices=keep_indices,
                             need_pruning=need_pruning,
                             is_spec_dec=is_spec_dec,
+                            batch_offset=0,
+                            full_batch_size=batch_size,
+                            micro_batch_size=batch_size,
                         ),)
                         
                         # Submit task and measure processing time
