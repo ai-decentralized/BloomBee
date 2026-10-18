@@ -28,7 +28,11 @@ class FromPretrainedMixin:
             low_cpu_mem_usage = True
 
         with ignore_keys(cls._keys_to_ignore_on_load_unexpected):
-            return super().from_pretrained(model_name_or_path, *args, low_cpu_mem_usage=low_cpu_mem_usage, **kwargs)
+            model = super().from_pretrained(model_name_or_path, *args, low_cpu_mem_usage=low_cpu_mem_usage, **kwargs)
+
+        if getattr(getattr(model, "config", None), "tuning_mode", None):
+            _freeze_all_but_prompts(model)
+        return model
 
     from_pretrained.__doc__ = BloomPreTrainedModel.from_pretrained.__doc__.replace(
         "low_cpu_mem_usage(`bool`, *optional*)",
@@ -37,6 +41,19 @@ class FromPretrainedMixin:
         "torch_dtype (`str` or `torch.dtype`, *optional*)",
         'torch_dtype (`str` or `torch.dtype`, *optional*, defaults to `"auto"` in Petals)',
     )
+
+
+def _freeze_all_but_prompts(model) -> None:
+    """Prompt tuning must train only the prompt embeddings (and the classification head, if any).
+
+    The model classes call `self.requires_grad_(False)` in __init__, but with transformers>=5 the checkpoint weights are
+    materialized afterwards and come back with requires_grad=True. That silently made the whole embedding table
+    (and lm_head / final norm) trainable. Re-freeze after loading.
+    """
+    for name, param in model.named_parameters():
+        is_prompt = "prompt_embeddings" in name
+        is_cls_head = name.split(".")[0] == "score"
+        param.requires_grad_(is_prompt or is_cls_head)
 
 
 _ignored_keys = ContextVar("ignored_keys", default=None)
