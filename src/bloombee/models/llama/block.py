@@ -895,7 +895,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         # never hits and grows with sequence length. Build the mask each call.
         if attention_mask is None:
             base_mask = torch.ones(
-                (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
             )
             attention_mask = _prepare_4d_causal_attention_mask(
                 attention_mask=base_mask,
@@ -1015,7 +1015,15 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
     def load_lm_head(self):
         expanded_path = self.expanded_apth
         self.input_layernorm.load_weight(expanded_path)
-        self.lm_head.load_weight(expanded_path)
+        head_path = expanded_path
+        # Safetensors may omit the duplicate LM head for tied embeddings.
+        # Reuse the embedding only when the model explicitly declares tying.
+        if (
+            getattr(self.config, "tie_word_embeddings", False)
+            and not os.path.isfile(os.path.join(expanded_path, "lm_head.weight"))
+        ):
+            head_path = os.path.join(expanded_path, "embed_tokens.weight")
+        self.lm_head.load_weight(head_path)
 
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):

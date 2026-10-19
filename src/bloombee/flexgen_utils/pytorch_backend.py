@@ -91,26 +91,20 @@ def apply_rotary_emb(
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, S, H, D = xq.shape
-    half = D // 2
-
-    q1, q2 = xq[..., :half].float(), xq[..., half:].float()
-    k1, k2 = xk[..., :half].float(), xk[..., half:].float()
-    qz = torch.complex(q1, q2)  # (B,S,H,half)
-    kz = torch.complex(k1, k2)
-
-    if freqs_cis.ndim == 2:            # (S, half)
-        freqs_bc = freqs_cis.view(1, S, 1, half)
-    elif freqs_cis.ndim == 3:          # (B, S, half)
-        freqs_bc = freqs_cis.view(B, S, 1, half)
+    # Match HF's projection dtype and multiply/add rounding order. A
+    # complex64 rotation followed by one final cast has different FP16 grads.
+    cos = torch.cat((freqs_cis.real, freqs_cis.real), dim=-1).to(xq.dtype)
+    sin = torch.cat((freqs_cis.imag, freqs_cis.imag), dim=-1).to(xq.dtype)
+    if freqs_cis.ndim == 2:
+        cos, sin = cos.view(1, S, 1, D), sin.view(1, S, 1, D)
+    elif freqs_cis.ndim == 3:
+        cos, sin = cos.view(B, S, 1, D), sin.view(B, S, 1, D)
     else:
         raise ValueError(f"unexpected freqs_cis shape: {freqs_cis.shape}")
-
-    qz = qz * freqs_bc
-    kz = kz * freqs_bc
-
-    q_out = torch.cat([qz.real, qz.imag], dim=-1).type_as(xq)
-    k_out = torch.cat([kz.real, kz.imag], dim=-1).type_as(xk)
-    return q_out, k_out
+    half = D // 2
+    q_rotated = torch.cat((-xq[..., half:], xq[..., :half]), dim=-1)
+    k_rotated = torch.cat((-xk[..., half:], xk[..., :half]), dim=-1)
+    return xq * cos + q_rotated * sin, xk * cos + k_rotated * sin
 
 def precompute_freqs_cis(
     dim: int, 
@@ -135,10 +129,10 @@ def rms_norm(hidden_states, weight, variance_epsilon=1e-5):
     # know their model's exact value (e.g. from config) should pass it explicitly.
     input_dtype = hidden_states.dtype
     x = hidden_states.to(torch.float32)
-    w = weight.to(torch.float32)
     var = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(var + variance_epsilon)
-    return (x * w).to(input_dtype)
+    # HF casts the normalized activation before multiplying by its weight.
+    return weight * x.to(input_dtype)
 
 def sample_top_p(probs, p):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -730,7 +724,7 @@ class TorchDevice:
         k = k.permute(0, 2, 3, 1).reshape(bsz * num_attention_heads, head_dim, q_len)
         v = v.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
         
-        attn_scores = torch.bmm(q, k) / math.sqrt(head_dim)  # [b*n_h, q_len, q_len]
+        attn_scores = torch.bmm(q, k) * scaling  # Match HF eager attention rounding.
         
         attn_scores = attn_scores.view(bsz, num_attention_heads, q_len, q_len)
         attn_scores = attn_scores + attention_mask.data

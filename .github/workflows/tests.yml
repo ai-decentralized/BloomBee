@@ -60,6 +60,9 @@ jobs:
             tests/test_serving_cache_regressions.py \
             tests/test_llama_kv_head_compat.py \
             tests/test_llama_rope_parameters.py \
+            tests/test_llama_fp16_semantics.py \
+            tests/test_llama_tied_head_loading.py \
+            tests/test_prompt_token_device.py \
             tests/test_falcon_generation_inputs.py \
             tests/test_falcon_cuda_graph_inputs.py \
             tests/test_spec_cache_reorder_sync.py \
