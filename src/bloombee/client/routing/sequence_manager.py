@@ -120,7 +120,6 @@ class RemoteSequenceManager:
                 _shared_resources.refcount += 1
         self._shared_resources = _shared_resources
 
-        self.lock_changes = threading.Lock()
         self._thread = _SequenceManagerUpdateThread(config.update_period, WeakMethod(self._update))
         self._thread_start_lock = threading.Lock()
         self.policy = NoSpendingPolicy()
@@ -134,6 +133,7 @@ class RemoteSequenceManager:
             state.banned_peers = Blacklist(base_time=config.ban_timeout, backoff_rate=2.0)
         if state.sequence_info is None:
             state.sequence_info = RemoteSequenceInfo.make_empty(block_uids)
+        self.lock_changes = state.sequence_info.lock_changes
 
         if state.sequence_info.last_updated_time is not None:
             assert block_uids == state.sequence_info.block_uids
@@ -323,25 +323,26 @@ class RemoteSequenceManager:
     def _make_sequence_with_max_throughput(self, start_index: int, end_index: int) -> List[RemoteSpanInfo]:
         client_server_rtts = self.ping_aggregator.to_dict()
 
-        span_sequence = []
-        current_index = start_index
-        while current_index < end_index:
-            candidate_spans = self.state.sequence_info.spans_containing_block[current_index]
-            if not candidate_spans:
-                raise MissingBlocksError(current_index)
+        with self.lock_changes:
+            span_sequence = []
+            current_index = start_index
+            while current_index < end_index:
+                candidate_spans = self.state.sequence_info.spans_containing_block[current_index]
+                if not candidate_spans:
+                    raise MissingBlocksError(current_index)
 
-            # We choose longer servers to minimize the number of hops but leave some randomization
-            # to distribute the load. We also exclude servers known to be unreachable.
-            eps = 1e-6
-            span_weights = np.array(
-                [span.length if client_server_rtts.get(span.peer_id) != np.inf else eps for span in candidate_spans],
-                dtype=np.float64,
-            )
-            chosen_span = np.random.choice(candidate_spans, p=span_weights / span_weights.sum())
+                # We choose longer servers to minimize the number of hops but leave some randomization
+                # to distribute the load. We also exclude servers known to be unreachable.
+                eps = 1e-6
+                span_weights = np.array(
+                    [span.length if client_server_rtts.get(span.peer_id) != np.inf else eps for span in candidate_spans],
+                    dtype=np.float64,
+                )
+                chosen_span = np.random.choice(candidate_spans, p=span_weights / span_weights.sum())
 
-            assert chosen_span.start <= current_index < chosen_span.end
-            span_sequence.append(dataclasses.replace(chosen_span, start=current_index))
-            current_index = chosen_span.end
+                assert chosen_span.start <= current_index < chosen_span.end
+                span_sequence.append(dataclasses.replace(chosen_span, start=current_index))
+                current_index = chosen_span.end
         return span_sequence
 
     def __getitem__(self, ix: Union[int, slice]) -> RemoteSequenceManager:
@@ -380,23 +381,21 @@ class RemoteSequenceManager:
                 and (self.blocked_servers is None or peer_id not in self.blocked_servers)
             }
 
-            # Remove temporarily banned peers, unless there are no peers left
-            valid_servers = {
-                peer_id: server_info
-                for peer_id, server_info in block_info.servers.items()
-                if peer_id not in self.state.banned_peers
-            }
-            if len(valid_servers) < len(block_info.servers):
-                if valid_servers:
+        with self.lock_changes:
+            # Check bans against the latest local failure state, after the DHT query.
+            # A failure may arrive while this refresh waits for the lock.
+            for block_info in new_block_infos:
+                valid_servers = {
+                    peer_id: server_info
+                    for peer_id, server_info in block_info.servers.items()
+                    if peer_id not in self.state.banned_peers
+                }
+                if len(valid_servers) < len(block_info.servers):
                     logger.debug(
                         f"Kept {len(valid_servers)} out of {len(block_info.servers)} servers holding {block_info.uid}"
                     )
                     block_info.servers = valid_servers
-                else:
-                    # If we blacklisted all servers, the error may actually be client-caused
-                    logger.debug(f"All servers holding {block_info.uid} are blacklisted, ignoring blacklist")
 
-        with self.lock_changes:
             self.state.sequence_info.update_(new_block_infos)
 
             first_servers = [span.peer_id for span in self.state.sequence_info.spans_containing_block[0]]
@@ -414,15 +413,12 @@ class RemoteSequenceManager:
 
     def on_request_failure(self, peer_id: Optional[PeerID]):
         """remove a given peer from the routing table. If the routing is no longer possible, trigger an update"""
-        if peer_id is not None:
-            logger.debug(f"Peer {peer_id} did not respond, banning it temporarily")
-            self.state.banned_peers.register_failure(peer_id)
         with self.lock_changes:
-            should_update = False
-            for info in self.state.sequence_info.block_infos:
-                info.servers.pop(peer_id, None)
-                if not info.servers:
-                    should_update = True
+            if peer_id is not None:
+                logger.debug(f"Peer {peer_id} did not respond, banning it temporarily")
+                self.state.banned_peers.register_failure(peer_id)
+            self.state.sequence_info.remove_peer_(peer_id)
+            should_update = any(not info.servers for info in self.state.sequence_info.block_infos)
             if should_update:
                 self.ready.clear()
                 self.update(wait=False)
