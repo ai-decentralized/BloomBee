@@ -14,7 +14,7 @@ from hivemind.utils.tensor_descr import BatchTensorDescriptor
 
 from bloombee.client.config import ClientConfig
 from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
-from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo, RPCInfo
+from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, ModuleUID, RemoteSpanInfo, RPCInfo
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.hivemind_compat import MSGPackSerializer, anext, get_logger
 from bloombee.utils.debug_config import is_log_channel_enabled
@@ -526,9 +526,20 @@ class _ServerInferenceSession:
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
         next_servers = []
         session = self.next_session
-        while session is not None and session.stepped: 
+        while session is not None and session.stepped:
+            # span.start/end are relative to the selected RemoteSequential slice.
+            # session.uid contains the actual model-global block UIDs.
+            session_uids = str(session.uid).split(CHAIN_DELIMITER)
+            global_start = int(session_uids[0].rsplit(UID_DELIMITER, 1)[1])
+            global_end = int(session_uids[-1].rsplit(UID_DELIMITER, 1)[1]) + 1
+
             next_servers.append(
-                (session.span.peer_id.to_base58(), session.session_id, session.span.start, session.span.end)
+                (
+                    session.span.peer_id.to_base58(),
+                    session.session_id,
+                    global_start,
+                    global_end,
+                )
             )
             session = session.next_session
         return next_servers

@@ -10,6 +10,8 @@ except ModuleNotFoundError as exc:
     if not str(exc.name).startswith("transformers.models.gpt_oss"):
         raise
 
+from bloombee.models.nemotron_h import *
+
 try:
     from bloombee.models.gemma4 import *
 except ModuleNotFoundError as exc:
@@ -20,4 +22,10 @@ try:
     from bloombee.models.qwen3 import *
 except ModuleNotFoundError as exc:
     if not str(exc.name).startswith("transformers.models.qwen3"):
+        raise
+
+try:
+    from bloombee.models.glm4_moe_lite import *
+except ModuleNotFoundError as exc:
+    if not str(exc.name).startswith("transformers.models.glm4_moe_lite"):
         raise
