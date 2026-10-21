@@ -542,17 +542,39 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             return left
         left_key, left_value = left
         right_key, right_value = right
-        if left_key.dim() == 4 and right_key.dim() == 4:
+        if all(tensor.dim() == 4 for tensor in (left_key, left_value, right_key, right_value)):
+            # select_cache() reserves attention-head strides, while HF GQA
+            # blocks return packed KV heads. Only the prefix can have unused
+            # head slots; never discard heads from the newly computed chunk.
+            heads = int(right_key.shape[1])
+            prefix_heads = int(left_key.shape[1])
+            if (
+                heads <= 0
+                or prefix_heads < heads
+                or prefix_heads % heads != 0
+                or left_value.shape[1] != prefix_heads
+                or right_value.shape[1] != heads
+            ):
+                raise RuntimeError(
+                    "Cannot concat KV caches with incompatible head layouts: "
+                    f"left_key={tuple(left_key.shape)}, left_value={tuple(left_value.shape)}, "
+                    f"right_key={tuple(right_key.shape)}, right_value={tuple(right_value.shape)}"
+                )
+            left_key = left_key[:, :heads]
+            left_value = left_value[:, :heads]
             return (
                 torch.cat([left_key, right_key], dim=2),
                 torch.cat([left_value, right_value], dim=2),
             )
-        if left_key.dim() == 3 and right_key.dim() == 3:
+        if all(tensor.dim() == 3 for tensor in (left_key, left_value, right_key, right_value)):
             return (
                 torch.cat([left_key, right_key], dim=2),
                 torch.cat([left_value, right_value], dim=1),
             )
-        return right
+        raise RuntimeError(
+            "Cannot concat KV caches with mixed ranks: "
+            f"left={tuple(left_key.shape)} right={tuple(right_key.shape)}"
+        )
 
     @staticmethod
     def _concat_bloom_kv_chunks(
@@ -1249,7 +1271,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         )
                         rotary_position_ids = rotary_position_ids[:, offset : offset + chunk_length]
                     else:
-                        rotary_position_ids = None
+                        # FlexGen LLaMA RoPE reads rotary_position_ids, not position_ids.
+                        # Dropping them falls back to a 4096-row table and crashes (or
+                        # applies the wrong angles) once prompt+decode exceeds that cap.
+                        rotary_position_ids = position_ids
                     
                     try:
                         step_result = self._run_block_forward(

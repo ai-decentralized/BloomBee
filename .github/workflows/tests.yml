@@ -53,6 +53,12 @@ jobs:
           python -m pip install --no-build-isolation --no-deps /tmp/hivemind
           python -m pip install --no-build-isolation -e ".[dev]"
 
-      - name: Run cache tests
+      - name: Run inference regression tests
         run: |
-          pytest tests/test_cache.py -v
+          pytest -v \
+            tests/test_cache.py \
+            tests/test_serving_cache_regressions.py \
+            tests/test_llama_kv_head_compat.py \
+            tests/test_llama_rope_parameters.py \
+            tests/test_falcon_generation_inputs.py \
+            tests/test_falcon_cuda_graph_inputs.py

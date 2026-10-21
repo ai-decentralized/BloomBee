@@ -36,6 +36,61 @@ fix_recursive_import()
 
 logger = get_logger(__name__)
 
+def _default_llama_inv_freq(head_dim: int, rope_theta: float) -> torch.Tensor:
+    return 1.0 / (float(rope_theta) ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+
+
+def _llama_rope_parameters(config) -> dict:
+    # Transformers 5 moves the legacy theta/scaling fields into this mapping.
+    parameters = getattr(config, "rope_parameters", None)
+    if isinstance(parameters, dict) and ("rope_type" in parameters or "rope_theta" in parameters):
+        return parameters
+    rope_scaling = getattr(config, "rope_scaling", None) or {}
+    return rope_scaling if isinstance(rope_scaling, dict) else {}
+
+
+def _llama_rope_type(config) -> str:
+    parameters = _llama_rope_parameters(config)
+    return str(parameters.get("rope_type") or parameters.get("type") or "default")
+
+
+def compute_llama_inv_freq(config, head_dim: int) -> torch.Tensor:
+    """Build RoPE inv_freq from the model config, including non-default scaling.
+
+    FlexGen applies ``t * inv_freq``. HF linear RoPE instead scales positions by
+    ``1/factor``, so a successful HF init still has to bake that factor into the
+    stored frequencies for this kernel.
+    """
+    rope_scaling = _llama_rope_parameters(config)
+    rope_theta = float(rope_scaling.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
+    rope_type = _llama_rope_type(config)
+    inv_freq = None
+
+    try:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+        init_fn = ROPE_INIT_FUNCTIONS.get(rope_type) or ROPE_INIT_FUNCTIONS.get("default")
+        if init_fn is not None:
+            maybe_inv_freq, _attention_scaling = init_fn(config, device=torch.device("cpu"))
+            if maybe_inv_freq is not None and maybe_inv_freq.numel() == head_dim // 2:
+                inv_freq = maybe_inv_freq.to(dtype=torch.float32)
+    except Exception:
+        logger.debug("Falling back to explicit RoPE inv_freq", exc_info=True)
+
+    if inv_freq is None:
+        inv_freq = _default_llama_inv_freq(head_dim, rope_theta)
+        if rope_type == "linear" and isinstance(rope_scaling, dict):
+            factor = float(rope_scaling.get("factor", 1.0) or 1.0)
+            if factor != 1.0:
+                inv_freq = inv_freq / factor
+        return inv_freq
+
+    # Current Transformers linear RoPE already divides inv_freq by factor
+    # (`embs = inv_freq @ position_ids`). FlexGen multiplies the same table by
+    # positions, so do not scale a successful HF init a second time.
+    return inv_freq
+
+
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaConfig,
@@ -323,20 +378,14 @@ class FLEX_LlamaAttention(LlamaAttention):
             # input layer norm
             ((h, ), dtype, path + "input_layernorm.weight"),
             # rotary_embed
-            ((head_dim // 2, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
+            ((head_dim // 2, ), np.float32, path + "self_attn.rotary_emb.inv_freq"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         # transformers >= 4.38 no longer persists rotary_emb.inv_freq, so the
         # np file is usually absent and the slot holds uninitialized memory.
         # The value is fully determined by the config; always recompute it.
-        rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
-        )
-        try:
-            weights[5].data.copy_(inv_freq.to(weights[5].data.dtype))
-        except Exception:
-            logger.warning("Could not overwrite rotary inv_freq; falling back to file contents")
+        inv_freq = compute_llama_inv_freq(self.config, head_dim)
+        weights[5].data.copy_(inv_freq.to(device=weights[5].data.device, dtype=torch.float32))
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):

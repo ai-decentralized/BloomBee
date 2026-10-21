@@ -2080,6 +2080,23 @@ class KVCacheManager:
         )
         source_batch_size = BH_src // source_heads
         write_bh_span = source_batch_size * H if source_heads < H else BH_src
+        # FlexGen GQA broadcasts KV onto the full attention-head stride, so
+        # BH_src is already B*H. Without a runtime batch hint,
+        # _source_heads_per_batch prefers packed n_kv (BH_src % n_kv == 0)
+        # and inflates write_bh_span to (BH_src / n_kv) * H, which exceeds
+        # the slab. Reinterpret as full-head layout when that happens.
+        if (
+            full_batch_size <= 0
+            and micro_batch_size <= 0
+            and source_heads < H
+            and BH_src <= BH_dst
+            and H > 0
+            and BH_src % H == 0
+            and write_bh_span > BH_dst
+        ):
+            source_heads = H
+            source_batch_size = BH_src // H
+            write_bh_span = BH_src
         
         working_slot = None
         active_batch_rows = None
