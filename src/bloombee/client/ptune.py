@@ -41,8 +41,10 @@ class PTuneMixin:
             raise NotImplementedError(f"{self.tuning_mode} mode is not supported for now")
 
     def get_prompt(self, batch_size):
-        prefix_tokens = self.prefix_tokens.unsqueeze(0).expand(batch_size, -1)
-        prefix_tokens = prefix_tokens.to(self.word_embeddings.weight.device)
+        # Build the indices here instead of reusing self.prefix_tokens: on transformers>=5 models are constructed
+        # on the "meta" device, so a tensor created in init_prompts() is an empty placeholder that cannot be moved.
+        device = self.word_embeddings.weight.device
+        prefix_tokens = torch.arange(self.pre_seq_len, device=device).long().unsqueeze(0).expand(batch_size, -1)
         prompts = self.prompt_embeddings(prefix_tokens)
 
         if self.config.tuning_mode == "deep_ptune":
