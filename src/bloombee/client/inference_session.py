@@ -4,11 +4,12 @@ import asyncio
 import itertools
 import time
 import uuid
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import AsyncIterator, Callable, List, Optional, Tuple
 
 import torch
 from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
 from hivemind.p2p import P2P
+from hivemind.p2p.p2p_daemon_bindings.utils import ControlFailure
 from hivemind.proto import runtime_pb2
 from hivemind.utils.tensor_descr import BatchTensorDescriptor
 
@@ -146,15 +147,20 @@ class _ServerInferenceSession:
         span: RemoteSpanInfo,
         uid: ModuleUID,
         rpc_info: RPCInfo,
+        *,
+        on_connect_failure: Optional[Callable[[], None]] = None,
         **metadata,
     ) -> _ServerInferenceSession:
         """Create a new session for a given remote module. This code is meant to be run inside RemoteExpertWorker"""
         stub = TransformerConnectionHandler.get_stub(p2p, span.peer_id)
         inputs_queue = asyncio.Queue()
-        outputs_stream = await asyncio.wait_for(
-            stub.rpc_inference(cls._read_inputs_from_queue(inputs_queue)),
-            config.connect_timeout,
-        )
+        stream_request = stub.rpc_inference(cls._read_inputs_from_queue(inputs_queue))
+        try:
+            outputs_stream = await asyncio.wait_for(stream_request, config.connect_timeout)
+        except (ControlFailure, ConnectionError, asyncio.TimeoutError):
+            if on_connect_failure is not None:
+                on_connect_failure()
+            raise
         return cls(config, span, uid, rpc_info, inputs_queue, outputs_stream, **metadata)
 
     @staticmethod
@@ -589,6 +595,7 @@ class InferenceSession:
         self.keep_indices = None
         self.prefill_length = 0
         self._step_count = 0  # Track step count for logging
+        self._failed_connect_peer_id = None
         
         # [MBPIPE] Log micro-batch pipeline configuration at client session creation
         mbpipe_log_config(logger, context="InferenceSession.__init__")
@@ -618,17 +625,24 @@ class InferenceSession:
                 metadata = self._sequence_manager.get_request_metadata(
                     "rpc_inference", span_uids, peer_id=span.peer_id
                 )
-                session = RemoteExpertWorker.run_coroutine(
-                    _ServerInferenceSession.create(
+                rpc_info = self._sequence_manager.rpc_info
+
+                def mark_connect_failure(peer_id=span.peer_id):
+                    self._failed_connect_peer_id = peer_id
+
+                async def create_session():
+                    return await _ServerInferenceSession.create(
                         self._sequence_manager.config,
                         self._sequence_manager.state.p2p,
                         span,
                         span_uids,
-                        rpc_info=self._sequence_manager.rpc_info,
+                        rpc_info=rpc_info,
                         max_length=self._max_length,
+                        on_connect_failure=mark_connect_failure,
                         **metadata,
                     )
-                )
+
+                session = RemoteExpertWorker.run_coroutine(create_session())
                 server_sessions.append(session)
                 session.__enter__()
             return server_sessions
@@ -728,6 +742,7 @@ class InferenceSession:
             for attempt_no in itertools.count():
                 logger.debug(f"Inference: block {block_idx}, attempt {attempt_no}")
                 server_session = None
+                self._failed_connect_peer_id = None
                 try:
                     if not self._server_sessions or attempt_no >= 1:
                         self._update_sequence(server_idx, block_idx, attempt_no)
@@ -793,14 +808,21 @@ class InferenceSession:
                     self._sequence_manager.on_request_success(server_session.span.peer_id)
                     break
                 except Exception as e:
+                    failed_peer_id = (
+                        server_session.span.peer_id
+                        if server_session is not None
+                        else self._failed_connect_peer_id
+                    )
+                    self._failed_connect_peer_id = None
                     self._sequence_manager.on_request_failure(
-                        server_session.span.peer_id if server_session is not None else None
+                        failed_peer_id
                     )
                     if attempt_no + 1 == self._sequence_manager.config.max_retries:
                         raise
                     delay = self._sequence_manager.get_retry_delay(attempt_no)
                     logger.warning(
-                        f"Caught exception when running inference via {server_session.span if server_session is not None else None} "
+                        f"Caught exception when running inference via "
+                        f"{server_session.span if server_session is not None else failed_peer_id} "
                         f"(retry in {delay:.0f} sec): {repr(e)}"
                     )
                     maybe_log_traceback(e)
