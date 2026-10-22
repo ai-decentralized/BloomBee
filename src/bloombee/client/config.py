@@ -29,8 +29,6 @@ class ClientConfig:
     allowed_servers: Optional[Sequence[Union[PeerID, str]]] = None  # if defined, send requests only to these servers
     blocked_servers: Optional[Sequence[Union[PeerID, str]]] = None  # if defined, do not use these servers
     use_server_to_server: bool = True  # Use direct server-to-server communication
-    # Opt-in training path: worker-to-worker gradients with bundled stage inputs.
-    use_server_to_server_backward: bool = False
     push_only_downstream_decode: bool = DEFAULT_PUSH_ONLY_DOWNSTREAM_DECODE  # downstream decode waits for upstream rpc_push after warmup
 
     connect_timeout: float = 5  # timeout for opening a connection

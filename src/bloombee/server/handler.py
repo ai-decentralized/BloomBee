@@ -27,9 +27,9 @@ from hivemind.utils.streaming import split_for_streaming
 import bloombee
 from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, ModuleUID
 from bloombee.server.backend import TransformerBackend
-from bloombee.utils.backward_protocol import BACKWARD_CHAIN, BACKWARD_CHAIN_VERSION, chain_response_metadata
+from bloombee.utils.backward_protocol import BACKWARD_CACHE_ID, BACKWARD_CHAIN_VERSION, BACKWARD_PROTOCOL_VERSION
 from bloombee.server.memory_cache import AllocationFailed
-from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
+from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_forward
 from bloombee.server.microbatch import (
     MicrobatchStepTracker,
     resolve_expected_num_microbatches,
@@ -594,7 +594,16 @@ class TransformerConnectionHandler(ConnectionHandler):
             self._listener_task = asyncio.create_task(self._listen_to_event_queue())
         if args:
             apply_p2p_max_msg_size(args[0], self._p2p_max_msg_size)
+        if not hasattr(self, "_backward_service"):
+            from bloombee.server.backward_chain import BackwardService
+            self._backward_service = BackwardService(self)
+            await self._backward_service.start(args[0])
         await super().add_p2p_handlers(*args, **kwargs)
+
+    async def remove_p2p_handlers(self, p2p, **kwargs) -> None:
+        if hasattr(self, "_backward_service"):
+            await self._backward_service.close(p2p)
+        await super().remove_p2p_handlers(p2p, **kwargs)
 
     def shutdown(self):
         if self.is_alive():
@@ -2560,6 +2569,23 @@ class TransformerConnectionHandler(ConnectionHandler):
                 measured_send_ms = send_time if send_time > 0 else (perf_counter() - send_start) * 1000.0
                 await self._push_limiter.release(send_time_ms=measured_send_ms, success=success)
 
+    async def _run_forward_with_cache(self, uid, tensors, backends, metadata, context):
+        cache_metadata = {}
+        if BACKWARD_CACHE_ID in metadata:
+            if metadata.get(BACKWARD_CHAIN_VERSION) != BACKWARD_PROTOCOL_VERSION:
+                raise ValueError("Client must use the cached backward protocol")
+            cache_metadata = self._backward_service.save(uid, tensors, metadata, context.remote_id)
+        try:
+            outputs = await run_rpc_forward(
+                *tensors, requested_backends=backends, prioritizer=self._prioritizer,
+                active_adapter=self._get_active_adapter(metadata), points=metadata.get("points", 0),
+            )
+            return outputs, cache_metadata
+        except BaseException:
+            if cache_metadata:
+                self._backward_service.discard(metadata[BACKWARD_CACHE_ID])
+            raise
+
     async def rpc_forward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
         async with timeout(self.request_timeout):
             # Start timing for server processing latency
@@ -2579,12 +2605,8 @@ class TransformerConnectionHandler(ConnectionHandler):
             ), f"rpc_forward should have number of points as number or None, got {points}"
 
             forward_start_time = perf_counter()
-            hidden_states = await run_rpc_forward(
-                *flat_inputs,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
+            hidden_states, cache_metadata = await self._run_forward_with_cache(
+                request.uid, flat_inputs, requested_backends, metadata, context
             )
             forward_compute_ms = (perf_counter() - forward_start_time) * 1000
 
@@ -2599,7 +2621,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                            f"Output Shape: {hidden_states.shape}")
             
             return runtime_pb2.ExpertResponse(
-                tensors=self._serialize_outputs(hidden_states, requested_backends, metadata)
+                tensors=self._serialize_outputs(hidden_states, requested_backends, metadata),
+                metadata=MSGPackSerializer.dumps(cache_metadata),
             )
 
     async def rpc_forward_stream(
@@ -2618,18 +2641,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points, (float, int)
             ), f"rpc_forward_stream should have number of points as number or None, got {points}"
 
-            hidden_states = await run_rpc_forward(
-                *flat_inputs,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
+            hidden_states, cache_metadata = await self._run_forward_with_cache(
+                uid_str, flat_inputs, requested_backends, metadata, context
             )
 
             # Split the serialized_output for streaming and respond to client
             for tensor in self._serialize_outputs(hidden_states, requested_backends, metadata):
                 for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE):
-                    yield runtime_pb2.ExpertResponse(tensors=[part])
+                    yield runtime_pb2.ExpertResponse(tensors=[part], metadata=MSGPackSerializer.dumps(cache_metadata))
 
     def _serialize_outputs(
         self,
@@ -2655,70 +2674,15 @@ class TransformerConnectionHandler(ConnectionHandler):
         ]
 
     async def rpc_backward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
-        async with timeout(self.request_timeout):
-            # Parse requests and prepare backends
-            flat_tensors = [deserialize_torch_tensor(tensor) for tensor in request.tensors]
-            requested_uids = self._check_uids(request.uid)
-            self._log_request("rpc_backward", requested_uids, context)
-
-            requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-            metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_backward should have number of points as number or None, got {points}"
-
-            if BACKWARD_CHAIN in metadata:
-                from bloombee.server.backward_chain import run_backward_chain
-                grads = await run_backward_chain(self, request.uid, flat_tensors, requested_backends, metadata)
-            else:
-                grads = await run_rpc_backward(
-                    *flat_tensors,
-                    requested_backends=requested_backends,
-                    prioritizer=self._prioritizer,
-                    active_adapter=active_adapter,
-                    points=points,
-                )
-
-            return runtime_pb2.ExpertResponse(
-                tensors=self._serialize_grads(grads, requested_backends, metadata),
-                metadata=MSGPackSerializer.dumps(chain_response_metadata()) if BACKWARD_CHAIN in metadata else b"",
-            )
+        # Old client-relayed requests contain inputs/prompts and are rejected by
+        # the cached protocol. New requests address their owning handler namespace.
+        return await self._backward_service.rpc_backward(request, context)
 
     async def rpc_backward_stream(
         self, requests: AsyncIterator[runtime_pb2.ExpertRequest], context: P2PContext
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
-        async with timeout(self.request_timeout):
-            uids_header, flat_tensors, metadata = await self._gather_inputs(requests, context)
-            requested_uids = self._check_uids(uids_header)
-            self._log_request("rpc_backward_stream", requested_uids, context)
-
-            requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_backward_stream should have number of points as number or None, got {points}"
-
-            if BACKWARD_CHAIN in metadata:
-                from bloombee.server.backward_chain import run_backward_chain
-                grads = await run_backward_chain(self, uids_header, flat_tensors, requested_backends, metadata)
-            else:
-                grads = await run_rpc_backward(
-                    *flat_tensors,
-                    requested_backends=requested_backends,
-                    prioritizer=self._prioritizer,
-                    active_adapter=active_adapter,
-                    points=points,
-                )
-            # Split the serialized_grad_inputs for streaming and respond
-            for tensor in self._serialize_grads(grads, requested_backends, metadata):
-                for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE):
-                    yield runtime_pb2.ExpertResponse(
-                        tensors=[part],
-                        metadata=MSGPackSerializer.dumps(chain_response_metadata()) if BACKWARD_CHAIN in metadata else b"",
-                    )
+        async for response in self._backward_service.rpc_backward_stream(requests, context):
+            yield response
 
     def _get_active_adapter(self, metadata: dict) -> str:
         active_adapter = metadata.get("active_adapter", "")
@@ -2971,7 +2935,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         result = {
             "version": bloombee.__version__,
             "dht_client_mode": self.dht.client_mode,
-            BACKWARD_CHAIN_VERSION: 1 if all(
+            BACKWARD_CHAIN_VERSION: BACKWARD_PROTOCOL_VERSION if all(
                 getattr(item, "optimizer", None) is None for item in self.module_backends.values()
             ) else 0,
             CACHE_TOKENS_AVAILABLE: backend.cache_manager.tokens_left(),

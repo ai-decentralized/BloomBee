@@ -3,6 +3,7 @@ A PyTorch autograd function that runs forward/backward on a sequence of remote s
 """
 import asyncio
 import itertools
+import uuid
 from collections import deque
 from typing import List, Optional, Sequence, Tuple
 
@@ -11,14 +12,18 @@ from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 
-from bloombee.client.remote_forward_backward import run_remote_backward, run_remote_backward_chain, run_remote_forward
+from bloombee.client.remote_forward_backward import run_remote_backward_chain, run_remote_forward
 from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, RemoteSpanInfo
+from bloombee.server.backward_chain import BackwardService
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.backward_protocol import (
+    BACKWARD_CACHE_ID,
     BACKWARD_CHAIN,
     BACKWARD_CHAIN_VERSION,
-    MAX_BACKWARD_STAGES,
+    BACKWARD_NAMESPACE,
+    BACKWARD_PROTOCOL_VERSION,
+    BackwardProtocolError,
     validate_backward_chain,
 )
 from bloombee.utils.hivemind_compat import MSGPackSerializer
@@ -35,7 +40,8 @@ async def sequential_forward(
     sequence_manager: RemoteSequenceManager,
     start_index: int = 0,
     end_index: Optional[int] = None,
-) -> Tuple[torch.Tensor, Sequence[torch.Tensor], Sequence[RemoteSpanInfo]]:
+    cache_for_backward: bool = True,
+) -> Tuple[torch.Tensor, Sequence[dict], Sequence[RemoteSpanInfo]]:
     """
     Constructs a routing path from <start_index> to <end_index>.
     Performs chained forward for each subsequence of blocks on the path.
@@ -56,7 +62,7 @@ async def sequential_forward(
     )  # should be n_layers - 1 but add extra prompts for convenience
 
     sequences = deque()
-    intermediate_inputs = []
+    backward_records = []
     done_sequences = []
 
     block_idx = start_index
@@ -77,7 +83,12 @@ async def sequential_forward(
                 flat_tensors = (inputs, prompts[span.start : span.end])
 
                 span_uids = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
-                metadata = sequence_manager.get_request_metadata("rpc_forward", span_uids, *flat_tensors)
+                metadata = dict(sequence_manager.get_request_metadata("rpc_forward", span_uids, *flat_tensors) or {})
+                response_metadata = {}
+                if cache_for_backward:
+                    metadata.update(
+                        {BACKWARD_CACHE_ID: uuid.uuid4().hex, BACKWARD_CHAIN_VERSION: BACKWARD_PROTOCOL_VERSION}
+                    )
                 (outputs,) = await run_remote_forward(
                     span_uids,
                     stub,
@@ -85,13 +96,27 @@ async def sequential_forward(
                     *flat_tensors,
                     config=sequence_manager.config,
                     metadata=MSGPackSerializer.dumps(metadata),
+                    response_metadata=response_metadata,
                 )
 
                 assert isinstance(outputs, torch.Tensor)
                 assert outputs.shape == inputs.shape, f"Expected output {inputs.shape}, got {outputs.shape}"
 
-                # Save intermediate inputs and subsequences if the forward is already done for them
-                intermediate_inputs.append(inputs)
+                if cache_for_backward:
+                    if response_metadata.get(BACKWARD_CHAIN_VERSION) != BACKWARD_PROTOCOL_VERSION:
+                        raise BackwardProtocolError(
+                            "Worker does not support cached backward; upgrade all model workers"
+                        )
+                    if response_metadata.get(BACKWARD_CACHE_ID) != metadata[BACKWARD_CACHE_ID]:
+                        raise BackwardProtocolError("Worker acknowledged a different forward cache")
+                    backward_records.append(
+                        {
+                            "uid": span_uids,
+                            "peer_id": str(span.peer_id),
+                            BACKWARD_CACHE_ID: metadata[BACKWARD_CACHE_ID],
+                            BACKWARD_NAMESPACE: response_metadata[BACKWARD_NAMESPACE],
+                        }
+                    )
                 done_sequences.append(span)
 
                 inputs = outputs
@@ -99,6 +124,8 @@ async def sequential_forward(
                 sequence_manager.on_request_success(span.peer_id)
                 break
             except Exception as e:
+                if isinstance(e, BackwardProtocolError):
+                    raise
                 sequence_manager.on_request_failure(span.peer_id if span is not None else None)
                 if attempt_no + 1 == sequence_manager.config.max_retries:
                     raise
@@ -110,187 +137,96 @@ async def sequential_forward(
                 await asyncio.sleep(delay)
 
     outputs = inputs.to(device=inputs_device, dtype=inputs_dtype)
-    intermediate_inputs = [tensor.to(device=inputs_device, dtype=inputs_dtype) for tensor in intermediate_inputs]
-    return outputs, intermediate_inputs, done_sequences
+    return outputs, backward_records, done_sequences
 
 
-async def _try_backward_chain(grad_outputs, intermediate_inputs, prompts, forward_sequences, sequence_manager):
-    """Use a negotiated worker chain; leave saved forward state intact for fallback."""
-    config = sequence_manager.config
-    if (
-        not getattr(config, "use_server_to_server_backward", False)
-        or len(forward_sequences) < 2
-        or len(forward_sequences) > MAX_BACKWARD_STAGES
-        or config.active_adapter
-    ):
-        return None
-    try:
-        cache = getattr(sequence_manager, "_s2s_backward_capabilities", None)
-        if cache is None:
-            cache = sequence_manager._s2s_backward_capabilities = {}
-        dtype = sequence_manager.rpc_info["forward_schema"][0][0].dtype
-        route = []
-        pairs = []
-        for inputs, span in reversed(list(zip(intermediate_inputs, forward_sequences))):
-            uid = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
-            key = (str(span.peer_id), uid)
-            if key not in cache:
-                stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, span.peer_id)
-                response = await stub.rpc_info(
-                    runtime_pb2.ExpertUID(uid=sequence_manager.block_uids[span.start]), timeout=config.request_timeout
-                )
-                info = MSGPackSerializer.loads(response.serialized_info)
-                cache[key] = (info.get(BACKWARD_CHAIN_VERSION) == 1, info["forward_schema"][0][0].dtype)
-            supported, peer_dtype = cache[key]
-            if not supported or peer_dtype != dtype:
-                logger.info("[S2S_BACKWARD_FALLBACK] unsupported peer or mixed worker dtypes: %s", span.peer_id)
-                return None
-            stage_prompts = prompts[span.start : span.end]
-            stage_metadata = (
-                sequence_manager.get_request_metadata(
-                    "rpc_backward", uid, inputs, *grad_outputs, stage_prompts, peer_id=span.peer_id
-                )
-                or {}
+async def sequential_backward(grad_outputs, backward_records, prompts, forward_sequences, sequence_manager):
+    """Start the reverse worker chain and receive its result directly from stage A."""
+    route = list(reversed(backward_records))
+    if not route or len(route) != len(forward_sequences):
+        raise RuntimeError("Backward requires the forward cache handles for every stage")
+    validate_backward_chain(route, route[0]["uid"])
+    config, p2p = sequence_manager.config, sequence_manager.state.p2p
+    metadata = {
+        BACKWARD_CHAIN: route,
+        BACKWARD_CHAIN_VERSION: BACKWARD_PROTOCOL_VERSION,
+        "client_peer": str(p2p.peer_id),
+        "position": 0,
+    }
+
+    def stub(stage):
+        from bloombee.utils.hivemind_compat import PeerID
+
+        return BackwardService.get_stub(p2p, PeerID.from_base58(stage["peer_id"]), namespace=stage[BACKWARD_NAMESPACE])
+
+    compression = sequence_manager.rpc_info["forward_schema"][0][0].compression
+    tasks = [
+        asyncio.create_task(
+            run_remote_backward_chain(
+                route[-1]["uid"],
+                stub(route[-1]),
+                (),
+                config=config,
+                metadata={**metadata, "position": len(route) - 1},
+                compression=compression,
+                collect=True,
             )
-            route.append({"uid": uid, "peer_id": str(span.peer_id), "metadata": stage_metadata})
-            pairs.append((inputs, stage_prompts))
-        payload = [pairs[0][0], grad_outputs[0], pairs[0][1]]
-        for inputs, stage_prompts in pairs[1:]:
-            payload.extend((inputs, stage_prompts))
-        validate_backward_chain(route, route[0]["uid"], len(payload))
-        metadata = dict(route[0]["metadata"])
-        metadata.update({BACKWARD_CHAIN: route, BACKWARD_CHAIN_VERSION: 1})
-        last_span = forward_sequences[-1]
-        stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, last_span.peer_id)
-        grads = await run_remote_backward_chain(
-            route[0]["uid"],
-            stub,
-            payload,
-            config=config,
-            metadata=metadata,
-            compression=sequence_manager.rpc_info["forward_schema"][0][0].compression,
-        )
-        expected_count = 1 if is_dummy(prompts) else 2
-        if len(grads) != expected_count or grads[0].shape != intermediate_inputs[0].shape:
-            raise RuntimeError("Backward chain returned invalid gradient schema")
-        if expected_count == 2 and grads[1].shape != prompts.shape:
-            raise RuntimeError("Backward chain returned invalid deep-prompt gradient shape")
+        ),
+        asyncio.create_task(
+            run_remote_backward_chain(
+                route[0]["uid"],
+                stub(route[0]),
+                grad_outputs,
+                config=config,
+                metadata=metadata,
+                compression=compression,
+            )
+        ),
+    ]
+    completed = False
+    try:
+        grads, ack = await asyncio.gather(*tasks)
+        expected = 1 if is_dummy(prompts) else 2
+        if ack or len(grads) != expected or grads[0].shape != grad_outputs[0].shape:
+            raise RuntimeError("Worker chain returned an invalid gradient schema")
+        if expected == 2 and grads[1].shape != prompts.shape:
+            raise RuntimeError("Worker chain returned an invalid deep-prompt gradient shape")
         for span in forward_sequences:
             sequence_manager.on_request_success(span.peer_id)
-        logger.info("[S2S_BACKWARD_CLIENT] stages=%d backward_rpc_calls=1", len(route))
-        return [grads[0]], grads[1] if len(grads) == 2 else None
-    except Exception as error:
-        # Frozen backbones have no remote optimizer update to replay. The
-        # original path retains its existing per-stage recovery/rerouting.
-        logger.warning("[S2S_BACKWARD_FALLBACK] %r; retrying through client", error)
-        return None
-
-
-async def sequential_backward(
-    grad_outputs: Sequence[torch.Tensor],
-    intermediate_inputs: List[torch.Tensor],
-    prompts: torch.Tensor,
-    forward_sequences: List[RemoteSpanInfo],
-    sequence_manager: RemoteSequenceManager,
-) -> Tuple[Sequence[torch.Tensor], torch.Tensor]:
-    """
-    Performs chained backward for each forward subsequence.
-    If some subsequence fails, reconstructs the particular sub-path and recovers the backward.
-    """
-    assert len(intermediate_inputs) == len(forward_sequences)
-
-    grad_outputs_device = grad_outputs[0].device if grad_outputs else None
-    grad_outputs_dtype = grad_outputs[0].dtype if grad_outputs else None
-    prompts_device = prompts.device
-    prompts_dtype = prompts.dtype
-
-    grad_outputs = [tensor.cpu() for tensor in grad_outputs]
-    intermediate_inputs = [tensor.cpu() for tensor in intermediate_inputs]
-    prompts = prompts.cpu()
-
-    chained = await _try_backward_chain(grad_outputs, intermediate_inputs, prompts, forward_sequences, sequence_manager)
-    if chained is not None:
-        grads, grad_prompts = chained
-        if grad_outputs_dtype is not None:
-            grads = [grad.to(device=grad_outputs_device, dtype=grad_outputs_dtype) for grad in grads]
-        if grad_prompts is not None:
-            grad_prompts = grad_prompts.to(device=prompts_device, dtype=prompts_dtype)
-        # Match the legacy path's release of saved activations after backward.
-        intermediate_inputs.clear()
-        forward_sequences.clear()
-        return grads, grad_prompts
-
-    grad_prompts_reversed = []
-    while len(forward_sequences) > 0 and len(intermediate_inputs) > 0:
-        inputs = intermediate_inputs.pop()
-        span = forward_sequences.pop()
-        for attempt_no in itertools.count():
-            logger.debug(f"Backward: block {span.end - 1}, attempt {attempt_no}")
-            try:
-                if attempt_no >= 1:
-                    _, backup_inputs, backup_sequences = await sequential_forward(
-                        inputs, prompts, sequence_manager, start_index=span.start, end_index=span.end
+        logger.info(
+            "[S2S_BACKWARD_CLIENT] stages=%d activation_upload_bytes=0 result_direct_from_first_worker=1", len(route)
+        )
+        completed = True
+        return [grads[0].to(grad_outputs[0])], grads[1].to(prompts) if expected == 2 else None
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if not completed:
+            # Release unconsumed caches on errors as well; never reroute via Client.
+            await asyncio.gather(
+                *[
+                    stub(stage).rpc_release(
+                        runtime_pb2.ExpertRequest(
+                            uid=stage["uid"],
+                            metadata=MSGPackSerializer.dumps({BACKWARD_CACHE_ID: stage[BACKWARD_CACHE_ID]}),
+                        ),
+                        timeout=config.connect_timeout,
                     )
-                    assert len(backup_inputs) == len(backup_sequences)
-                    assert backup_sequences[0].start == span.start
-                    assert backup_sequences[-1].end == span.end
-
-                    intermediate_inputs.extend(backup_inputs)
-                    forward_sequences.extend(backup_sequences)
-                    inputs = intermediate_inputs.pop()
-                    span = forward_sequences.pop()
-
-                grad_outputs_cpu = [grad.cpu() for grad in grad_outputs]
-                flat_tensors = (
-                    inputs,
-                    *grad_outputs_cpu,
-                    prompts[span.start : span.end],
-                )
-
-                span_uids = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
-                stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, span.peer_id)
-                metadata = sequence_manager.get_request_metadata(
-                    "rpc_backward", span_uids, *flat_tensors, peer_id=span.peer_id
-                )
-                grad_outputs, *span_grad_prompts = await run_remote_backward(
-                    span_uids,
-                    stub,
-                    sequence_manager.rpc_info,
-                    *flat_tensors,
-                    config=sequence_manager.config,
-                    metadata=MSGPackSerializer.dumps(metadata),
-                )
-                grad_outputs = [grad_outputs]
-                grad_prompts_reversed.extend(span_grad_prompts)
-                sequence_manager.on_request_success(span.peer_id)
-                break
-            except Exception as e:
-                sequence_manager.on_request_failure(span.peer_id if span is not None else None)
-                if attempt_no + 1 == sequence_manager.config.max_retries:
-                    raise
-                delay = sequence_manager.get_retry_delay(attempt_no)
-                logger.warning(
-                    f"Caught exception when running backward via {span} (retry in {delay:.0f} sec): {repr(e)}"
-                )
-                maybe_log_traceback(e)
-                await asyncio.sleep(delay)
-
-    # For now, we do not support mixed dummy and grad prompts
-    # Concat in num_layer dimension
-    grad_prompts = torch.cat(grad_prompts_reversed[::-1], dim=0) if grad_prompts_reversed else None
-
-    if grad_outputs_dtype is not None:
-        grad_outputs = [tensor.to(device=grad_outputs_device, dtype=grad_outputs_dtype) for tensor in grad_outputs]
-    if grad_prompts is not None:
-        grad_prompts = grad_prompts.to(device=prompts_device, dtype=prompts_dtype)
-    return grad_outputs, grad_prompts
+                    for stage in route
+                ],
+                return_exceptions=True,
+            )
+        backward_records.clear()
+        forward_sequences.clear()
 
 
-async def _gather_forward(input_batches, prompt_batches, sequence_manager):
+async def _gather_forward(input_batches, prompt_batches, sequence_manager, cache_for_backward):
     """Wrapper for asyncio.gather to perform parallel sequential forwards"""
     return await asyncio.gather(
         *[
-            sequential_forward(input_batch, prompt_batch, sequence_manager)
+            sequential_forward(input_batch, prompt_batch, sequence_manager, cache_for_backward=cache_for_backward)
             for input_batch, prompt_batch in zip(input_batches, prompt_batches)
         ]
     )
@@ -326,7 +262,9 @@ class _RemoteSequentialAutogradFunction(torch.autograd.Function):
             prompt_batches: Sequence[torch.Tensor] = prompts.detach().split(batch_size, dim=1)
 
         sequence_manager.rpc_info  # lazy init
-        outputs = RemoteExpertWorker.run_coroutine(_gather_forward(input_batches, prompt_batches, sequence_manager))
+        outputs = RemoteExpertWorker.run_coroutine(
+            _gather_forward(input_batches, prompt_batches, sequence_manager, any(ctx.needs_input_grad[:2]))
+        )
         assert len(outputs) == len(input_batches)
 
         output_batches = [output[0] for output in outputs]
@@ -335,13 +273,13 @@ class _RemoteSequentialAutogradFunction(torch.autograd.Function):
 
         ctx.prompt_batches = prompt_batches
         ctx.sequence_manager = sequence_manager
-        ctx.intemediate_input_batches = intemediate_input_batches
+        ctx.backward_records_for_batches = intemediate_input_batches
         ctx.sequences_for_batches = sequences_for_batches
         return torch.cat(output_batches, dim=0)
 
     @staticmethod
     def backward(ctx, grad_outputs: torch.Tensor):
-        intermediate_input_batches: List[Sequence[torch.Tensor]] = ctx.intemediate_input_batches
+        intermediate_input_batches: List[Sequence[torch.Tensor]] = ctx.backward_records_for_batches
         forward_sequences: List[Sequence[RemoteSpanInfo]] = ctx.sequences_for_batches
         ctx.sequence_manager.rpc_info  # lazy init
 
