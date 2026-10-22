@@ -6,11 +6,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 from hivemind.proto import runtime_pb2
+from hivemind.utils.tensor_descr import BatchTensorDescriptor
 
 from bloombee.client import remote_forward_backward as wire
 from bloombee.client.config import ClientConfig
 from bloombee.client.sequential_autograd import sequential_backward
 from bloombee.server import backward_chain as worker
+from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.utils.backward_protocol import (
     BACKWARD_CACHE_ID,
     BACKWARD_CHAIN,
@@ -21,7 +23,7 @@ from bloombee.utils.backward_protocol import (
     validate_backward_chain,
 )
 from bloombee.utils.hivemind_compat import MSGPackSerializer, PeerID
-from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
+from bloombee.utils.lossless_transport import deserialize_tensor_stream
 from bloombee.utils.misc import DUMMY, is_dummy
 
 
@@ -68,7 +70,9 @@ def test_rejects_invalid_chain(failure):
 
 def make_service(index):
     uid = f"model.{index}"
-    backend = SimpleNamespace(uid=uid, optimizer=None, args_schema=[SimpleNamespace(compression=0)])
+    backend = SimpleNamespace(
+        uid=uid, optimizer=None, args_schema=[BatchTensorDescriptor(2, 3, 4, dtype=torch.float32)], kwargs_schema={}
+    )
 
     async def gather(requests, context):
         parts = [r async for r in requests]
@@ -83,8 +87,8 @@ def make_service(index):
         request_timeout=2,
         module_backends={uid: backend},
         _gather_inputs=gather,
-        _serialize_grads=lambda grads, *args: [serialize_torch_tensor(t, 0) for t in grads],
     )
+    handler._serialize_grads = TransformerConnectionHandler._serialize_grads.__get__(handler)
     return worker.BackwardService(handler)
 
 

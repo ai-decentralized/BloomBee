@@ -409,20 +409,6 @@ def _adaptive_hybrid_prefers_zstd_dict(debug_context: Optional[Dict[str, object]
     return _context_value(debug_context, "blocks") in _lossless_hybrid_dict_blocks()
 
 
-def _phase_aware_prefers_dict(debug_context):
-    """Phase-aware dict gate.
-
-    Use the trained zstd dictionary only on prefill, where the +9.5% ratio gain
-    pays for the +33% compress-time overhead (long sequences -> compress cost
-    amortized over many bytes). On decode the per-token tensor is small and
-    256 decode steps amplify the +12% per-call compress overhead, so we fall
-    back to plain zstd_byte_split (no dict).
-    """
-    if not debug_context:
-        return False
-    return str(debug_context.get("phase", "")).strip().lower() == "prefill"
-
-
 def _should_wire_truncate_fp16(
     tensor: Optional[torch.Tensor],
     debug_context: Optional[Dict[str, object]],

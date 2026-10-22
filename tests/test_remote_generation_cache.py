@@ -11,28 +11,9 @@ from bloombee.client.remote_generation import RemoteGenerationMixin, RemotePastK
 from bloombee.models.mixtral.config import DistributedMixtralConfig
 
 
-class _LocalLayers(torch.nn.Module):
-    def __init__(self, config, dht=None):
-        super().__init__()
-        self.active_session = None
-
-    @contextlib.contextmanager
-    def use_session(self, session):
-        previous = self.active_session
-        self.active_session = session
-        try:
-            yield session
-        finally:
-            self.active_session = previous
-
-    def forward(self, hidden_states, **kwargs):
-        self.active_session.position += hidden_states.shape[1]
-        return hidden_states
-
-
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_mixtral_generate_uses_remote_cache_and_resumes(monkeypatch, batch_size):
-    monkeypatch.setattr(mixtral_model, "RemoteSequential", _LocalLayers)
+def test_mixtral_generate_uses_remote_cache_and_resumes(monkeypatch, local_remote_layers, batch_size):
+    monkeypatch.setattr(mixtral_model, "RemoteSequential", local_remote_layers)
     config = DistributedMixtralConfig(
         vocab_size=32,
         hidden_size=16,

@@ -2570,6 +2570,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 await self._push_limiter.release(send_time_ms=measured_send_ms, success=success)
 
     async def _run_forward_with_cache(self, uid, tensors, backends, metadata, context):
+        active_adapter = self._get_active_adapter(metadata)
+        points = metadata.get("points", 0)
+        assert isinstance(points, (float, int)), f"Forward points must be numeric, got {points}"
         cache_metadata = {}
         if BACKWARD_CACHE_ID in metadata:
             if metadata.get(BACKWARD_CHAIN_VERSION) != BACKWARD_PROTOCOL_VERSION:
@@ -2578,7 +2581,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         try:
             outputs = await run_rpc_forward(
                 *tensors, requested_backends=backends, prioritizer=self._prioritizer,
-                active_adapter=self._get_active_adapter(metadata), points=metadata.get("points", 0),
+                active_adapter=active_adapter, points=points,
             )
             return outputs, cache_metadata
         except BaseException:
@@ -2598,12 +2601,6 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
             metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_forward should have number of points as number or None, got {points}"
-
             forward_start_time = perf_counter()
             hidden_states, cache_metadata = await self._run_forward_with_cache(
                 request.uid, flat_inputs, requested_backends, metadata, context
@@ -2635,12 +2632,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             self._log_request("rpc_forward_stream", requested_uids, context)
 
             requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_forward_stream should have number of points as number or None, got {points}"
-
             hidden_states, cache_metadata = await self._run_forward_with_cache(
                 uid_str, flat_inputs, requested_backends, metadata, context
             )

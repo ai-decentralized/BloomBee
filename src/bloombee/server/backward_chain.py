@@ -25,7 +25,7 @@ from bloombee.utils.backward_protocol import (
     validate_backward_chain,
 )
 from bloombee.utils.hivemind_compat import MSGPackSerializer, P2PContext, PeerID, ServicerBase, get_logger
-from bloombee.utils.lossless_transport import deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.lossless_transport import deserialize_torch_tensor
 
 logger = get_logger(__name__)
 
@@ -226,8 +226,7 @@ class BackwardService(ServicerBase):
             try:
                 grads = await asyncio.shield(entry.result)
                 backends = tuple(self.handler.module_backends[u] for u in entry.uid.split(" "))
-                for grad in grads:
-                    tensor = serialize_torch_tensor(grad, backends[0].args_schema[0].compression)
+                for tensor in self.handler._serialize_grads(grads, backends, metadata):
                     for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE):
                         yield runtime_pb2.ExpertResponse(
                             tensors=[part], metadata=MSGPackSerializer.dumps(chain_response_metadata())

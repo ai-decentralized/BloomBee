@@ -1,6 +1,5 @@
 """Exercise Falcon generation preparation with real tensors and client code."""
 
-import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -106,34 +105,9 @@ def test_falcon_explicit_position_ids_match_the_uncached_suffix():
     torch.testing.assert_close(prepared["position_ids"], torch.tensor([[17, 18, 19]]))
 
 
-class _RecordingRemoteLayers(torch.nn.Module):
-    """Replace network transport while retaining the production client stack."""
-
-    def __init__(self, config, dht=None):
-        super().__init__()
-        self.active_session = None
-
-    @property
-    def position(self):
-        return self.active_session.position if self.active_session is not None else 0
-
-    @contextlib.contextmanager
-    def use_session(self, session):
-        previous = self.active_session
-        self.active_session = session
-        try:
-            yield session
-        finally:
-            self.active_session = previous
-
-    def forward(self, hidden_states, **kwargs):
-        self.active_session.position += hidden_states.shape[1]
-        return hidden_states
-
-
 @pytest.fixture
-def local_falcon(monkeypatch):
-    monkeypatch.setattr(falcon_model, "RemoteSequential", _RecordingRemoteLayers)
+def local_falcon(monkeypatch, local_remote_layers):
+    monkeypatch.setattr(falcon_model, "RemoteSequential", local_remote_layers)
     monkeypatch.setattr(
         falcon_model, "LMHead", lambda config: torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
     )

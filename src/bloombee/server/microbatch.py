@@ -38,13 +38,6 @@ def slice_microbatch_inputs(
     full_batch_size: int,
 ) -> MicrobatchInputs:
     mb_size = mb_end - mb_start
-    if hypo_ids is None or is_dummy(hypo_ids):
-        mb_hypo = hypo_ids
-    else:
-        # Keep the full mapping. Slicing global row ids like [2, 3] makes
-        # TransformerBackend treat them as a permutation of the entire KV slab.
-        mb_hypo = hypo_ids
-
     # Micro-batches are processed sequentially on the current runtime path, so we
     # can pass a view into the original hidden-state batch instead of eagerly
     # cloning each slice. This avoids an extra GPU copy on every micro-batch.
@@ -54,7 +47,8 @@ def slice_microbatch_inputs(
 
     return MicrobatchInputs(
         hidden_states=mb_hidden_states,
-        hypo_ids=mb_hypo,
+        # Keep global row IDs; the backend normalizes them using batch_offset.
+        hypo_ids=hypo_ids,
         tree_attention_mask=slice_batch_aligned(tree_attention_mask, mb_start, mb_end, full_batch_size),
         kv_cache_position_ids=slice_batch_aligned(kv_cache_position_ids, mb_start, mb_end, full_batch_size),
         draft_tokens=slice_batch_aligned(draft_tokens, mb_start, mb_end, full_batch_size),

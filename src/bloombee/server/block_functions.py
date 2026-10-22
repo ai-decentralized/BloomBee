@@ -975,15 +975,18 @@ async def iterate_rpc_inference(
                 hidden_states = restore_hidden_states(hidden_states, keep_indices, draft_tokens.shape[-1])
             
             # [MB_DEBUG] Log after fill_microbatch_defaults
-            logger.debug(f"[MB_DEBUG] After fill_microbatch_defaults:")
-            logger.debug(f"[MB_DEBUG]   hidden_states.shape={hidden_states.shape}")
+            logger.debug("[MB_DEBUG] After fill_microbatch_defaults:")
+            logger.debug("[MB_DEBUG]   hidden_states.shape=%s", hidden_states.shape)
             # Guarded: .item() forces a CUDA sync, so it must never run unless DEBUG is on.
             if hidden_states.numel() > 0 and logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"[MB_DEBUG]   hidden_states.abs().mean()={hidden_states.abs().mean().item():.6f}")
-            logger.debug(f"[MB_DEBUG]   keep_indices={keep_indices}")
-            logger.debug(f"[MB_DEBUG]   tree_attention_mask={tree_attention_mask is not None}")
-            logger.debug(f"[MB_DEBUG]   kv_cache_position_ids={kv_cache_position_ids}")
-            logger.debug(f"[MB_DEBUG]   prefill_length={prefill_length}, is_spec_dec={is_spec_dec}, need_pruning={need_pruning}")
+            logger.debug("[MB_DEBUG]   keep_indices=%s", keep_indices)
+            logger.debug("[MB_DEBUG]   tree_attention_mask=%s", tree_attention_mask is not None)
+            logger.debug("[MB_DEBUG]   kv_cache_position_ids=%s", kv_cache_position_ids)
+            logger.debug(
+                "[MB_DEBUG]   prefill_length=%s, is_spec_dec=%s, need_pruning=%s",
+                prefill_length, is_spec_dec, need_pruning,
+            )
             
             # Ensure prompts/hypo_ids match the current micro-batch.
             if not isinstance(prompts, list) or len(prompts) != len(requested_backends):
@@ -1105,7 +1108,7 @@ async def iterate_rpc_inference(
                     # [MB_DEBUG] Log after submit_task
                     logger.debug(f"[MB_DEBUG] submit_task completed in {submit_time_ms:.2f}ms")
                     logger.debug(f"[MB_DEBUG] output hidden_states.shape={hidden_states.shape}")
-                    logger.debug(f"[MB_DEBUG] output keep_indices={keep_indices}")
+                    logger.debug("[MB_DEBUG] output keep_indices=%s", keep_indices)
 
                 else:
                     # Process through backends sequentially

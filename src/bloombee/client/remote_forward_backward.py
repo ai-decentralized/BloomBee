@@ -2,7 +2,7 @@
 Utility functions that call RPC forward or backward on a single remote server
 """
 import asyncio
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from hivemind.p2p import StubBase
@@ -10,12 +10,11 @@ from hivemind.p2p.p2p_daemon_bindings.control import DEFAULT_MAX_MSG_SIZE, MAX_U
 from hivemind.proto import runtime_pb2
 from hivemind.utils.asyncio import aiter_with_timeout, iter_as_aiter
 from hivemind.utils.streaming import split_for_streaming
-from hivemind.utils.tensor_descr import BatchTensorDescriptor
 
 from bloombee.client.config import ClientConfig
 from bloombee.data_structures import ModuleUID, RPCInfo
 from bloombee.utils.backward_protocol import BACKWARD_CHAIN_VERSION, BACKWARD_PROTOCOL_VERSION
-from bloombee.utils.hivemind_compat import MSGPackSerializer, nested_compare, nested_flatten, nested_pack
+from bloombee.utils.hivemind_compat import MSGPackSerializer, nested_flatten, nested_pack
 from bloombee.utils.lossless_transport import (
     deserialize_tensor_stream,
     deserialize_torch_tensor,
@@ -103,13 +102,17 @@ def _check_chain_response(response):
         raise RuntimeError("Worker did not acknowledge the full backward chain")
 
 
+async def _serialize_tensors(inputs, compression):
+    loop = asyncio.get_running_loop()
+    return await asyncio.gather(
+        *(loop.run_in_executor(None, serialize_torch_tensor, tensor, compression) for tensor in inputs)
+    )
+
+
 async def run_remote_backward_chain(uid, stub, tensors, *, config, metadata, compression, collect=False):
     """Send only gradients, or collect a result directly from the first worker."""
     inputs = tuple(tensor.detach().cpu().contiguous() for tensor in tensors)
-    loop = asyncio.get_running_loop()
-    serialized = await asyncio.gather(
-        *(loop.run_in_executor(None, serialize_torch_tensor, tensor, compression) for tensor in inputs)
-    )
+    serialized = await _serialize_tensors(inputs, compression)
     size = sum(tensor.element_size() * tensor.nelement() for tensor in inputs)
     call = _backward_stream if collect or size > MAX_UNARY_PAYLOAD_SIZE // 2 else _backward_unary
     return await call(
@@ -145,27 +148,13 @@ async def run_remote_forward(
 
     # Note: we put keyword arguments in the same order as on a server to prevent f(a=1, b=2) != f(b=2, a=1) errors
     forward_inputs = tuple(nested_flatten((inputs, kwargs)))
-    args_schema, kwargs_schema = rpc_info["forward_schema"]
+    args_schema, _ = rpc_info["forward_schema"]
     compression = args_schema[0].compression
-    forward_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in forward_inputs)
-    inputs = tuple(tensor.cpu().detach() for tensor in forward_inputs)
+    inputs = tuple(tensor.detach().cpu().contiguous() for tensor in forward_inputs)
     # TODO: create more explicit way to check servers schema and client's structure
     assert len(inputs) >= len(args_schema) + 1, "Inputs and prompt tensors are necessary for a forward step"
 
-    # Asynchronous serialization
-    # Fix for bus error in cross-machine setups: ensure tensors are contiguous before serialization
-    loop = asyncio.get_running_loop()
-    serialized_tensors = await asyncio.gather(
-        *(
-            loop.run_in_executor(
-                None,
-                serialize_torch_tensor,
-                tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
-                proto.compression,
-            )
-            for tensor, proto in zip(inputs, forward_schema)
-        )
-    )
+    serialized_tensors = await _serialize_tensors(inputs, compression)
 
     # call RPC on remote server
     size = sum(t.element_size() * t.nelement() for t in inputs)

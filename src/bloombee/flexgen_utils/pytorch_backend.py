@@ -20,6 +20,7 @@ from bloombee.flexgen_utils.utils import (GB, T, cpu_mem_stats, vector_gather, t
     torch_dtype_to_num_bytes)
 from torch import nn
 from transformers.activations import ACT2FN
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 import logging
 from hivemind.utils import get_logger
 from bloombee.utils.debug import dprint
@@ -90,21 +91,18 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, S, H, D = xq.shape
+    B, S, _, D = xq.shape
     # Match HF's projection dtype and multiply/add rounding order. A
     # complex64 rotation followed by one final cast has different FP16 grads.
     cos = torch.cat((freqs_cis.real, freqs_cis.real), dim=-1).to(xq.dtype)
     sin = torch.cat((freqs_cis.imag, freqs_cis.imag), dim=-1).to(xq.dtype)
     if freqs_cis.ndim == 2:
-        cos, sin = cos.view(1, S, 1, D), sin.view(1, S, 1, D)
+        cos, sin = cos.view(1, S, D), sin.view(1, S, D)
     elif freqs_cis.ndim == 3:
-        cos, sin = cos.view(B, S, 1, D), sin.view(B, S, 1, D)
+        cos, sin = cos.view(B, S, D), sin.view(B, S, D)
     else:
         raise ValueError(f"unexpected freqs_cis shape: {freqs_cis.shape}")
-    half = D // 2
-    q_rotated = torch.cat((-xq[..., half:], xq[..., :half]), dim=-1)
-    k_rotated = torch.cat((-xk[..., half:], xk[..., :half]), dim=-1)
-    return xq * cos + q_rotated * sin, xk * cos + k_rotated * sin
+    return apply_rotary_pos_emb(xq, xk, cos, sin, unsqueeze_dim=2)
 
 def precompute_freqs_cis(
     dim: int, 

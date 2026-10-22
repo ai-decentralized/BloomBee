@@ -32,7 +32,6 @@ from bloombee.utils.microbatch_config import (
 )
 from bloombee.utils.real_activation_dumper import capture_activation
 from pynvml import *
-import logging
 import time
 import threading
 
@@ -40,11 +39,6 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
-
-# Create dedicated offloading debug logger
-offload_logger = logging.getLogger('bloombee.offloading')
-offload_logger.setLevel(logging.INFO)
-
 
 _STEP_PROFILE_ENABLED = os.environ.get("BLOOMBEE_STEP_PROFILE", "0") == "1"
 _STEP_PROFILE_INTERVAL = int(os.environ.get("BLOOMBEE_STEP_PROFILE_INTERVAL", "32"))
@@ -1887,8 +1881,6 @@ class _MergedInferenceStep:
     def __init__(self, backends: Dict[ExpertUID, TransformerBackend]):
         self.backends = backends
         self._call_count = 0  # Track number of calls for logging
-        # [KVCACHE_OFFLOAD] Track offloaded micro-batch slices: {(mb_offset, mb_size): (k_cpu, v_cpu)}
-        self._offloaded_slices: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         # Get cache_manager from first backend for offloading operations
         self._cache_manager = next(iter(backends.values())).cache_manager if backends else None
         self._kv_counter_keys = (
@@ -1914,76 +1906,6 @@ class _MergedInferenceStep:
             "gpu_reserved_mb",
             "gpu_max_alloc_mb",
         )
-
-    def _offload_completed_microbatch(self, k_cache: torch.Tensor, v_cache: torch.Tensor, 
-                                       mb_offset: int, mb_size: int, num_heads: int) -> None:
-        """
-        [KVCACHE_OFFLOAD] Copy micro-batch KV slice from GPU to CPU staging.
-        Called after all blocks complete for this micro-batch.
-        """
-        if k_cache is None or v_cache is None:
-            return
-        
-        # Calculate BH (batch * heads) slice for this micro-batch
-        BH_start = mb_offset * num_heads
-        BH_end = (mb_offset + mb_size) * num_heads
-        
-        try:
-            # k_cache shape: (S, BH_total, D), v_cache shape: (S, BH_total, D)
-            k_slice = k_cache[:, BH_start:BH_end, :].clone()
-            v_slice = v_cache[:, BH_start:BH_end, :]
-            
-            # Async copy to CPU (non-blocking for performance)
-            k_cpu = k_slice.to('cpu', non_blocking=True)
-            v_cpu = v_slice.to('cpu', non_blocking=True)
-            
-            # Store in offload tracking dict
-            key = (mb_offset, mb_size)
-            self._offloaded_slices[key] = (k_cpu, v_cpu)
-            
-            # Clear GPU slice (optional - helps memory but may not be needed if we just reuse)
-            # We don't zero it here as it may be reused in next iteration
-            
-            offload_logger.info(
-                f"[KVCACHE_OFFLOAD] Offloaded: mb_offset={mb_offset}, mb_size={mb_size}, "
-                f"BH=[{BH_start}:{BH_end}], k_shape={k_cpu.shape}"
-            )
-        except Exception as e:
-            offload_logger.warning(f"[KVCACHE_OFFLOAD] Offload failed: {e}")
-
-    def _prefetch_if_needed(self, k_cache: torch.Tensor, v_cache: torch.Tensor,
-                             mb_offset: int, mb_size: int, num_heads: int) -> None:
-        """
-        [KVCACHE_OFFLOAD] Copy micro-batch KV slice from CPU back to GPU if previously offloaded.
-        Called before processing a micro-batch.
-        """
-        key = (mb_offset, mb_size)
-        if key not in self._offloaded_slices:
-            return  # Not offloaded, nothing to prefetch
-        
-        if k_cache is None or v_cache is None:
-            return
-            
-        k_cpu, v_cpu = self._offloaded_slices[key]
-        
-        # Calculate BH slice
-        BH_start = mb_offset * num_heads
-        BH_end = (mb_offset + mb_size) * num_heads
-        
-        try:
-            # Async copy back to GPU
-            k_cache[:, BH_start:BH_end, :].copy_(k_cpu.to(k_cache.device, non_blocking=True))
-            v_cache[:, BH_start:BH_end, :].copy_(v_cpu.to(v_cache.device, non_blocking=True))
-            
-            # Remove from tracking
-            del self._offloaded_slices[key]
-            
-            offload_logger.info(
-                f"[KVCACHE_OFFLOAD] Prefetched: mb_offset={mb_offset}, mb_size={mb_size}, "
-                f"BH=[{BH_start}:{BH_end}]"
-            )
-        except Exception as e:
-            offload_logger.warning(f"[KVCACHE_OFFLOAD] Prefetch failed: {e}")
 
     def _snapshot_kv_timing(self) -> Optional[Dict[str, float]]:
         if self._cache_manager is None or not hasattr(self._cache_manager, "get_kv_timing_snapshot"):

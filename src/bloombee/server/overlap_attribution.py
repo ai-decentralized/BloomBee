@@ -226,25 +226,6 @@ def summarize_cross_stage_overlap(
         ):
             mb0_wait_start_us = mb0_wait_end_us - int(round(stage2_queue_wait_pre_ms * 1000.0))
 
-        def _interval_overlap_ms(
-            range_start_us: int,
-            range_end_us: int,
-            window_start_us: int,
-            window_end_us: int,
-        ) -> float:
-            if (
-                range_start_us <= 0
-                or range_end_us <= range_start_us
-                or window_start_us <= 0
-                or window_end_us <= window_start_us
-            ):
-                return 0.0
-            overlap_start_us = max(range_start_us, window_start_us)
-            overlap_end_us = min(range_end_us, window_end_us)
-            if overlap_end_us <= overlap_start_us:
-                return 0.0
-            return (overlap_end_us - overlap_start_us) / 1000.0
-
         if (
             mb0_wait_start_us > 0
             and mb0_wait_end_us > mb0_wait_start_us
@@ -264,31 +245,31 @@ def summarize_cross_stage_overlap(
                 mb0_sender_send_us + mb0_clock_offset_us if mb0_sender_send_us > 0 else 0
             )
 
-            stage2_queue_wait_pre_upstream_compute_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_upstream_compute_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_prev_start_local_us,
                 mb0_prev_end_local_us,
             )
-            stage2_queue_wait_pre_sender_compute_to_serialize_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_sender_compute_to_serialize_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_prev_end_local_us,
                 mb0_sender_ser_start_local_us,
             )
-            stage2_queue_wait_pre_sender_serialize_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_sender_serialize_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_sender_ser_start_local_us,
                 mb0_sender_ser_end_local_us,
             )
-            stage2_queue_wait_pre_sender_pre_send_wait_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_sender_pre_send_wait_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_sender_ser_end_local_us,
                 mb0_sender_send_local_us,
             )
-            stage2_queue_wait_pre_sender_post_compute_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_sender_post_compute_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_prev_end_local_us,
@@ -301,13 +282,13 @@ def summarize_cross_stage_overlap(
             )
             if sender_post_compute_segment_sum_ms > 0.0:
                 stage2_queue_wait_pre_sender_post_compute_ms = sender_post_compute_segment_sum_ms
-            stage2_queue_wait_pre_wire_receive_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_wire_receive_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_sender_send_local_us,
                 mb0_receiver_receive_us,
             )
-            stage2_queue_wait_pre_receiver_dispatch_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_receiver_dispatch_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_receiver_receive_us,
@@ -338,13 +319,13 @@ def summarize_cross_stage_overlap(
                 and mb0_receiver_receive_us > 0
                 and mb0_receiver_queue_put_us < mb0_wait_end_us
             ):
-                receiver_handle_ms = _interval_overlap_ms(
+                receiver_handle_ms = _interval_overlap_ms_from_us(
                     mb0_wait_start_us,
                     mb0_wait_end_us,
                     mb0_receiver_receive_us,
                     mb0_receiver_queue_put_us,
                 )
-                receiver_ready_ms = _interval_overlap_ms(
+                receiver_ready_ms = _interval_overlap_ms_from_us(
                     mb0_wait_start_us,
                     mb0_wait_end_us,
                     mb0_receiver_queue_put_us,
