@@ -84,7 +84,15 @@ def make_empty_kv_cache(layer_idx: int = 0) -> DynamicCache:
     keep the old pre-population pattern there for safety.
     """
     dc = DynamicCache()
-    if not _IS_TF5:
+    if _IS_TF5:
+        # Transformers 5.x: DynamicCache() starts with zero layers.
+        # Nemotron-H full-attention accesses cache.layers[layer_idx],
+        # so materialize empty DynamicLayer objects through this index.
+        from transformers.cache_utils import DynamicLayer
+
+        while len(dc.layers) <= layer_idx:
+            dc.layers.append(DynamicLayer())
+    else:
         # tf 4.x: pre-fill with None so key_cache[layer_idx] exists after update()
         dc.key_cache = [None] * layer_idx
         dc.value_cache = [None] * layer_idx

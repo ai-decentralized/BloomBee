@@ -354,7 +354,9 @@ class TorchDevice:
         if not policy.compress_cache:
             b = policy.gpu_batch_size
             num_attention_heads = config.num_attention_heads
-            head_dim = config.hidden_size // num_attention_heads
+            head_dim = getattr(config, "head_dim", None) or (
+                config.hidden_size // num_attention_heads
+            )
             max_seq_len = task.prompt_len + task.gen_len - 1
             self.attention_compute_workspace = []
             self.workspace_pt = 0
