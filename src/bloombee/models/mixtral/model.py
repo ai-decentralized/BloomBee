@@ -143,6 +143,7 @@ class DistributedMixtralModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMi
 class DistributedMixtralForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, MixtralForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedMixtralModel._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedMixtralModel._keys_to_ignore_on_load_unexpected
+    _supports_cache_class = True
 
     config_class = DistributedMixtralConfig
 

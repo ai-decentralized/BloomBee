@@ -79,4 +79,5 @@ jobs:
             tests/test_spe_dec_tree.py \
             tests/test_fast_generate_eligibility.py \
             tests/test_qwen3_block_parity.py \
-            tests/test_recovery_history_source.py
+            tests/test_recovery_history_source.py \
+            tests/test_remote_generation_cache.py
