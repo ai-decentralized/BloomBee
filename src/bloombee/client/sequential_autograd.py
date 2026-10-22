@@ -8,12 +8,19 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
+from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 
-from bloombee.client.remote_forward_backward import run_remote_backward, run_remote_forward
+from bloombee.client.remote_forward_backward import run_remote_backward, run_remote_backward_chain, run_remote_forward
 from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, RemoteSpanInfo
 from bloombee.server.handler import TransformerConnectionHandler
+from bloombee.utils.backward_protocol import (
+    BACKWARD_CHAIN,
+    BACKWARD_CHAIN_VERSION,
+    MAX_BACKWARD_STAGES,
+    validate_backward_chain,
+)
 from bloombee.utils.hivemind_compat import MSGPackSerializer
 from bloombee.utils.misc import DUMMY, is_dummy
 
@@ -70,9 +77,7 @@ async def sequential_forward(
                 flat_tensors = (inputs, prompts[span.start : span.end])
 
                 span_uids = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
-                metadata = sequence_manager.get_request_metadata(
-                    "rpc_forward", span_uids, *flat_tensors
-                )
+                metadata = sequence_manager.get_request_metadata("rpc_forward", span_uids, *flat_tensors)
                 (outputs,) = await run_remote_forward(
                     span_uids,
                     stub,
@@ -109,6 +114,78 @@ async def sequential_forward(
     return outputs, intermediate_inputs, done_sequences
 
 
+async def _try_backward_chain(grad_outputs, intermediate_inputs, prompts, forward_sequences, sequence_manager):
+    """Use a negotiated worker chain; leave saved forward state intact for fallback."""
+    config = sequence_manager.config
+    if (
+        not getattr(config, "use_server_to_server_backward", False)
+        or len(forward_sequences) < 2
+        or len(forward_sequences) > MAX_BACKWARD_STAGES
+        or config.active_adapter
+    ):
+        return None
+    try:
+        cache = getattr(sequence_manager, "_s2s_backward_capabilities", None)
+        if cache is None:
+            cache = sequence_manager._s2s_backward_capabilities = {}
+        dtype = sequence_manager.rpc_info["forward_schema"][0][0].dtype
+        route = []
+        pairs = []
+        for inputs, span in reversed(list(zip(intermediate_inputs, forward_sequences))):
+            uid = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
+            key = (str(span.peer_id), uid)
+            if key not in cache:
+                stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, span.peer_id)
+                response = await stub.rpc_info(
+                    runtime_pb2.ExpertUID(uid=sequence_manager.block_uids[span.start]), timeout=config.request_timeout
+                )
+                info = MSGPackSerializer.loads(response.serialized_info)
+                cache[key] = (info.get(BACKWARD_CHAIN_VERSION) == 1, info["forward_schema"][0][0].dtype)
+            supported, peer_dtype = cache[key]
+            if not supported or peer_dtype != dtype:
+                logger.info("[S2S_BACKWARD_FALLBACK] unsupported peer or mixed worker dtypes: %s", span.peer_id)
+                return None
+            stage_prompts = prompts[span.start : span.end]
+            stage_metadata = (
+                sequence_manager.get_request_metadata(
+                    "rpc_backward", uid, inputs, *grad_outputs, stage_prompts, peer_id=span.peer_id
+                )
+                or {}
+            )
+            route.append({"uid": uid, "peer_id": str(span.peer_id), "metadata": stage_metadata})
+            pairs.append((inputs, stage_prompts))
+        payload = [pairs[0][0], grad_outputs[0], pairs[0][1]]
+        for inputs, stage_prompts in pairs[1:]:
+            payload.extend((inputs, stage_prompts))
+        validate_backward_chain(route, route[0]["uid"], len(payload))
+        metadata = dict(route[0]["metadata"])
+        metadata.update({BACKWARD_CHAIN: route, BACKWARD_CHAIN_VERSION: 1})
+        last_span = forward_sequences[-1]
+        stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, last_span.peer_id)
+        grads = await run_remote_backward_chain(
+            route[0]["uid"],
+            stub,
+            payload,
+            config=config,
+            metadata=metadata,
+            compression=sequence_manager.rpc_info["forward_schema"][0][0].compression,
+        )
+        expected_count = 1 if is_dummy(prompts) else 2
+        if len(grads) != expected_count or grads[0].shape != intermediate_inputs[0].shape:
+            raise RuntimeError("Backward chain returned invalid gradient schema")
+        if expected_count == 2 and grads[1].shape != prompts.shape:
+            raise RuntimeError("Backward chain returned invalid deep-prompt gradient shape")
+        for span in forward_sequences:
+            sequence_manager.on_request_success(span.peer_id)
+        logger.info("[S2S_BACKWARD_CLIENT] stages=%d backward_rpc_calls=1", len(route))
+        return [grads[0]], grads[1] if len(grads) == 2 else None
+    except Exception as error:
+        # Frozen backbones have no remote optimizer update to replay. The
+        # original path retains its existing per-stage recovery/rerouting.
+        logger.warning("[S2S_BACKWARD_FALLBACK] %r; retrying through client", error)
+        return None
+
+
 async def sequential_backward(
     grad_outputs: Sequence[torch.Tensor],
     intermediate_inputs: List[torch.Tensor],
@@ -130,6 +207,18 @@ async def sequential_backward(
     grad_outputs = [tensor.cpu() for tensor in grad_outputs]
     intermediate_inputs = [tensor.cpu() for tensor in intermediate_inputs]
     prompts = prompts.cpu()
+
+    chained = await _try_backward_chain(grad_outputs, intermediate_inputs, prompts, forward_sequences, sequence_manager)
+    if chained is not None:
+        grads, grad_prompts = chained
+        if grad_outputs_dtype is not None:
+            grads = [grad.to(device=grad_outputs_device, dtype=grad_outputs_dtype) for grad in grads]
+        if grad_prompts is not None:
+            grad_prompts = grad_prompts.to(device=prompts_device, dtype=prompts_dtype)
+        # Match the legacy path's release of saved activations after backward.
+        intermediate_inputs.clear()
+        forward_sequences.clear()
+        return grads, grad_prompts
 
     grad_prompts_reversed = []
     while len(forward_sequences) > 0 and len(intermediate_inputs) > 0:

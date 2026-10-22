@@ -57,6 +57,7 @@ jobs:
         run: |
           pytest -v \
             tests/test_cache.py \
+            tests/test_backward_chain.py \
             tests/test_serving_cache_regressions.py \
             tests/test_llama_kv_head_compat.py \
             tests/test_llama_rope_parameters.py \

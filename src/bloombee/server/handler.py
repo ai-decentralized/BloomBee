@@ -27,6 +27,7 @@ from hivemind.utils.streaming import split_for_streaming
 import bloombee
 from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, ModuleUID
 from bloombee.server.backend import TransformerBackend
+from bloombee.utils.backward_protocol import BACKWARD_CHAIN, BACKWARD_CHAIN_VERSION, chain_response_metadata
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
 from bloombee.server.microbatch import (
@@ -2668,15 +2669,22 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points, (float, int)
             ), f"rpc_backward should have number of points as number or None, got {points}"
 
-            grads = await run_rpc_backward(
-                *flat_tensors,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
-            )
+            if BACKWARD_CHAIN in metadata:
+                from bloombee.server.backward_chain import run_backward_chain
+                grads = await run_backward_chain(self, request.uid, flat_tensors, requested_backends, metadata)
+            else:
+                grads = await run_rpc_backward(
+                    *flat_tensors,
+                    requested_backends=requested_backends,
+                    prioritizer=self._prioritizer,
+                    active_adapter=active_adapter,
+                    points=points,
+                )
 
-            return runtime_pb2.ExpertResponse(tensors=self._serialize_grads(grads, requested_backends, metadata))
+            return runtime_pb2.ExpertResponse(
+                tensors=self._serialize_grads(grads, requested_backends, metadata),
+                metadata=MSGPackSerializer.dumps(chain_response_metadata()) if BACKWARD_CHAIN in metadata else b"",
+            )
 
     async def rpc_backward_stream(
         self, requests: AsyncIterator[runtime_pb2.ExpertRequest], context: P2PContext
@@ -2693,17 +2701,24 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points, (float, int)
             ), f"rpc_backward_stream should have number of points as number or None, got {points}"
 
-            grads = await run_rpc_backward(
-                *flat_tensors,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
-            )
+            if BACKWARD_CHAIN in metadata:
+                from bloombee.server.backward_chain import run_backward_chain
+                grads = await run_backward_chain(self, uids_header, flat_tensors, requested_backends, metadata)
+            else:
+                grads = await run_rpc_backward(
+                    *flat_tensors,
+                    requested_backends=requested_backends,
+                    prioritizer=self._prioritizer,
+                    active_adapter=active_adapter,
+                    points=points,
+                )
             # Split the serialized_grad_inputs for streaming and respond
             for tensor in self._serialize_grads(grads, requested_backends, metadata):
                 for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE):
-                    yield runtime_pb2.ExpertResponse(tensors=[part])
+                    yield runtime_pb2.ExpertResponse(
+                        tensors=[part],
+                        metadata=MSGPackSerializer.dumps(chain_response_metadata()) if BACKWARD_CHAIN in metadata else b"",
+                    )
 
     def _get_active_adapter(self, metadata: dict) -> str:
         active_adapter = metadata.get("active_adapter", "")
@@ -2956,6 +2971,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         result = {
             "version": bloombee.__version__,
             "dht_client_mode": self.dht.client_mode,
+            BACKWARD_CHAIN_VERSION: 1 if all(
+                getattr(item, "optimizer", None) is None for item in self.module_backends.values()
+            ) else 0,
             CACHE_TOKENS_AVAILABLE: backend.cache_manager.tokens_left(),
         }
 

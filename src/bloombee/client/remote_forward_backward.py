@@ -14,8 +14,13 @@ from hivemind.utils.tensor_descr import BatchTensorDescriptor
 
 from bloombee.client.config import ClientConfig
 from bloombee.data_structures import ModuleUID, RPCInfo
-from bloombee.utils.hivemind_compat import nested_compare, nested_flatten, nested_pack
-from bloombee.utils.lossless_transport import deserialize_tensor_stream, deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.backward_protocol import BACKWARD_CHAIN_VERSION
+from bloombee.utils.hivemind_compat import MSGPackSerializer, nested_compare, nested_flatten, nested_pack
+from bloombee.utils.lossless_transport import (
+    deserialize_tensor_stream,
+    deserialize_torch_tensor,
+    serialize_torch_tensor,
+)
 
 
 async def _forward_unary(
@@ -29,12 +34,19 @@ async def _forward_unary(
 
 
 async def _backward_unary(
-    uid: str, serialized_tensors: Iterable[runtime_pb2.Tensor], stub, config: ClientConfig, **kwargs
+    uid: str,
+    serialized_tensors: Iterable[runtime_pb2.Tensor],
+    stub,
+    config: ClientConfig,
+    require_chain_response: bool = False,
+    **kwargs,
 ) -> List[torch.Tensor]:
     grad_inputs: runtime_pb2.ExpertResponse = await stub.rpc_backward(
         runtime_pb2.ExpertRequest(uid=uid, tensors=list(serialized_tensors), **kwargs),
         timeout=config.request_timeout,
     )
+    if require_chain_response:
+        _check_chain_response(grad_inputs)
     return [deserialize_torch_tensor(t) for t in grad_inputs.tensors]
 
 
@@ -52,7 +64,12 @@ async def _forward_stream(
 
 
 async def _backward_stream(
-    uid: str, serialized_tensors: Iterable[runtime_pb2.Tensor], stub, config: ClientConfig, **kwargs
+    uid: str,
+    serialized_tensors: Iterable[runtime_pb2.Tensor],
+    stub,
+    config: ClientConfig,
+    require_chain_response: bool = False,
+    **kwargs,
 ) -> List[torch.Tensor]:
     parts = (
         runtime_pb2.ExpertRequest(uid=uid, tensors=[part], **kwargs)
@@ -61,7 +78,34 @@ async def _backward_stream(
     )
     grad_inputs = await asyncio.wait_for(stub.rpc_backward_stream(iter_as_aiter(parts)), config.connect_timeout)
     grad_inputs = aiter_with_timeout(grad_inputs, config.request_timeout)
-    return await deserialize_tensor_stream(msg.tensors async for msg in grad_inputs)
+
+    async def checked_parts():
+        async for msg in grad_inputs:
+            if require_chain_response:
+                _check_chain_response(msg)
+            yield msg.tensors
+
+    return await deserialize_tensor_stream(checked_parts())
+
+
+def _check_chain_response(response):
+    metadata = MSGPackSerializer.loads(response.metadata) if response.metadata else {}
+    if metadata.get(BACKWARD_CHAIN_VERSION) != 1:
+        raise RuntimeError("Worker did not acknowledge the full backward chain")
+
+
+async def run_remote_backward_chain(uid, stub, tensors, *, config, metadata, compression):
+    """Send a stateless chain through the same unary/streaming backward transport."""
+    inputs = tuple(tensor.detach().cpu().contiguous() for tensor in tensors)
+    loop = asyncio.get_running_loop()
+    serialized = await asyncio.gather(
+        *(loop.run_in_executor(None, serialize_torch_tensor, tensor, compression) for tensor in inputs)
+    )
+    size = sum(tensor.element_size() * tensor.nelement() for tensor in inputs)
+    call = _backward_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else _backward_unary
+    return await call(
+        uid, serialized, stub, config, metadata=MSGPackSerializer.dumps(metadata), require_chain_response=True
+    )
 
 
 async def run_remote_forward(
@@ -102,7 +146,7 @@ async def run_remote_forward(
                 None,
                 serialize_torch_tensor,
                 tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
-                proto.compression
+                proto.compression,
             )
             for tensor, proto in zip(inputs, forward_schema)
         )
@@ -148,7 +192,7 @@ async def run_remote_backward(
                 None,
                 serialize_torch_tensor,
                 tensor.contiguous().to(proto.dtype) if not tensor.is_contiguous() else tensor.to(proto.dtype),
-                proto.compression
+                proto.compression,
             )
             for tensor, proto in zip(inputs_and_grad_outputs, backward_schema)
         )
