@@ -2062,17 +2062,13 @@ class KVCacheManager:
         key, value = new_kvs
 
         # If possibly FlexGen wrapper/compression, convert to torch.Tensor
-        try:
-            def _to_torch(x):
-                if hasattr(x, 'device') and (
-                    getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
-                    or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
-                ):
-                    return x.device.decompress(x)
-                return getattr(x, 'data', x)
-        except Exception:
-            def _to_torch(x):
-                return getattr(x, 'data', x)
+        def _to_torch(x):
+            if hasattr(x, 'device') and (
+                getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
+                or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
+            ):
+                return x.device.decompress(x)
+            return getattr(x, 'data', x)
 
         key_t = _to_torch(key)       # (BH_micro, D, s_new)
         value_t = _to_torch(value)   # (BH_micro, s_new, D)
