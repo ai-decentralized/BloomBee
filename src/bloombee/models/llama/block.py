@@ -30,7 +30,6 @@ from bloombee.flexgen_utils.llama_config import get_llama_config, download_llama
 from bloombee.flexgen_utils.task import Task
 from transformers import AutoTokenizer
 import os
-from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage, log_mem
 from bloombee.utils.debug import dprint
 from bloombee.utils.debug_config import is_log_channel_enabled
 from hivemind.utils import get_logger
@@ -375,25 +374,15 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             model_name = model_name[:-3]
 
         self.llama_config.name = model_name
-        expanded_path = os.path.abspath(os.path.expanduser(
-            os.path.join(self.path, f"{model_name}-np")))
-        check_path = os.path.join(expanded_path, "embed_tokens.weight")
-        if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
-            if local_src_dir is not None:
-                from bloombee.flexgen_utils.llama_config import convert_local_llama_weights
-                convert_local_llama_weights(local_src_dir, model_name, self.path)
-            elif raw_path and "/" in raw_path:
-                # A real hub repo id: convert the actual repo's weights instead of
-                # guessing a huggyllama mirror (which only exists for canonical
-                # llama-7b/13b/30b/65b sizes and silently mismatches anything else,
-                # e.g. TinyLlama).
-                from huggingface_hub import snapshot_download
-                from bloombee.flexgen_utils.llama_config import convert_local_llama_weights
-                src_dir = snapshot_download(raw_path, allow_patterns=["*.safetensors", "*.bin", "*.json"])
-                convert_local_llama_weights(src_dir, model_name, self.path)
-            else:
-                download_llama_weights(self.llama_config.name, self.path)
-
+        from bloombee.flexgen_utils.llama_config import resolve_flexgen_llama_weights
+        expanded_path = resolve_flexgen_llama_weights(
+            path=self.path,
+            model_name=model_name,
+            raw_path=raw_path,
+            local_src_dir=local_src_dir,
+            revision=getattr(self.llama_config, "_bloombee_revision", None),
+            token=getattr(self.llama_config, "_bloombee_token", None),
+        )
         self.expanded_apth = expanded_path
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 
@@ -874,11 +863,6 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
 
 
 class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        #   Performance optimization: Pre-allocate attention_mask cache
-        self._attention_mask_cache = {}
-    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -907,20 +891,18 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             # print(f' WrappedLlamaBlock.forward: position_ids shape={position_ids.shape}, content={position_ids}')
 
         # print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}, past_key_value: {past_key_value}")
-        #   Optimized: Reuse cached attention_mask
+        # Decode past_len changes every step, so an unbounded per-length dict
+        # never hits and grows with sequence length. Build the mask each call.
         if attention_mask is None:
-            cache_key = (batch_size, seq_length, past_key_values_length, hidden_states.device, hidden_states.dtype)
-            if cache_key not in self._attention_mask_cache:
-                base_mask = torch.ones(
-                    (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
-                )
-                self._attention_mask_cache[cache_key] = _prepare_4d_causal_attention_mask(
-                    attention_mask=base_mask,
-                    input_shape=(batch_size, seq_length),
-                    inputs_embeds=hidden_states,
-                    past_key_values_length=past_key_values_length,
-                )
-            attention_mask = self._attention_mask_cache[cache_key]
+            base_mask = torch.ones(
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
+            )
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask=base_mask,
+                input_shape=(batch_size, seq_length),
+                inputs_embeds=hidden_states,
+                past_key_values_length=past_key_values_length,
+            )
         if attention_mask.dim() == 3:
             attention_mask = attention_mask.unsqueeze(1)
         elif attention_mask.dim() == 4:
@@ -1033,7 +1015,15 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
     def load_lm_head(self):
         expanded_path = self.expanded_apth
         self.input_layernorm.load_weight(expanded_path)
-        self.lm_head.load_weight(expanded_path)
+        head_path = expanded_path
+        # Safetensors may omit the duplicate LM head for tied embeddings.
+        # Reuse the embedding only when the model explicitly declares tying.
+        if (
+            getattr(self.config, "tie_word_embeddings", False)
+            and not os.path.isfile(os.path.join(expanded_path, "lm_head.weight"))
+        ):
+            head_path = os.path.join(expanded_path, "embed_tokens.weight")
+        self.lm_head.load_weight(head_path)
 
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):

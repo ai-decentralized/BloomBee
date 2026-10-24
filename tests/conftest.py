@@ -1,6 +1,6 @@
 import asyncio
 import gc
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 
 import psutil
 import pytest
@@ -9,6 +9,36 @@ from hivemind.utils.logging import get_logger
 from hivemind.utils.mpfuture import MPFuture
 
 logger = get_logger(__name__)
+
+
+@pytest.fixture
+def local_remote_layers():
+    """Replace network transport while retaining the production generation stack."""
+    import torch
+
+    class LocalRemoteLayers(torch.nn.Module):
+        def __init__(self, config, dht=None):
+            super().__init__()
+            self.active_session = None
+
+        @property
+        def position(self):
+            return self.active_session.position if self.active_session is not None else 0
+
+        @contextmanager
+        def use_session(self, session):
+            previous = self.active_session
+            self.active_session = session
+            try:
+                yield session
+            finally:
+                self.active_session = previous
+
+        def forward(self, hidden_states, **kwargs):
+            self.active_session.position += hidden_states.shape[1]
+            return hidden_states
+
+    return LocalRemoteLayers
 
 
 @pytest.fixture

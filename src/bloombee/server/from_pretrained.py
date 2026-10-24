@@ -17,7 +17,6 @@ import safetensors
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-# from accelerate.utils import set_module_tensor_to_device
 from hivemind.utils.logging import get_logger
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import EntryNotFoundError
@@ -45,11 +44,8 @@ from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, TorchTensor
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
-import numpy as np
-# import pdb
 
 from bloombee.models.llama.flex_llama import load_weights_from_pytorch_model
-from bloombee.utils.memory_usage import log_mem
 import os
 
 
@@ -63,10 +59,10 @@ logger = get_logger(__name__)
 def load_pretrained_block(
     model_name: str,
     block_index: int,
-    env: ExecutionEnv,
-    policy: Policy,
-    weight_home: array_1d,
-    path: str,
+    env: Optional[ExecutionEnv] = None,
+    policy: Optional[Policy] = None,
+    weight_home: Optional[array_1d] = None,
+    path: Optional[str] = None,
     *,
     config: Optional[PretrainedConfig] = None,
     torch_dtype: Union[torch.dtype, str] = "auto",
@@ -92,6 +88,11 @@ def load_pretrained_block(
             config._name_or_path = model_name
         except Exception:
             pass
+    try:
+        config._bloombee_revision = revision
+        config._bloombee_token = token
+    except Exception:
+        pass
 
     use_native_flexgen_llama_tp = (
         getattr(config, "model_type", None) == "llama"
@@ -110,6 +111,10 @@ def load_pretrained_block(
         WrappedNemotronHBlock,
         WrappedGlm4MoeLiteBlock,
     )
+
+    needs_flexgen = (not _is_hf_model) and getattr(config, "model_type", None) != "gpt_oss"
+    if needs_flexgen and None in (env, policy, weight_home, path):
+        raise TypeError("LLaMA FlexGen load_pretrained_block requires env, policy, weight_home, and path")
 
     if use_native_flexgen_llama_tp:
         with init_empty_weights():
@@ -132,6 +137,7 @@ def load_pretrained_block(
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
         block = _load_hf_block_weights(
             block, model_name, block_index, config,
+            revision=revision,
             token=token, cache_dir=cache_dir, max_disk_space=max_disk_space, torch_dtype=torch_dtype,
         )
     else:
@@ -150,6 +156,11 @@ def load_pretrained_block(
                 config._name_or_path = model_name
             except Exception:
                 pass
+        try:
+            config._bloombee_revision = revision
+            config._bloombee_token = token
+        except Exception:
+            pass
         with init_empty_weights():
             logger.debug('load_pretrained_block: init_empty_weights()')
             block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
@@ -158,6 +169,10 @@ def load_pretrained_block(
 
 
 _DEEPSEEKV3_LEGACY_EXPERT_KEY_RE = re.compile(r"^(.*mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+_MIXTRAL_LEGACY_EXPERT_KEY_RE = re.compile(
+    r"^(.*)block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$"
+)
+_MIXTRAL_LEGACY_GATE_KEY_RE = re.compile(r"^(.*)block_sparse_moe\.gate\.(weight|bias)$")
 
 
 def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
@@ -241,12 +256,98 @@ def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
     return state_dict
 
 
+def _remap_mixtral_expert_state_dict(state_dict: "StateDict") -> "StateDict":
+    """Map Hub Mixtral per-expert keys onto Transformers 5 packed experts.
+
+    Official checkpoints store:
+        block_sparse_moe.gate.weight
+        block_sparse_moe.experts.{i}.w1.weight  [intermediate, hidden]  (gate)
+        block_sparse_moe.experts.{i}.w3.weight  [intermediate, hidden]  (up)
+        block_sparse_moe.experts.{i}.w2.weight  [hidden, intermediate]  (down)
+    Transformers 5 ``MixtralDecoderLayer`` uses:
+        mlp.gate.weight
+        mlp.experts.gate_up_proj  [E, 2*intermediate, hidden]  (w1 then w3)
+        mlp.experts.down_proj     [E, hidden, intermediate]    (w2)
+    """
+    per_expert = defaultdict(dict)
+    for key in list(state_dict.keys()):
+        m = _MIXTRAL_LEGACY_EXPERT_KEY_RE.match(key)
+        if m is None:
+            continue
+        stem, expert_idx, proj = m.group(1), int(m.group(2)), m.group(3)
+        per_expert[(stem, expert_idx)][proj] = state_dict.pop(key)
+
+    for key in list(state_dict.keys()):
+        m = _MIXTRAL_LEGACY_GATE_KEY_RE.match(key)
+        if m is None:
+            continue
+        stem, leaf = m.group(1), m.group(2)
+        state_dict[f"{stem}mlp.gate.{leaf}"] = state_dict.pop(key)
+
+    if not per_expert:
+        return state_dict
+
+    by_stem = defaultdict(dict)
+    for (stem, expert_idx), tensors in per_expert.items():
+        by_stem[stem][expert_idx] = tensors
+    per_expert.clear()
+
+    for stem, experts_by_idx in by_stem.items():
+        num_experts = max(experts_by_idx) + 1
+        missing = [i for i in range(num_experts) if i not in experts_by_idx]
+        if missing:
+            raise ValueError(
+                f"{stem}block_sparse_moe: missing expert indices {missing} while remapping "
+                f"legacy Mixtral weights (found {sorted(experts_by_idx)})"
+            )
+        sample = experts_by_idx[0].get("w1")
+        if sample is None:
+            raise ValueError(
+                f"{stem}block_sparse_moe.experts.0: missing w1 while remapping legacy Mixtral weights"
+            )
+        intermediate, hidden = sample.shape
+        dtype = sample.dtype
+        gate_up_proj = torch.empty((num_experts, 2 * intermediate, hidden), dtype=dtype)
+        down_proj = torch.empty((num_experts, hidden, intermediate), dtype=dtype)
+        required = ("w1", "w2", "w3")
+        for i in range(num_experts):
+            tensors = experts_by_idx.pop(i)
+            missing_proj = [name for name in required if name not in tensors]
+            if missing_proj:
+                raise ValueError(
+                    f"{stem}block_sparse_moe.experts.{i}: missing {missing_proj} "
+                    f"while remapping legacy Mixtral weights"
+                )
+            w1 = tensors.pop("w1")
+            w3 = tensors.pop("w3")
+            w2 = tensors.pop("w2")
+            if tuple(w1.shape) != (intermediate, hidden) or tuple(w3.shape) != (intermediate, hidden):
+                raise ValueError(
+                    f"{stem}block_sparse_moe.experts.{i}: expected w1/w3 "
+                    f"{(intermediate, hidden)}, got w1={tuple(w1.shape)} w3={tuple(w3.shape)}"
+                )
+            if tuple(w2.shape) != (hidden, intermediate):
+                raise ValueError(
+                    f"{stem}block_sparse_moe.experts.{i}: expected w2 "
+                    f"{(hidden, intermediate)}, got {tuple(w2.shape)}"
+                )
+            gate_up_proj[i, :intermediate] = w1
+            gate_up_proj[i, intermediate:] = w3
+            down_proj[i] = w2
+        prefix = f"{stem}mlp.experts"
+        state_dict[f"{prefix}.gate_up_proj"] = gate_up_proj
+        state_dict[f"{prefix}.down_proj"] = down_proj
+
+    return state_dict
+
+
 def _load_hf_block_weights(
     block: nn.Module,
     model_name: str,
     block_index: int,
     config: PretrainedConfig,
     *,
+    revision: Optional[str] = None,
     token: Optional[Union[str, bool]],
     cache_dir: str,
     max_disk_space: Optional[int],
@@ -254,10 +355,11 @@ def _load_hf_block_weights(
 ) -> nn.Module:
     """Load HF state dict weights into a block for non-FlexGen models (Falcon, Mixtral)."""
     block_prefix = f"{config.block_prefix}.{block_index}."
-    logger.info(f"Loading HF weights for {block_prefix} from {model_name}")
+    logger.info(f"Loading HF weights for {block_prefix} from {model_name} revision={revision}")
     state_dict = _load_state_dict_from_repo(
         model_name,
         block_prefix,
+        revision=revision,
         token=token,
         cache_dir=cache_dir,
         max_disk_space=max_disk_space,
@@ -267,15 +369,20 @@ def _load_hf_block_weights(
         return block.load_checkpoint_state(state_dict, torch_dtype)
     if isinstance(block, WrappedDeepseekV3Block):
         state_dict = _remap_deepseekv3_expert_state_dict(state_dict)
-        result = block.load_state_dict(state_dict, strict=False)
-        if result.missing_keys or result.unexpected_keys:
-            logger.warning(
-                f"{block_prefix}: state_dict load left {len(result.missing_keys)} missing and "
-                f"{len(result.unexpected_keys)} unexpected key(s) -- weights may be incomplete. "
-                f"missing={result.missing_keys[:10]} unexpected={result.unexpected_keys[:10]}"
-            )
-    else:
-        block.load_state_dict(state_dict, strict=False)
+    elif isinstance(block, WrappedMixtralBlock):
+        state_dict = _remap_mixtral_expert_state_dict(state_dict)
+    # Bare decoder layers have initialized parameters even before loading.
+    # Reject incomplete checkpoints before mutating the block, while allowing
+    # optional/generated buffers (e.g. rotary frequencies) to be absent.
+    missing_parameters = sorted(set(dict(block.named_parameters())) - state_dict.keys())
+    if missing_parameters:
+        raise ValueError(
+            f"Incomplete checkpoint for {block_prefix} from {model_name}: "
+            f"missing required parameters {missing_parameters}"
+        )
+    result = block.load_state_dict(state_dict, strict=False)
+    if result.unexpected_keys:
+        logger.warning(f"{block_prefix}: ignoring unexpected checkpoint keys {result.unexpected_keys[:10]}")
     return block.to(dtype=torch_dtype)
 
 
@@ -296,7 +403,13 @@ def _load_state_dict_from_repo(
 
     index_file = _find_index_file(model_name, revision=revision, token=token, cache_dir=cache_dir)
     if index_file.endswith(".index.json"):  # Sharded model
-        path = get_file_from_repo(model_name, filename=index_file, use_auth_token=token, cache_dir=cache_dir)
+        path = get_file_from_repo(
+            model_name,
+            filename=index_file,
+            revision=revision,
+            use_auth_token=token,
+            cache_dir=cache_dir,
+        )
         if path is None:
             # _find_index_file() told that a file exists but we can't get it (e.g., it just disappeared)
             raise ValueError(f"Failed to get file {index_file}")
@@ -427,135 +540,3 @@ def _load_state_dict_from_local_file(path: str, *, block_prefix: Optional[str] =
             return res
 
     raise ValueError(f"Unknown weight format: {path}")
-
-def get_choice(cur_percent, percents, choices):
-    percents = np.cumsum(percents)
-    assert np.abs(percents[-1] - 100) < 1e-5
-
-    for i in range(len(percents)):
-        if cur_percent < percents[i]:
-            return choices[i]
-    return choices[-1]
-
-def set_module_tensor_to_device(
-    module: nn.Module,
-    tensor_name: str,
-    device: Union[int, str, torch.device],
-    # weight: TorchTensor,
-    value: Optional[torch.Tensor] = None,
-    dtype: Optional[Union[str, torch.dtype]] = None,
-    fp16_statistics: Optional[torch.HalfTensor] = None,
-    tied_params_map: Optional[Dict[int, Dict[torch.device, torch.Tensor]]] = None,
-):
-    
-    # Recurse if needed
-    if "." in tensor_name:
-        splits = tensor_name.split(".")
-        for split in splits[:-1]:
-            new_module = getattr(module, split)
-            if new_module is None:
-                raise ValueError(f"{module} has no attribute {split}.")
-            module = new_module
-        tensor_name = splits[-1]
-    # import pdb; pdb.set_trace() 
-    # module._parameters: OrderedDict([('weight', Parameter containing: tensor(..., device='meta', size=(4096, 4096), requires_grad=True)), ('bias', None)])
-    if tensor_name not in module._parameters and tensor_name not in module._buffers:
-        raise ValueError(f"{module} does not have a parameter or a buffer named {tensor_name}.")
-    is_buffer = tensor_name in module._buffers #-------
-    old_value = getattr(module, tensor_name)#---------
-
-    if (
-        value is not None
-        and tied_params_map is not None
-        and value.data_ptr() in tied_params_map
-        and device in tied_params_map[value.data_ptr()]
-    ):
-        module._parameters[tensor_name] = tied_params_map[value.data_ptr()][device]
-        return
-    elif (
-        tied_params_map is not None
-        and old_value.data_ptr() in tied_params_map
-        and device in tied_params_map[old_value.data_ptr()]
-    ):
-        module._parameters[tensor_name] = tied_params_map[old_value.data_ptr()][device]
-        return
-
-    if old_value.device == torch.device("meta") and device not in ["meta", torch.device("meta")] and value is None:
-        raise ValueError(f"{tensor_name} is on the meta device, we need a `value` to put in on {device}.")
-    param = module._parameters[tensor_name] if tensor_name in module._parameters else None
-    param_cls = type(param) # param_cls is <class 'torch.nn.parameter.Parameter'>
-    if value is not None:
-        # Check shape mismatch (bitsandbytes quantization is not used, so no special handling needed)
-        if old_value.shape != value.shape:
-            raise ValueError(
-                f'Trying to set a tensor of shape {value.shape} in "{tensor_name}" (which has shape {old_value.shape}), this looks incorrect.'
-            )
-
-        if dtype is None:
-            # For compatibility with PyTorch load_state_dict which converts state dict dtype to existing dtype in model
-            value = value.to(old_value.dtype)
-        elif not str(value.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
-            value = value.to(dtype) #------------
-
-    with torch.no_grad(): #------------
-        # leave it on cpu first before moving them to cuda
-        # Note: bitsandbytes quantization is not used, so no special device handling needed
-        # # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16)).
-        if isinstance(device, int):
-            if is_npu_available():
-                device = f"npu:{device}"
-            elif is_mlu_available():
-                device = f"mlu:{device}"
-            elif is_musa_available():
-                device = f"musa:{device}"
-            elif is_xpu_available():
-                device = f"xpu:{device}"
-        if "xpu" in str(device) and not is_xpu_available():
-            raise ValueError(f'{device} is not available, you should use device="cpu" instead')
-        if value is None:
-            new_value = old_value.to(device)
-            if dtype is not None and device in ["meta", torch.device("meta")]:
-                if not str(old_value.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
-                    new_value = new_value.to(dtype)
-
-                if not is_buffer:
-                    module._parameters[tensor_name] = param_cls(new_value, requires_grad=old_value.requires_grad)
-        elif isinstance(value, torch.Tensor):
-            new_value = value.to(device) #------------
-        else:
-            new_value = torch.tensor(value, device=device)
-        if is_buffer:
-            module._buffers[tensor_name] = new_value
-        elif value is not None or not check_device_same(torch.device(device), module._parameters[tensor_name].device):
-            param_cls = type(module._parameters[tensor_name]) #------------
-            # Note: bitsandbytes quantization is not used, so no special handling for Int8Params, Params4bit, etc.
-            # Standard parameter handling only
-            if param_cls.__name__ in ["QTensor", "QBitsTensor"]:
-                new_value = torch.nn.Parameter(new_value, requires_grad=old_value.requires_grad).to(device)
-            elif param_cls.__name__ in ["AffineQuantizedTensor"]:
-                new_value = torch.nn.Parameter(
-                    param_cls(
-                        new_value.layout_tensor,
-                        new_value.block_size,
-                        new_value.shape,
-                        new_value.quant_min,
-                        new_value.quant_max,
-                        new_value.zero_point_domain,
-                    ),
-                    requires_grad=old_value.requires_grad,
-                ).to(device)
-            else:
-                new_value = param_cls(new_value, requires_grad=old_value.requires_grad).to(device)
-
-            # module._parameters[tensor_name] = weight.data #######------------
-            # compare_tensors(new_value, weight.data)
-            
-            module._parameters[tensor_name] = new_value #######------------
-            if fp16_statistics is not None:
-                module._parameters[tensor_name].SCB = fp16_statistics.to(device)
-                del fp16_statistics
-            # Note: bitsandbytes Linear8bitLt and Linear4bit handling removed (not used)
-    if device != "cpu": #---------
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    

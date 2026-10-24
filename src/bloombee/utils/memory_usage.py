@@ -9,13 +9,6 @@ import logging
 _mbpipe_mem_logger = logging.getLogger('bloombee.mbpipe_memory')
 _mbpipe_mem_logger.setLevel(logging.INFO)
 
-def nvidia_smi_usage():
-	nvmlInit()
-	handle = nvmlDeviceGetHandleByIndex(0)
-	info = nvmlDeviceGetMemoryInfo(handle)
-	return (info.used) / 1024 / 1024 / 1024
-
-
 # =============================================================================
 # [MBPIPE_DEBUG] Micro-batch Memory Debugging Utilities
 # =============================================================================
@@ -222,17 +215,6 @@ def see_memory_usage(message: str, force: bool = True):
 	report += f"Memory Allocated: {stats['torch_allocated']:.2f} GB\n"
 	report += f"Max Memory Allocated: {stats['torch_max_allocated']:.2f} GB\n"
 	print(report)
-
-def memlog_enabled() -> bool:
-	"""Return True if memory logging is enabled via env var BB_MEMLOG."""
-	val = os.environ.get("BB_MEMLOG", "0")
-	return str(val).lower() in ("1", "true", "yes", "on")
-
-def log_mem(message: str):
-    """Conditionally log memory usage when BB_MEMLOG is enabled."""
-    # if memlog_enabled():
-    #     see_memory_usage(message)
-    pass
 
 def profile_weight_init(func):
 	"""Decorator to profile memory usage during weight initialization."""

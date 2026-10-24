@@ -111,15 +111,24 @@ class WrappedGemma4Block(_BaseDecoderLayer):
         # Same fp16/bf16 rotary buffer guard as Qwen3: keep inv_freq buffers
         # in fp32 even after the module is cast to half-precision. Gemma-4's
         # rotary stores one pair per layer type, so we walk both.
-        out = super()._apply(fn, recurse=recurse)
+        # Save the original tensors BEFORE dtype conversion; casting rounded
+        # fp16/bf16 values back to fp32 cannot recover their original precision.
         rot = getattr(self, "_rotary_emb", None)
+        rotary_buffers = {}
         if rot is not None:
             for layer_type in getattr(rot, "layer_types", ()):
                 for suffix in ("inv_freq", "original_inv_freq"):
                     name = f"{layer_type}_{suffix}"
-                    buf = getattr(rot, name, None)
-                    if buf is not None and buf.is_floating_point() and buf.dtype != torch.float32:
-                        rot.register_buffer(name, buf.float(), persistent=False)
+                    value = getattr(rot, name, None)
+                    if value is not None and value.is_floating_point():
+                        rotary_buffers[name] = value
+        out = super()._apply(fn, recurse=recurse)
+        if rot is not None:
+            for name, value in rotary_buffers.items():
+                target = getattr(rot, name)
+                # setattr preserves whether HF registered a buffer or used a
+                # plain tensor attribute.
+                setattr(rot, name, value.to(device=target.device, dtype=torch.float32))
         return out
 
     def forward(

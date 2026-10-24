@@ -679,11 +679,6 @@ class Wrapped{{ M }}Block(Optimized{{ M }}DecoderLayer):
       - (optionally) build HF-style 4D causal masks
       - delegate to Optimized{{ M }}DecoderLayer.forward
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Pre-allocate attention_mask cache
-        self._attention_mask_cache = {}
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -707,20 +702,16 @@ class Wrapped{{ M }}Block(Optimized{{ M }}DecoderLayer):
             {% endif %}
 
         {% if prepare_mask_with_hf %}
-        # Optimized: Reuse cached attention_mask
         if attention_mask is None:
-            cache_key = (batch_size, seq_length, past_key_values_length, hidden_states.device, hidden_states.dtype)
-            if cache_key not in self._attention_mask_cache:
-                base_mask = torch.ones(
-                    (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
-                )
-                self._attention_mask_cache[cache_key] = _prepare_4d_causal_attention_mask(
-                    attention_mask=base_mask,
-                    input_shape=(batch_size, seq_length),
-                    inputs_embeds=hidden_states,
-                    past_key_values_length=past_key_values_length,
-                )
-            attention_mask = self._attention_mask_cache[cache_key]
+            base_mask = torch.ones(
+                (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
+            )
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask=base_mask,
+                input_shape=(batch_size, seq_length),
+                inputs_embeds=hidden_states,
+                past_key_values_length=past_key_values_length,
+            )
         else:
             attention_mask = _prepare_4d_causal_attention_mask(
                 attention_mask=attention_mask,

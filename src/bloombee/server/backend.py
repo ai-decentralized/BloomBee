@@ -21,7 +21,7 @@ from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor, nested_flatten
-from bloombee.utils.misc import get_size_in_bytes, is_dummy
+from bloombee.utils.misc import flag_to_bool, get_size_in_bytes, is_dummy, slice_batch_aligned
 from bloombee.utils.memory_usage import see_memory_usage
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -32,7 +32,6 @@ from bloombee.utils.microbatch_config import (
 )
 from bloombee.utils.real_activation_dumper import capture_activation
 from pynvml import *
-import logging
 import time
 import threading
 
@@ -40,22 +39,6 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
-
-# Create dedicated offloading debug logger
-offload_logger = logging.getLogger('bloombee.offloading')
-offload_logger.setLevel(logging.INFO)
-
-
-def _flag_to_bool(value) -> bool:
-    # Hoisted from inference_step: the closure redefinition was ~1 alloc/step.
-    if value is None:
-        return False
-    if torch.is_tensor(value):
-        if value.numel() == 0:
-            return False
-        return bool(value.bool().any().item())
-    return bool(value)
-
 
 _STEP_PROFILE_ENABLED = os.environ.get("BLOOMBEE_STEP_PROFILE", "0") == "1"
 _STEP_PROFILE_INTERVAL = int(os.environ.get("BLOOMBEE_STEP_PROFILE_INTERVAL", "32"))
@@ -245,7 +228,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # per distinct (B, src_len, device) triple instead of every step.
         # At B=32 × 40 layers × 128 decode steps this removes ~160k
         # per-step allocs of a float32 tensor that's otherwise constant.
-        self._decode_mask_scores_cache: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
+        # Decode-path mask scores: a single growable zeros tensor per backend.
+        # Caching every (B, src_len) copy would grow as O(L^2) over a long session.
+        self._decode_mask_zeros: Optional[torch.Tensor] = None
 
         # Decide device placement policy for module based on offloading policy
         offload_policy = cache_manager.offloading_policy
@@ -288,6 +273,21 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             return False
         expected = torch.arange(hypo_ids.numel(), device=hypo_ids.device, dtype=hypo_ids.dtype)
         return torch.equal(hypo_ids, expected)
+
+    def _get_decode_mask_scores(self, batch_size: int, src_len: int, device: torch.device) -> torch.Tensor:
+        buf = self._decode_mask_zeros
+        if (
+            buf is None
+            or buf.device != device
+            or buf.dtype != torch.float32
+            or buf.shape[0] < batch_size
+            or buf.shape[-1] < src_len
+        ):
+            new_b = batch_size if buf is None else max(int(buf.shape[0]), batch_size)
+            new_s = src_len if buf is None else max(int(buf.shape[-1]), src_len)
+            self._decode_mask_zeros = torch.zeros(new_b, 1, new_s, dtype=torch.float32, device=device)
+            buf = self._decode_mask_zeros
+        return buf[:batch_size, :, :src_len]
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step.
@@ -407,17 +407,33 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             return int(cache_hd)
         per_layer_configs = getattr(self.config, "per_layer_config", None)
         if per_layer_configs:
-            block_index = self.block_index
-            if block_index is not None and 0 <= block_index < len(per_layer_configs):
-                return int(per_layer_configs[block_index].head_dim)
-            return int(per_layer_configs[0].head_dim)
+            try:
+                block_index = self.block_index
+                if block_index is not None and 0 <= block_index < len(per_layer_configs):
+                    layer_cfg = per_layer_configs[block_index]
+                else:
+                    layer_cfg = per_layer_configs[0]
+                hd = getattr(layer_cfg, "head_dim", None)
+                if hd:
+                    return int(hd)
+            except (TypeError, IndexError, AttributeError):
+                pass
 
-        default_hd = getattr(self.config, "head_dim", None) or (
-            self.config.hidden_size // self.config.num_attention_heads
-        )
+        try:
+            default_hd = getattr(self.config, "head_dim", None)
+        except AttributeError:
+            default_hd = None
+        if not default_hd:
+            heads = getattr(self.config, "num_attention_heads", None) or getattr(
+                self.config, "n_head", None
+            )
+            default_hd = self.config.hidden_size // int(heads)
         layer_type = self._layer_type_for_this_block()
         if layer_type == "full_attention":
-            global_hd = getattr(self.config, "global_head_dim", None)
+            try:
+                global_hd = getattr(self.config, "global_head_dim", None)
+            except Exception:
+                global_hd = None
             if global_hd:
                 return int(global_hd)
         return int(default_hd)
@@ -654,7 +670,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if self._is_spec_decoding:
             self.cache_manager.update_cache_and_async_reorder(
                 new_kvs,
-                self._slice_batch_aligned(
+                slice_batch_aligned(
                     kv_cache_position_ids,
                     inference_info.batch_offset,
                     inference_info.batch_offset + inference_info.micro_batch_size,
@@ -741,7 +757,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if ids.ndim == 1:
             ids = ids.unsqueeze(0)
         if ids.ndim >= 2 and ids.shape[0] != batch_size:
-            ids = self._slice_batch_aligned(
+            ids = slice_batch_aligned(
                 ids,
                 batch_offset,
                 batch_offset + batch_size,
@@ -791,7 +807,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         """
         mask = local_tree_mask
         if mask.ndim >= 3 and mask.shape[0] != batch_size:
-            mask = self._slice_batch_aligned(
+            mask = slice_batch_aligned(
                 mask,
                 batch_offset,
                 batch_offset + batch_size,
@@ -940,8 +956,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
                 # Parse flags per request (not just first-ever call), otherwise spec/non-spec
                 # mode can get stuck after the first request served by this backend.
-                self._need_pruning = _flag_to_bool(inference_info.need_pruning)
-                requested_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
+                self._need_pruning = flag_to_bool(inference_info.need_pruning)
+                requested_spec_decoding = flag_to_bool(inference_info.is_spec_dec)
                 self._is_spec_decoding = requested_spec_decoding
                 if self._need_pruning and self.pruner_manager is None:
                     logger.debug(
@@ -975,18 +991,40 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # use_cache), then treat downstream as identity. Subsequent smaller
                 # steps then read/write the contiguous first B_active rows.
                 row_perm_applied = False
+                full_batch_size = int(inference_info.full_batch_size or 0) or int(hidden_states.shape[0])
+                batch_offset = int(getattr(inference_info, "batch_offset", 0) or 0)
                 if (
                     hypo_ids is not None
                     and not is_dummy(hypo_ids)
                     and hypo_ids.ndim == 1
                     and hypo_ids.numel() > 0
-                    and not self._is_identity_hypo_ids(hypo_ids)
-                    and self._layer_type_for_this_block()
-                    not in ("linear_attention", "moe", "mlp")
+                    and self._layer_type_for_this_block() not in ("linear_attention", "moe", "mlp")
                 ):
-                    self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
-                    hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
-                    row_perm_applied = True
+                    if hypo_ids.numel() == full_batch_size:
+                        if batch_offset == 0 and not self._is_identity_hypo_ids(hypo_ids):
+                            self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
+                            row_perm_applied = True
+                        hypo_ids = torch.arange(batch_size, dtype=hypo_ids.dtype, device=hypo_ids.device)
+                    else:
+                        expected_global = torch.arange(
+                            batch_offset,
+                            batch_offset + hypo_ids.numel(),
+                            device=hypo_ids.device,
+                            dtype=hypo_ids.dtype,
+                        )
+                        if torch.equal(hypo_ids, expected_global) or self._is_identity_hypo_ids(hypo_ids):
+                            hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
+                        elif batch_offset == 0:
+                            self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
+                            row_perm_applied = True
+                            hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
+                        else:
+                            logger.warning(
+                                "Skipping sliced non-identity hypo_ids at batch_offset=%s; "
+                                "row permutation must be applied once at request scope",
+                                batch_offset,
+                            )
+                            hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
 
                 logger.debug(f"[MB_DEBUG] backend.inference_step: uid={inference_info.uid}, "
                             f"batch_offset={inference_info.batch_offset}, "
@@ -1176,7 +1214,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         and torch.is_tensor(request_attention_mask)
                         and request_attention_mask.ndim == 2
                     ):
-                        request_attention_mask = self._slice_batch_aligned(
+                        request_attention_mask = slice_batch_aligned(
                             request_attention_mask,
                             inference_info.batch_offset,
                             inference_info.batch_offset + batch_size,
@@ -1202,14 +1240,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             attention_mask = self.convert_mask_to_scores(full_mask)
                     elif seq_len == 1 and cache_len >= 0 and not self._is_spec_decoding:
                         src_len = cache_len + 1
-                        cache_key = (batch_size, src_len, hidden_states.device)
-                        attention_mask = self._decode_mask_scores_cache.get(cache_key)
-                        if attention_mask is None:
-                            attention_mask = torch.zeros(
-                                batch_size, seq_len, src_len,
-                                dtype=torch.float, device=hidden_states.device,
-                            )
-                            self._decode_mask_scores_cache[cache_key] = attention_mask
+                        attention_mask = self._get_decode_mask_scores(
+                            batch_size, src_len, hidden_states.device
+                        )
                         full_mask = None
                     else:
                         full_mask = self._create_causal_attention_mask(
@@ -1625,7 +1658,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             # Only apply logical batch_offset slicing when the incoming tensor
             # still represents the full logical batch.
             if kv_cache_position_ids.ndim >= 2 and kv_cache_position_ids.shape[0] != B:
-                kv_cache_position_ids = self._slice_batch_aligned(
+                kv_cache_position_ids = slice_batch_aligned(
                     kv_cache_position_ids,
                     batch_offset,
                     batch_offset + B,
@@ -1652,7 +1685,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             if tree_attention_mask is not None and cache_len is not None and target_seq_len is not None:
                 tree_attention_mask = tree_attention_mask.to(device)
                 if tree_attention_mask.ndim >= 3 and tree_attention_mask.shape[0] != B:
-                    tree_attention_mask = self._slice_batch_aligned(
+                    tree_attention_mask = slice_batch_aligned(
                         tree_attention_mask,
                         batch_offset,
                         batch_offset + B,
@@ -1682,27 +1715,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             position_ids = base_positions.unsqueeze(1) + tree_position_ids.unsqueeze(0)
             
             return position_ids
-        
-    def _slice_batch_aligned(
-        self,
-        value: Any,
-        mb_start: int,
-        mb_end: int,
-        full_batch_size: int,
-    ) -> Any:
-        """
-        Slice tensor-like request fields only if they are batch-aligned.
-        Non-tensor / scalar / already-global fields are returned as-is.
-        """
-        if value is None or not torch.is_tensor(value):
-            return value
-        if is_dummy(value):
-            return value
-        if value.ndim == 0:
-            return value
-        if value.shape[0] == full_batch_size:
-            return value[mb_start:mb_end].contiguous()
-        return value
 
     def _normalize_kv_valid_lengths(
         self,
@@ -1869,8 +1881,6 @@ class _MergedInferenceStep:
     def __init__(self, backends: Dict[ExpertUID, TransformerBackend]):
         self.backends = backends
         self._call_count = 0  # Track number of calls for logging
-        # [KVCACHE_OFFLOAD] Track offloaded micro-batch slices: {(mb_offset, mb_size): (k_cpu, v_cpu)}
-        self._offloaded_slices: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         # Get cache_manager from first backend for offloading operations
         self._cache_manager = next(iter(backends.values())).cache_manager if backends else None
         self._kv_counter_keys = (
@@ -1896,76 +1906,6 @@ class _MergedInferenceStep:
             "gpu_reserved_mb",
             "gpu_max_alloc_mb",
         )
-
-    def _offload_completed_microbatch(self, k_cache: torch.Tensor, v_cache: torch.Tensor, 
-                                       mb_offset: int, mb_size: int, num_heads: int) -> None:
-        """
-        [KVCACHE_OFFLOAD] Copy micro-batch KV slice from GPU to CPU staging.
-        Called after all blocks complete for this micro-batch.
-        """
-        if k_cache is None or v_cache is None:
-            return
-        
-        # Calculate BH (batch * heads) slice for this micro-batch
-        BH_start = mb_offset * num_heads
-        BH_end = (mb_offset + mb_size) * num_heads
-        
-        try:
-            # k_cache shape: (S, BH_total, D), v_cache shape: (S, BH_total, D)
-            k_slice = k_cache[:, BH_start:BH_end, :].clone()
-            v_slice = v_cache[:, BH_start:BH_end, :]
-            
-            # Async copy to CPU (non-blocking for performance)
-            k_cpu = k_slice.to('cpu', non_blocking=True)
-            v_cpu = v_slice.to('cpu', non_blocking=True)
-            
-            # Store in offload tracking dict
-            key = (mb_offset, mb_size)
-            self._offloaded_slices[key] = (k_cpu, v_cpu)
-            
-            # Clear GPU slice (optional - helps memory but may not be needed if we just reuse)
-            # We don't zero it here as it may be reused in next iteration
-            
-            offload_logger.info(
-                f"[KVCACHE_OFFLOAD] Offloaded: mb_offset={mb_offset}, mb_size={mb_size}, "
-                f"BH=[{BH_start}:{BH_end}], k_shape={k_cpu.shape}"
-            )
-        except Exception as e:
-            offload_logger.warning(f"[KVCACHE_OFFLOAD] Offload failed: {e}")
-
-    def _prefetch_if_needed(self, k_cache: torch.Tensor, v_cache: torch.Tensor,
-                             mb_offset: int, mb_size: int, num_heads: int) -> None:
-        """
-        [KVCACHE_OFFLOAD] Copy micro-batch KV slice from CPU back to GPU if previously offloaded.
-        Called before processing a micro-batch.
-        """
-        key = (mb_offset, mb_size)
-        if key not in self._offloaded_slices:
-            return  # Not offloaded, nothing to prefetch
-        
-        if k_cache is None or v_cache is None:
-            return
-            
-        k_cpu, v_cpu = self._offloaded_slices[key]
-        
-        # Calculate BH slice
-        BH_start = mb_offset * num_heads
-        BH_end = (mb_offset + mb_size) * num_heads
-        
-        try:
-            # Async copy back to GPU
-            k_cache[:, BH_start:BH_end, :].copy_(k_cpu.to(k_cache.device, non_blocking=True))
-            v_cache[:, BH_start:BH_end, :].copy_(v_cpu.to(v_cache.device, non_blocking=True))
-            
-            # Remove from tracking
-            del self._offloaded_slices[key]
-            
-            offload_logger.info(
-                f"[KVCACHE_OFFLOAD] Prefetched: mb_offset={mb_offset}, mb_size={mb_size}, "
-                f"BH=[{BH_start}:{BH_end}]"
-            )
-        except Exception as e:
-            offload_logger.warning(f"[KVCACHE_OFFLOAD] Prefetch failed: {e}")
 
     def _snapshot_kv_timing(self) -> Optional[Dict[str, float]]:
         if self._cache_manager is None or not hasattr(self._cache_manager, "get_kv_timing_snapshot"):

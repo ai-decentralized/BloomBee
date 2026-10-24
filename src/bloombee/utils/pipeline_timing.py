@@ -6,7 +6,6 @@ import asyncio
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from time import perf_counter
 from time import perf_counter as _perf_counter
 from typing import Any, Callable, Deque, Optional
 
@@ -15,11 +14,6 @@ from bloombee.utils.microbatch_config import MBPIPE_LOG_PREFIX, mbpipe_info_logs
 # =============================================================================
 # Stage Timing Infrastructure for Cross-Stage Pipeline Overlap
 # =============================================================================
-
-from dataclasses import dataclass, field
-from time import perf_counter
-from collections import deque
-from typing import Deque
 
 
 @dataclass

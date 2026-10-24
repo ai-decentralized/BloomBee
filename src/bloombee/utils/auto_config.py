@@ -53,21 +53,16 @@ class _AutoDistributedBase:
 
 
 class DefaultRevisionMixin:
-    """
-    BloomBee only supports Falcon loaded in the new in-library format (transformers.FalconModel).
-    TII models were recently converted to this format but then reverted back due to compatibility issues.
-    We chose to support only the new format since HF staff promised to eventually convert these models
-    to the new format again, see https://huggingface.co/tiiuae/falcon-40b/discussions/90#64b4d23bf44fd957492f7602
-    Until it happens, we override the default `main` revision for the TII repos with the commit
-    pointing out to the model in the in-library format.
+    """Optional default revision overrides for HuggingFace ids.
+
+    Falcon used to be pinned to old in-library `.bin` commits because TII
+    briefly reverted `main`. Those pins now break Transformers 5 / recent
+    torch, which refuse `torch.load` on the `.bin` shards. Hub `main` ships
+    safetensors, so we no longer override the revision. Callers can still
+    pass an explicit `revision=`.
     """
 
-    DEFAULT_REVISIONS = {
-        "tiiuae/falcon-40b": "f1ba7d328c06aa6fbb4a8afd3c756f46d7e6b232",
-        "tiiuae/falcon-40b-instruct": "7475ff8cfc36ed9a962b658ae3c33391566a85a5",
-        "tiiuae/falcon-7b": "4e2d06f0a7c6370ebabbc30c6f59377ae8f73d76",
-        "tiiuae/falcon-7b-instruct": "f8dac3fff96d5debd43edf56fb4e1abcfffbef28",
-    }
+    DEFAULT_REVISIONS: dict[str, str] = {}
 
     @classmethod
     def from_pretrained(

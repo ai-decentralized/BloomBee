@@ -27,9 +27,14 @@ from hivemind.utils.streaming import split_for_streaming
 import bloombee
 from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, ModuleUID
 from bloombee.server.backend import TransformerBackend
+from bloombee.utils.backward_protocol import BACKWARD_CACHE_ID, BACKWARD_CHAIN_VERSION, BACKWARD_PROTOCOL_VERSION
 from bloombee.server.memory_cache import AllocationFailed
-from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
-from bloombee.server.microbatch import resolve_expected_num_microbatches
+from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_forward
+from bloombee.server.microbatch import (
+    MicrobatchStepTracker,
+    resolve_expected_num_microbatches,
+    s2s_extra_tensor_names,
+)
 from bloombee.server.s2s_flow import AdaptivePushConcurrency, S2SLinkTelemetry
 from bloombee.server.timing_summary import emit_session_timing_summary
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
@@ -66,6 +71,7 @@ from bloombee.utils.microbatch_schema import (
     MBPIPE_SCHEMA_PREFIX,
 )
 from bloombee.utils.p2p import apply_p2p_max_msg_size, get_default_p2p_max_msg_size
+from bloombee.utils.misc import dtype_name, flag_to_bool, to_int
 
 logger = get_logger(__name__)
 
@@ -263,10 +269,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._mb_expected: Dict[tuple, int] = {}
         # Key: (session_id, step_id) -> count of received micro-batches
         self._mb_received: Dict[tuple, int] = {}
-        # Key: (session_id, step_id) -> set of (mb_idx) already processed (idempotency)
-        self._mb_processed: Dict[tuple, set] = {}
-        self._mb_processed_timestamps: Dict[tuple, float] = {}
-        self._MB_PROCESSED_TTL = 120  # seconds
+        # Delivery/abort tracker: queued MBs are not replayed after a partial S2S failure.
+        self._mb_step_tracker = MicrobatchStepTracker(ttl_s=120.0)
+        self._MB_PROCESSED_TTL = 120  # seconds; kept for log compatibility
 
         # [CLOCK_SYNC] Per-peer clock offset estimator for cross-machine strict overlap.
         # offset_us is "remote_clock - local_clock" for the target peer.
@@ -313,13 +318,6 @@ class TransformerConnectionHandler(ConnectionHandler):
     @staticmethod
     def _now_us() -> int:
         return int(time.time() * 1_000_000)
-
-    @staticmethod
-    def _to_int(value: Any, default: int = 0) -> int:
-        try:
-            return int(value)
-        except Exception:
-            return default
 
     def _get_clock_sync_estimate(self, peer_id: str) -> Optional[Dict[str, int]]:
         state = self._clock_sync_state.get(peer_id)
@@ -385,8 +383,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         if not isinstance(response_meta, dict):
             return
 
-        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
-        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
+        receiver_recv_us = to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
+        receiver_ack_us = to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
         if receiver_recv_us <= 0 or receiver_ack_us <= 0 or sender_ack_us < sender_send_us:
             return
 
@@ -596,7 +594,16 @@ class TransformerConnectionHandler(ConnectionHandler):
             self._listener_task = asyncio.create_task(self._listen_to_event_queue())
         if args:
             apply_p2p_max_msg_size(args[0], self._p2p_max_msg_size)
+        if not hasattr(self, "_backward_service"):
+            from bloombee.server.backward_chain import BackwardService
+            self._backward_service = BackwardService(self)
+            await self._backward_service.start(args[0])
         await super().add_p2p_handlers(*args, **kwargs)
+
+    async def remove_p2p_handlers(self, p2p, **kwargs) -> None:
+        if hasattr(self, "_backward_service"):
+            await self._backward_service.close(p2p)
+        await super().remove_p2p_handlers(p2p, **kwargs)
 
     def shutdown(self):
         if self.is_alive():
@@ -681,16 +688,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points = metadata.get("points", 0)
                 session_id = metadata.get("session_id")
                 alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
-                def _flag_to_bool(value: Any) -> bool:
-                    if value is None:
-                        return False
-                    if torch.is_tensor(value):
-                        if value.numel() == 0:
-                            return False
-                        return bool(value.bool().any().item())
-                    return bool(value)
-
-                is_spec_request = _flag_to_bool(metadata.get("is_spec_dec", 0))
+                is_spec_request = flag_to_bool(metadata.get("is_spec_dec", 0))
                 if is_spec_request and not self._speculative_pruner_enabled:
                     logger.info(
                         f"{MBPIPE_LOG_PREFIX} Speculative decoding requested without an active pruner; "
@@ -1147,8 +1145,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         if not isinstance(response_meta, dict):
             return result
 
-        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
-        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
+        receiver_recv_us = to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
+        receiver_ack_us = to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
         if receiver_recv_us <= 0 or receiver_ack_us < receiver_recv_us or sender_ack_us < sender_send_us:
             return result
 
@@ -1315,6 +1313,19 @@ class TransformerConnectionHandler(ConnectionHandler):
                             )
                             request = None
                             skip_direct_request = True
+                        if (
+                            (not skip_direct_request)
+                            and session_id is not None
+                            and step_id is not None
+                            and self._mb_step_tracker.is_aborted((session_id, step_id))
+                        ):
+                            logger.warning(
+                                f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping full-batch replay for "
+                                f"aborted step_id={step_id} committed_mbs="
+                                f"{sorted(self._mb_step_tracker.received_indices((session_id, step_id)))}"
+                            )
+                            request = None
+                            skip_direct_request = True
 
                         if (not skip_direct_request) and (step_id is None or step_id not in processed_step_ids):
                             metadata["_queue_wait_ms"] = float(queue_wait_ms)
@@ -1388,9 +1399,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         if metadata.get("pushed"):
             sender_blocks = str(metadata.get("sender_blocks", "unknown"))
             receiver_blocks = str(metadata.get("receiver_blocks", "unknown"))
-            sender_send_us = self._to_int(metadata.get("clock_sync_sender_send_us"), 0)
-            sender_to_receiver_clock_offset_us = self._to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
-            sender_to_receiver_clock_samples = self._to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
+            sender_send_us = to_int(metadata.get("clock_sync_sender_send_us"), 0)
+            sender_to_receiver_clock_offset_us = to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
+            sender_to_receiver_clock_samples = to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
             clock_sync_ok = sender_to_receiver_clock_samples > 0
             raw_transfer_ms = (
                 max(0.0, (receive_us - sender_send_us) / 1000.0)
@@ -1451,6 +1462,33 @@ class TransformerConnectionHandler(ConnectionHandler):
         """
         session_id = metadata["session_id"]
         step_id = metadata.get("step_id")
+        if metadata.get("s2s_abort"):
+            mb_key = (session_id, step_id)
+            committed = self._mb_step_tracker.abort(mb_key)
+            logger.warning(
+                f"{MBPIPE_LOG_PREFIX} rpc_push abort: session={session_id} step={step_id} "
+                f"committed_mbs={sorted(committed)}"
+            )
+            self._mb_expected.pop(mb_key, None)
+            self._mb_received.pop(mb_key, None)
+            from bloombee.server.block_functions import _drop_mb_step_state
+            _drop_mb_step_state(mb_key, overlap=True, accum=True)
+            abort_metadata = dict(metadata)
+            abort_metadata["type"] = "micro_batch"
+            abort_metadata["s2s_abort"] = True
+            abort_item = create_microbatch_queue_item(
+                request_id=session_id,
+                step_id=step_id,
+                mb_idx=int(metadata.get("micro_batch_idx", -1)),
+                expected_num_mb=1,
+                payload=request,
+                metadata=abort_metadata,
+                offset=0,
+                size=0,
+                full_batch_size=int(metadata.get("full_batch_size", 1) or 1),
+            )
+            self._put_into_session_queue(session_id, abort_item)
+            return runtime_pb2.ExpertResponse()
         mb_idx = metadata.get("micro_batch_idx", 0)
         mb_offset = metadata.get("micro_batch_offset", 0)
         mb_size = metadata.get("micro_batch_size", 1)
@@ -1480,37 +1518,29 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         
         mb_key = (session_id, step_id)
-        
-        # [MBPIPE] Idempotency check - skip if already processed
-        if mb_key not in self._mb_processed:
-            self._mb_processed[mb_key] = set()
-            self._mb_processed_timestamps[mb_key] = time.monotonic()
-            # TTL cleanup: remove stale entries
-            now = time.monotonic()
-            stale_keys = [k for k, t in self._mb_processed_timestamps.items()
-                          if now - t > self._MB_PROCESSED_TTL]
-            for k in stale_keys:
-                self._mb_processed.pop(k, None)
-                self._mb_processed_timestamps.pop(k, None)
-        
-        if mb_idx in self._mb_processed[mb_key]:
+        decision = self._mb_step_tracker.decide(mb_key, int(mb_idx))
+        if decision == "aborted":
+            logger.warning(
+                f"{MBPIPE_LOG_PREFIX} rpc_push: rejecting mb_idx={mb_idx} because "
+                f"session={session_id} step={step_id} was aborted"
+            )
+            return runtime_pb2.ExpertResponse()
+        if decision == "duplicate":
             logger.info(
                 f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} already processed (idempotency), skipping"
             )
             return runtime_pb2.ExpertResponse()
-        
-        self._mb_processed[mb_key].add(mb_idx)
         metadata["s2s_receiver_receive_us"] = int(receive_us)
 
         # [S2S_WIRE] Sender->receiver micro-batch transport timing breakdown.
         # Uses sender->receiver clock offset when available to isolate pure wire time.
         sender_blocks = str(metadata.get("sender_blocks", "unknown"))
         receiver_blocks = str(metadata.get("receiver_blocks", "unknown"))
-        sender_send_us = self._to_int(metadata.get("clock_sync_sender_send_us"), 0)
-        sender_ser_start_us = self._to_int(metadata.get("s2s_sender_serialize_start_us"), 0)
-        sender_ser_end_us = self._to_int(metadata.get("s2s_sender_serialize_end_us"), 0)
-        sender_enqueue_us = self._to_int(metadata.get("s2s_sender_enqueue_us"), 0)
-        push_timestamp_us = self._to_int(metadata.get("stage_push_timestamp_us"), 0)
+        sender_send_us = to_int(metadata.get("clock_sync_sender_send_us"), 0)
+        sender_ser_start_us = to_int(metadata.get("s2s_sender_serialize_start_us"), 0)
+        sender_ser_end_us = to_int(metadata.get("s2s_sender_serialize_end_us"), 0)
+        sender_enqueue_us = to_int(metadata.get("s2s_sender_enqueue_us"), 0)
+        push_timestamp_us = to_int(metadata.get("stage_push_timestamp_us"), 0)
         sender_compute_to_serialize_start_ms = 0.0
         try:
             sender_compute_to_serialize_start_ms = float(
@@ -1524,9 +1554,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         except Exception:
             sender_sem_wait_ms = 0.0
 
-        sender_to_receiver_clock_offset_us = self._to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
-        sender_to_receiver_clock_rtt_us = max(0, self._to_int(metadata.get("sender_to_receiver_clock_rtt_us"), 0))
-        sender_to_receiver_clock_samples = self._to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
+        sender_to_receiver_clock_offset_us = to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
+        sender_to_receiver_clock_rtt_us = max(0, to_int(metadata.get("sender_to_receiver_clock_rtt_us"), 0))
+        sender_to_receiver_clock_samples = to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
         clock_sync_ok = sender_to_receiver_clock_samples > 0
 
         sender_serialize_ms = (
@@ -1654,12 +1684,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"(received={received_count}/{expected_num_mb})"
         )
 
-        # Cleanup tracking when all micro-batches for this step are queued.
+        # Drop assembly counters once the step is fully queued. Keep the
+        # delivery set so a late retry cannot replay committed micro-batches.
         if received_count >= expected_num_mb:
             self._mb_expected.pop(mb_key, None)
             self._mb_received.pop(mb_key, None)
-            self._mb_processed.pop(mb_key, None)
-            self._mb_processed_timestamps.pop(mb_key, None)
 
         return runtime_pb2.ExpertResponse()
 
@@ -1814,7 +1843,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             if os.environ.get("BLOOMBEE_DUMP_WIRE_ACTIVATIONS", "0") == "1" and next_tensors:
                 try:
                     push_hidden = deserialize_torch_tensor(next_tensors[0])
-                    push_hidden_dtype = str(push_hidden.dtype).replace("torch.", "") if torch.is_tensor(push_hidden) else ""
+                    push_hidden_dtype = dtype_name(push_hidden.dtype) if torch.is_tensor(push_hidden) else ""
                     capture_wire_activation(
                         push_hidden,
                         source="server",
@@ -2050,7 +2079,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # Serialize the micro-batch tensors
             outputs_schema = requested_backends[-1].decode_outputs_schema
-            sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
+            sender_compute_end_us = to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
             serialize_start_us = self._now_us()
             transport_phase = (
                 "spec_verify"
@@ -2061,9 +2090,22 @@ class TransformerConnectionHandler(ConnectionHandler):
             sender_blocks = sender_blocks_str
             push_blocks = f"{sender_blocks_str}->{next_start}:{next_end}"
             hidden_wire = mb_hidden.to(outputs_schema[0].dtype)
-            hidden_compute_dtype = str(mb_hidden.dtype).replace("torch.", "")
-            hidden_schema_dtype = str(outputs_schema[0].dtype).replace("torch.", "")
-            hidden_wire_dtype = str(hidden_wire.dtype).replace("torch.", "")
+            hidden_compute_dtype = dtype_name(mb_hidden.dtype)
+            hidden_schema_dtype = dtype_name(outputs_schema[0].dtype)
+            hidden_wire_dtype = dtype_name(hidden_wire.dtype)
+
+            def _push_debug_context(tensor_name: str, **extra: Any) -> dict:
+                ctx = {
+                    "phase": transport_phase,
+                    "tensor_name": tensor_name,
+                    "source": "server",
+                    "channel": "rpc_push_microbatch",
+                    "blocks": push_blocks,
+                    "batch": int(mb_size),
+                }
+                ctx.update(extra)
+                return ctx
+
             capture_wire_activation(
                 hidden_wire,
                 source="server",
@@ -2088,78 +2130,51 @@ class TransformerConnectionHandler(ConnectionHandler):
                     hidden_to_send,
                     _s2s_output_compression if _s2s_output_compression is not None else outputs_schema[0].compression,
                     allow_inplace=True,
-                    debug_context={
-                        "phase": transport_phase,
-                        "tensor_name": "hidden_states_int8" if quant_meta is not None else "hidden_states",
-                        "source": "server",
-                        "channel": "rpc_push_microbatch",
-                        "blocks": push_blocks,
-                        "batch": int(mb_size),
-                        "compute_dtype": hidden_compute_dtype,
-                        "schema_dtype": hidden_schema_dtype,
-                        "wire_dtype": hidden_wire_dtype,
-                        "upcast_suspect": int(
+                    debug_context=_push_debug_context(
+                        "hidden_states_int8" if quant_meta is not None else "hidden_states",
+                        compute_dtype=hidden_compute_dtype,
+                        schema_dtype=hidden_schema_dtype,
+                        wire_dtype=hidden_wire_dtype,
+                        upcast_suspect=int(
                             mb_hidden.dtype in (torch.float16, torch.bfloat16)
                             and outputs_schema[0].dtype == torch.float32
                         ),
-                    },
+                    ),
                 )
                 if mb_keep_indices is not None:
                     serialized_keep = serialize_torch_tensor(
                         mb_keep_indices.to(torch.int64),
                         outputs_schema[1].compression if len(outputs_schema) > 1 else runtime_pb2.CompressionType.NONE,
                         allow_inplace=True,
-                        debug_context={
-                            "phase": transport_phase,
-                            "tensor_name": "keep_indices",
-                            "source": "server",
-                            "channel": "rpc_push_microbatch",
-                            "blocks": push_blocks,
-                            "batch": int(mb_size),
-                        },
+                        debug_context=_push_debug_context("keep_indices"),
                     )
                 else:
                     serialized_keep = serialize_torch_tensor(
                         torch.arange(mb_hidden.shape[1], dtype=torch.int64),
                         runtime_pb2.CompressionType.NONE,
                         allow_inplace=True,
-                        debug_context={
-                            "phase": transport_phase,
-                            "tensor_name": "keep_indices",
-                            "source": "server",
-                            "channel": "rpc_push_microbatch",
-                            "blocks": push_blocks,
-                            "batch": int(mb_size),
-                        },
+                        debug_context=_push_debug_context("keep_indices"),
                     )
                 serialized_spec_tensors = []
-                if is_spec_push and spec_tensors:
-                    for tensor_name in (
-                        "tree_attention_mask",
-                        "kv_cache_position_ids",
-                        "draft_tokens",
-                        "prefill_length",
-                    ):
-                        value = spec_tensors.get(tensor_name)
-                        if value is None:
-                            value = torch.empty(0, dtype=torch.int64)
-                        elif not torch.is_tensor(value):
-                            value = torch.as_tensor(value)
-                        serialized_spec_tensors.append(
-                            serialize_torch_tensor(
-                                value,
-                                runtime_pb2.CompressionType.NONE,
-                                allow_inplace=True,
-                                debug_context={
-                                    "phase": transport_phase,
-                                    "tensor_name": tensor_name,
-                                    "source": "server",
-                                    "channel": "rpc_push_microbatch",
-                                    "blocks": push_blocks,
-                                    "batch": int(mb_size),
-                                },
-                            )
+                extra_names = s2s_extra_tensor_names(is_spec_push, spec_tensors)
+                if "tree_attention_mask" in extra_names and not is_spec_push:
+                    metadata["s2s_padding_mask"] = True
+                if "hypo_ids" in extra_names:
+                    metadata["s2s_hypo_ids"] = True
+                for tensor_name in extra_names:
+                    value = (spec_tensors or {}).get(tensor_name)
+                    if value is None:
+                        value = torch.empty(0, dtype=torch.int64)
+                    elif not torch.is_tensor(value):
+                        value = torch.as_tensor(value)
+                    serialized_spec_tensors.append(
+                        serialize_torch_tensor(
+                            value,
+                            runtime_pb2.CompressionType.NONE,
+                            allow_inplace=True,
+                            debug_context=_push_debug_context(tensor_name),
                         )
+                    )
                 serialized_scale = None
                 if quant_meta is not None:
                     if scale_tensor is None:
@@ -2168,14 +2183,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         scale_tensor,
                         runtime_pb2.CompressionType.NONE,
                         allow_inplace=True,
-                        debug_context={
-                            "phase": transport_phase,
-                            "tensor_name": "hidden_states_int8_scale",
-                            "source": "server",
-                            "channel": "rpc_push_microbatch",
-                            "blocks": push_blocks,
-                            "batch": int(mb_size),
-                        },
+                        debug_context=_push_debug_context("hidden_states_int8_scale"),
                     )
             serialize_end_perf = perf_counter()
             serialize_end_us = self._now_us()
@@ -2294,6 +2302,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                 # [MBPIPE_FIX] Critical for KV correctness on downstream stage:
                 # ensures each micro-batch of a step uses the same logical prefix.
                 "start_from_position",
+                "hypo_ids",
+                "s2s_padding_mask",
+                "s2s_hypo_ids",
             ]:
                 if key in metadata:
                     push_metadata[key] = metadata[key]
@@ -2461,7 +2472,22 @@ class TransformerConnectionHandler(ConnectionHandler):
                 )
                 await asyncio.sleep(synthetic_delay_ms / 1000.0)
 
-            response = await stub.rpc_push(request, timeout=self.request_timeout)
+            last_error = None
+            response = None
+            for attempt in range(3):
+                try:
+                    response = await stub.rpc_push(request, timeout=self.request_timeout)
+                    last_error = None
+                    break
+                except Exception as send_exc:
+                    last_error = send_exc
+                    logger.warning(
+                        f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send attempt {attempt + 1}/3 failed: {send_exc}"
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.05 * (attempt + 1))
+            if last_error is not None or response is None:
+                raise last_error if last_error is not None else RuntimeError("S2S rpc_push returned no response")
             sender_ack_us = self._now_us()
             rpc_timing = self._extract_rpc_push_timing(
                 response,
@@ -2515,6 +2541,26 @@ class TransformerConnectionHandler(ConnectionHandler):
             logger.warning(
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send failed: {e}"
             )
+            abort_meta = {
+                "session_id": push_metadata.get("session_id"),
+                "step_id": step_id,
+                "s2s_abort": True,
+                "pushed": True,
+                "is_microbatch_push": True,
+                "type": "micro_batch",
+            }
+            try:
+                abort_request = runtime_pb2.ExpertRequest(
+                    uid=next_uid,
+                    tensors=[],
+                    metadata=MSGPackSerializer.dumps(abort_meta),
+                )
+                await stub.rpc_push(abort_request, timeout=min(float(self.request_timeout), 2.0))
+            except Exception as abort_exc:
+                logger.warning(
+                    f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] failed to abort downstream "
+                    f"session={abort_meta.get('session_id')} step={step_id}: {abort_exc}"
+                )
         finally:
             if isinstance(request_metadata, dict):
                 _cleanup_s2s_local_shm_refs(request_metadata.get("_s2s_local_shm_refs"))
@@ -2522,6 +2568,26 @@ class TransformerConnectionHandler(ConnectionHandler):
             if release_slot and hasattr(self, "_push_limiter"):
                 measured_send_ms = send_time if send_time > 0 else (perf_counter() - send_start) * 1000.0
                 await self._push_limiter.release(send_time_ms=measured_send_ms, success=success)
+
+    async def _run_forward_with_cache(self, uid, tensors, backends, metadata, context):
+        active_adapter = self._get_active_adapter(metadata)
+        points = metadata.get("points", 0)
+        assert isinstance(points, (float, int)), f"Forward points must be numeric, got {points}"
+        cache_metadata = {}
+        if BACKWARD_CACHE_ID in metadata:
+            if metadata.get(BACKWARD_CHAIN_VERSION) != BACKWARD_PROTOCOL_VERSION:
+                raise ValueError("Client must use the cached backward protocol")
+            cache_metadata = self._backward_service.save(uid, tensors, metadata, context.remote_id)
+        try:
+            outputs = await run_rpc_forward(
+                *tensors, requested_backends=backends, prioritizer=self._prioritizer,
+                active_adapter=active_adapter, points=points,
+            )
+            return outputs, cache_metadata
+        except BaseException:
+            if cache_metadata:
+                self._backward_service.discard(metadata[BACKWARD_CACHE_ID])
+            raise
 
     async def rpc_forward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
         async with timeout(self.request_timeout):
@@ -2535,19 +2601,9 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
             metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_forward should have number of points as number or None, got {points}"
-
             forward_start_time = perf_counter()
-            hidden_states = await run_rpc_forward(
-                *flat_inputs,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
+            hidden_states, cache_metadata = await self._run_forward_with_cache(
+                request.uid, flat_inputs, requested_backends, metadata, context
             )
             forward_compute_ms = (perf_counter() - forward_start_time) * 1000
 
@@ -2562,7 +2618,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                            f"Output Shape: {hidden_states.shape}")
             
             return runtime_pb2.ExpertResponse(
-                tensors=self._serialize_outputs(hidden_states, requested_backends, metadata)
+                tensors=self._serialize_outputs(hidden_states, requested_backends, metadata),
+                metadata=MSGPackSerializer.dumps(cache_metadata),
             )
 
     async def rpc_forward_stream(
@@ -2575,24 +2632,14 @@ class TransformerConnectionHandler(ConnectionHandler):
             self._log_request("rpc_forward_stream", requested_uids, context)
 
             requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_forward_stream should have number of points as number or None, got {points}"
-
-            hidden_states = await run_rpc_forward(
-                *flat_inputs,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
+            hidden_states, cache_metadata = await self._run_forward_with_cache(
+                uid_str, flat_inputs, requested_backends, metadata, context
             )
 
             # Split the serialized_output for streaming and respond to client
             for tensor in self._serialize_outputs(hidden_states, requested_backends, metadata):
                 for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE):
-                    yield runtime_pb2.ExpertResponse(tensors=[part])
+                    yield runtime_pb2.ExpertResponse(tensors=[part], metadata=MSGPackSerializer.dumps(cache_metadata))
 
     def _serialize_outputs(
         self,
@@ -2618,56 +2665,15 @@ class TransformerConnectionHandler(ConnectionHandler):
         ]
 
     async def rpc_backward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
-        async with timeout(self.request_timeout):
-            # Parse requests and prepare backends
-            flat_tensors = [deserialize_torch_tensor(tensor) for tensor in request.tensors]
-            requested_uids = self._check_uids(request.uid)
-            self._log_request("rpc_backward", requested_uids, context)
-
-            requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-            metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_backward should have number of points as number or None, got {points}"
-
-            grads = await run_rpc_backward(
-                *flat_tensors,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
-            )
-
-            return runtime_pb2.ExpertResponse(tensors=self._serialize_grads(grads, requested_backends, metadata))
+        # Old client-relayed requests contain inputs/prompts and are rejected by
+        # the cached protocol. New requests address their owning handler namespace.
+        return await self._backward_service.rpc_backward(request, context)
 
     async def rpc_backward_stream(
         self, requests: AsyncIterator[runtime_pb2.ExpertRequest], context: P2PContext
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
-        async with timeout(self.request_timeout):
-            uids_header, flat_tensors, metadata = await self._gather_inputs(requests, context)
-            requested_uids = self._check_uids(uids_header)
-            self._log_request("rpc_backward_stream", requested_uids, context)
-
-            requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
-            active_adapter = self._get_active_adapter(metadata)
-            points = metadata.get("points", 0)
-            assert isinstance(
-                points, (float, int)
-            ), f"rpc_backward_stream should have number of points as number or None, got {points}"
-
-            grads = await run_rpc_backward(
-                *flat_tensors,
-                requested_backends=requested_backends,
-                prioritizer=self._prioritizer,
-                active_adapter=active_adapter,
-                points=points,
-            )
-            # Split the serialized_grad_inputs for streaming and respond
-            for tensor in self._serialize_grads(grads, requested_backends, metadata):
-                for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE):
-                    yield runtime_pb2.ExpertResponse(tensors=[part])
+        async for response in self._backward_service.rpc_backward_stream(requests, context):
+            yield response
 
     def _get_active_adapter(self, metadata: dict) -> str:
         active_adapter = metadata.get("active_adapter", "")
@@ -2920,6 +2926,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         result = {
             "version": bloombee.__version__,
             "dht_client_mode": self.dht.client_mode,
+            BACKWARD_CHAIN_VERSION: BACKWARD_PROTOCOL_VERSION if all(
+                getattr(item, "optimizer", None) is None for item in self.module_backends.values()
+            ) else 0,
             CACHE_TOKENS_AVAILABLE: backend.cache_manager.tokens_left(),
         }
 

@@ -36,13 +36,20 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         # loads a bare block and calls .to(dtype=fp16). Without this override the
         # buffer rounds to fp16 and rotary positions accumulate quantization
         # error, corrupting generation (symptom: repeated tokens in groups).
-        out = super()._apply(fn, recurse=recurse)
         rot = getattr(self, "_rotary_emb", None)
+        # Save the original tensors BEFORE dtype conversion; casting rounded
+        # fp16/bf16 values back to fp32 cannot recover their original precision.
+        rotary_buffers = {
+            name: value
+            for name in ("inv_freq", "original_inv_freq")
+            if (value := getattr(rot, name, None)) is not None and value.is_floating_point()
+        }
+        out = super()._apply(fn, recurse=recurse)
         if rot is not None:
-            for name in ("inv_freq", "original_inv_freq"):
-                buf = getattr(rot, name, None)
-                if buf is not None and buf.is_floating_point() and buf.dtype != torch.float32:
-                    rot.register_buffer(name, buf.float(), persistent=False)
+            for name, value in rotary_buffers.items():
+                # setattr preserves whether HF registered a buffer or used a
+                # plain tensor attribute (original_inv_freq in some versions).
+                setattr(rot, name, value.to(device=rot.inv_freq.device, dtype=torch.float32))
         return out
 
     def forward(

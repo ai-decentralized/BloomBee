@@ -94,8 +94,19 @@ def test_full_attention_layer_uses_different_kv_shape_than_sliding():
         f"sliding kv_shape={sliding._kv_shape()} == full kv_shape={full._kv_shape()} "
         "— the whole point of Gemma-4's dual-head-dim layout"
     )
-    assert sliding._kv_shape() == (cfg.num_key_value_heads, cfg.head_dim)
-    assert full._kv_shape() == (cfg.num_global_key_value_heads, cfg.global_head_dim)
+    # Per-layer KV geometry lives on the block, not on global config attrs.
+    # transformers 5.16 raises AmbiguousGlobalPerLayerAttributeError for
+    # cfg.num_global_key_value_heads / cfg.global_head_dim.
+    assert sliding._kv_shape() == (
+        sliding.self_attn.num_key_value_heads,
+        sliding.self_attn.head_dim,
+    )
+    assert full._kv_shape() == (
+        full.self_attn.num_key_value_heads,
+        full.self_attn.head_dim,
+    )
+    assert sliding._kv_shape() == (4, 16)
+    assert full._kv_shape() == (2, 32)
 
 
 def test_decode_step_after_prefill_extends_kv():

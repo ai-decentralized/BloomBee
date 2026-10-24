@@ -40,6 +40,24 @@ class WrappedDeepseekV3Block(DeepseekV3DecoderLayer):
         if not hasattr(self.self_attn, "num_key_value_heads"):
             self.self_attn.num_key_value_heads = config.num_key_value_heads
 
+    def _apply(self, fn, recurse=True):
+        # Keep rotary inv_freq buffers in fp32 across .to(dtype=fp16/bf16) calls.
+        # HF's full model achieves this via _keep_in_fp32_modules, but BloomBee
+        # loads a bare block and calls .to(dtype=fp16). Without this override the
+        # buffer rounds to fp16/bf16; later .float() in RoPE compute cannot
+        # recover the lost mantissa, corrupting long-context positions.
+        rot = getattr(self, "_rotary_emb", None)
+        rotary_buffers = {
+            name: value
+            for name in ("inv_freq", "original_inv_freq")
+            if (value := getattr(rot, name, None)) is not None and value.is_floating_point()
+        }
+        out = super()._apply(fn, recurse=recurse)
+        if rot is not None:
+            for name, value in rotary_buffers.items():
+                setattr(rot, name, value.to(device=rot.inv_freq.device, dtype=torch.float32))
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,

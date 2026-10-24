@@ -95,20 +95,7 @@ def split_tensor_to_microbatches(
         # No splitting needed, return as single-element list
         return [tensor]
     
-    ranges = compute_micro_batch_ranges(batch_size)
-    
-    chunks = []
-    for start, end in ranges:
-        if dim == 0:
-            chunk = tensor[start:end]
-        elif dim == 1:
-            chunk = tensor[:, start:end]
-        else:
-            # Generic case using narrow
-            chunk = tensor.narrow(dim, start, end - start)
-        chunks.append(chunk)
-    
-    return chunks
+    return [tensor.narrow(dim, start, end - start) for start, end in compute_micro_batch_ranges(batch_size)]
 
 
 def merge_microbatch_outputs(

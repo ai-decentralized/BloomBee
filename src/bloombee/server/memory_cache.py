@@ -76,7 +76,7 @@ def _is_paged_kv_enabled() -> bool:
     return get_env_bool_with_debug_fallback(
         "BLOOMBEE_PAGED_KV",
         default=False,
-        groups=("kv_cache",),
+        groups=(),
     )
 
 

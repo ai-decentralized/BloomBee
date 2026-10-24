@@ -13,6 +13,7 @@ from transformers.generation.utils import ModelOutput
 
 from bloombee.client.inference_session import InferenceSession
 from bloombee.client.remote_sequential import RemoteSequential
+from bloombee.utils.cache_compat import init_cache_base
 from bloombee.utils.misc import DUMMY, docstring_from
 
 logger = get_logger(__name__)
@@ -43,15 +44,7 @@ class RemotePastKeyValues(Cache):
     """only keeps the number of seen tokens. pretends to be a legit cache"""
 
     def __init__(self) -> None:
-        # TF 5.x's Cache.__init__ requires exactly one of `layers` or
-        # `layer_class_to_replicate`. BloomBee doesn't actually store layers
-        # here (the real cache lives on the remote server), so hand it an
-        # empty list. TF 4.x's Cache.__init__ takes no args — in that case we
-        # skip super() entirely to stay compatible.
-        try:
-            super().__init__(layers=[])
-        except TypeError:
-            super().__init__()
+        init_cache_base(self)
         self._seen_tokens: Optional[torch.Tensor] = None
         self.hypo_ids: Optional[torch.LongTensor] = None
         self.kv_cache_position_ids: Optional[torch.LongTensor] = None
@@ -202,7 +195,8 @@ class RemoteGenerationMixin(_SkipTokensMixin):
                 # but keep them for transformers.GenerationMixin (e.g., to compute repetition_penalty)
                 _skipped_tokens.set(max(0, n_prev_tokens - 1))
 
-            if self._supports_cache_class and "past_key_values" not in kwargs:
+            # Transformers 5 no longer defines this flag on all model classes.
+            if getattr(self, "_supports_cache_class", True) and "past_key_values" not in kwargs:
                 past_key_values = RemotePastKeyValues()
                 past_key_values.update_seen(session.position)
                 kwargs["past_key_values"] = past_key_values
@@ -274,7 +268,9 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         if kwargs.get("return_dict_in_generate"):
             return False
         if kwargs.get("generation_config") is not None:
-            # Custom generation_config may carry flags we don't honor.
+            # Fast greedy does not merge generation_config into eos/pad/processors.
+            # Accepting a greedy config here would silently drop eos_token_id,
+            # repetition_penalty, min_new_tokens, and similar fields.
             return False
         # Unknown kwargs → legacy path.
         unknown = set(kwargs) - self._FAST_GENERATE_KNOWN_KWARGS - {"generation_config"}
@@ -344,6 +340,7 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         layers = self.transformer.h               # RemoteSequential
         ln_f = self.transformer.ln_f              # final norm on client
         lm_head = self.lm_head                    # projection to vocab on client
+        embed_ln = getattr(self.transformer, "word_embeddings_layernorm", None)
 
         output = input_ids
         done = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
@@ -351,16 +348,17 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         with context_manager as _sess:
             # Resume-token handling (matches the legacy path's n_prev_tokens logic).
             if _sess.output_ids is not None and _sess.output_ids.shape[1] > 0:
-                # Session already advanced past some tokens; only the newest
-                # token needs to be fed on this step.
                 prev = _sess.output_ids
                 output = torch.cat([prev, input_ids], dim=1) if input_ids.shape[1] > 0 else prev
-                step_ids = input_ids[:, -1:] if input_ids.shape[1] > 0 else prev[:, -1:]
+                # Feed every new prompt token, not just the last one.
+                step_ids = input_ids if input_ids.shape[1] > 0 else prev[:, -1:]
             else:
                 step_ids = input_ids  # Prefill with the full prompt on step 0.
 
             for step in range(max_new_tokens):
                 hidden = embed(step_ids)               # (B, step_tokens, H)
+                if embed_ln is not None and not isinstance(embed_ln, torch.nn.Identity):
+                    hidden = embed_ln(hidden)
                 hidden = layers(hidden)                # RemoteSequential → session.step
                 hidden = ln_f(hidden)                  # (B, step_tokens, H)
                 logits = lm_head(hidden[:, -1:, :])    # (B, 1, V) — only last position
@@ -369,17 +367,24 @@ class RemoteGenerationMixin(_SkipTokensMixin):
                 next_id = logits.argmax(dim=-1)        # (B, 1)
 
                 if eos_set:
-                    # Once a sequence has emitted EOS, keep it frozen on
-                    # pad_token_id (or EOS when pad is missing) — matches
-                    # HF's behavior under `pad_token_id`.
+                    is_eos = torch.zeros_like(done)
                     for e in eos_set:
-                        done = done | next_id.squeeze(-1).eq(e)
+                        is_eos = is_eos | next_id.squeeze(-1).eq(e)
+                    if pad_token_id is not None:
+                        emit = torch.where(
+                            done.unsqueeze(-1), torch.full_like(next_id, pad_token_id), next_id
+                        )
+                    else:
+                        emit = next_id
+                    output = torch.cat([output, emit], dim=1)
+                    done = done | is_eos
                     if pad_token_id is not None:
                         next_id = torch.where(
                             done.unsqueeze(-1), torch.full_like(next_id, pad_token_id), next_id
                         )
+                else:
+                    output = torch.cat([output, next_id], dim=1)
 
-                output = torch.cat([output, next_id], dim=1)
                 step_ids = next_id
 
                 if eos_set and bool(done.all().item()):

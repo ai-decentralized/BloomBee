@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test-cache:
+  test-cpu:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,7 +20,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('setup.cfg') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('setup.cfg', 'setup.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -53,12 +53,31 @@ jobs:
           python -m pip install --no-build-isolation --no-deps /tmp/hivemind
           python -m pip install --no-build-isolation -e ".[dev]"
 
-      - name: Run inference regression tests
+      - name: Run CPU unit tests
         run: |
           pytest -v \
             tests/test_cache.py \
+            tests/test_backward_chain.py \
             tests/test_serving_cache_regressions.py \
             tests/test_llama_kv_head_compat.py \
             tests/test_llama_rope_parameters.py \
+            tests/test_llama_fp16_semantics.py \
+            tests/test_llama_tied_head_loading.py \
+            tests/test_prompt_token_device.py \
             tests/test_falcon_generation_inputs.py \
-            tests/test_falcon_cuda_graph_inputs.py
+            tests/test_falcon_cuda_graph_inputs.py \
+            tests/test_spec_cache_reorder_sync.py \
+            tests/test_review_p1_fixes.py \
+            tests/test_debug_config.py \
+            tests/test_lossless_transport.py \
+            tests/test_spec_decoding_verify.py \
+            tests/test_spec_session_position.py \
+            tests/test_gemma4_block_parity.py \
+            tests/test_gemma4_head_dim_dispatch.py \
+            tests/test_gemma4_kv_eq_v.py \
+            tests/test_backend_tree_position_ids.py \
+            tests/test_spe_dec_tree.py \
+            tests/test_fast_generate_eligibility.py \
+            tests/test_qwen3_block_parity.py \
+            tests/test_recovery_history_source.py \
+            tests/test_remote_generation_cache.py

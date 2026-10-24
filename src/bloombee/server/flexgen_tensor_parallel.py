@@ -73,16 +73,33 @@ def _infer_llama_model_name(config: PretrainedConfig) -> str:
         return "llama-30b"
     if (h, layers) == (8192, 80):
         return "llama-70b" if intermediate == 28672 else "llama-65b"
-    return "llama-7b"
+    raise ValueError(
+        f"Cannot infer LLaMA FlexGen cache name from architecture "
+        f"(hidden={h}, layers={layers}, intermediate={intermediate})"
+    )
 
 
 def _resolve_expanded_path(config: PretrainedConfig, path: str) -> str:
-    model_name = _infer_llama_model_name(config)
-    expanded_path = os.path.abspath(os.path.expanduser(os.path.join(path, f"{model_name}-np")))
-    check_path = os.path.join(expanded_path, "embed_tokens.weight")
-    if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
-        download_llama_weights(model_name, path)
-    return expanded_path
+    from bloombee.flexgen_utils.llama_config import resolve_flexgen_llama_weights
+
+    raw_path = None
+    for attr in ("name_or_path", "_name_or_path", "name"):
+        value = getattr(config, attr, None)
+        if value and isinstance(value, str):
+            raw_path = value
+            break
+    model_name = os.path.basename(str(raw_path).rstrip("/")) if raw_path else _infer_llama_model_name(config)
+    if model_name.endswith("-hf"):
+        model_name = model_name[:-3]
+    local_src_dir = raw_path if raw_path and os.path.isdir(raw_path) else None
+    return resolve_flexgen_llama_weights(
+        path=path,
+        model_name=model_name,
+        raw_path=raw_path,
+        local_src_dir=local_src_dir,
+        revision=getattr(config, "_bloombee_revision", None),
+        token=getattr(config, "_bloombee_token", None),
+    )
 
 
 def _load_array_slice(filename: str, row_slice: Optional[slice] = None, col_slice: Optional[slice] = None) -> np.ndarray:
@@ -217,7 +234,7 @@ class _FlexgenLlamaShard(nn.Module):
             ((local_hidden, h), np.float16, DUMMY_WEIGHT),
             ((h, local_hidden), np.float16, DUMMY_WEIGHT),
             ((h,), np.float16, DUMMY_WEIGHT),
-            ((h // self.config.num_attention_heads // 2,), np.float16, DUMMY_WEIGHT),
+            ((h // self.config.num_attention_heads // 2,), np.float32, DUMMY_WEIGHT),
         ]
         weights = init_weight_list(specs, self.policy, self.env)
         path = self._layer_path()
@@ -228,7 +245,10 @@ class _FlexgenLlamaShard(nn.Module):
         _load_weight_into_tensor(weights[2], path + "self_attn.v_proj.weight", row_slice=row_slice)
         _load_weight_into_tensor(weights[3], path + "self_attn.o_proj.weight", col_slice=col_slice)
         _load_weight_into_tensor(weights[4], path + "input_layernorm.weight")
-        _load_weight_into_tensor(weights[5], path + "self_attn.rotary_emb.inv_freq")
+        from bloombee.models.llama.flex_llama import compute_llama_inv_freq
+        head_dim = int(self.config.hidden_size // self.config.num_attention_heads)
+        inv_freq = compute_llama_inv_freq(self.config, head_dim)
+        weights[5].load_from_np(inv_freq.detach().cpu().numpy().astype(np.float32, copy=False))
         return tuple(weights)
 
     def _init_mlp_weights(self):
@@ -496,6 +516,7 @@ class _FlexgenLlamaShard(nn.Module):
                 input_layernorm,
                 rotary_emb_inv_freq,
                 rotary_ids,
+                rms_norm_eps=float(getattr(self.config, "rms_norm_eps", 1e-5)),
             )
         else:
             k_cache, v_cache = local_past
@@ -516,6 +537,7 @@ class _FlexgenLlamaShard(nn.Module):
                 input_layernorm,
                 rotary_emb_inv_freq,
                 rotary_ids,
+                rms_norm_eps=float(getattr(self.config, "rms_norm_eps", 1e-5)),
             )
 
         return _as_torch_tensor(output_tt), _as_torch_tensor(k_new), _as_torch_tensor(v_new)
