@@ -61,4 +61,5 @@ jobs:
             tests/test_llama_kv_head_compat.py \
             tests/test_llama_rope_parameters.py \
             tests/test_falcon_generation_inputs.py \
-            tests/test_falcon_cuda_graph_inputs.py
+            tests/test_falcon_cuda_graph_inputs.py \
+            tests/test_smollm3_block_parity.py

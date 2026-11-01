@@ -409,8 +409,14 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if per_layer_configs:
             block_index = self.block_index
             if block_index is not None and 0 <= block_index < len(per_layer_configs):
-                return int(per_layer_configs[block_index].head_dim)
-            return int(per_layer_configs[0].head_dim)
+                layer_config = per_layer_configs[block_index]
+            else:
+                layer_config = per_layer_configs[0]
+            # Some configs (e.g. SmolLM3) have no head_dim field; attention derives it.
+            layer_hd = getattr(layer_config, "head_dim", None) or (
+                layer_config.hidden_size // layer_config.num_attention_heads
+            )
+            return int(layer_hd)
 
         default_hd = getattr(self.config, "head_dim", None) or (
             self.config.hidden_size // self.config.num_attention_heads

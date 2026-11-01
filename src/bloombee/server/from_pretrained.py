@@ -34,6 +34,7 @@ from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.gemma4.block import WrappedGemma4Block
 from bloombee.models.glm4_moe_lite.block import WrappedGlm4MoeLiteBlock
 from bloombee.models.qwen3.block import WrappedQwen3Block
+from bloombee.models.smollm3.block import WrappedSmolLM3Block
 from bloombee.server.block_utils import get_model_block, resolve_block_dtype
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.disk_cache import DEFAULT_CACHE_DIR, allow_cache_reads, allow_cache_writes, free_disk_space_for
@@ -99,7 +100,7 @@ def load_pretrained_block(
         and len(tensor_parallel_devices) > 1
     )
 
-    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Bloom, Falcon, Mixtral, Qwen3, Gemma4)
+    # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Bloom, Falcon, Mixtral, Qwen3, Gemma4, SmolLM3)
     _is_hf_model = config.block_class in (
         WrappedBloomBlock,
         WrappedFalconBlock,
@@ -109,6 +110,7 @@ def load_pretrained_block(
         WrappedDeepseekV3Block,
         WrappedNemotronHBlock,
         WrappedGlm4MoeLiteBlock,
+        WrappedSmolLM3Block,
     )
 
     if use_native_flexgen_llama_tp:
