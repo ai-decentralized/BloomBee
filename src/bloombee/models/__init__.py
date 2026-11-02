@@ -29,3 +29,9 @@ try:
 except ModuleNotFoundError as exc:
     if not str(exc.name).startswith("transformers.models.glm4_moe_lite"):
         raise
+
+try:
+    from bloombee.models.smollm3 import *
+except ModuleNotFoundError as exc:
+    if not str(exc.name).startswith("transformers.models.smollm3"):
+        raise
