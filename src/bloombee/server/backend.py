@@ -19,6 +19,7 @@ from transformers import PretrainedConfig
 
 from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
+from bloombee.server.mla_chunk import concat_mla_chunks, record_glm_mla_chunk
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor, nested_flatten
 from bloombee.utils.misc import flag_to_bool, get_size_in_bytes, is_dummy, slice_batch_aligned
@@ -1330,14 +1331,27 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         output_hidden_states = output_hidden_states_chunk
 
                     if seq_len > max_chunk_length:
-                        new_kvs_bloom = self._kv_to_bloom_layout(new_kvs, batch_size)
-                        chunk_new_kvs.append(new_kvs_bloom)
-                        new_kvs_llama = self._kv_to_llama_layout(new_kvs_bloom, batch_size)
-                        chunk_layer_past_llama = self._kv_to_llama_layout(chunk_layer_past, batch_size)
-                        chunk_layer_past = self._concat_llama_kvs(chunk_layer_past_llama, new_kvs_llama)
+                        if is_glm_mla:
+                            # kv_nope and k_rot have different last dims
+                            # (512 vs 64 on GLM-4.7-Flash). The shared-head
+                            # bloom view cannot represent that pair, so a
+                            # prompt long enough to be chunked dies on the
+                            # first chunk boundary.
+                            chunk_layer_past = record_glm_mla_chunk(
+                                chunk_layer_past, new_kvs, chunk_new_kvs
+                            )
+                        else:
+                            new_kvs_bloom = self._kv_to_bloom_layout(new_kvs, batch_size)
+                            chunk_new_kvs.append(new_kvs_bloom)
+                            new_kvs_llama = self._kv_to_llama_layout(new_kvs_bloom, batch_size)
+                            chunk_layer_past_llama = self._kv_to_llama_layout(chunk_layer_past, batch_size)
+                            chunk_layer_past = self._concat_llama_kvs(chunk_layer_past_llama, new_kvs_llama)
 
                 if seq_len > max_chunk_length:
-                    concatenated_kvs = self._concat_bloom_kv_chunks(chunk_new_kvs)
+                    if is_glm_mla:
+                        concatenated_kvs = concat_mla_chunks(chunk_new_kvs)
+                    else:
+                        concatenated_kvs = self._concat_bloom_kv_chunks(chunk_new_kvs)
                     if concatenated_kvs is not None:
                         new_kvs = concatenated_kvs
 

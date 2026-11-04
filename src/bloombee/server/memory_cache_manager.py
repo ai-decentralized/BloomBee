@@ -1356,14 +1356,20 @@ class KVCacheManager:
             v_sbh = torch.cat([gpu_v_part, v_rest_t[:, BH_gpu:BH, :]], dim=1)
 
         # 2) (S, BH, D) -> (B, H, S, D) standard PKV view (zero-copy)
-        H = getattr(self.block_config, "num_attention_heads", None)
-        assert H is not None, "block_config.num_attention_heads is required"
+        # H is the stride used to slice this cache. Nemotron-H slabs are packed
+        # num_key_value_heads (32 query / 2 KV). Replacing that with
+        # num_attention_heads collapses every batch>1 decode: BH=4 is treated as
+        # one sequence of 4 heads, and DynamicCache.update then crashes when the
+        # new token's [B, 2, 1, D] keys are concatenated.
         BH = k_sbh.shape[1]
-        # For MQA/GQA models (e.g. Falcon-7b with num_kv_heads=1), BH = B*num_kv_heads < num_attention_heads.
-        # Use BH as H in that case so B = BH/H = 1 is correct.
-        if BH < H:
-            H = BH
-        assert (BH % H) == 0, f"BH={BH} not divisible by H={H}"
+        if getattr(self.block_config, "model_type", None) != "nemotron_h":
+            H = getattr(self.block_config, "num_attention_heads", None)
+            assert H is not None, "block_config.num_attention_heads is required"
+            # MQA slabs such as Falcon-7B can be narrower than the query-head
+            # stride. A single sequence then has BH < num_attention_heads.
+            if BH < H:
+                H = BH
+        assert H > 0 and (BH % H) == 0, f"BH={BH} not divisible by H={H}"
         B = BH // H
 
         def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:

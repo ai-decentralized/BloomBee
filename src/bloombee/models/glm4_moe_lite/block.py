@@ -35,6 +35,23 @@ class WrappedGlm4MoeLiteBlock(Glm4MoeLiteDecoderLayer):
         if not hasattr(self.self_attn, "num_key_value_heads"):
             self.self_attn.num_key_value_heads = config.num_key_value_heads
 
+    def _apply(self, fn, recurse=True):
+        # BloomBee loads a bare decoder layer and casts it with block.to(dtype).
+        # That rounds these RoPE buffers to bf16/fp16. Glm4MoeLiteRotaryEmbedding
+        # later promotes inv_freq with .float(), which cannot recover the lost
+        # mantissa, so long-context positions drift and generation repeats tokens.
+        rot = getattr(self, "_rotary_emb", None)
+        rotary_buffers = {
+            name: value
+            for name in ("inv_freq", "original_inv_freq")
+            if (value := getattr(rot, name, None)) is not None and value.is_floating_point()
+        }
+        out = super()._apply(fn, recurse=recurse)
+        if rot is not None:
+            for name, value in rotary_buffers.items():
+                setattr(rot, name, value.to(device=rot.inv_freq.device, dtype=torch.float32))
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,

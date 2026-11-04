@@ -80,4 +80,7 @@ jobs:
             tests/test_fast_generate_eligibility.py \
             tests/test_qwen3_block_parity.py \
             tests/test_recovery_history_source.py \
-            tests/test_remote_generation_cache.py
+            tests/test_remote_generation_cache.py \
+            tests/test_glm_mla_chunks.py \
+            tests/test_nemotron_select_cache.py \
+            tests/test_glm_rotary_precision.py
