@@ -73,7 +73,7 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
     pad_token_id = getattr(tokenizer, 'pad_token_id', 0)
     if pad_token_id is None:
         pad_token_id = 0
-    simple_input_ids = [pad_token_id]
+    simple_input_ids = [pad_token_id] * max(1, int(prompt_len))
     return (simple_input_ids,) * num_prompts
 
 
@@ -242,24 +242,25 @@ class Optimized{{ M }}DecoderLayer({{ decoder_base_class }}):
         return self._cached_tokenizer
 
     def _get_cached_test_inputs(self, prompt_len, num_prompts):
-        """Cache test_inputs results to avoid duplicate calculations"""
+        """Build placeholder prompt ids that match the real batch/prompt shape."""
         cache_key = (prompt_len, num_prompts)
         if cache_key not in self._test_inputs_cache:
             tokenizer = self._get_tokenizer()
+            pad_token_id = 0
             if tokenizer is not None:
-                self._test_inputs_cache[cache_key] = get_test_inputs(
-                    prompt_len, num_prompts, tokenizer
-                )
-            else:
-                self._test_inputs_cache[cache_key] = ([0],) * num_prompts
+                pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+            self._test_inputs_cache[cache_key] = tuple(
+                [pad_token_id] * max(1, int(prompt_len)) for _ in range(max(1, int(num_prompts)))
+            )
         return self._test_inputs_cache[cache_key]
 
-    def _should_rebuild_task(self, max_new_tokens, actual_prompt_len):
+    def _should_rebuild_task(self, max_new_tokens, actual_prompt_len, actual_batch_size):
         """Simplify Task rebuild logic"""
         if self._cached_task is None:
             return True
         if (self._cached_task.gen_len != max_new_tokens or
-            self._cached_task.prompt_len != actual_prompt_len):
+            self._cached_task.prompt_len != actual_prompt_len or
+            len(self._cached_task.inputs) != actual_batch_size):
             return True
         return False
 
@@ -373,15 +374,15 @@ class Optimized{{ M }}DecoderLayer({{ decoder_base_class }}):
         verbose: int = 0,
         **kwargs,
     ):
-        num_prompts = 1
+        num_prompts = hidden_states.shape[0] if hidden_states.ndim >= 1 and hidden_states.shape[0] > 0 else 1
         actual_prompt_len = hidden_states.shape[1] if hidden_states.shape[1] > 0 else 1
         prompt_len, gen_len, cut_gen_len = actual_prompt_len, max_new_tokens, max_new_tokens
 
-        if self._should_rebuild_task(max_new_tokens, actual_prompt_len):
+        if self._should_rebuild_task(max_new_tokens, actual_prompt_len, num_prompts):
             inputs = self._get_cached_test_inputs(prompt_len, num_prompts)
             self._cached_task = Task(
                 inputs=inputs,
-                prompt_len=len(inputs[0]),
+                prompt_len=actual_prompt_len,
                 gen_len=max_new_tokens,
                 cut_gen_len=cut_gen_len,
                 do_sample=do_sample,

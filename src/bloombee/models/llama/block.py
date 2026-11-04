@@ -263,27 +263,28 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         return self._cached_tokenizer
 
     def _get_cached_test_inputs(self, prompt_len, num_prompts):
-        """Optimization: cache test_inputs results to avoid duplicate calculations"""
+        """Build placeholder prompt ids that match the real batch/prompt shape."""
         cache_key = (prompt_len, num_prompts)
         if cache_key not in self._test_inputs_cache:
-            # Task only needs a tiny placeholder input for FlexGen scheduling.
-            # Loading a tokenizer here is both unnecessary and expensive in the
-            # decode hot path, especially for local snapshots whose basename is
-            # not a valid Hugging Face repo id.
+            # Use config metadata without loading a tokenizer in the hot path.
             pad_token_id = getattr(self.llama_config, "pad_token_id", 0)
             if pad_token_id is None:
                 pad_token_id = 0
-            self._test_inputs_cache[cache_key] = ([int(pad_token_id)],) * num_prompts
+            self._test_inputs_cache[cache_key] = tuple(
+                [int(pad_token_id)] * max(1, int(prompt_len))
+                for _ in range(max(1, int(num_prompts)))
+            )
         return self._test_inputs_cache[cache_key]
 
-    def _should_rebuild_task(self, max_new_tokens, actual_prompt_len):
+    def _should_rebuild_task(self, max_new_tokens, actual_prompt_len, actual_batch_size):
         """Optimization: simplify Task rebuild logic, reduce duplicate checks"""
         if self._cached_task is None:
             return True
         
         # Only rebuild when there are actual changes
         if (self._cached_task.gen_len != max_new_tokens or 
-            self._cached_task.prompt_len != actual_prompt_len):
+            self._cached_task.prompt_len != actual_prompt_len or
+            len(self._cached_task.inputs) != actual_batch_size):
             return True
             
         return False
@@ -447,21 +448,21 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         # if self._cached_tokenizer is None:
         #     self._cached_tokenizer = self._get_tokenizer()
 
-        num_prompts = 1
+        num_prompts = hidden_states.shape[0] if hidden_states.ndim >= 1 and hidden_states.shape[0] > 0 else 1
         actual_prompt_len = hidden_states.shape[1] if hidden_states.shape[1] > 0 else 1
         prompt_len, gen_len, cut_gen_len = actual_prompt_len, max_new_tokens, max_new_tokens
 
         # Use simplified Task rebuild logic and add performance monitoring
         task_rebuild_start = None
-        if self._should_rebuild_task(max_new_tokens, actual_prompt_len):
+        if self._should_rebuild_task(max_new_tokens, actual_prompt_len, num_prompts):
             task_rebuild_start = time.time()
             
-            # Use cached test_inputs
+            # Build placeholder prompt ids that preserve the real batch/prompt shape.
             inputs = self._get_cached_test_inputs(prompt_len, num_prompts)
 
             self._cached_task = Task(
                 inputs=inputs,
-                prompt_len=len(inputs[0]),
+                prompt_len=actual_prompt_len,
                 gen_len=max_new_tokens,
                 cut_gen_len=cut_gen_len,
                 do_sample=do_sample,
@@ -1034,6 +1035,6 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
     if pad_token_id is None:
         pad_token_id = 0
     
-    # Create simple input_ids list with length 1 (minimum valid length)
-    simple_input_ids = [pad_token_id]
+    # Keep the synthetic prompt length aligned with the real request length.
+    simple_input_ids = [pad_token_id] * max(1, int(prompt_len))
     return (simple_input_ids,) * num_prompts

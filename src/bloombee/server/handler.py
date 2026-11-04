@@ -598,9 +598,17 @@ class TransformerConnectionHandler(ConnectionHandler):
             from bloombee.server.backward_chain import BackwardService
             self._backward_service = BackwardService(self)
             await self._backward_service.start(args[0])
+        from bloombee.server.lora import LoRAService, lora_enabled
+        from bloombee.utils.lora import LORA_NAMESPACE
+        if lora_enabled() and not hasattr(self, "_lora_service"):
+            self._lora_service = LoRAService(self)
+            await self._lora_service.add_p2p_handlers(args[0], namespace=LORA_NAMESPACE)
         await super().add_p2p_handlers(*args, **kwargs)
 
     async def remove_p2p_handlers(self, p2p, **kwargs) -> None:
+        if hasattr(self, "_lora_service"):
+            from bloombee.utils.lora import LORA_NAMESPACE
+            await self._lora_service.remove_p2p_handlers(p2p, namespace=LORA_NAMESPACE)
         if hasattr(self, "_backward_service"):
             await self._backward_service.close(p2p)
         await super().remove_p2p_handlers(p2p, **kwargs)

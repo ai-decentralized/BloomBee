@@ -295,6 +295,10 @@ rg -n -o "BLOOMBEE_[A-Z0-9_]+" README*.md src benchmarks tests | sort -u
 
 ## Python API
 
+For standard LoRA training on LLaMA/Qwen3 workers, see
+[Standard LoRA training](README.lora.md). It provides trainable A/B parameters,
+remote block gradients, client optimizers and PEFT-compatible adapter export.
+
 BloomBee integrates with HuggingFace Transformers. Use the `Auto` classes to load a distributed model:
 
 ```python

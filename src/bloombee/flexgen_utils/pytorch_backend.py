@@ -24,6 +24,7 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 import logging
 from hivemind.utils import get_logger
 from bloombee.utils.debug import dprint
+from bloombee.utils.lora import lora_linear
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -694,9 +695,9 @@ class TorchDevice:
         
         hidden = rms_norm(hidden_states.data, input_layernorm.data, variance_epsilon=rms_norm_eps)
         
-        q = F.linear(hidden, w_q.data)
-        k = F.linear(hidden, w_k.data)
-        v = F.linear(hidden, w_v.data)
+        q = lora_linear(hidden, w_q.data, "q_proj")
+        k = lora_linear(hidden, w_k.data, "k_proj")
+        v = lora_linear(hidden, w_v.data, "v_proj")
         
         q = q.view(bsz, q_len, num_attention_heads, head_dim)
         k = k.view(bsz, q_len, num_kv_heads, head_dim)
@@ -728,7 +729,7 @@ class TorchDevice:
         value = torch.bmm(attn_weights, v).view(bsz, num_attention_heads, q_len, head_dim)
         value = value.transpose(1, 2).reshape(bsz, q_len, qkv_hidden_size)
 
-        value = F.linear(value, w_out.data)
+        value = lora_linear(value, w_out.data, "o_proj")
         value.add_(hidden_states.data)
         
         if donate[0]: hidden_states.delete()
@@ -780,9 +781,9 @@ class TorchDevice:
         # logger.info(f"after norm, hidden states: {hidden}")
         
         # shape: (b, 1, h)
-        q = F.linear(hidden, w_q.data)
-        k = F.linear(hidden, w_k.data)
-        v = F.linear(hidden, w_v.data)
+        q = lora_linear(hidden, w_q.data, "q_proj")
+        k = lora_linear(hidden, w_k.data, "k_proj")
+        v = lora_linear(hidden, w_v.data, "v_proj")
         
         # shape: (b, 1, n_head, head_dim) for q; (b, 1, n_kv, head_dim) for k/v
         q = q.view(b, tgt_s, n_head, head_dim)
@@ -919,7 +920,7 @@ class TorchDevice:
         # shape: (b, 1, h)
         value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, qkv_hidden_size)
         
-        value = F.linear(value, w_out.data)
+        value = lora_linear(value, w_out.data, "o_proj")
 
         value.add_(inputs.data)
         
@@ -1093,7 +1094,10 @@ class TorchDevice:
             variance_epsilon=float(getattr(config, "rms_norm_eps", 1e-5)),
         )
         # src_out = F.layer_norm(inputs.data, (h,), weight=post_attention_layernorm.data)
-        out = F.linear(act_fn(F.linear(src_out, gate.data)) * F.linear(src_out, up.data), down.data)
+        out = lora_linear(
+            act_fn(lora_linear(src_out, gate.data, "gate_proj"))
+            * lora_linear(src_out, up.data, "up_proj"), down.data, "down_proj"
+        )
 
         out.add_(inputs.data)
         # if donate[0]: inputs.delete()

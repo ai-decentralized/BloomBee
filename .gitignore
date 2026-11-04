@@ -192,3 +192,7 @@ cache/
 
 # macOS folder metadata
 .DS_Store
+
+# Isolated LoRA integration artifacts and optional pytest plugin installs
+/test-results/
+/.testdeps/

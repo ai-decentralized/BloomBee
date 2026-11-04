@@ -120,6 +120,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.backward_pool = PrioritizedTaskPool(
             self.backward, max_batch_size=max_batch_size, device=device, name=f"{self.name}_backward"
         )
+        from bloombee.server.lora import lora_enabled, run_lora_block
+        if lora_enabled() and config.model_type in ("llama", "qwen3"):
+            from functools import partial
+            from bloombee.utils.lora import install_lora_hooks
+            if config.model_type != "llama":
+                install_lora_hooks(self.module.module_shards[0])
+            self.lora_pool = PrioritizedTaskPool(
+                partial(run_lora_block, self), max_batch_size=max_batch_size,
+                device=device, name=f"{self.name}_lora",
+            )
 
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
@@ -1844,7 +1854,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
     # Cache writing is centralized in KVCacheManager.update_cache()
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
-        return self.forward_pool, self.backward_pool, self.inference_pool
+        pools = self.forward_pool, self.backward_pool, self.inference_pool
+        return (*pools, self.lora_pool) if hasattr(self, "lora_pool") else pools
 
     def get_info(self) -> Dict[str, Any]:
         """Get module parameters and stats. Used by RemoteExpert to check shapes and for DMoE orchestration."""
@@ -1853,6 +1864,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
     def shutdown(self):
         # Break the cyclic references, otherwise TransformerBackend may be not garbage-collected
         self.forward_pool = self.backward_pool = self.inference_pool = None
+        if hasattr(self, "lora_pool"):
+            self.lora_pool = None
 
         # Explicitly free the GPU memory. This is not necessary at the time this code is written,
         # but may help to avoid future issues when the module is not garbage-collected for some reasons
