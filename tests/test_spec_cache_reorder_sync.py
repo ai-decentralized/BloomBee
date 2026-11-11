@@ -7,6 +7,8 @@ from bloombee.server.memory_cache_manager import KVCacheManager
 
 def test_spec_cache_reorder_update_blocks_until_reorder_finishes():
     manager = KVCacheManager.__new__(KVCacheManager)
+    manager._pending_reorder = None
+    manager._pending_reorder_lock = threading.Lock()
 
     entered = threading.Event()
     release = threading.Event()

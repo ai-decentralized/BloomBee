@@ -18,6 +18,10 @@ from bloombee.models.deepseekv3.expert_quant import dequantize_expert_weight, qu
 
 
 class QuantizedDeepseekV3Experts(nn.Module):
+    # These buffers are model weights, not runtime caches. Include them in the
+    # standard block wrapper's CPU/GPU weight placement and forward staging.
+    offload_buffer_names = ("gate_up_data", "gate_up_scale", "down_data", "down_scale")
+
     def __init__(self, experts: nn.Module, group_size: int = 128):
         super().__init__()
         self.num_experts = experts.num_experts

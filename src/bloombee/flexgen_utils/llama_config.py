@@ -8,12 +8,77 @@ Some configs are adopted from https://github.com/huggingface/transformers/blob/m
 import argparse
 import dataclasses
 import glob
+import hashlib
+import json
 import os
+from typing import Optional
 
 import numpy as np
 from tqdm import tqdm
 
 from bloombee.utils.debug import dprint
+
+FLEXGEN_NP_FORMAT_VERSION = "np-v1"
+FLEXGEN_NP_MANIFEST_NAME = ".bloombee_np_manifest.json"
+FLEXGEN_NP_COMPLETE_NAME = ".bloombee_np_converted"
+
+
+def flexgen_np_cache_identity(source: str, revision: Optional[str] = None) -> str:
+    """Stable identity for a FlexGen numpy conversion cache.
+
+    Basename-only cache directories collide across orgs, local paths, and
+    revisions. Hash the resolved source, revision, and conversion format.
+    """
+    if source and os.path.isdir(source):
+        source_key = os.path.abspath(os.path.expanduser(source))
+    else:
+        source_key = str(source or "")
+    payload = f"{source_key}|{revision or ''}|{FLEXGEN_NP_FORMAT_VERSION}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def flexgen_np_cache_dirname(source: str, model_name: str, revision: Optional[str] = None) -> str:
+    safe_name = str(model_name).replace("/", "_").replace(" ", "_") or "llama"
+    return f"{safe_name}-{flexgen_np_cache_identity(source, revision)}-np"
+
+
+def flexgen_np_cache_dir(path: str, source: str, model_name: str, revision: Optional[str] = None) -> str:
+    return os.path.abspath(os.path.expanduser(os.path.join(path, flexgen_np_cache_dirname(source, model_name, revision))))
+
+
+def _write_flexgen_np_manifest(out_dir: str, *, source: str, revision: Optional[str], files: list) -> None:
+    manifest = {
+        "source": source,
+        "revision": revision,
+        "format_version": FLEXGEN_NP_FORMAT_VERSION,
+        "files": sorted(files),
+    }
+    with open(os.path.join(out_dir, FLEXGEN_NP_MANIFEST_NAME), "w") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    with open(os.path.join(out_dir, FLEXGEN_NP_COMPLETE_NAME), "w") as handle:
+        handle.write("ok\n")
+
+
+def _flexgen_np_cache_ready(out_dir: str, *, source: str, revision: Optional[str]) -> bool:
+    complete = os.path.join(out_dir, FLEXGEN_NP_COMPLETE_NAME)
+    embed = os.path.join(out_dir, "embed_tokens.weight")
+    manifest_path = os.path.join(out_dir, FLEXGEN_NP_MANIFEST_NAME)
+    if not (os.path.isfile(complete) and os.path.isfile(embed)):
+        return False
+    if not os.path.isfile(manifest_path):
+        return False
+    try:
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if manifest.get("format_version") != FLEXGEN_NP_FORMAT_VERSION:
+        return False
+    if str(manifest.get("source") or "") != str(source or ""):
+        return False
+    if str(manifest.get("revision") or "") != str(revision or ""):
+        return False
+    return True
 
 @dataclasses.dataclass(frozen=True)
 class LlamaConfig:
@@ -67,88 +132,14 @@ def get_llama_config(name, **kwargs):
     return dataclasses.replace(config, **kwargs)
 
 
-def download_llama_weights_old(model_name, path):
-    """Download weights from huggingface."""
-    import torch
-    from transformers import LlamaForCausalLM
-
-    if "/" in model_name:
-        model_name = model_name.split("/")[1].lower()
-    path = os.path.join(path, f"{model_name}-np")
-    path = os.path.abspath(os.path.expanduser(path))
-
-    if "llama" in model_name:
-        hf_model_name = "huggyllama/" + model_name
-        model_class = LlamaForCausalLM
-    else:
-        raise ValueError("Invalid model name: {model_name}")
-
-    dprint(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
-          f"The downloading and cpu loading can take dozens of minutes. "
-          f"If it seems to get stuck, you can monitor the progress by "
-          f"checking the memory usage of this process.")
-
-    disable_torch_init()
-    model = model_class.from_pretrained(hf_model_name, torch_dtype=torch.float16,
-                                        _fast_init=True)
-    restore_torch_init()
-
-    os.makedirs(path, exist_ok=True)
-
-    dprint(f"Convert the weights to numpy format under {path} ...")
-    if "llama" in model_name:
-        for name, param in tqdm(list(model.model.named_parameters())):
-            param_path = os.path.join(path, name)
-            with open(param_path, "wb") as f:
-                np.save(f, param.cpu().detach().numpy())
-    else:
-        raise ValueError("Invalid model name: {model_name}")
-
-
-global torch_linear_init_backup
-global torch_layer_norm_init_backup
-
-
-def disable_torch_init():
-    """
-    Disable the redundant torch default initialization to accelerate model creation.
-    """
-    import torch
-    global torch_linear_init_backup
-    global torch_layer_norm_init_backup
-
-    torch_linear_init_backup = torch.nn.Linear.reset_parameters
-    setattr(torch.nn.Linear, "reset_parameters", lambda self: None)
-
-    torch_layer_norm_init_backup = torch.nn.LayerNorm.reset_parameters
-    setattr(torch.nn.LayerNorm, "reset_parameters", lambda self: None)
-
-
-def restore_torch_init():
-    """Rollback the change made by disable_torch_init."""
-    import torch
-    setattr(torch.nn.Linear, "reset_parameters", torch_linear_init_backup)
-    setattr(torch.nn.LayerNorm, "reset_parameters", torch_layer_norm_init_backup)
-
-
-def disable_hf_llama_init():
-    """
-    Disable the redundant default initialization to accelerate model creation.
-    """
-    import transformers
-
-    setattr(transformers.models.llama.modeling_llama.LlamaPreTrainedModel,
-            "_init_weights", lambda *args, **kwargs: None)
-
-
-def convert_local_llama_weights(src_model_dir, model_name, path):
+def convert_local_llama_weights(src_model_dir, model_name, path, revision: Optional[str] = None):
     """Convert local HF llama weights (safetensors or .bin) to FlexGen
-    numpy-layout cache at ``{path}/{model_name}-np/``.
+    numpy-layout cache at ``{path}/{model_name}-{identity}-np/``.
 
     FlexGen reads weights as one ``.weight`` file per parameter via
     ``np.load``. Target layout:
-        {path}/{model_name}-np/layers.{i}.self_attn.q_proj.weight
-        {path}/{model_name}-np/embed_tokens.weight
+        {path}/{model_name}-{identity}-np/layers.{i}.self_attn.q_proj.weight
+        {path}/{model_name}-{identity}-np/embed_tokens.weight
         ...
 
     This is the non-downloading analog of ``download_llama_weights``,
@@ -157,12 +148,11 @@ def convert_local_llama_weights(src_model_dir, model_name, path):
     """
     import torch
 
-    out_dir = os.path.join(path, f"{model_name}-np")
-    out_dir = os.path.abspath(os.path.expanduser(out_dir))
-    sentinel = os.path.join(out_dir, ".bloombee_np_converted")
-    if os.path.exists(sentinel):
+    source_key = os.path.abspath(os.path.expanduser(src_model_dir)) if os.path.isdir(src_model_dir) else str(src_model_dir)
+    out_dir = flexgen_np_cache_dir(path, source_key, model_name, revision)
+    if _flexgen_np_cache_ready(out_dir, source=source_key, revision=revision):
         dprint(f"FlexGen numpy cache already present at {out_dir}; skipping conversion.")
-        return
+        return out_dir
     os.makedirs(out_dir, exist_ok=True)
 
     dprint(f"Converting {src_model_dir} → FlexGen numpy layout at {out_dir}")
@@ -185,6 +175,7 @@ def convert_local_llama_weights(src_model_dir, model_name, path):
         for bf in tqdm(bin_files, desc="Read .bin"):
             state.update(torch.load(bf, map_location="cpu"))
 
+    written = []
     for name, param in tqdm(list(state.items()), desc="Convert → np"):
         stripped = name.replace("model.", "")
         stripped = stripped.replace("final_layer_norm", "layer_norm")
@@ -193,9 +184,17 @@ def convert_local_llama_weights(src_model_dir, model_name, path):
         arr = param.detach().to(torch.float16).cpu().numpy()
         with open(param_path, "wb") as f:
             np.save(f, arr)
+        written.append(stripped)
 
-    with open(sentinel, "w") as f:
-        f.write("ok\n")
+    if "embed_tokens.weight" not in written and not os.path.isfile(os.path.join(out_dir, "embed_tokens.weight")):
+        raise FileNotFoundError(
+            f"FlexGen conversion of {src_model_dir} did not produce embed_tokens.weight"
+        )
+    tmp_manifest = os.path.join(out_dir, FLEXGEN_NP_MANIFEST_NAME + ".tmp")
+    _write_flexgen_np_manifest(out_dir, source=source_key, revision=revision, files=written)
+    if os.path.isfile(tmp_manifest):
+        os.replace(tmp_manifest, os.path.join(out_dir, FLEXGEN_NP_MANIFEST_NAME))
+    return out_dir
 
 
 def download_llama_weights(model_name, path):
@@ -230,6 +229,74 @@ def download_llama_weights(model_name, path):
             param_path = os.path.join(path, name)
             with open(param_path, "wb") as f:
                 np.save(f, param.cpu().detach().numpy())
+
+
+def _looks_like_hf_repo_id(value: Optional[str]) -> bool:
+    """True for HuggingFace ids like `huggyllama/llama-7b`, not filesystem paths.
+
+    Older LLaMA configs bake a converter machine path into `_name_or_path`
+    (e.g. `/home/sgugger/tmp/llama/llama-7b/`). Those strings contain `/` but
+    are not Hub repo ids and must not be passed to `snapshot_download`.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value or os.path.isabs(value) or os.path.exists(value):
+        return False
+    if value.startswith(".") or "\\" in value or ":" in value:
+        return False
+    parts = [part for part in value.split("/") if part]
+    if len(parts) not in (1, 2):
+        return False
+    return all(part not in (".", "..") for part in parts)
+
+
+def resolve_flexgen_llama_weights(
+    *,
+    path: str,
+    model_name: str,
+    raw_path: Optional[str] = None,
+    local_src_dir: Optional[str] = None,
+    revision: Optional[str] = None,
+    token=None,
+) -> str:
+    """Return a complete FlexGen numpy cache directory for this source/revision."""
+    dummy = "_DUMMY_"
+    if dummy in (model_name or "") or dummy in (raw_path or "") or dummy in (path or ""):
+        return os.path.abspath(os.path.expanduser(os.path.join(path, f"{model_name}-np")))
+
+    if local_src_dir is not None:
+        return convert_local_llama_weights(local_src_dir, model_name, path, revision=revision)
+
+    if raw_path and os.path.isdir(raw_path):
+        return convert_local_llama_weights(raw_path, model_name, path, revision=revision)
+
+    if _looks_like_hf_repo_id(raw_path):
+        from huggingface_hub import snapshot_download
+
+        src_dir = snapshot_download(
+            raw_path,
+            revision=revision,
+            token=token,
+            allow_patterns=["*.safetensors", "*.bin", "*.json"],
+        )
+        return convert_local_llama_weights(src_dir, model_name, path, revision=revision)
+
+    if str(model_name).startswith("llama-"):
+        from huggingface_hub import snapshot_download
+
+        clean_name = str(model_name).replace("-hf", "")
+        src_dir = snapshot_download(
+            "huggyllama/" + clean_name,
+            revision=revision,
+            token=token,
+            allow_patterns=["*.safetensors", "*.bin", "*.json"],
+        )
+        return convert_local_llama_weights(src_dir, model_name, path, revision=revision)
+
+    raise FileNotFoundError(
+        f"Cannot resolve FlexGen weights for model_name={model_name!r} raw_path={raw_path!r}"
+    )
 
 
 if __name__ == "__main__":

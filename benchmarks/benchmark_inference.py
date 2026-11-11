@@ -13,6 +13,11 @@ from transformers import AutoTokenizer
 from bloombee import AutoDistributedModelForCausalLM
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 
+if __package__:
+    from .inference_workload import add_workload_arguments, benchmark_requests
+else:
+    from inference_workload import add_workload_arguments, benchmark_requests
+
 logger = get_logger()
 
 # Set logging level to INFO to see all debug messages
@@ -38,9 +43,9 @@ def main():
              "See README.client-placement.md",
     )
     parser.add_argument("--n_processes", type=str, default=1, help="Number of concurrent processes")
-    parser.add_argument("--seq_len", type=int, default=2048, help="Number of tokens to generate (generation length)")
+    parser.add_argument("--seq_len", type=int, default=2048, help="Generation length; per-request output cap in request mode")
     parser.add_argument("--prompt_len", type=int, default=None, help="Desired prompt/prefill length in tokens (optional)")
-    parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
+    parser.add_argument("--warmup_steps", type=int, default=1, help="Legacy token warmup; request mode uses --warmup_requests")
     parser.add_argument("--batch_size", type=int, default=1, help="Client batch size (number of sequences to generate in parallel)")
     parser.add_argument(
         "--early_terminate_steps",
@@ -79,12 +84,23 @@ def main():
              "Set to False to have the client mediate every hop itself instead — useful when a "
              "server-to-server relay hop is broken or unreachable even though client<->server works.",
     )
+    add_workload_arguments(parser)
     args = parser.parse_args()
 
     if args.n_processes == "n_gpus":
         args.n_processes = torch.cuda.device_count()
     else:
         args.n_processes = int(args.n_processes)
+
+    if (
+        args.dataset is not None
+        or args.prompt is not None
+        or args.num_requests is not None
+        or args.concurrency != 1
+        or args.request_rate is not None
+    ):
+        benchmark_requests(args)
+        return
 
     # Use spawn, not fork: by this point the parent already runs background
     # threads (HF hub I/O, torch). Forking then makes the child's hivemind DHT

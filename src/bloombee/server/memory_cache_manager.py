@@ -248,10 +248,20 @@ class KVCacheManager:
             kv_heads = max(matching) if matching else None
         else:
             kv_heads = None
-            if source_head_dim > 0 and source_head_dim == getattr(self.block_config, "global_head_dim", None):
-                kv_heads = getattr(self.block_config, "num_global_key_value_heads", None)
+            try:
+                global_hd = getattr(self.block_config, "global_head_dim", None)
+            except Exception:
+                global_hd = None
+            if source_head_dim > 0 and source_head_dim == global_hd:
+                try:
+                    kv_heads = getattr(self.block_config, "num_global_key_value_heads", None)
+                except Exception:
+                    kv_heads = None
             if kv_heads is None:
-                kv_heads = getattr(self.block_config, "num_key_value_heads", None)
+                try:
+                    kv_heads = getattr(self.block_config, "num_key_value_heads", None)
+                except Exception:
+                    kv_heads = None
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
             try:
@@ -1346,14 +1356,20 @@ class KVCacheManager:
             v_sbh = torch.cat([gpu_v_part, v_rest_t[:, BH_gpu:BH, :]], dim=1)
 
         # 2) (S, BH, D) -> (B, H, S, D) standard PKV view (zero-copy)
-        H = getattr(self.block_config, "num_attention_heads", None)
-        assert H is not None, "block_config.num_attention_heads is required"
+        # H is the stride used to slice this cache. Nemotron-H slabs are packed
+        # num_key_value_heads (32 query / 2 KV). Replacing that with
+        # num_attention_heads collapses every batch>1 decode: BH=4 is treated as
+        # one sequence of 4 heads, and DynamicCache.update then crashes when the
+        # new token's [B, 2, 1, D] keys are concatenated.
         BH = k_sbh.shape[1]
-        # For MQA/GQA models (e.g. Falcon-7b with num_kv_heads=1), BH = B*num_kv_heads < num_attention_heads.
-        # Use BH as H in that case so B = BH/H = 1 is correct.
-        if BH < H:
-            H = BH
-        assert (BH % H) == 0, f"BH={BH} not divisible by H={H}"
+        if getattr(self.block_config, "model_type", None) != "nemotron_h":
+            H = getattr(self.block_config, "num_attention_heads", None)
+            assert H is not None, "block_config.num_attention_heads is required"
+            # MQA slabs such as Falcon-7B can be narrower than the query-head
+            # stride. A single sequence then has BH < num_attention_heads.
+            if BH < H:
+                H = BH
+        assert H > 0 and (BH % H) == 0, f"BH={BH} not divisible by H={H}"
         B = BH // H
 
         def _to_pkv(x_sbh: torch.Tensor) -> torch.Tensor:
@@ -2052,17 +2068,13 @@ class KVCacheManager:
         key, value = new_kvs
 
         # If possibly FlexGen wrapper/compression, convert to torch.Tensor
-        try:
-            def _to_torch(x):
-                if hasattr(x, 'device') and (
-                    getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
-                    or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
-                ):
-                    return x.device.decompress(x)
-                return getattr(x, 'data', x)
-        except Exception:
-            def _to_torch(x):
-                return getattr(x, 'data', x)
+        def _to_torch(x):
+            if hasattr(x, 'device') and (
+                getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
+                or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
+            ):
+                return x.device.decompress(x)
+            return getattr(x, 'data', x)
 
         key_t = _to_torch(key)       # (BH_micro, D, s_new)
         value_t = _to_torch(value)   # (BH_micro, s_new, D)

@@ -25,7 +25,10 @@ class PTuneMixin:
         if config.tuning_mode and "ptune" in config.tuning_mode:
             assert config.pre_seq_len > 0, "The number of prefix tokens must be > 0"
             self.pre_seq_len = config.pre_seq_len
-            self.prefix_tokens = torch.arange(self.pre_seq_len).long()
+            # HF may construct the model under torch.device("meta"). This
+            # plain attribute is not materialized by checkpoint loading or
+            # Module.to(), so explicitly allocate its real index data on CPU.
+            self.prefix_tokens = torch.arange(self.pre_seq_len, dtype=torch.long, device="cpu")
 
             with force_non_empty_weights():
                 # Prompt embeddings and their optimizer stats are kept in float32 to increase ptune quality

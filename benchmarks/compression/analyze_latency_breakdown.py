@@ -882,12 +882,11 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             f"{'sender->receiver':28} {'wire_ms':>12} {'e2e_ser_end_ms':>14} {'count':>8}"
         )
         for pair, count in sorted(pair_counts.items()):
-            pair_rows = [x for x in s2s_wire_rows if (x["sender_blocks"], x["receiver_blocks"]) == pair]
-            pair_wire = [x["wire_ms"] for x in pair_rows if x["clock_sync"] == 1 and x["wire_ms"] >= 0.0]
+            pair_wire = [x["wire_ms"] for x in valid_wire if (x["sender_blocks"], x["receiver_blocks"]) == pair]
             pair_e2e = [
                 x["e2e_from_serialize_end_ms"]
-                for x in pair_rows
-                if x["clock_sync"] == 1 and x["e2e_from_serialize_end_ms"] >= 0.0
+                for x in valid_e2e
+                if (x["sender_blocks"], x["receiver_blocks"]) == pair
             ]
             pair_name = f"{pair[0]}->{pair[1]}"
             print(

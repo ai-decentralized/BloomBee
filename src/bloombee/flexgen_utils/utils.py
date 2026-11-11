@@ -53,6 +53,15 @@ torch_dtype_to_num_bytes = {
 }
 
 
+def get_choice(cur_percent, percents, choices):
+    percents = np.cumsum(percents)
+    assert np.abs(percents[-1] - 100) < 1e-5
+    for i in range(len(percents)):
+        if cur_percent < percents[i]:
+            return choices[i]
+    return choices[-1]
+
+
 def piecewise_linear_func(xs, ys):
     """Return a function created by linear inerpolation."""
     indices = np.argsort(xs)
@@ -144,13 +153,7 @@ class ValueHolder:
         self.val = None
 
     def store(self, val):
-        # assert self.val is None #####
-        # self.val = val
-        if self.val is None: ####
-            self.val = val ######
-        else : ####
-            self.val = val ######
-        
+        self.val = val
 
     def pop(self):
         ret = self.val
@@ -215,26 +218,8 @@ def str2bool(v):
 
 def project_decode_latency(costs, prompt_len, gen_len):
     decode_costs = costs[1:]
-
-    if gen_len / prompt_len < 0.1:
-        warmup = 2
-        decode_latency = (sum(decode_costs[:warmup]) +
-            np.mean(decode_costs[warmup:]) * (gen_len - 1 - warmup))
-    else:
-        warmup = 2
-        decode_latency = (sum(decode_costs[:warmup]) +
-            np.mean(decode_costs[warmup:]) * (gen_len - 1 - warmup))
-
-        #assert len(decode_costs) >= 4
-        #warmup = 2
-        #xs = np.arange(warmup, len(decode_costs))
-        #ys = np.asarray(decode_costs[warmup:])
-        #curve = np.poly1d(np.polyfit(xs, ys, deg=1))
-        #ys_pred = [curve(x) for x in range(gen_len-1)]
-        #decode_latency = sum(ys_pred)
-
-
-    return decode_latency
+    warmup = 2
+    return sum(decode_costs[:warmup]) + np.mean(decode_costs[warmup:]) * (gen_len - 1 - warmup)
 
 
 def write_benchmark_log(filename, model_size, cache_size, hidden_size,

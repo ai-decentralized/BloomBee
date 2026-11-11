@@ -2,6 +2,7 @@
 Tools for converting transformer blocks, applying quantization and/or tensor parallelism
 """
 import re
+import warnings
 from enum import Enum
 from typing import Optional, Sequence
 
@@ -14,51 +15,45 @@ from tensor_parallel.slicing_configs import get_bloom_config
 from transformers import PretrainedConfig
 from pynvml import *
 from bloombee.utils.debug import dprint
-from bloombee.utils.memory_usage import see_memory_usage, log_mem
+from bloombee.flexgen_utils.utils import get_choice
 from bloombee.server.flexgen_tensor_parallel import FlexgenLlamaTensorParallel
 
 logger = get_logger(__name__)
 
 
-def _get_choice(cur_percent, percents, choices):
-    """Return which device a parameter belongs to based on its cumulative position.
-
-    Mirrors LLaMA's get_choice in flex_llama.py / from_pretrained.py.
-
-    Args:
-        cur_percent: Midpoint percentage (0-100) of this parameter in the full model.
-        percents:    Allocation percentages [disk%, cpu%, gpu%] that must sum to 100.
-        choices:     Corresponding device choices.
-    """
-    cum = np.cumsum(percents)
-    for i, boundary in enumerate(cum):
-        if cur_percent < boundary:
-            return choices[i]
-    return choices[-1]
+def _named_weight_buffers(module):
+    """Yield explicitly declared weight buffers, excluding runtime caches."""
+    for prefix, submodule in module.named_modules():
+        for name in getattr(submodule, "offload_buffer_names", ()):
+            buffer = submodule.get_buffer(name)
+            if buffer is not None:
+                yield f"{prefix}.{name}" if prefix else name, buffer
 
 
-def _assign_param_devices(module, policy, gpu_device):
-    """Assign each named parameter to CPU or GPU using the same cumulative-midpoint
-    logic that LLaMA's FlexGen system uses (init_weight_list in flex_llama.py).
+def _assign_weight_devices(module, policy, gpu_device):
+    """Assign parameters and declared weight buffers with cumulative midpoints.
 
     With policy.w_gpu_percent=50 / w_cpu_percent=50 the first ~50% of parameters
-    (by element count) are placed on CPU, the remaining ~50% on GPU.
+    and weight buffers (by bytes) are placed on CPU, the remainder on GPU.
+    Byte counts account for int8 weights and fp32 scales correctly.
 
     Disk offload is not supported for standard HF modules; w_disk_percent is merged
     into the CPU allocation instead.
 
     Returns:
-        dict mapping parameter name → torch.device
+        dict mapping weight name → torch.device
     """
     cpu_device = torch.device('cpu')
 
-    param_list = list(module.named_parameters())
-    if not param_list:
+    weight_list = list(module.named_parameters()) + list(_named_weight_buffers(module))
+    if not weight_list:
         return {}
 
-    sizes = np.array([p.numel() for _, p in param_list], dtype=np.float64)
+    sizes = np.array([p.numel() * p.element_size() for _, p in weight_list], dtype=np.float64)
     sizes_cumsum = np.cumsum(sizes)
     total = sizes_cumsum[-1]
+    if total == 0:
+        return {name: gpu_device for name, _ in weight_list}
 
     # Merge disk% into CPU% (disk offload not implemented for HF blocks)
     effective_cpu = getattr(policy, 'w_cpu_percent', 0) + getattr(policy, 'w_disk_percent', 0)
@@ -68,11 +63,11 @@ def _assign_param_devices(module, policy, gpu_device):
     dev_percents = [0.0, float(effective_cpu), float(effective_gpu)]
     dev_choices  = [cpu_device, cpu_device, gpu_device]
 
-    param_devices = {}
-    for i, (name, _) in enumerate(param_list):
+    weight_devices = {}
+    for i, (name, _) in enumerate(weight_list):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / total * 100
-        param_devices[name] = _get_choice(mid_percent, dev_percents, dev_choices)
-    return param_devices
+        weight_devices[name] = get_choice(mid_percent, dev_percents, dev_choices)
+    return weight_devices
 
 
 class QuantType(Enum):
@@ -181,6 +176,8 @@ def convert_block(
             # Fine-grained per-parameter CPU/GPU split, mirroring LLaMA's FlexGen approach.
             # FlexGen blocks use meta-device initially — skip them.
             first_param = next(iter(module.parameters()), None)
+            if first_param is None:
+                first_param = next(_named_weight_buffers(module), ("", None))[1]
             is_hf_block = (
                 first_param is not None
                 and first_param.device.type != 'meta'
@@ -188,6 +185,7 @@ def convert_block(
             )
 
             self._param_devices = {}   # name → torch.device
+            self._buffer_devices = {}
             self._cpu_offload = False
 
             if is_hf_block and policy is not None:
@@ -196,11 +194,13 @@ def convert_block(
                     + getattr(policy, 'w_disk_percent', 0)
                 )
                 if effective_cpu > 0:
-                    # Assign each parameter individually using cumulative-midpoint logic.
-                    # Buffers (e.g. rotary embedding inv_freq, lazy cos_cached/sin_cached)
-                    # are kept on GPU at all times to avoid device-mismatch issues with
-                    # lazily-registered buffers (registered during the first forward call).
-                    self._param_devices = _assign_param_devices(module, policy, output_device)
+                    weight_devices = _assign_weight_devices(module, policy, output_device)
+                    self._param_devices = {
+                        name: weight_devices[name] for name, _ in module.named_parameters()
+                    }
+                    self._buffer_devices = {
+                        name: weight_devices[name] for name, _ in _named_weight_buffers(module)
+                    }
                     pin = getattr(policy, 'pin_weight', False) and output_device.type == 'cuda'
 
                     # Move parameters to their assigned device
@@ -214,26 +214,26 @@ def convert_block(
                         else:
                             param.data = param.data.to(output_device)
 
-                    # Always keep buffers on GPU so that lazily-registered buffers
-                    # (like Falcon's cos_cached / sin_cached) are created on GPU too.
+                    # Runtime buffers stay on the compute device; declared
+                    # quantized weights follow the weight placement policy.
+                    # Assignment preserves each buffer's checkpoint persistence.
                     for buf_name, buf in list(module.named_buffers()):
-                        if buf is not None and buf.device.type != output_device.type:
-                            # Navigate to the submodule that owns this buffer and re-register
-                            parts = buf_name.split('.')
-                            submod = module
-                            for part in parts[:-1]:
-                                submod = getattr(submod, part)
-                            submod.register_buffer(parts[-1], buf.to(output_device), persistent=False)
+                        target = self._buffer_devices.get(buf_name, output_device)
+                        moved = buf.to(target)
+                        if target.type == "cpu" and pin and not moved.is_pinned():
+                            moved = moved.pin_memory()
+                        prefix, _, name = buf_name.rpartition(".")
+                        setattr(module.get_submodule(prefix), name, moved)
 
                     self._cpu_offload = any(
-                        d.type == 'cpu' for d in self._param_devices.values()
+                        d.type == 'cpu' for d in weight_devices.values()
                     )
-                    n_cpu = sum(1 for d in self._param_devices.values() if d.type == 'cpu')
-                    n_gpu = len(self._param_devices) - n_cpu
+                    n_cpu = sum(1 for d in weight_devices.values() if d.type == 'cpu')
+                    n_gpu = len(weight_devices) - n_cpu
                     logger.info(
-                        f"[block {block_index}] Per-parameter CPU offload: "
-                        f"{n_cpu}/{len(self._param_devices)} params on CPU, "
-                        f"{n_gpu}/{len(self._param_devices)} params on GPU "
+                        f"[block {block_index}] CPU offload: "
+                        f"{n_cpu}/{len(weight_devices)} weight tensors on CPU, "
+                        f"{n_gpu}/{len(weight_devices)} weight tensors on GPU "
                         f"(w_gpu={getattr(policy,'w_gpu_percent',100)}%, "
                         f"w_cpu={getattr(policy,'w_cpu_percent',0)}%)"
                     )
@@ -245,21 +245,33 @@ def convert_block(
 
         def forward(self, *args, **kwargs):
             if self._cpu_offload:
-                # Move CPU-resident parameters to GPU before forward.
-                # Buffers stay on GPU permanently (see __init__).
-                for name, param in self._module.named_parameters():
-                    if self._param_devices.get(name, self.output_device).type == 'cpu':
-                        param.data = param.data.to(self.output_device, non_blocking=True)
-                if self.output_device.type == 'cuda':
-                    torch.cuda.synchronize(self.output_device)
-
-                result = self._module.forward(*args, **kwargs)
-
-                # Restore CPU params asynchronously after forward
-                for name, param in self._module.named_parameters():
-                    if self._param_devices.get(name, self.output_device).type == 'cpu':
-                        param.data = param.data.to('cpu', non_blocking=True)
-                return result
+                # Weights are read-only during inference. Keep their CPU homes
+                # (including pinned storage) until staging and forward finish,
+                # so cleanup also works if either transfer or compute raises.
+                cpu_params = [
+                    (param, param.data)
+                    for name, param in self._module.named_parameters()
+                    if self._param_devices.get(name, self.output_device).type == "cpu"
+                ]
+                cpu_buffers = []
+                for buf_name, target in self._buffer_devices.items():
+                    if target.type == "cpu":
+                        prefix, _, name = buf_name.rpartition(".")
+                        owner = self._module.get_submodule(prefix)
+                        cpu_buffers.append((owner, name, getattr(owner, name)))
+                try:
+                    for param, home in cpu_params:
+                        param.data = home.to(self.output_device, non_blocking=True)
+                    for owner, name, home in cpu_buffers:
+                        setattr(owner, name, home.to(self.output_device, non_blocking=True))
+                    if self.output_device.type == "cuda":
+                        torch.cuda.synchronize(self.output_device)
+                    return self._module.forward(*args, **kwargs)
+                finally:
+                    for param, home in cpu_params:
+                        param.data = home
+                    for owner, name, home in cpu_buffers:
+                        setattr(owner, name, home)
             return self._module.forward(*args, **kwargs)
 
         def __call__(self, *args, **kwargs):
@@ -271,9 +283,6 @@ def convert_block(
         def named_parameters(self, *args, **kwargs):
             return self._module.named_parameters(*args, **kwargs)
 
-        def parameters(self, *args, **kwargs):
-            return self._module.parameters(*args, **kwargs)
-            
         def named_buffers(self, *args, **kwargs):
             return self._module.named_buffers(*args, **kwargs)
 
@@ -325,7 +334,12 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
     This function is a no-op and kept for backward compatibility.
     """
     if quant_type != QuantType.NONE:
-        logger.debug(f"Quantization type {quant_type} specified, but quantization is handled by FlexGen compression system")
+        warnings.warn(
+            f"quantize_module(quant_type={quant_type}) is a no-op; "
+            "BloomBee quantization is handled by FlexGen compression, not this shim.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     return model
 
 

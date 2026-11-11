@@ -179,11 +179,13 @@ def run_inference_with_dumping(
     """
     Run inference and dump activations at each step.
     
-    This hooks into the BloomBee inference pipeline to capture
-    hidden states being transmitted between servers.
+    Capture the final remote block's output before the client's final norm
+    and language-model head. Intermediate worker boundaries are not observed.
     """
-    from bloombee import AutoDistributedModelForCausalLM, AutoDistributedConfig
-    from hivemind import DHT
+    from bloombee import AutoDistributedModelForCausalLM
+
+    if num_tokens < 1 or num_samples < 1:
+        raise ValueError("num_tokens and num_samples must be positive")
     
     logger.info(f"Loading model: {model_name}")
     logger.info(f"Initial peers: {initial_peers}")
@@ -208,23 +210,12 @@ def run_inference_with_dumping(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Initialize DHT and model
-    config = AutoDistributedConfig.from_pretrained(
-        model_name,
-        initial_peers=initial_peers.split(","),
-    )
-    
-    dht = DHT(
-        initial_peers=config.initial_peers,
-        client_mode=True,
-        start=True,
-    )
-    
     model = AutoDistributedModelForCausalLM.from_pretrained(
         model_name,
-        dht=dht,
+        initial_peers=initial_peers.split(","),
         torch_dtype=torch_dtype_obj,
     )
+    model.eval()
     
     # Tokenize input
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -233,40 +224,25 @@ def run_inference_with_dumping(
     logger.info(f"Starting inference with prompt: '{prompt[:50]}...'")
     logger.info(f"Input shape: {input_ids.shape}")
     
-    # Generate tokens one by one, capturing activations
-    generated_ids = input_ids.clone()
-    
-    for step in range(num_tokens):
-        if dumper.saved_count >= num_samples:
-            logger.info(f"Reached max samples ({num_samples}), stopping early")
-            break
-        
-        with torch.no_grad():
-            # Get model output
-            outputs = model(generated_ids)
-            logits = outputs.logits
-            
-            # Sample next token
-            next_token_logits = logits[:, -1, :]
-            next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-            
-            # Capture the hidden states (logits as proxy since we don't have direct access)
-            # In practice, we'd hook into the actual hidden states in the inference session
-            dumper.capture(
-                hidden_states=logits[:, -1:, :].float(),  # Last position logits as sample
-                layer_idx=0,
-                position=step,
-                extra_info={
-                    "token_id": int(next_token_id[0, 0]),
-                    "input_length": generated_ids.shape[1],
-                }
-            )
-            
-            # Append token
-            generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
-        
-        if step % 10 == 0:
-            logger.info(f"Generated {step + 1}/{num_tokens} tokens...")
+    remote_layers = model.transformer.h
+    position = 0
+
+    def capture_output(module, args, output):
+        nonlocal position
+        dumper.capture(
+            hidden_states=output,
+            layer_idx=len(remote_layers) - 1,
+            position=position,
+            extra_info={
+                "block_uid": remote_layers.sequence_manager.block_uids[-1],
+                "phase": "prefill" if position == 0 else "decode",
+                "tensor_name": "hidden_states",
+            },
+        )
+        position += output.shape[1]
+
+    with remote_layers.register_forward_hook(capture_output), torch.inference_mode():
+        generated_ids = model.generate(input_ids, max_new_tokens=min(num_tokens, num_samples), do_sample=False)
     
     # Save metadata
     dumper.save_metadata()

@@ -16,14 +16,9 @@ from typing import Any, Dict
 
 from hivemind.utils.logging import get_logger
 
+from bloombee.utils.misc import to_int
+
 logger = get_logger(__name__)
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
 
 
 def _interval_overlap_ms_from_us(a_start_us: int, a_end_us: int, b_start_us: int, b_end_us: int) -> float:
@@ -66,8 +61,8 @@ def summarize_cross_stage_overlap(
     for i, mb_n in enumerate(sorted_mb_indices):
         mb_data = overlap_summary[mb_n]
         this_compute_ms = float(mb_data.get('this_stage_process_time_ms', 0) or 0.0)
-        this_compute_start_us = _to_int(mb_data.get('this_stage_compute_start_us'), 0)
-        this_compute_end_us = _to_int(mb_data.get('this_stage_compute_end_us'), 0)
+        this_compute_start_us = to_int(mb_data.get('this_stage_compute_start_us'), 0)
+        this_compute_end_us = to_int(mb_data.get('this_stage_compute_end_us'), 0)
         total_stage2_compute_ms += this_compute_ms
 
         # Check overlap with next MB
@@ -75,17 +70,17 @@ def summarize_cross_stage_overlap(
             mb_n_plus_1 = sorted_mb_indices[i + 1]
             next_mb_data = overlap_summary.get(mb_n_plus_1, {})
 
-            stage1_next_start_us = _to_int(next_mb_data.get('prev_stage_compute_start_us'), 0)
-            stage1_next_end_us = _to_int(next_mb_data.get('prev_stage_compute_end_us'), 0)
-            stage1_next_sender_serialize_start_us = _to_int(
+            stage1_next_start_us = to_int(next_mb_data.get('prev_stage_compute_start_us'), 0)
+            stage1_next_end_us = to_int(next_mb_data.get('prev_stage_compute_end_us'), 0)
+            stage1_next_sender_serialize_start_us = to_int(
                 next_mb_data.get('sender_serialize_start_us'), 0
             )
-            stage1_next_sender_serialize_end_us = _to_int(
+            stage1_next_sender_serialize_end_us = to_int(
                 next_mb_data.get('sender_serialize_end_us'), 0
             )
-            stage1_next_clock_offset_us = _to_int(next_mb_data.get('prev_stage_clock_offset_us'), 0)
-            stage1_next_clock_rtt_us = max(0, _to_int(next_mb_data.get('prev_stage_clock_rtt_us'), 0))
-            stage1_next_clock_samples = _to_int(next_mb_data.get('prev_stage_clock_samples'), 0)
+            stage1_next_clock_offset_us = to_int(next_mb_data.get('prev_stage_clock_offset_us'), 0)
+            stage1_next_clock_rtt_us = max(0, to_int(next_mb_data.get('prev_stage_clock_rtt_us'), 0))
+            stage1_next_clock_samples = to_int(next_mb_data.get('prev_stage_clock_samples'), 0)
 
             if (
                 this_compute_start_us <= 0
@@ -206,17 +201,17 @@ def summarize_cross_stage_overlap(
         )
 
         mb0_data = overlap_summary.get(0, {})
-        mb0_wait_start_us = _to_int(mb0_data.get('this_stage_queue_wait_start_us'), 0)
-        mb0_wait_end_us = _to_int(mb0_data.get('this_stage_queue_wait_end_us'), 0)
-        mb0_prev_start_us = _to_int(mb0_data.get('prev_stage_compute_start_us'), 0)
-        mb0_prev_end_us = _to_int(mb0_data.get('prev_stage_compute_end_us'), 0)
-        mb0_clock_offset_us = _to_int(mb0_data.get('prev_stage_clock_offset_us'), 0)
-        mb0_clock_samples = _to_int(mb0_data.get('prev_stage_clock_samples'), 0)
-        mb0_sender_send_us = _to_int(mb0_data.get('sender_send_us'), 0)
-        mb0_sender_ser_start_us = _to_int(mb0_data.get('sender_serialize_start_us'), 0)
-        mb0_sender_ser_end_us = _to_int(mb0_data.get('sender_serialize_end_us'), 0)
-        mb0_receiver_receive_us = _to_int(mb0_data.get('receiver_receive_us'), 0)
-        mb0_receiver_queue_put_us = _to_int(mb0_data.get('receiver_queue_put_us'), 0)
+        mb0_wait_start_us = to_int(mb0_data.get('this_stage_queue_wait_start_us'), 0)
+        mb0_wait_end_us = to_int(mb0_data.get('this_stage_queue_wait_end_us'), 0)
+        mb0_prev_start_us = to_int(mb0_data.get('prev_stage_compute_start_us'), 0)
+        mb0_prev_end_us = to_int(mb0_data.get('prev_stage_compute_end_us'), 0)
+        mb0_clock_offset_us = to_int(mb0_data.get('prev_stage_clock_offset_us'), 0)
+        mb0_clock_samples = to_int(mb0_data.get('prev_stage_clock_samples'), 0)
+        mb0_sender_send_us = to_int(mb0_data.get('sender_send_us'), 0)
+        mb0_sender_ser_start_us = to_int(mb0_data.get('sender_serialize_start_us'), 0)
+        mb0_sender_ser_end_us = to_int(mb0_data.get('sender_serialize_end_us'), 0)
+        mb0_receiver_receive_us = to_int(mb0_data.get('receiver_receive_us'), 0)
+        mb0_receiver_queue_put_us = to_int(mb0_data.get('receiver_queue_put_us'), 0)
 
         if (
             stage2_queue_wait_pre_ms > 0.0
@@ -230,25 +225,6 @@ def summarize_cross_stage_overlap(
             and mb0_wait_end_us > 0
         ):
             mb0_wait_start_us = mb0_wait_end_us - int(round(stage2_queue_wait_pre_ms * 1000.0))
-
-        def _interval_overlap_ms(
-            range_start_us: int,
-            range_end_us: int,
-            window_start_us: int,
-            window_end_us: int,
-        ) -> float:
-            if (
-                range_start_us <= 0
-                or range_end_us <= range_start_us
-                or window_start_us <= 0
-                or window_end_us <= window_start_us
-            ):
-                return 0.0
-            overlap_start_us = max(range_start_us, window_start_us)
-            overlap_end_us = min(range_end_us, window_end_us)
-            if overlap_end_us <= overlap_start_us:
-                return 0.0
-            return (overlap_end_us - overlap_start_us) / 1000.0
 
         if (
             mb0_wait_start_us > 0
@@ -269,31 +245,31 @@ def summarize_cross_stage_overlap(
                 mb0_sender_send_us + mb0_clock_offset_us if mb0_sender_send_us > 0 else 0
             )
 
-            stage2_queue_wait_pre_upstream_compute_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_upstream_compute_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_prev_start_local_us,
                 mb0_prev_end_local_us,
             )
-            stage2_queue_wait_pre_sender_compute_to_serialize_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_sender_compute_to_serialize_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_prev_end_local_us,
                 mb0_sender_ser_start_local_us,
             )
-            stage2_queue_wait_pre_sender_serialize_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_sender_serialize_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_sender_ser_start_local_us,
                 mb0_sender_ser_end_local_us,
             )
-            stage2_queue_wait_pre_sender_pre_send_wait_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_sender_pre_send_wait_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_sender_ser_end_local_us,
                 mb0_sender_send_local_us,
             )
-            stage2_queue_wait_pre_sender_post_compute_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_sender_post_compute_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_prev_end_local_us,
@@ -306,13 +282,13 @@ def summarize_cross_stage_overlap(
             )
             if sender_post_compute_segment_sum_ms > 0.0:
                 stage2_queue_wait_pre_sender_post_compute_ms = sender_post_compute_segment_sum_ms
-            stage2_queue_wait_pre_wire_receive_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_wire_receive_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_sender_send_local_us,
                 mb0_receiver_receive_us,
             )
-            stage2_queue_wait_pre_receiver_dispatch_ms = _interval_overlap_ms(
+            stage2_queue_wait_pre_receiver_dispatch_ms = _interval_overlap_ms_from_us(
                 mb0_wait_start_us,
                 mb0_wait_end_us,
                 mb0_receiver_receive_us,
@@ -343,13 +319,13 @@ def summarize_cross_stage_overlap(
                 and mb0_receiver_receive_us > 0
                 and mb0_receiver_queue_put_us < mb0_wait_end_us
             ):
-                receiver_handle_ms = _interval_overlap_ms(
+                receiver_handle_ms = _interval_overlap_ms_from_us(
                     mb0_wait_start_us,
                     mb0_wait_end_us,
                     mb0_receiver_receive_us,
                     mb0_receiver_queue_put_us,
                 )
-                receiver_ready_ms = _interval_overlap_ms(
+                receiver_ready_ms = _interval_overlap_ms_from_us(
                     mb0_wait_start_us,
                     mb0_wait_end_us,
                     mb0_receiver_queue_put_us,

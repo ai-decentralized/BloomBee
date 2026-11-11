@@ -48,7 +48,6 @@ setup(
     python_requires=">=3.9",  
     install_requires=[  
         "torch>=1.12",  
-        "bitsandbytes==0.46.0",  
         "accelerate>=0.27.2",  
         "huggingface-hub>=1.5.0,<2.0.0",  
         "tokenizers>=0.13.3",  
@@ -88,14 +87,19 @@ setup(
         "zstandard>=0.22.0",
     ],  
     extras_require={  
+        # Keep install_requires in sync with setup.cfg [options].
         "dev": [  
             "pytest>=8.2,<10",  
             "pytest-forked",  
             "pytest-asyncio>=0.23,<2",  
+            "pytest-timeout",
             "anyio<4",
             "black==22.3.0",  
             "isort==5.10.1",  
             "psutil",  
+        ],  
+        "bnb": [  
+            "bitsandbytes==0.46.0",  
         ],  
     },  
 )

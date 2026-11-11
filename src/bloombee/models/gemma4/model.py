@@ -85,7 +85,10 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
     # After `key_mapping` flattens `model.language_model.*` to `model.*`,
     # per-layer keys look like `model.layers.<i>.*` — ignored here so the
     # embed/norm-only client doesn't complain about them.
-    _keys_to_ignore_on_load_unexpected = [r"^model\.layers\."] + _VISION_IGNORE_KEYS
+    _keys_to_ignore_on_load_unexpected = [
+        r"^model\.layers\.",
+        r"^model\.language_model\.layers\.",
+    ] + _VISION_IGNORE_KEYS
 
     config_class = DistributedGemma4Config
 

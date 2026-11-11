@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 from pathlib import Path
@@ -56,7 +57,7 @@ def main() -> None:
             continue
         rows.append(
             {
-                "layer": parse_layer(sample.get("block_uid", "")),
+                "layer": (parse_layer(sample["block_uid"]) if sample.get("block_uid") else sample.get("layer_idx")),
                 "block_uid": sample.get("block_uid", ""),
                 "filename": filename,
                 "dtype": sample.get("dtype", ""),
@@ -85,7 +86,7 @@ def main() -> None:
     direct = np.array([row["direct_ratio"] for row in rows if row["layer"] is not None], dtype=float)
     split = np.array([row["split_ratio"] for row in rows if row["layer"] is not None], dtype=float)
     improve = np.array([-row["delta_pct_vs_direct"] for row in rows if row["layer"] is not None], dtype=float)
-    if layers.size >= 2:
+    if np.unique(layers).size >= 2:
         direct_corr = float(np.corrcoef(layers, direct)[0, 1])
         split_corr = float(np.corrcoef(layers, split)[0, 1])
         improve_corr = float(np.corrcoef(layers, improve)[0, 1])
@@ -120,25 +121,10 @@ def main() -> None:
             "direct_zstd_bytes",
             "split_total_with_header_bytes",
         ]
-        lines = [",".join(header)]
-        for row in rows:
-            lines.append(
-                ",".join(
-                    [
-                        str(row["layer"]),
-                        str(row["block_uid"]),
-                        str(row["filename"]),
-                        str(row["dtype"]),
-                        f"{row['direct_ratio']:.6f}",
-                        f"{row['split_ratio']:.6f}",
-                        f"{row['delta_pct_vs_direct']:+.2f}",
-                        str(row["raw_bytes"]),
-                        str(row["direct_zstd_bytes"]),
-                        str(row["split_total_with_header_bytes"]),
-                    ]
-                )
-            )
-        args.csv.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with args.csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
         print(f"Saved CSV: {args.csv}")
 
 

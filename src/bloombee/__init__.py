@@ -31,3 +31,6 @@ def _override_bfloat16_mode_default():
 
 _initialize_logs()
 _override_bfloat16_mode_default()
+
+from bloombee.client.lora import DistributedLoRA
+from bloombee.utils.lora import LoRAConfig

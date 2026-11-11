@@ -316,6 +316,10 @@ class WrappedNemotronHBlock(NemotronHBlock):
                 dtype=torch.long,
             )
 
+            # HF attention broadcasts masks across [batch, heads, query, key].
+            if attention_mask is not None and attention_mask.ndim == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+
             output = super().forward(
                 hidden_states,
                 past_key_values=cache,

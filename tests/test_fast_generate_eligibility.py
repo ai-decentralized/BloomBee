@@ -99,10 +99,50 @@ def test_return_dict_is_ineligible():
 
 
 def test_custom_generation_config_is_ineligible():
+    from transformers import GenerationConfig
+
     m = _Stub()
-    gc = MagicMock()
+    cfg = GenerationConfig(
+        eos_token_id=2,
+        pad_token_id=0,
+        repetition_penalty=1.2,
+        min_new_tokens=4,
+        no_repeat_ngram_size=3,
+    )
     assert not m._fast_generate_eligible(
-        _basic_inputs(), (), {"max_new_tokens": 32, "generation_config": gc}, None
+        _basic_inputs(), (), {"max_new_tokens": 100, "generation_config": cfg}, None
+    )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("eos_token_id", 2),
+        ("pad_token_id", 0),
+        ("repetition_penalty", 1.2),
+        ("min_new_tokens", 4),
+        ("no_repeat_ngram_size", 3),
+    ],
+)
+def test_generation_config_fields_are_not_silently_accepted(field, value):
+    from transformers import GenerationConfig
+
+    m = _Stub()
+    cfg = GenerationConfig(**{field: value})
+    assert not m._fast_generate_eligible(
+        _basic_inputs(), (), {"max_new_tokens": 32, "generation_config": cfg}, None
+    )
+
+
+def test_empty_generation_config_kwarg_is_ineligible():
+    from transformers import GenerationConfig
+
+    m = _Stub()
+    assert not m._fast_generate_eligible(
+        _basic_inputs(),
+        (),
+        {"max_new_tokens": 32, "generation_config": GenerationConfig()},
+        None,
     )
 
 

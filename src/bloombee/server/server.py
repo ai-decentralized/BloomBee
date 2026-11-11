@@ -260,7 +260,7 @@ class Server:
 
         is_multiquery_attn = self.block_config.num_key_value_groups > 1
         if max_batch_size is None:
-            max_batch_size = 8192 if is_multiquery_attn else 8192
+            max_batch_size = 8192
         if inference_max_length is None:
             inference_max_length = 8192 if is_multiquery_attn else 4096
         self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
@@ -272,6 +272,7 @@ class Server:
         # Align cache token budget with inference_max_length by default to fit requested allocations
         if attn_cache_tokens is None:
             attn_cache_tokens = self.inference_max_length
+        self.attn_cache_tokens = attn_cache_tokens
         # Per-token KV values per block (K and V), accounting for multi-query heads
         cache_values_per_block = 2 * self.block_config.hidden_size * attn_cache_tokens
         cache_values_per_block //= self.block_config.num_key_value_groups
@@ -512,6 +513,7 @@ class Server:
                 max_chunk_size_bytes=self.max_chunk_size_bytes,
                 max_alloc_timeout=self.max_alloc_timeout,
                 inference_max_length=self.inference_max_length,
+                attn_cache_tokens=self.attn_cache_tokens,
                 torch_dtype=self.torch_dtype,
                 cache_dir=self.cache_dir,
                 max_disk_space=self.max_disk_space,
@@ -651,6 +653,7 @@ class ModuleContainer(threading.Thread):
         max_chunk_size_bytes: int,
         max_alloc_timeout: float,
         inference_max_length: int,
+        attn_cache_tokens: Optional[int] = None,
         torch_dtype: torch.dtype,
         cache_dir: str,
         max_disk_space: int,
@@ -667,7 +670,9 @@ class ModuleContainer(threading.Thread):
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
 
-        cache_manager = KVCacheManager(inference_max_length, max_alloc_timeout, policy, env, block_config)
+        if attn_cache_tokens is None:
+            attn_cache_tokens = inference_max_length
+        cache_manager = KVCacheManager(attn_cache_tokens, max_alloc_timeout, policy, env, block_config)
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(

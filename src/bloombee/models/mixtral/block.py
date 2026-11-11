@@ -25,6 +25,26 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         if not hasattr(self.self_attn, "num_key_value_heads"):
             self.self_attn.num_key_value_heads = config.num_key_value_heads
 
+    def _apply(self, fn, recurse=True):
+        # Keep rotary inv_freq buffers in fp32 across .to(dtype=fp16/bf16).
+        # BloomBee loads a bare MixtralDecoderLayer and _load_hf_block_weights
+        # ends in block.to(dtype=torch_dtype). HF's full-model
+        # _keep_in_fp32_modules never runs, so frequencies would round and
+        # generation collapses into repeated token groups (same bug Qwen-3
+        # fixed by saving originals *before* super()._apply).
+        rot = getattr(self, "_rotary_emb", None)
+        rotary_buffers = {
+            name: value
+            for name in ("inv_freq", "original_inv_freq")
+            if (value := getattr(rot, name, None)) is not None and value.is_floating_point()
+        }
+        out = super()._apply(fn, recurse=recurse)
+        if rot is not None:
+            device = rot.inv_freq.device
+            for name, value in rotary_buffers.items():
+                setattr(rot, name, value.to(device=device, dtype=torch.float32))
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,

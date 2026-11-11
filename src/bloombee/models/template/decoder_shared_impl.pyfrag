@@ -22,18 +22,18 @@
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
-        num_prompts = 1
+        num_prompts = hidden_states.shape[0] if hidden_states.ndim >= 1 and hidden_states.shape[0] > 0 else 1
         actual_prompt_len = hidden_states.shape[1] if hidden_states.shape[1] > 0 else 1
         prompt_len, gen_len, cut_gen_len = actual_prompt_len, max_new_tokens, max_new_tokens
 
         # Use simplified Task rebuild logic
-        if self._should_rebuild_task(max_new_tokens, actual_prompt_len):
-            # Use cached test_inputs
+        if self._should_rebuild_task(max_new_tokens, actual_prompt_len, num_prompts):
+            # Build placeholder prompt ids that preserve the real batch/prompt shape.
             inputs = self._get_cached_test_inputs(prompt_len, num_prompts)
 
             self._cached_task = Task(
                 inputs=inputs,
-                prompt_len=len(inputs[0]),
+                prompt_len=actual_prompt_len,
                 gen_len=max_new_tokens,
                 cut_gen_len=cut_gen_len,
                 do_sample=do_sample,

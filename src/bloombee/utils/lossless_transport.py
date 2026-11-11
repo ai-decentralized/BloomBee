@@ -409,20 +409,6 @@ def _adaptive_hybrid_prefers_zstd_dict(debug_context: Optional[Dict[str, object]
     return _context_value(debug_context, "blocks") in _lossless_hybrid_dict_blocks()
 
 
-def _phase_aware_prefers_dict(debug_context):
-    """Phase-aware dict gate.
-
-    Use the trained zstd dictionary only on prefill, where the +9.5% ratio gain
-    pays for the +33% compress-time overhead (long sequences -> compress cost
-    amortized over many bytes). On decode the per-token tensor is small and
-    256 decode steps amplify the +12% per-call compress overhead, so we fall
-    back to plain zstd_byte_split (no dict).
-    """
-    if not debug_context:
-        return False
-    return str(debug_context.get("phase", "")).strip().lower() == "prefill"
-
-
 def _should_wire_truncate_fp16(
     tensor: Optional[torch.Tensor],
     debug_context: Optional[Dict[str, object]],
@@ -1354,24 +1340,55 @@ def zipnn_oracle_roundtrip(
     return info
 
 
-@lru_cache(maxsize=8)
+_tls = threading.local()
+
+
+def _thread_codec_cache() -> dict:
+    cache = getattr(_tls, "codec_cache", None)
+    if cache is None:
+        cache = {}
+        _tls.codec_cache = cache
+    return cache
+
+
+def _clear_thread_codec_cache() -> None:
+    if hasattr(_tls, "codec_cache"):
+        delattr(_tls, "codec_cache")
+
+
 def _get_zipnn_compressor(dtype_name: str, zstd_level: int):
     if _ZipNN is None:
         return None
-    return _ZipNN(
-        method="ZSTD",
-        input_format="byte",
-        bytearray_dtype=dtype_name,
-        compression_threshold=1.0,
-        zstd_level=zstd_level,
-    )
+    cache = _thread_codec_cache()
+    key = ("zipnn_c", str(dtype_name), int(zstd_level))
+    compressor = cache.get(key)
+    if compressor is None:
+        compressor = _ZipNN(
+            method="ZSTD",
+            input_format="byte",
+            bytearray_dtype=dtype_name,
+            compression_threshold=1.0,
+            zstd_level=zstd_level,
+        )
+        cache[key] = compressor
+    return compressor
 
 
-@lru_cache(maxsize=1)
+_get_zipnn_compressor.cache_clear = _clear_thread_codec_cache
+
+
 def _get_zipnn_decompressor():
     if _ZipNN is None:
         return None
-    return _ZipNN(method="ZSTD", input_format="byte")
+    cache = _thread_codec_cache()
+    decompressor = cache.get("zipnn_d")
+    if decompressor is None:
+        decompressor = _ZipNN(method="ZSTD", input_format="byte")
+        cache["zipnn_d"] = decompressor
+    return decompressor
+
+
+_get_zipnn_decompressor.cache_clear = _clear_thread_codec_cache
 
 
 @lru_cache(maxsize=8)
@@ -1823,18 +1840,33 @@ def _reconstruct_high_byte_lane(extracted: bytes, remaining: bytes, elem_size: i
     raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
 
 
-@lru_cache(maxsize=16)
 def _get_zstd_compressor(level: int):
     if _zstd is None:
         return None
-    return _zstd.ZstdCompressor(level=level)
+    cache = _thread_codec_cache()
+    key = ("zstd_c", int(level))
+    compressor = cache.get(key)
+    if compressor is None:
+        compressor = _zstd.ZstdCompressor(level=level)
+        cache[key] = compressor
+    return compressor
 
 
-@lru_cache(maxsize=1)
+_get_zstd_compressor.cache_clear = _clear_thread_codec_cache
+
+
 def _get_zstd_decompressor():
     if _zstd is None:
         return None
-    return _zstd.ZstdDecompressor()
+    cache = _thread_codec_cache()
+    decompressor = cache.get("zstd_d")
+    if decompressor is None:
+        decompressor = _zstd.ZstdDecompressor()
+        cache["zstd_d"] = decompressor
+    return decompressor
+
+
+_get_zstd_decompressor.cache_clear = _clear_thread_codec_cache
 
 
 def _lossless_zstd_dict_path() -> str:
@@ -1855,24 +1887,40 @@ def _get_zstd_dict(dict_path: str):
         return None
 
 
-@lru_cache(maxsize=16)
 def _get_zstd_dict_compressor_cached(dict_path: str, level: int):
     dictionary = _get_zstd_dict(dict_path)
     if dictionary is None:
         return None
-    return _zstd.ZstdCompressor(level=level, dict_data=dictionary)
+    cache = _thread_codec_cache()
+    key = ("zstd_dict_c", str(dict_path), int(level))
+    compressor = cache.get(key)
+    if compressor is None:
+        compressor = _zstd.ZstdCompressor(level=level, dict_data=dictionary)
+        cache[key] = compressor
+    return compressor
+
+
+_get_zstd_dict_compressor_cached.cache_clear = _clear_thread_codec_cache
 
 
 def _get_zstd_dict_compressor(level: int):
     return _get_zstd_dict_compressor_cached(_lossless_zstd_dict_path(), level)
 
 
-@lru_cache(maxsize=4)
 def _get_zstd_dict_decompressor_cached(dict_path: str):
     dictionary = _get_zstd_dict(dict_path)
     if dictionary is None:
         return None
-    return _zstd.ZstdDecompressor(dict_data=dictionary)
+    cache = _thread_codec_cache()
+    key = ("zstd_dict_d", str(dict_path))
+    decompressor = cache.get(key)
+    if decompressor is None:
+        decompressor = _zstd.ZstdDecompressor(dict_data=dictionary)
+        cache[key] = decompressor
+    return decompressor
+
+
+_get_zstd_dict_decompressor_cached.cache_clear = _clear_thread_codec_cache
 
 
 def _get_zstd_dict_decompressor():
@@ -1975,23 +2023,47 @@ def _decompress_zlib_capped(payload: bytes, original_size: int) -> bytes:
     return raw
 
 
+def _zstd_stream_decompress(decompressor, payload: bytes, original_size: int) -> bytes:
+    if original_size < 0:
+        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+    if decompressor is None:
+        raise RuntimeError("Received zstd-wrapped tensor, but 'zstandard' is not installed")
+    try:
+        params = _zstd.get_frame_parameters(payload)
+        content_size = int(getattr(params, "content_size", 0) or 0)
+        unknown = getattr(_zstd, "CONTENTSIZE_UNKNOWN", None)
+        error = getattr(_zstd, "CONTENTSIZE_ERROR", None)
+        if content_size not in (0, unknown, error) and content_size > original_size:
+            raise ValueError(
+                f"zstd frame content size {content_size} exceeds declared {original_size}"
+            )
+    except _zstd.ZstdError:
+        pass
+    import io
+
+    reader = decompressor.stream_reader(io.BytesIO(payload))
+    try:
+        raw = reader.read(original_size)
+        extra = reader.read(1)
+    finally:
+        reader.close()
+    if extra:
+        raise ValueError(f"Lossless zstd payload exceeds declared size: {original_size}")
+    if len(raw) != original_size:
+        raise ValueError(f"Lossless wrapper size mismatch: expected {original_size}, got {len(raw)}")
+    return raw
+
+
 def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> bytes:
     t0 = time.perf_counter()
     if algo_id == _ALGO_ZSTD:
-        decompressor = _get_zstd_decompressor()
-        if decompressor is None:
-            raise RuntimeError("Received zstd-wrapped tensor, but 'zstandard' is not installed")
-        raw = decompressor.decompress(payload, max_output_size=original_size)
+        raw = _zstd_stream_decompress(_get_zstd_decompressor(), payload, original_size)
     elif algo_id == _ALGO_ZLIB:
         raw = _decompress_zlib_capped(payload, original_size)
     elif algo_id == _ALGO_ZIPNN:
         decompressor = _get_zipnn_decompressor()
         if decompressor is None:
             raise RuntimeError("Received ZipNN-wrapped tensor, but 'zipnn' is not installed")
-        # ZipNN's API offers no max-output cap, so a hostile payload can still
-        # expand past original_size during this call; the caller-level
-        # BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES check bounds the declared size and
-        # the length check below rejects any mismatch after the fact.
         raw = bytes(decompressor.decompress(payload))
     else:
         raise ValueError(f"Unknown lossless wrapper algorithm id: {algo_id}")
@@ -2101,8 +2173,8 @@ def _decode_dict_byte_split_with(decompressor, payload: bytes, original_size: in
     remaining_raw_size = original_size - extracted_raw_size
 
     t0 = time.perf_counter()
-    extracted_raw = decompressor.decompress(extracted_comp, max_output_size=extracted_raw_size)
-    remaining_raw = decompressor.decompress(remaining_comp, max_output_size=remaining_raw_size)
+    extracted_raw = _zstd_stream_decompress(decompressor, extracted_comp, extracted_raw_size)
+    remaining_raw = _zstd_stream_decompress(decompressor, remaining_comp, remaining_raw_size)
     dt_ms = (time.perf_counter() - t0) * 1000.0
     _record_transport_profile("decompress_calls", 2.0)
     _record_transport_profile("decompress_ms", dt_ms)

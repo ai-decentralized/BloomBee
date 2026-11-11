@@ -1,17 +1,13 @@
-import argparse
 import dataclasses
-
-import functools
-import gc
-import math
-import os
-from typing import Tuple, Union, Optional, Any, Sequence, List
+from typing import List, Optional, Union
 
 import numpy as np
-import torch
+
+
 @dataclasses.dataclass(frozen=True)
 class Task:
     """A generation task."""
+
     inputs: Union[np.array, List[List[int]]]
     prompt_len: int
     gen_len: int

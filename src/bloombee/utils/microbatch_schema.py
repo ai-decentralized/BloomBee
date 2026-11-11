@@ -34,11 +34,12 @@ REQUIRED_FIELDS: Set[str] = {
 }
 
 # Fields that are request-level and only need to be sent with mb0
-# These are cached and reused for subsequent micro-batches
+# These are cached and reused for subsequent micro-batches.
+# tree_attention_mask is *not* request-level: padding masks are sliced
+# per micro-batch, so reusing mb0's slice would apply the wrong rows.
 REQUEST_LEVEL_FIELDS: Set[str] = {
     "prompts",
     "hypo_ids",
-    "tree_attention_mask",
     "kv_cache_position_ids",
     "draft_tokens",
     "prefill_length",
@@ -71,36 +72,6 @@ def get_default_prompts(batch_size: int, num_backends: int) -> list:
 def get_default_hypo_ids(batch_size: int, device: torch.device) -> torch.Tensor:
     """Return default hypo_ids (identity mapping)."""
     return torch.arange(batch_size, dtype=torch.int64, device=device)
-
-
-def get_default_tree_attention_mask() -> None:
-    """Return default tree_attention_mask (None - no speculative decoding)."""
-    return None
-
-
-def get_default_kv_cache_position_ids() -> None:
-    """Return default kv_cache_position_ids (None)."""
-    return None
-
-
-def get_default_draft_tokens() -> None:
-    """Return default draft_tokens (None - no speculative decoding)."""
-    return None
-
-
-def get_default_prefill_length() -> int:
-    """Return default prefill_length (0)."""
-    return 0
-
-
-def get_default_is_spec_dec() -> bool:
-    """Return default is_spec_dec (False)."""
-    return False
-
-
-def get_default_need_pruning() -> bool:
-    """Return default need_pruning (False)."""
-    return False
 
 
 def get_default_keep_indices(seq_length: int, device: torch.device) -> torch.Tensor:
@@ -214,12 +185,12 @@ def fill_microbatch_defaults(
     if request_context is not None and request_context.is_initialized:
         prompts = request_context.get_field("prompts", get_default_prompts(batch_size, num_backends))
         hypo_ids = request_context.get_field("hypo_ids", get_default_hypo_ids(batch_size, device))
-        tree_attention_mask = request_context.get_field("tree_attention_mask", get_default_tree_attention_mask())
-        kv_cache_position_ids = request_context.get_field("kv_cache_position_ids", get_default_kv_cache_position_ids())
-        draft_tokens = request_context.get_field("draft_tokens", get_default_draft_tokens())
-        prefill_length = request_context.get_field("prefill_length", get_default_prefill_length())
-        is_spec_dec = request_context.get_field("is_spec_dec", get_default_is_spec_dec())
-        need_pruning = request_context.get_field("need_pruning", get_default_need_pruning())
+        tree_attention_mask = request_context.get_field("tree_attention_mask", None)
+        kv_cache_position_ids = request_context.get_field("kv_cache_position_ids", None)
+        draft_tokens = request_context.get_field("draft_tokens", None)
+        prefill_length = request_context.get_field("prefill_length", 0)
+        is_spec_dec = request_context.get_field("is_spec_dec", False)
+        need_pruning = request_context.get_field("need_pruning", False)
     else:
         # No context available - use all defaults.
         # Default to debug-level to avoid noisy WARNs in decode loops;
@@ -239,12 +210,12 @@ def fill_microbatch_defaults(
             logger.debug(f"{MBPIPE_SCHEMA_PREFIX} No request context available, using all defaults")
         prompts = get_default_prompts(batch_size, num_backends)
         hypo_ids = get_default_hypo_ids(batch_size, device)
-        tree_attention_mask = get_default_tree_attention_mask()
-        kv_cache_position_ids = get_default_kv_cache_position_ids()
-        draft_tokens = get_default_draft_tokens()
-        prefill_length = get_default_prefill_length()
-        is_spec_dec = get_default_is_spec_dec()
-        need_pruning = get_default_need_pruning()
+        tree_attention_mask = None
+        kv_cache_position_ids = None
+        draft_tokens = None
+        prefill_length = 0
+        is_spec_dec = False
+        need_pruning = False
     
     return (
         mb_hidden_states,

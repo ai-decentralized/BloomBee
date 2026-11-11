@@ -20,9 +20,11 @@ from bloombee.flexgen_utils.utils import (GB, T, cpu_mem_stats, vector_gather, t
     torch_dtype_to_num_bytes)
 from torch import nn
 from transformers.activations import ACT2FN
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 import logging
 from hivemind.utils import get_logger
 from bloombee.utils.debug import dprint
+from bloombee.utils.lora import lora_linear
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -78,39 +80,23 @@ def see_memory_usage(message, force=True):
 	dprint(logger)
  
  
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    B, S, H, D = xq.shape
-    half = D // 2
-
-    q1, q2 = xq[..., :half].float(), xq[..., half:].float()
-    k1, k2 = xk[..., :half].float(), xk[..., half:].float()
-    qz = torch.complex(q1, q2)  # (B,S,H,half)
-    kz = torch.complex(k1, k2)
-
-    if freqs_cis.ndim == 2:            # (S, half)
-        freqs_bc = freqs_cis.view(1, S, 1, half)
-    elif freqs_cis.ndim == 3:          # (B, S, half)
-        freqs_bc = freqs_cis.view(B, S, 1, half)
+    B, S, _, D = xq.shape
+    # Match HF's projection dtype and multiply/add rounding order. A
+    # complex64 rotation followed by one final cast has different FP16 grads.
+    cos = torch.cat((freqs_cis.real, freqs_cis.real), dim=-1).to(xq.dtype)
+    sin = torch.cat((freqs_cis.imag, freqs_cis.imag), dim=-1).to(xq.dtype)
+    if freqs_cis.ndim == 2:
+        cos, sin = cos.view(1, S, D), sin.view(1, S, D)
+    elif freqs_cis.ndim == 3:
+        cos, sin = cos.view(B, S, D), sin.view(B, S, D)
     else:
         raise ValueError(f"unexpected freqs_cis shape: {freqs_cis.shape}")
-
-    qz = qz * freqs_bc
-    kz = kz * freqs_bc
-
-    q_out = torch.cat([qz.real, qz.imag], dim=-1).type_as(xq)
-    k_out = torch.cat([kz.real, kz.imag], dim=-1).type_as(xk)
-    return q_out, k_out
+    return apply_rotary_pos_emb(xq, xk, cos, sin, unsqueeze_dim=2)
 
 def precompute_freqs_cis(
     dim: int, 
@@ -135,10 +121,10 @@ def rms_norm(hidden_states, weight, variance_epsilon=1e-5):
     # know their model's exact value (e.g. from config) should pass it explicitly.
     input_dtype = hidden_states.dtype
     x = hidden_states.to(torch.float32)
-    w = weight.to(torch.float32)
     var = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(var + variance_epsilon)
-    return (x * w).to(input_dtype)
+    # HF casts the normalized activation before multiplying by its weight.
+    return weight * x.to(input_dtype)
 
 def sample_top_p(probs, p):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -679,7 +665,7 @@ class TorchDevice:
 
         return TorchTensor.create_from_torch(value, self), k_new, v_new
     
-    def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out, num_attention_heads, donate, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids):
+    def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out, num_attention_heads, donate, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids, rms_norm_eps=1e-5):
         """Multi-head attention (prefill phase)."""
         
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -707,11 +693,11 @@ class TorchDevice:
         )
         scaling = head_dim ** -0.5
         
-        hidden = rms_norm(hidden_states.data, input_layernorm.data)
+        hidden = rms_norm(hidden_states.data, input_layernorm.data, variance_epsilon=rms_norm_eps)
         
-        q = F.linear(hidden, w_q.data)
-        k = F.linear(hidden, w_k.data)
-        v = F.linear(hidden, w_v.data)
+        q = lora_linear(hidden, w_q.data, "q_proj")
+        k = lora_linear(hidden, w_k.data, "k_proj")
+        v = lora_linear(hidden, w_v.data, "v_proj")
         
         q = q.view(bsz, q_len, num_attention_heads, head_dim)
         k = k.view(bsz, q_len, num_kv_heads, head_dim)
@@ -732,7 +718,7 @@ class TorchDevice:
         k = k.permute(0, 2, 3, 1).reshape(bsz * num_attention_heads, head_dim, q_len)
         v = v.permute(0, 2, 1, 3).reshape(bsz * num_attention_heads, q_len, head_dim)
         
-        attn_scores = torch.bmm(q, k) / math.sqrt(head_dim)  # [b*n_h, q_len, q_len]
+        attn_scores = torch.bmm(q, k) * scaling  # Match HF eager attention rounding.
         
         attn_scores = attn_scores.view(bsz, num_attention_heads, q_len, q_len)
         attn_scores = attn_scores + attention_mask.data
@@ -743,7 +729,7 @@ class TorchDevice:
         value = torch.bmm(attn_weights, v).view(bsz, num_attention_heads, q_len, head_dim)
         value = value.transpose(1, 2).reshape(bsz, q_len, qkv_hidden_size)
 
-        value = F.linear(value, w_out.data)
+        value = lora_linear(value, w_out.data, "o_proj")
         value.add_(hidden_states.data)
         
         if donate[0]: hidden_states.delete()
@@ -762,7 +748,7 @@ class TorchDevice:
     
     def mha_gen_llama(self, inputs, attention_mask, w_q, w_k, w_v,
                 w_out, n_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids):
+                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids, rms_norm_eps=1e-5):
         """Multi-head attention (decoding phase)."""
         global _MHA_GEN_DECODE_PROBE_EMITTED, _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED
         # decompress weights
@@ -790,14 +776,14 @@ class TorchDevice:
         )
         scaling = head_dim ** -0.5
 
-        hidden = rms_norm(inputs.data, input_layernorm.data)
+        hidden = rms_norm(inputs.data, input_layernorm.data, variance_epsilon=rms_norm_eps)
         
         # logger.info(f"after norm, hidden states: {hidden}")
         
         # shape: (b, 1, h)
-        q = F.linear(hidden, w_q.data)
-        k = F.linear(hidden, w_k.data)
-        v = F.linear(hidden, w_v.data)
+        q = lora_linear(hidden, w_q.data, "q_proj")
+        k = lora_linear(hidden, w_k.data, "k_proj")
+        v = lora_linear(hidden, w_v.data, "v_proj")
         
         # shape: (b, 1, n_head, head_dim) for q; (b, 1, n_kv, head_dim) for k/v
         q = q.view(b, tgt_s, n_head, head_dim)
@@ -934,7 +920,7 @@ class TorchDevice:
         # shape: (b, 1, h)
         value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, qkv_hidden_size)
         
-        value = F.linear(value, w_out.data)
+        value = lora_linear(value, w_out.data, "o_proj")
 
         value.add_(inputs.data)
         
@@ -1102,9 +1088,16 @@ class TorchDevice:
         b, s, h = inputs.shape
         hidden_act = config.hidden_act
         act_fn = ACT2FN[hidden_act]
-        src_out = rms_norm(inputs.data, post_attention_layernorm.data)
+        src_out = rms_norm(
+            inputs.data,
+            post_attention_layernorm.data,
+            variance_epsilon=float(getattr(config, "rms_norm_eps", 1e-5)),
+        )
         # src_out = F.layer_norm(inputs.data, (h,), weight=post_attention_layernorm.data)
-        out = F.linear(act_fn(F.linear(src_out, gate.data)) * F.linear(src_out, up.data), down.data)
+        out = lora_linear(
+            act_fn(lora_linear(src_out, gate.data, "gate_proj"))
+            * lora_linear(src_out, up.data, "up_proj"), down.data, "down_proj"
+        )
 
         out.add_(inputs.data)
         # if donate[0]: inputs.delete()
