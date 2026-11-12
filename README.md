@@ -22,7 +22,10 @@ Instead of requiring a single powerful machine, BloomBee splits a model's transf
 </p>
 
 ## News
-
+- `2026/11/01`: Optimize backward passes and add standard LoRA training (PR [#72](../../pull/72) by @JiuChen0).
+- `2026/10/22`: Fix prompt-tuning training bugs with transformers>=5 (PR [#70](../../pull/70) by @tanish-malekar).
+- `2026/10/20`: Add distributed inference support for Nemotron-H and GLM-4.7-Flash (PR [#69](../../pull/69) by @puriaman).
+- `2026/10/12`: Fix long-context RoPE, GQA cache layouts, and Falcon generation (PR [#68](../../pull/68) by @JiuChen0).
 - `2026/09/06`: Support GPT-OSS and Gemma 4 compatibility (PR [#64](...) by @JiuChen0).
 - `2026/08/30`: Add DeepSeek-V3 support for BloomBee (PR [#63](...) by @syj-7).
 - `2026/08/04`: Add the EAGLE-2 speculative drafter runtime (PR [#57](...) by @XinRanZh).
