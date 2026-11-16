@@ -26,6 +26,7 @@ from bloombee.utils.hf_compat import get_file_from_repo
 
 from bloombee.constants import DTYPE_MAP
 from bloombee.models.bloom.block import WrappedBloomBlock
+from bloombee.models.beam.block import WrappedBeamBlock
 from bloombee.models.deepseekv3.block import WrappedDeepseekV3Block
 from bloombee.models.mixtral import WrappedMixtralBlock
 from bloombee.models.nemotron_h.block import WrappedNemotronHBlock
@@ -110,6 +111,7 @@ def load_pretrained_block(
         WrappedDeepseekV3Block,
         WrappedNemotronHBlock,
         WrappedGlm4MoeLiteBlock,
+        WrappedBeamBlock,
     )
 
     needs_flexgen = (not _is_hf_model) and getattr(config, "model_type", None) != "gpt_oss"
@@ -173,6 +175,12 @@ _MIXTRAL_LEGACY_EXPERT_KEY_RE = re.compile(
     r"^(.*)block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$"
 )
 _MIXTRAL_LEGACY_GATE_KEY_RE = re.compile(r"^(.*)block_sparse_moe\.gate\.(weight|bias)$")
+_NEMOTRON_H_LEGACY_EXPERT_KEY_RE = re.compile(
+    r"^(.*mixer\.experts)\.(\d+)\.(up_proj|down_proj)\.weight$"
+)
+_NEMOTRON_H_LEGACY_EXPERT_KEY_RE = re.compile(
+    r"^(.*mixer\.experts)\.(\d+)\.(up_proj|down_proj)\.weight$"
+)
 
 
 def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
@@ -251,6 +259,209 @@ def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
             # instead of staying alive until the whole layer is done.
 
         state_dict[f"{prefix}.gate_up_proj"] = gate_up_proj
+        state_dict[f"{prefix}.down_proj"] = down_proj
+
+    return state_dict
+
+
+def _remap_nemotron_h_expert_state_dict(state_dict: "StateDict") -> "StateDict":
+    """Pack NVIDIA Nemotron-H routed experts for Transformers 5.x.
+
+    Official NVIDIA checkpoints store routed experts separately:
+
+        mixer.experts.{i}.up_proj.weight
+            [intermediate, hidden]
+        mixer.experts.{i}.down_proj.weight
+            [hidden, intermediate]
+
+    Transformers 5.x Nemotron-H stores all routed experts as two batched
+    parameters instead:
+
+        mixer.experts.up_proj
+            [num_experts, intermediate, hidden]
+        mixer.experts.down_proj
+            [num_experts, hidden, intermediate]
+
+    Shared experts and router weights already use the runtime key names and
+    therefore remain untouched.
+
+    The destination tensors are allocated once and filled expert-by-expert so
+    that we do not create additional torch.stack intermediates for the entire
+    MoE layer.
+    """
+    per_expert = defaultdict(dict)
+
+    for key in list(state_dict.keys()):
+        match = _NEMOTRON_H_LEGACY_EXPERT_KEY_RE.match(key)
+        if match is None:
+            continue
+
+        prefix = match.group(1)
+        expert_idx = int(match.group(2))
+        projection = match.group(3)
+
+        per_expert[(prefix, expert_idx)][projection] = state_dict.pop(key)
+
+    if not per_expert:
+        return state_dict
+
+    by_prefix = defaultdict(dict)
+    for (prefix, expert_idx), tensors in per_expert.items():
+        by_prefix[prefix][expert_idx] = tensors
+    per_expert.clear()
+
+    for prefix, experts_by_idx in by_prefix.items():
+        num_experts = max(experts_by_idx) + 1
+
+        missing_experts = [
+            idx for idx in range(num_experts)
+            if idx not in experts_by_idx
+        ]
+        if missing_experts:
+            raise ValueError(
+                f"{prefix}: missing expert indices {missing_experts} "
+                f"while remapping Nemotron-H weights "
+                f"(found {sorted(experts_by_idx)})"
+            )
+
+        sample_up = experts_by_idx[0].get("up_proj")
+        if sample_up is None:
+            raise ValueError(
+                f"{prefix}.0: missing up_proj while remapping "
+                "Nemotron-H weights"
+            )
+
+        intermediate, hidden = sample_up.shape
+        dtype = sample_up.dtype
+        device = sample_up.device
+
+        up_proj = torch.empty(
+            (num_experts, intermediate, hidden),
+            dtype=dtype,
+            device=device,
+        )
+        down_proj = torch.empty(
+            (num_experts, hidden, intermediate),
+            dtype=dtype,
+            device=device,
+        )
+
+        for idx in range(num_experts):
+            tensors = experts_by_idx.pop(idx)
+
+            missing = [
+                name for name in ("up_proj", "down_proj")
+                if name not in tensors
+            ]
+            if missing:
+                raise ValueError(
+                    f"{prefix}.{idx}: missing {missing} while remapping "
+                    "Nemotron-H weights"
+                )
+
+            up = tensors.pop("up_proj")
+            down = tensors.pop("down_proj")
+
+            if tuple(up.shape) != (intermediate, hidden):
+                raise ValueError(
+                    f"{prefix}.{idx}.up_proj: expected "
+                    f"{(intermediate, hidden)}, got {tuple(up.shape)}"
+                )
+
+            if tuple(down.shape) != (hidden, intermediate):
+                raise ValueError(
+                    f"{prefix}.{idx}.down_proj: expected "
+                    f"{(hidden, intermediate)}, got {tuple(down.shape)}"
+                )
+
+            up_proj[idx] = up
+            down_proj[idx] = down
+
+        state_dict[f"{prefix}.up_proj"] = up_proj
+        state_dict[f"{prefix}.down_proj"] = down_proj
+
+    return state_dict
+
+
+def _remap_nemotron_h_expert_state_dict(state_dict: "StateDict") -> "StateDict":
+    """Pack NVIDIA Nemotron-H per-expert checkpoint weights for Transformers 5.x."""
+    per_expert = defaultdict(dict)
+
+    for key in list(state_dict.keys()):
+        match = _NEMOTRON_H_LEGACY_EXPERT_KEY_RE.match(key)
+        if match is None:
+            continue
+
+        prefix = match.group(1)
+        expert_idx = int(match.group(2))
+        projection = match.group(3)
+        per_expert[(prefix, expert_idx)][projection] = state_dict.pop(key)
+
+    if not per_expert:
+        return state_dict
+
+    by_prefix = defaultdict(dict)
+    for (prefix, expert_idx), tensors in per_expert.items():
+        by_prefix[prefix][expert_idx] = tensors
+    per_expert.clear()
+
+    for prefix, experts_by_idx in by_prefix.items():
+        num_experts = max(experts_by_idx) + 1
+
+        missing_experts = [
+            idx for idx in range(num_experts)
+            if idx not in experts_by_idx
+        ]
+        if missing_experts:
+            raise ValueError(
+                f"{prefix}: missing expert indices {missing_experts} "
+                "while remapping Nemotron-H weights"
+            )
+
+        sample_up = experts_by_idx[0].get("up_proj")
+        if sample_up is None:
+            raise ValueError(f"{prefix}.0: missing up_proj")
+
+        intermediate, hidden = sample_up.shape
+        dtype = sample_up.dtype
+        device = sample_up.device
+
+        up_proj = torch.empty(
+            (num_experts, intermediate, hidden),
+            dtype=dtype,
+            device=device,
+        )
+        down_proj = torch.empty(
+            (num_experts, hidden, intermediate),
+            dtype=dtype,
+            device=device,
+        )
+
+        for idx in range(num_experts):
+            tensors = experts_by_idx.pop(idx)
+
+            if "up_proj" not in tensors or "down_proj" not in tensors:
+                raise ValueError(
+                    f"{prefix}.{idx}: incomplete Nemotron-H expert"
+                )
+
+            up = tensors.pop("up_proj")
+            down = tensors.pop("down_proj")
+
+            if tuple(up.shape) != (intermediate, hidden):
+                raise ValueError(
+                    f"{prefix}.{idx}.up_proj wrong shape {tuple(up.shape)}"
+                )
+
+            if tuple(down.shape) != (hidden, intermediate):
+                raise ValueError(
+                    f"{prefix}.{idx}.down_proj wrong shape {tuple(down.shape)}"
+                )
+
+            up_proj[idx] = up
+            down_proj[idx] = down
+
+        state_dict[f"{prefix}.up_proj"] = up_proj
         state_dict[f"{prefix}.down_proj"] = down_proj
 
     return state_dict
@@ -369,8 +580,19 @@ def _load_hf_block_weights(
         return block.load_checkpoint_state(state_dict, torch_dtype)
     if isinstance(block, WrappedDeepseekV3Block):
         state_dict = _remap_deepseekv3_expert_state_dict(state_dict)
+    elif isinstance(block, WrappedGlm4MoeLiteBlock):
+        # GLM-4.7-Flash Hub checkpoints store each expert separately as
+        # gate_proj/up_proj/down_proj, while Transformers 5 expects packed
+        # gate_up_proj/down_proj tensors -- same layout conversion as DeepSeek.
+        state_dict = _remap_deepseekv3_expert_state_dict(state_dict)
+    elif isinstance(block, WrappedBeamBlock):
+        state_dict = _remap_deepseekv3_expert_state_dict(state_dict)
     elif isinstance(block, WrappedMixtralBlock):
         state_dict = _remap_mixtral_expert_state_dict(state_dict)
+    elif isinstance(block, WrappedNemotronHBlock):
+        state_dict = _remap_nemotron_h_expert_state_dict(state_dict)
+    elif isinstance(block, WrappedNemotronHBlock):
+        state_dict = _remap_nemotron_h_expert_state_dict(state_dict)
     # Bare decoder layers have initialized parameters even before loading.
     # Reject incomplete checkpoints before mutating the block, while allowing
     # optional/generated buffers (e.g. rotary frequencies) to be absent.
