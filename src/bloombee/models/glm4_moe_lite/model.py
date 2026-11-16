@@ -2,7 +2,8 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
     Glm4MoeLiteForCausalLM,
     Glm4MoeLiteModel,
@@ -135,7 +136,7 @@ class DistributedGlm4MoeLiteModel(
         if past_key_values is None:
             past_key_values = RemotePastKeyValues()
 
-        past_key_values.update_seen(hidden_states.size(1))
+        past_key_values.advance_seen(hidden_states.size(1))
 
         hidden_states = self.layers(
             hidden_states,
@@ -149,11 +150,12 @@ class DistributedGlm4MoeLiteModel(
         hidden_states = self.norm(hidden_states)
         hidden_states = hidden_states.view(output_shape)
 
-        return BaseModelOutputWithPast(
+        return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=None,
             attentions=None,
+            router_logits=None,
         )
 
     def get_input_embeddings(self):
@@ -202,6 +204,140 @@ class DistributedGlm4MoeLiteForCausalLM(
         self.lm_head = LMHead(config)
 
         self.post_init()
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        use_cache=True,
+        **kwargs,
+    ):
+        """
+        Prepare incremental generation inputs for BloomBee's remote GLM cache.
+
+        RemotePastKeyValues tracks how many tokens have already traversed the
+        distributed decoder. During decode, send only tokens that have not
+        previously been processed and keep position/cache positions aligned.
+        """
+        if past_key_values is not None:
+            past_length = past_key_values.get_seq_length()
+
+            # Keep only tokens that have not already traversed the remote model.
+            if input_ids.shape[1] > past_length:
+                input_ids = input_ids[:, past_length:]
+            else:
+                input_ids = input_ids[:, -1:]
+        else:
+            past_length = 0
+
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+
+            # On cached decode only positions for the new tokens are needed.
+            if past_key_values is not None:
+                position_ids = position_ids[:, -input_ids.shape[1]:]
+        else:
+            position_ids = torch.arange(
+                past_length,
+                past_length + input_ids.shape[1],
+                dtype=torch.long,
+                device=input_ids.device,
+            ).unsqueeze(0).expand(input_ids.shape[0], -1)
+
+        # GLM's forward path explicitly checks that cache_position and
+        # position_ids describe the same positions.
+        cache_position = position_ids
+
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids.contiguous()}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+            }
+        )
+
+        return model_inputs
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
+    ) -> dict:
+        # BloomBee's remote cache tracks already-processed tokens. During
+        # decode, trim input_ids so Transformers does not resend the full
+        # prefill sequence to the remote swarm.
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = getattr(past_key_values, "_seen_tokens", None)
+
+                if past_length is None:
+                    past_length = cache_length
+
+                if hasattr(past_key_values, "get_max_length"):
+                    max_cache_length = past_key_values.get_max_length()
+                elif hasattr(past_key_values, "get_max_cache_shape"):
+                    max_cache_length = past_key_values.get_max_cache_shape()
+                else:
+                    max_cache_length = None
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            if (
+                attention_mask is not None
+                and attention_mask.shape[1] > input_ids.shape[1]
+            ):
+                input_ids = input_ids[
+                    :, -(attention_mask.shape[1] - past_length):
+                ]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+
+        if attention_mask is not None and position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+
+            if past_key_values is not None:
+                position_ids = position_ids[:, -input_ids.shape[1]:]
+
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+
+        return model_inputs
 
     def get_output_embeddings(self):
         return self.lm_head

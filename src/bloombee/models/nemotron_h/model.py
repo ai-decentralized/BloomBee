@@ -2,7 +2,8 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.nemotron_h import (
     NemotronHForCausalLM,
     NemotronHModel,
@@ -143,7 +144,7 @@ class DistributedNemotronHModel(
         if past_key_values is None:
             past_key_values = RemotePastKeyValues()
 
-        past_key_values.update_seen(hidden_states.size(1))
+        past_key_values.advance_seen(hidden_states.size(1))
 
         hidden_states = self.layers(
             hidden_states,
@@ -157,11 +158,12 @@ class DistributedNemotronHModel(
         hidden_states = self.norm_f(hidden_states)
         hidden_states = hidden_states.view(output_shape)
 
-        return BaseModelOutputWithPast(
+        return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=None,
             attentions=None,
+            router_logits=None,
         )
 
     def get_input_embeddings(self):
@@ -204,6 +206,32 @@ class DistributedNemotronHForCausalLM(
     )
 
     config_class = DistributedNemotronHConfig
+    _supports_cache_class = True
+
+    _checkpoint_conversion_mapping = {
+        r"^backbone\.embeddings\.": "model.embeddings.",
+        r"^backbone\.norm_f\.": "model.norm_f.",
+    }
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # NVIDIA's Nemotron-3.5 checkpoint stores the client-side embedding
+        # and final norm under `backbone.*`, while BloomBee's distributed
+        # CausalLM owns them under `model.*`.
+        key_mapping = kwargs.pop("key_mapping", None)
+        if key_mapping is None:
+            key_mapping = dict(cls._checkpoint_conversion_mapping)
+        else:
+            key_mapping = {
+                **cls._checkpoint_conversion_mapping,
+                **key_mapping,
+            }
+
+        return super().from_pretrained(
+            *args,
+            key_mapping=key_mapping,
+            **kwargs,
+        )
 
     def __init__(self, config: DistributedNemotronHConfig):
         # Avoid NemotronHForCausalLM.__init__, because it would construct a
@@ -215,6 +243,77 @@ class DistributedNemotronHForCausalLM(
         self.lm_head = LMHead(config)
 
         self.post_init()
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
+    ) -> dict:
+        # BloomBee's remote cache tracks already-processed tokens. Trim
+        # input_ids during decode so Transformers 5.x does not repeatedly
+        # resend the full prefill sequence to the remote swarm.
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = getattr(past_key_values, "_seen_tokens", None)
+
+                if past_length is None:
+                    past_length = cache_length
+
+                if hasattr(past_key_values, "get_max_length"):
+                    max_cache_length = past_key_values.get_max_length()
+                elif hasattr(past_key_values, "get_max_cache_shape"):
+                    max_cache_length = past_key_values.get_max_cache_shape()
+                else:
+                    max_cache_length = None
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            if (
+                attention_mask is not None
+                and attention_mask.shape[1] > input_ids.shape[1]
+            ):
+                input_ids = input_ids[
+                    :, -(attention_mask.shape[1] - past_length):
+                ]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+
+        if attention_mask is not None and position_ids is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+
+            if past_key_values is not None:
+                position_ids = position_ids[:, -input_ids.shape[1]:]
+
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+
+        return model_inputs
 
     def get_output_embeddings(self):
         return self.lm_head
