@@ -348,6 +348,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--boundary-compression", dest="boundary_compression", default="none",
                         help="opt-in lossy activation codec: none, int8, hadamard-int8")
+    parser.add_argument("--adapter-wire", dest="adapter_wire", default="float32", choices=("float32", "bfloat16"))
     parser.add_argument("--sim-link", default="", help="'<latency_ms>,<mbit>' simulated client link")
     parser.add_argument("--reference", action="store_true", help="also train HF+PEFT and compare (accuracy gate)")
     parser.add_argument("--worker-env", nargs="*", default=[], help="extra KEY=VALUE env for workers")
@@ -397,7 +398,11 @@ def main():
         torch.manual_seed(args.seed)
         config = LoRAConfig(r=args.r, lora_alpha=args.alpha, lora_dropout=args.dropout,
                             target_modules=tuple(args.targets.split(",")))  # fmt: skip
-        extra = {} if args.boundary_compression == "none" else dict(boundary_compression=args.boundary_compression)
+        extra = {}
+        if args.boundary_compression != "none":
+            extra["boundary_compression"] = args.boundary_compression
+        if args.adapter_wire != "float32":
+            extra["adapter_wire"] = args.adapter_wire
         lora = DistributedLoRA(client, config, **extra).cuda().train()
         adapter_dir = args.output / "initial-adapter"
         lora.save_pretrained(adapter_dir)

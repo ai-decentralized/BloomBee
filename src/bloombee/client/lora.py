@@ -59,7 +59,7 @@ async def _call_lora(manager, span, inputs, metadata):
 
     result = await deserialize_tensor_stream(checked())
     sim_link.account_receive(received)
-    delay = sim_link.link_delay(received)
+    delay = sim_link.link_delay(received, "down")
     if delay:
         await asyncio.sleep(delay)
     return result, response_meta
@@ -81,6 +81,7 @@ class _SpanCall:
         self.cache_id = uuid.uuid4().hex if needs_grad else None
         self.lock = sequence._upload_locks.setdefault(self.key, asyncio.Lock())
         self.codec = sequence.boundary_codec
+        self.adapter_wire = sequence.adapter_wire
         # Inside train_step: workers sum dA/dB over the step and the client collects them once.
         self.accumulate = getattr(sequence._local, "accumulate", None)
 
@@ -95,7 +96,14 @@ class _SpanCall:
         }
         if self.codec != "none":
             meta.update(codec=self.codec, wire_dtype=self.wire_dtype)
+        if self.adapter_wire != "float32":
+            meta["adapter_wire"] = self.adapter_wire
         return meta
+
+    def _wire_params(self, parameters):
+        if self.adapter_wire == "float32":
+            return tuple(parameters)
+        return tuple(p.detach().to(getattr(torch, self.adapter_wire)) for p in parameters)
 
     def _encode(self, tensor):
         self.wire_dtype = str(tensor.dtype).replace("torch.", "")
@@ -109,7 +117,7 @@ class _SpanCall:
 
     async def _forward(self, inputs, parameters, send):
         for _ in range(3):
-            tensors = (*self._encode(inputs), *parameters) if send else tuple(self._encode(inputs))
+            tensors = (*self._encode(inputs), *self._wire_params(parameters)) if send else tuple(self._encode(inputs))
             result, response = await _call_lora(self.manager, self.span, tensors, self._meta("forward"))
             miss = response.get("cache_miss")
             if miss is None:
@@ -146,7 +154,7 @@ class _SpanCall:
             if response.get("cache_miss"):
                 gradients = None
         if gradients is None:  # expired / evicted / restarted worker: same result, recomputed
-            tensors = (*self._encode(inputs), *self._encode(grad_outputs), *parameters)
+            tensors = (*self._encode(inputs), *self._encode(grad_outputs), *self._wire_params(parameters))
             gradients, _ = await _call_lora(self.manager, self.span, tensors, self._meta("stateless", cache_id=None))
             self.adapters[self.key] = self.version
         self.cache_id = None
@@ -196,6 +204,7 @@ class LoRARemoteSequential(RemoteSequential):
         self._local = threading.local()  # per-microbatch route / seed / step token (train_step)
         self._upload_locks = {}
         self.boundary_codec = "none"  # see bloombee.utils.lora_codec; set via DistributedLoRA
+        self.adapter_wire = "float32"  # "bfloat16" halves adapter/gradient traffic; set via DistributedLoRA
         shapes = projection_shapes(original.config)
         self.adapters = nn.ModuleList(
             [
@@ -286,6 +295,8 @@ class LoRARemoteSequential(RemoteSequential):
             seed=0,
             accumulate=token,
         )
+        if self.adapter_wire != "float32":
+            metadata["adapter_wire"] = self.adapter_wire
         jobs = [(span, self.span_parameters(span)) for span in spans.values()]
 
         async def gather():
@@ -332,11 +343,15 @@ class DistributedLoRA(nn.Module):
     weights are sent again at backward; there is no worker-side optimizer step.
     """
 
-    def __init__(self, model, config=None, *, boundary_compression="none"):
+    def __init__(self, model, config=None, *, boundary_compression="none", adapter_wire="float32"):
         """``boundary_compression`` ("none", "int8", "hadamard-int8") is an opt-in, lossy
         codec for activations and activation gradients on the network (see
-        bloombee.utils.lora_codec). Adapters and their gradients are always exact."""
+        bloombee.utils.lora_codec). ``adapter_wire="bfloat16"`` is a second opt-in: adapters
+        are uploaded and their gradients returned as bf16 (fp32 masters, optimizer state and
+        gradient sums stay fp32), halving the adapter traffic. Both default to exact."""
         super().__init__()
+        if adapter_wire not in ("float32", "bfloat16"):
+            raise ValueError("adapter_wire must be 'float32' or 'bfloat16'")
         if boundary_compression not in lora_codec.CODECS:
             raise ValueError(f"boundary_compression must be one of {lora_codec.CODECS}")
         self.lora_config = config or LoRAConfig()
@@ -357,6 +372,7 @@ class DistributedLoRA(nn.Module):
         parent_path, _, attribute = name.rpartition(".")
         sequence = LoRARemoteSequential(original, self.lora_config)
         sequence.boundary_codec = boundary_compression
+        sequence.adapter_wire = adapter_wire
         setattr(model.get_submodule(parent_path), attribute, sequence)
         self.model = model
         self._sequence_path = name

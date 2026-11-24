@@ -9,6 +9,7 @@ Unset (the default) adds no delay.
 import asyncio
 import os
 import threading
+import time
 
 _lock = threading.Lock()
 TRANSFER_STATS = {"bytes_sent": 0, "bytes_received": 0, "calls": 0}
@@ -26,11 +27,20 @@ def _parse(value):
 _LINK = _parse(os.getenv("BLOOMBEE_SIM_LINK", ""))
 
 
-def link_delay(nbytes):
+_busy_until = {"up": 0.0, "down": 0.0}
+
+
+def link_delay(nbytes, direction="up"):
+    """Seconds to wait for `nbytes`: latency plus transmission on a link shared by all
+    concurrent messages of this direction (they queue behind each other)."""
     if _LINK is None:
         return 0.0
     latency_s, bytes_per_s = _LINK
-    return latency_s + nbytes / bytes_per_s
+    with _lock:
+        now = time.monotonic()
+        start = max(now, _busy_until[direction])
+        _busy_until[direction] = start + nbytes / bytes_per_s
+        return (_busy_until[direction] - now) + latency_s
 
 
 async def account_send(nbytes):
@@ -38,7 +48,7 @@ async def account_send(nbytes):
     with _lock:
         TRANSFER_STATS["bytes_sent"] += nbytes
         TRANSFER_STATS["calls"] += 1
-    delay = link_delay(nbytes)
+    delay = link_delay(nbytes, "up")
     if delay:
         await asyncio.sleep(delay)
 

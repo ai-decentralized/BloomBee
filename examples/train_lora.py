@@ -45,6 +45,12 @@ def main():
         help="Split each batch into this many microbatches that pipeline across workers (same gradients)",
     )
     parser.add_argument(
+        "--adapter_wire",
+        default="float32",
+        choices=("float32", "bfloat16"),
+        help="Opt-in: send adapters/gradients as bf16 (half the adapter traffic); masters stay fp32",
+    )
+    parser.add_argument(
         "--boundary_compression",
         default="none",
         choices=("none", "int8", "hadamard-int8"),
@@ -101,13 +107,16 @@ def main():
     base = AutoDistributedModelForCausalLM.from_pretrained(args.model, **kwargs).to(args.device)
     if args.resume_adapter or args.resume_checkpoint:
         model = DistributedLoRA.from_pretrained(
-            base, args.resume_adapter or args.resume_checkpoint, boundary_compression=args.boundary_compression
+            base, args.resume_adapter or args.resume_checkpoint,
+            boundary_compression=args.boundary_compression,
+            adapter_wire=args.adapter_wire,
         )
     else:
         model = DistributedLoRA(
             base,
             LoRAConfig(args.r, args.lora_alpha, args.lora_dropout, tuple(args.target_modules)),
             boundary_compression=args.boundary_compression,
+            adapter_wire=args.adapter_wire,
         )
     model.to(args.device).train()
     parameters = [p for p in model.parameters() if p.requires_grad]

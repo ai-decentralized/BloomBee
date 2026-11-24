@@ -221,22 +221,38 @@ def test_worker_accumulates_step_gradients_and_collects_once(fresh_caches, monke
 
 
 @pytest.mark.parametrize("codec", ["int8", "hadamard-int8"])
-def test_boundary_codecs_roundtrip_with_outliers(codec):
+def test_boundary_codecs_roundtrip_with_massive_activations(codec):
     from bloombee.utils import lora_codec
 
     torch.manual_seed(0)
     x = torch.randn(2, 16, 256).half()
-    x[..., 7] *= 200  # an outlier channel, as in real LLM hidden states
+    x[..., 7] *= 300  # a "massive activation" channel, as in real LLM hidden states
     parts = lora_codec.encode(x, codec)
     assert parts[0].dtype == torch.int8 and len(parts) == lora_codec.wire_count(codec)
     y = lora_codec.decode(parts, codec, torch.float16)
     assert y.shape == x.shape and y.dtype == torch.float16
-    error = (y.float() - x.float()).norm() / x.float().norm()
-    assert error < (0.01 if codec == "hadamard-int8" else 0.05)
+    # Block-wise scales isolate the outlier: channels in the other blocks keep full int8 precision
+    # (a single per-token scale would have rounded them all to ~0). Channels sharing the outlier's
+    # block of 32 do lose precision; that is the price of the codec and is what the accuracy gate measures.
+    other = slice(32, 256)
+    other_error = (y[..., other].float() - x[..., other].float()).norm() / x[..., other].float().norm()
+    assert other_error < 0.02
+    outlier_error = (y[..., 7].float() - x[..., 7].float()).norm() / x[..., 7].float().norm()
+    assert outlier_error < 0.02
     # Deterministic: a stateless retry sees the very same decoded values.
     assert torch.equal(lora_codec.decode(lora_codec.encode(x, codec), codec, torch.float16), y)
-    small = x[..., :7].float()
-    small_error = (y[..., :7].float() - small).norm() / small.norm()
-    if codec == "hadamard-int8":
-        assert small_error < 0.25  # rotation spreads the outlier: ordinary channels survive
     assert lora_codec.decode(lora_codec.encode(x, "none"), "none", torch.float16) is x
+    # Width that is not a multiple of the block still works (one block per token).
+    odd = torch.randn(1, 3, 40).half()
+    back = lora_codec.decode(lora_codec.encode(odd, codec), codec, torch.float16)
+    assert (back.float() - odd.float()).norm() / odd.float().norm() < 0.05
+
+
+@pytest.mark.parametrize("codec", ["int8", "hadamard-int8"])
+def test_boundary_codecs_keep_tiny_gradients(codec):
+    from bloombee.utils import lora_codec
+
+    torch.manual_seed(1)
+    grad = (torch.randn(2, 8, 64) * 1e-6).half()  # typical activation-gradient magnitude
+    back = lora_codec.decode(lora_codec.encode(grad, codec), codec, torch.float16)
+    assert (back.float() - grad.float()).norm() / grad.float().norm() < 0.03

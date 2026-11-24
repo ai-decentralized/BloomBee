@@ -1,11 +1,12 @@
 """Opt-in lossy codecs for activations / activation gradients crossing the network in LoRA training.
 
   none           exact (default)
-  int8           per-token absmax int8 + fp16 scale: ~2x fewer bytes than fp16
-  hadamard-int8  orthonormal block-Hadamard rotation (blocks of 128 along hidden), then
-                 per-(token, block) absmax int8. Rotation spreads the few huge outlier
-                 channels typical of LLM hidden states over the block, so int8 keeps far
-                 more precision (as in QuaRot / TAH-Quant).
+  int8           absmax int8 per (token, block of 32 channels) + bf16 scale: ~1.9x fewer bytes
+                 than fp16. Small blocks matter: LLM hidden states contain "massive
+                 activation" channels 100-1000x larger than the rest, and with one scale per
+                 whole token they would crush every other channel to zero.
+  hadamard-int8  the same after an orthonormal Hadamard rotation inside each block of 32,
+                 which spreads outliers within the block (as in QuaRot / TAH-Quant).
 
 Only boundary activations and their gradients use a codec; adapters and adapter gradients
 always travel as exact fp32. Encoding is deterministic, so a stateless retry sees exactly
@@ -17,7 +18,7 @@ import math
 import torch
 
 CODECS = ("none", "int8", "hadamard-int8")
-_BLOCK = 128
+_BLOCK = 32
 _HADAMARD = {}
 
 
@@ -31,10 +32,6 @@ def _hadamard(n, device):
     return _HADAMARD[key]
 
 
-def _uses_hadamard(codec, width):
-    return codec == "hadamard-int8" and width % _BLOCK == 0
-
-
 def encode(tensor, codec):
     """Return the list of tensors to put on the wire."""
     if codec == "none":
@@ -43,12 +40,14 @@ def encode(tensor, codec):
         raise ValueError(f"Unknown LoRA boundary codec {codec!r}; choose from {CODECS}")
     x = tensor.float()
     width = x.shape[-1]
-    if _uses_hadamard(codec, width):
-        x = (x.reshape(-1, _BLOCK) @ _hadamard(_BLOCK, x.device)).reshape(*x.shape[:-1], width // _BLOCK, _BLOCK)
+    if width % _BLOCK == 0:
+        x = x.reshape(*x.shape[:-1], width // _BLOCK, _BLOCK)
+        if codec == "hadamard-int8":
+            x = x @ _hadamard(_BLOCK, x.device)
     else:
-        x = x.unsqueeze(-2)  # one block per token
-    scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127.0
-    scale = scale.to(torch.float16).clamp_min(torch.finfo(torch.float16).tiny)
+        x = x.unsqueeze(-2)  # width not a multiple of the block: one block per token
+    # bf16 scales (fp32 exponent range): activation *gradients* are ~1e-6 and would underflow fp16.
+    scale = (x.abs().amax(-1, keepdim=True) / 127.0).clamp_min(1e-30).to(torch.bfloat16)
     q = torch.round(x / scale.float()).clamp_(-127, 127).to(torch.int8)
     return [q.reshape(tensor.shape), scale.squeeze(-1)]
 
@@ -61,8 +60,8 @@ def decode(parts, codec, dtype):
     width = q.shape[-1]
     blocks = scale.shape[-1]
     x = q.float().reshape(*q.shape[:-1], blocks, width // blocks) * scale.float().unsqueeze(-1)
-    if _uses_hadamard(codec, width):
-        x = (x.reshape(-1, _BLOCK) @ _hadamard(_BLOCK, x.device).T).reshape(q.shape)
+    if codec == "hadamard-int8" and width // blocks == _BLOCK:
+        x = x @ _hadamard(_BLOCK, x.device).T
     return x.reshape(q.shape).to(dtype)
 
 

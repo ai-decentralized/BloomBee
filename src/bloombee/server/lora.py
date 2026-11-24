@@ -473,6 +473,14 @@ class LoRAService(ServicerBase):
                         raise ValueError("LoRA request tensor count mismatch")
                     decoded = [lora_codec.decode(tensors[i * k : (i + 1) * k], codec, wire_dtype) for i in range(n_act)]
                     tensors = [*decoded, *tensors[k * n_act :]]
+                adapter_wire = metadata.get("adapter_wire", "float32")
+                if adapter_wire not in ("float32", "bfloat16"):
+                    raise ValueError("Invalid LoRA adapter wire dtype")
+                if adapter_wire != "float32" and op in ("forward", "stateless"):
+                    n_act = 1 + int(op == "stateless")
+                    if any(t.dtype != torch.bfloat16 for t in tensors[n_act:]):
+                        raise ValueError("Adapters must arrive in the announced wire dtype")
+                    tensors = [*tensors[:n_act], *(t.float() for t in tensors[n_act:])]
                 if op in ("release", "collect"):
                     if tensors:
                         raise ValueError("LoRA release/collect take no tensors")
@@ -503,6 +511,9 @@ class LoRAService(ServicerBase):
                 outputs, response_meta = (), {"version": version, "cache_miss": what}
             if op == "release" and not response_meta.get("cache_miss"):
                 outputs = ()
+            if outputs and op in ("backward", "stateless", "collect") and metadata.get("adapter_wire") == "bfloat16":
+                lead = 0 if op == "collect" else 1  # dX is not an adapter gradient
+                outputs = (*outputs[:lead], *(g.to(torch.bfloat16) for g in outputs[lead:]))
             if outputs and codec != "none" and op in ("forward", "backward", "stateless"):
                 outputs = (*lora_codec.encode(outputs[0], codec), *outputs[1:])
             packed = MSGPackSerializer.dumps(response_meta)
