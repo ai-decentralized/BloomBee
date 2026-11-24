@@ -16,6 +16,7 @@ from torch.autograd.function import once_differentiable
 
 from bloombee.client.remote_sequential import RemoteSequential
 from bloombee.server.lora import LoRAService
+from bloombee.utils import sim_link
 from bloombee.utils.hivemind_compat import MSGPackSerializer
 from bloombee.utils.lora import LORA_NAMESPACE, LORA_PROTOCOL_VERSION, LoRAConfig, LoRAProjection, projection_shapes
 from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
@@ -31,17 +32,26 @@ async def _call_lora(manager, span, inputs, metadata):
             runtime_pb2.ExpertRequest(uid=uid, tensors=[part], metadata=MSGPackSerializer.dumps(metadata))
             for part in split_for_streaming(wire, DEFAULT_MAX_MSG_SIZE)
         )
+    await sim_link.account_send(sum(part.ByteSize() for part in parts))
     responses = await asyncio.wait_for(
         stub.rpc_lora_stream(iter_as_aiter(parts)), timeout=manager.config.connect_timeout
     )
+    received = 0
 
     async def checked():
+        nonlocal received
         async for response in aiter_with_timeout(responses, manager.config.request_timeout):
             if MSGPackSerializer.loads(response.metadata).get("version") != LORA_PROTOCOL_VERSION:
                 raise RuntimeError("Worker did not acknowledge LoRA protocol v1")
+            received += response.ByteSize()
             yield response.tensors
 
-    return await deserialize_tensor_stream(checked())
+    result = await deserialize_tensor_stream(checked())
+    sim_link.account_receive(received)
+    delay = sim_link.link_delay(received)
+    if delay:
+        await asyncio.sleep(delay)
+    return result
 
 
 class _RemoteLoRAFunction(torch.autograd.Function):
