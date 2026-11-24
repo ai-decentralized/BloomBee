@@ -43,8 +43,18 @@ def nvidia_smi(query, section="gpu"):
     return [[cell.strip() for cell in line.split(",")] for line in out.strip().splitlines() if line.strip()]
 
 
-def assert_gpus_idle(gpus, max_mem_mib=1000, max_util=10):
-    """Refuse to use a GPU that anyone else is using."""
+def assert_gpus_idle(gpus, max_mem_mib=1000, max_util=10, attempts=4):
+    """Refuse to use a GPU that anyone else is using (retries: utilization lags a finished job)."""
+    for attempt in range(attempts):
+        try:
+            return _check_idle(gpus, max_mem_mib, max_util)
+        except RuntimeError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(8)
+
+
+def _check_idle(gpus, max_mem_mib, max_util):
     rows = {int(r[0]): r for r in nvidia_smi("index,uuid,memory.used,utilization.gpu")}
     busy = {r[0] for r in nvidia_smi("gpu_uuid,pid", section="compute-apps")}
     for gpu in gpus:
@@ -336,6 +346,8 @@ def main():
     parser.add_argument("--targets", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--boundary-compression", dest="boundary_compression", default="none",
+                        help="opt-in lossy activation codec: none, int8, hadamard-int8")
     parser.add_argument("--sim-link", default="", help="'<latency_ms>,<mbit>' simulated client link")
     parser.add_argument("--reference", action="store_true", help="also train HF+PEFT and compare (accuracy gate)")
     parser.add_argument("--worker-env", nargs="*", default=[], help="extra KEY=VALUE env for workers")
@@ -361,7 +373,7 @@ def main():
     git = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
     report = dict(
         label=args.label,
-        commit=git.stdout.strip(),
+        commit=git.stdout.strip() or ((REPO / ".commit").read_text().strip() if (REPO / ".commit").exists() else ""),
         args={k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
         devices=[r[1] for r in nvidia_smi("index,name")],
         tokens_per_step=args.batch * args.seq,
@@ -385,7 +397,8 @@ def main():
         torch.manual_seed(args.seed)
         config = LoRAConfig(r=args.r, lora_alpha=args.alpha, lora_dropout=args.dropout,
                             target_modules=tuple(args.targets.split(",")))  # fmt: skip
-        lora = DistributedLoRA(client, config).cuda().train()
+        extra = {} if args.boundary_compression == "none" else dict(boundary_compression=args.boundary_compression)
+        lora = DistributedLoRA(client, config, **extra).cuda().train()
         adapter_dir = args.output / "initial-adapter"
         lora.save_pretrained(adapter_dir)
         params = [p for p in lora.parameters() if p.requires_grad]

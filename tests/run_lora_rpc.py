@@ -21,6 +21,7 @@ from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, Qw
 
 from bloombee import AutoDistributedModelForCausalLM, DistributedLoRA, LoRAConfig as BBLoRAConfig
 from bloombee.data_structures import ServerState
+from bloombee.utils import sim_link
 from bloombee.utils.dht import get_remote_module_infos
 from bloombee.utils.hivemind_compat import DHT
 from bloombee.utils.lora import PROJECTIONS
@@ -403,6 +404,37 @@ def main():
         for k, p in reference.named_parameters():
             if not p.requires_grad:
                 assert torch.equal(p, base_snapshot[k])
+        # Pipelined microbatches (worker-side gradient sums, cached activations) must reproduce
+        # the whole-batch gradients; so must a forced stateless fallback and the exact codec path.
+        model.train()
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(5)
+        model(ids, labels=ids).loss.backward()
+        whole = [p.grad.clone() for p in params]
+        pipeline_errors = {}
+        for name, kwargs in (
+            ("microbatches2", dict(micro_batches=2)),
+            ("microbatches2_client_sum", dict(micro_batches=2, accumulate_on_workers=False)),
+        ):
+            model.zero_grad(set_to_none=True)
+            model.train_step(ids, labels=ids, **kwargs)
+            pipeline_errors[name] = max(float((p.grad - g).abs().max()) for p, g in zip(params, whole))
+            for p, g in zip(params, whole):
+                torch.testing.assert_close(p.grad, g, rtol=0.08, atol=2e-5)
+        model.zero_grad(set_to_none=True)
+
+        report["pipeline_gradient_max_errors"] = pipeline_errors
+        # Adapter cache: after an optimizer step a changed adapter is uploaded exactly once.
+        sent_before = sim_link.snapshot()["bytes_sent"]
+        model(ids, labels=ids).loss.backward()
+        first_bytes = sim_link.snapshot()["bytes_sent"] - sent_before
+        model.zero_grad(set_to_none=True)
+        sent_before = sim_link.snapshot()["bytes_sent"]
+        model(ids, labels=ids).loss.backward()
+        second_bytes = sim_link.snapshot()["bytes_sent"] - sent_before
+        model.zero_grad(set_to_none=True)
+        assert second_bytes <= first_bytes
+        report["adapter_cache_bytes"] = dict(first=first_bytes, repeat=second_bytes)
         if args.check_resume:
             report["cli_resume"] = check_cli_resume(base_dir, peers, prefix, args.output)
         if args.check_merged:

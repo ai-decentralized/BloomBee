@@ -13,8 +13,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-LORA_PROTOCOL_VERSION = 1
-LORA_NAMESPACE = "lora-v1"
+LORA_PROTOCOL_VERSION = 2
+LORA_NAMESPACE = "lora-v1"  # unchanged: v2 workers still serve v1 requests
 PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 _ACTIVE_LORA = ContextVar("bloombee_request_lora", default=None)
 
@@ -113,6 +113,35 @@ def lora_linear(inputs, weight, projection):
     output = F.linear(inputs, weight)
     delta = lora_delta(inputs, projection)
     return output if delta is None else output + delta.to(output.dtype)
+
+
+def lora_linear_group(inputs, projections):
+    """Several frozen projections of the same input (e.g. q/k/v, gate/up) with their adapters.
+
+    Without dropout, the adapters' A matrices are stacked so the input is cast once and
+    multiplied once: x @ [A_q; A_k; A_v]^T, then each B on its slice. Mathematically the
+    same as separate lora_linear calls; with dropout each target keeps its own mask.
+    """
+    outputs = [F.linear(inputs, weight) for weight, _ in projections]
+    state = _ACTIVE_LORA.get()
+    if state is None:
+        return outputs
+    config, pairs, training, _ = state
+    active = [i for i, (_, name) in enumerate(projections) if name in pairs]
+    if not active:
+        return outputs
+    if (training and config.lora_dropout) or len(active) == 1:
+        for i in active:
+            delta = lora_delta(inputs, projections[i][1])
+            outputs[i] = outputs[i] + delta.to(outputs[i].dtype)
+        return outputs
+    a_stack = torch.cat([pairs[projections[i][1]][0] for i in active], dim=0)
+    low_rank = F.linear(inputs.to(dtype=a_stack.dtype), a_stack).split(config.r, dim=-1)
+    scale = config.lora_alpha / config.r
+    for i, hidden in zip(active, low_rank):
+        delta = F.linear(hidden, pairs[projections[i][1]][1]) * scale
+        outputs[i] = outputs[i] + delta.to(outputs[i].dtype)
+    return outputs
 
 
 def install_lora_hooks(module):

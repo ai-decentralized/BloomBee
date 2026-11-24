@@ -120,16 +120,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.backward_pool = PrioritizedTaskPool(
             self.backward, max_batch_size=max_batch_size, device=device, name=f"{self.name}_backward"
         )
-        from bloombee.server.lora import lora_enabled, run_lora_block
+        from bloombee.server.lora import lora_enabled, make_lora_pool
         if lora_enabled() and config.model_type in ("llama", "qwen3"):
-            from functools import partial
             from bloombee.utils.lora import install_lora_hooks
             if config.model_type != "llama":
                 install_lora_hooks(self.module.module_shards[0])
-            self.lora_pool = PrioritizedTaskPool(
-                partial(run_lora_block, self), max_batch_size=max_batch_size,
-                device=device, name=f"{self.name}_lora",
-            )
+            self.lora_pool = make_lora_pool(self, PrioritizedTaskPool, max_batch_size, device)
 
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
