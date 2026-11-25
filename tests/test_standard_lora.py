@@ -86,7 +86,9 @@ def make_qwen_backend(device="cpu", policy=None):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA weight offload test")
-def test_qwen_lora_offload_gradients_match_resident_weights_and_restore_homes():
+def test_qwen_lora_offload_gradients_match_resident_weights_and_restore_homes(monkeypatch):
+    # Offloaded blocks always take the module path; compare like with like.
+    monkeypatch.setenv("BLOOMBEE_LORA_FASTPATH", "0")
     torch.manual_seed(51)
     resident, _ = make_qwen_backend("cuda:0")
     torch.manual_seed(51)
@@ -205,24 +207,27 @@ def test_fp32_client_fp16_worker_casts_forward_and_gradients():
     assert torch.isfinite(output).all() and all(torch.isfinite(t).all() for t in gradients)
 
 
-def test_remote_autograd_runs_for_frozen_inputs_and_detects_early_update(monkeypatch):
+def test_remote_autograd_runs_for_frozen_inputs_and_detects_early_update():
     from bloombee.client import lora as client
 
-    async def local_call(manager, span, tensors, metadata):
-        backward = metadata["backward"]
-        with torch.set_grad_enabled(backward):
-            x, a, b = [t.detach().requires_grad_(backward) for t in tensors[:3]]
-            y = x + torch.nn.functional.linear(torch.nn.functional.linear(x, a), b)
-            return list(torch.autograd.grad(y, (x, a, b), tensors[3])) if backward else [y.detach()]
+    class LocalCall:
+        async def forward(self, x, params):
+            a, b = params
+            return x + torch.nn.functional.linear(torch.nn.functional.linear(x, a), b)
 
-    monkeypatch.setattr(client, "_call_lora", local_call)
+        async def backward(self, grad, x, params):
+            with torch.enable_grad():
+                x, a, b = [t.detach().requires_grad_() for t in (x, *params)]
+                y = x + torch.nn.functional.linear(torch.nn.functional.linear(x, a), b)
+                return list(torch.autograd.grad(y, (x, a, b), grad))
+
     x = torch.randn(1, 3, 4)  # Frozen embedding, no gradient anchor necessary.
     a, b = nn.Parameter(torch.randn(2, 4)), nn.Parameter(torch.randn(4, 2))
-    y = client._RemoteLoRAFunction.apply(x, None, None, {}, a, b)
+    y = client._RemoteLoRAFunction.apply(x, LocalCall(), a, b)
     assert y.requires_grad
     y.square().mean().backward()
     assert a.grad.norm() > 0 and b.grad.norm() > 0
-    stale = client._RemoteLoRAFunction.apply(x, None, None, {}, a, b)
+    stale = client._RemoteLoRAFunction.apply(x, LocalCall(), a, b)
     with torch.no_grad():
         b.add_(0.01)
     with pytest.raises(RuntimeError, match="modified by an inplace operation"):

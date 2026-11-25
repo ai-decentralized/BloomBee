@@ -17,6 +17,22 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_MAX_RETRIES` | unset | Client-side retry limit before raising an exception. |
 | `BLOOMBEE_FAST_GENERATE` | `0` | Opt-in fast-path generation on the client. See `client/remote_generation.py` for the trade-offs (skips some safety checks for lower per-step overhead). |
 
+## LoRA Training (workers)
+
+Start workers with `BLOOMBEE_ENABLE_LORA=1` to serve `DistributedLoRA` training. Client options (`train_step(micro_batches=...)`, `boundary_compression=...`) are Python arguments, see `examples/train_lora.py`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BLOOMBEE_ENABLE_LORA` | `0` | Registers the LoRA training service on this worker (LLaMA and Qwen3 blocks). |
+| `BLOOMBEE_LORA_FASTPATH` | `1` | Training-only SDPA attention block for LLaMA/Qwen3. Set `0` to use the serving module's forward (slower, same math up to fp16 rounding). Blocks with offloaded or compressed weights always use the module path. |
+| `BLOOMBEE_LORA_KEEP_GRAPH` | `1` | Keep each layer's autograd graph between forward and backward (no recomputation) while it fits `BLOOMBEE_LORA_CACHE_BYTES`; otherwise only layer inputs are kept and backward recomputes. |
+| `BLOOMBEE_LORA_CACHE_BYTES` | 1/4 of GPU memory | Budget for cached activations and graphs of in-flight batches. A forward that does not fit is answered "budget" and the client's backward runs statelessly. |
+| `BLOOMBEE_LORA_ADAPTER_CACHE_BYTES` | `1073741824` | Per-worker cache of client adapters (one version per client span). |
+| `BLOOMBEE_LORA_CACHE_TTL` | `300` | Seconds before an unused cached forward or gradient sum expires (client then falls back to a stateless request). |
+| `BLOOMBEE_SIM_LINK` | unset | Client-side benchmark knob `"<latency_ms>,<bandwidth_mbit>"`: delays every LoRA message by latency + bytes/bandwidth to emulate internet peers on one machine. Also used by `benchmarks/benchmark_lora.py --sim-link`. |
+| `BLOOMBEE_SIM_COMPUTE` | unset | Benchmark-only worker mode `"<fwd_s>,<bwd_s>[,<fixed_s>]"` (seconds per layer-token of forward and of backward, plus a fixed cost per task): the worker skips the model math and sleeps that long, keeping all protocol state, so many workers can be emulated on few GPUs. Outputs are zeros. |
+| `BLOOMBEE_LORA_TIMING_LOG` | unset | File to which each LoRA task appends `op layers tokens seconds` (used to calibrate `BLOOMBEE_SIM_COMPUTE`). |
+
 ## Micro-Batching, Overlap, and Server-to-Server Push
 
 | Variable | Default | What it does |

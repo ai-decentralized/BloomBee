@@ -38,6 +38,30 @@ def main():
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--target_modules", nargs="+", default=["q_proj", "v_proj"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--micro_batches",
+        type=int,
+        default=1,
+        help="Split each batch into this many microbatches that pipeline across workers (same gradients)",
+    )
+    parser.add_argument(
+        "--adapter_wire",
+        default="float32",
+        choices=("float32", "bfloat16"),
+        help="Opt-in: send adapters/gradients as bf16 (half the adapter traffic); masters stay fp32",
+    )
+    parser.add_argument(
+        "--boundary_compression",
+        default="none",
+        choices=("none", "int8", "hadamard-int8"),
+        help="Opt-in lossy compression of activations/gradients on the network; default is exact",
+    )
+    parser.add_argument(
+        "--replica_sync",
+        default="peer",
+        choices=("peer", "client"),
+        help="Replicated spans: peer (replicas pull adapters from one seed, a leader sums gradients) or client",
+    )
     args = parser.parse_args()
     if min(args.steps, args.batch_size, args.gradient_accumulation_steps) < 1 or args.seq_len < 2:
         raise ValueError("steps, batch and accumulation must be positive; seq_len must be >=2")
@@ -88,10 +112,19 @@ def main():
         kwargs["dht_prefix"] = args.dht_prefix
     base = AutoDistributedModelForCausalLM.from_pretrained(args.model, **kwargs).to(args.device)
     if args.resume_adapter or args.resume_checkpoint:
-        model = DistributedLoRA.from_pretrained(base, args.resume_adapter or args.resume_checkpoint)
+        model = DistributedLoRA.from_pretrained(
+            base, args.resume_adapter or args.resume_checkpoint,
+            boundary_compression=args.boundary_compression,
+            adapter_wire=args.adapter_wire,
+            replica_sync=args.replica_sync,
+        )
     else:
         model = DistributedLoRA(
-            base, LoRAConfig(args.r, args.lora_alpha, args.lora_dropout, tuple(args.target_modules))
+            base,
+            LoRAConfig(args.r, args.lora_alpha, args.lora_dropout, tuple(args.target_modules)),
+            boundary_compression=args.boundary_compression,
+            adapter_wire=args.adapter_wire,
+            replica_sync=args.replica_sync,
         )
     model.to(args.device).train()
     parameters = [p for p in model.parameters() if p.requires_grad]
@@ -105,6 +138,15 @@ def main():
             mean_loss = 0.0
             for _ in range(args.gradient_accumulation_steps):
                 ids = chunks[torch.randint(count, (args.batch_size,), device="cpu")].to(args.device)
+                if args.micro_batches > 1:
+                    loss = model.train_step(
+                        ids,
+                        labels=ids,
+                        micro_batches=min(args.micro_batches, len(ids)),
+                        loss_scale=1.0 / args.gradient_accumulation_steps,
+                    )
+                    mean_loss += loss / args.gradient_accumulation_steps
+                    continue
                 output = model(input_ids=ids, labels=ids, use_cache=False)
                 (output.loss / args.gradient_accumulation_steps).backward()
                 mean_loss += float(output.loss.detach()) / args.gradient_accumulation_steps
