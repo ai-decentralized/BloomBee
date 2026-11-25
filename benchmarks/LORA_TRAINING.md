@@ -53,6 +53,50 @@ traffic (about 70 MB each way per step here) dominates, which is what `adapter_w
 addresses. A worker-side optimizer would remove it entirely but gives up the
 client-owned-optimizer design (fault tolerance, checkpointing); not attempted.
 
+## Data parallelism over replicas
+
+When several workers serve the same span, `train_step` spreads microbatches over them. Adapters
+and the optimizer stay on the client, so there is no all-reduce: gradients just add up. A
+microbatch picks its replicas when it starts (least busy, so faster replicas take more work), and
+with replicated spans the number in flight is capped at twice the number of workers.
+
+`DistributedLoRA(..., replica_sync="peer")` (default) keeps the client's traffic independent of
+the replica count: the client uploads each adapter version to one replica per span, the others
+pull it from there (worker to worker; the unguessable adapter version authorises the pull), and
+one leader replica sums the replicas' gradient sums before the client downloads them. A failed
+pull falls back to a direct upload. `replica_sync="client"` exchanges adapters and gradients
+with every replica (cheaper for 2 replicas on a fast client link).
+
+Worker cache fix found while measuring: kept autograd graphs could fill the whole activation
+budget, so later microbatches could not even store their inputs and the client redid the span
+statelessly (re-sending activations and a full adapter upload). Old graphs are now dropped
+(recomputed in backward) before any "budget" miss is reported. TinyLlama, batch 32 on one
+GPU: 6.70 -> 3.81 s/step, 835 MB -> 185 MB sent per step.
+
+Replica scaling, TinyLlama, batch 32 (16 microbatches), s/step. Replica counts above one are
+emulated on one GPU with `BLOOMBEE_SIM_COMPUTE` (workers skip the math and sleep the time
+measured on a dedicated A6000: 2.19 us forward, 5.0 us backward per layer-token, 13 ms per task;
+emulated 1 replica 3.90 s vs real 3.81 s). Emulation checks timing and the protocol, not
+accuracy; accuracy of the replicated path is covered by `tests/run_lora_replicas.py`.
+
+| Replicas | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| light adapters (q, v; r=8), peer sync | 3.38 | 2.01 | 1.46 | 1.62 |
+| heavy adapters (7 projections; r=16, 50 MB), peer sync | 3.93 | 2.86 | 2.95 | 4.29 |
+| heavy adapters, client sync | 3.93 | 2.49 | 7.04 | n/a |
+
+Simulated 50 ms / 200 Mbit/s client link, heavy adapters: 1 replica 11.0 s, 2: 11.7 s (client
+sync 15.1 s), 4: 11.6 s (client sync 27.7 s). Client bytes per step with 4 replicas: 185 MB
+(peer sync, same as one replica) vs 337 MB (client sync).
+
+What limits it: every activation still crosses the client link, so the speedup saturates near
+2.3x at 4 replicas and replicas cannot help when that link is the bottleneck (use
+`boundary_compression` / `adapter_wire` there). Heavy adapters add a fixed per-step sync (upload,
+pull, reduce, download) that data parallelism cannot shrink; the leader sums its peers' gradients one
+at a time (fetching them all concurrently was 3x slower with 7 peers: the leader's handler process,
+not the link, is the limit), so 8 replicas with heavy adapters get slower than 4. A tree reduce
+is the next step; with light adapters 8 replicas are still within 11% of 4.
+
 ## Usage
 
 ```bash

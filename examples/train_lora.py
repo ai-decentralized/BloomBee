@@ -56,6 +56,12 @@ def main():
         choices=("none", "int8", "hadamard-int8"),
         help="Opt-in lossy compression of activations/gradients on the network; default is exact",
     )
+    parser.add_argument(
+        "--replica_sync",
+        default="peer",
+        choices=("peer", "client"),
+        help="Replicated spans: peer (replicas pull adapters from one seed, a leader sums gradients) or client",
+    )
     args = parser.parse_args()
     if min(args.steps, args.batch_size, args.gradient_accumulation_steps) < 1 or args.seq_len < 2:
         raise ValueError("steps, batch and accumulation must be positive; seq_len must be >=2")
@@ -110,6 +116,7 @@ def main():
             base, args.resume_adapter or args.resume_checkpoint,
             boundary_compression=args.boundary_compression,
             adapter_wire=args.adapter_wire,
+            replica_sync=args.replica_sync,
         )
     else:
         model = DistributedLoRA(
@@ -117,6 +124,7 @@ def main():
             LoRAConfig(args.r, args.lora_alpha, args.lora_dropout, tuple(args.target_modules)),
             boundary_compression=args.boundary_compression,
             adapter_wire=args.adapter_wire,
+            replica_sync=args.replica_sync,
         )
     model.to(args.device).train()
     parameters = [p for p in model.parameters() if p.requires_grad]

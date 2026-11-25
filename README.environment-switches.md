@@ -30,6 +30,8 @@ Start workers with `BLOOMBEE_ENABLE_LORA=1` to serve `DistributedLoRA` training.
 | `BLOOMBEE_LORA_ADAPTER_CACHE_BYTES` | `1073741824` | Per-worker cache of client adapters (one version per client span). |
 | `BLOOMBEE_LORA_CACHE_TTL` | `300` | Seconds before an unused cached forward or gradient sum expires (client then falls back to a stateless request). |
 | `BLOOMBEE_SIM_LINK` | unset | Client-side benchmark knob `"<latency_ms>,<bandwidth_mbit>"`: delays every LoRA message by latency + bytes/bandwidth to emulate internet peers on one machine. Also used by `benchmarks/benchmark_lora.py --sim-link`. |
+| `BLOOMBEE_SIM_COMPUTE` | unset | Benchmark-only worker mode `"<fwd_s>,<bwd_s>[,<fixed_s>]"` (seconds per layer-token of forward and of backward, plus a fixed cost per task): the worker skips the model math and sleeps that long, keeping all protocol state, so many workers can be emulated on few GPUs. Outputs are zeros. |
+| `BLOOMBEE_LORA_TIMING_LOG` | unset | File to which each LoRA task appends `op layers tokens seconds` (used to calibrate `BLOOMBEE_SIM_COMPUTE`). |
 
 ## Micro-Batching, Overlap, and Server-to-Server Push
 

@@ -152,10 +152,16 @@ class Swarm:
         self.processes, self.logs = [], []
 
     def plan(self):
+        """(gpu, start, end) per worker. split: one pipeline over all GPUs; full: whole-model
+        replicas; hybrid: --stages spans x (len(--gpus) / stages) replicas. A GPU may be listed
+        more than once (several workers on one GPU, e.g. with BLOOMBEE_SIM_COMPUTE)."""
         if self.args.topology == "full":
             return [(gpu, 0, self.layers) for gpu in _GPUS[: self.args.replicas]]
-        cuts = [round(i * self.layers / len(_GPUS)) for i in range(len(_GPUS) + 1)]
-        return [(gpu, cuts[i], cuts[i + 1]) for i, gpu in enumerate(_GPUS)]
+        stages = len(_GPUS) if self.args.topology == "split" else self.args.stages
+        if stages < 1 or len(_GPUS) % stages:
+            raise ValueError("hybrid topology needs len(--gpus) divisible by --stages")
+        cuts = [round(i * self.layers / stages) for i in range(stages + 1)]
+        return [(gpu, cuts[i % stages], cuts[i % stages + 1]) for i, gpu in enumerate(_GPUS)]
 
     def start(self):
         plan = self.plan()
@@ -260,6 +266,9 @@ class GpuSampler(threading.Thread):
         )
 
 
+STEP_WINDOWS = []
+
+
 def run_training(model, params, train, args, *, timed):
     """Identical loop for BloomBee and the PEFT reference. Returns per-step losses and times."""
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
@@ -285,6 +294,7 @@ def run_training(model, params, train, args, *, timed):
         optimizer.step()
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - begin
+        STEP_WINDOWS.append((begin, begin + elapsed))
         after = sim_link.snapshot()
         losses.append(loss)
         if timed and step >= args.warmup:
@@ -293,6 +303,30 @@ def run_training(model, params, train, args, *, timed):
         if step % 5 == 0 or step == len(train) // args.batch - 1:
             print(f"step={step} loss={loss:.5f} time={elapsed:.3f}s", flush=True)
     return losses, times, transfer
+
+
+def _last_step_calls(calls, times):
+    """Every LoRA RPC of the last timed step as [op, start, end, tensors], relative to step start."""
+    if not calls or not STEP_WINDOWS:
+        return None
+    begin, end = STEP_WINDOWS[-1]
+    rows = sorted((c for c in calls if begin <= c[1] <= end), key=lambda c: c[1])
+    return dict(
+        step_s=round(end - begin, 3),
+        calls=[dict(op=str(op), start=round(a - begin, 3), end=round(b - begin, 3), tensors=n) for op, a, b, n in rows],
+    )
+
+
+def _span_load(route_log, warmup):
+    """Microbatches each worker span served over the timed steps (balance check)."""
+    if len(STEP_WINDOWS) <= warmup:
+        return {}
+    cutoff, load = STEP_WINDOWS[warmup][0], {}
+    for stamp, route in route_log:
+        if stamp >= cutoff:
+            for span in route:
+                load[span] = load.get(span, 0) + 1
+    return dict(sorted(load.items()))
 
 
 @torch.no_grad()
@@ -327,8 +361,9 @@ def main():
     parser.add_argument("--gpus", default="0", help="comma-separated idle GPUs hosting workers")
     parser.add_argument("--client-gpu", type=int, default=None, help="client GPU (default: first of --gpus)")
     parser.add_argument("--skip-idle-check", action="store_true")
-    parser.add_argument("--topology", choices=("split", "full"), default="split")
+    parser.add_argument("--topology", choices=("split", "full", "hybrid"), default="split")
     parser.add_argument("--replicas", type=int, default=1, help="full topology: worker replicas")
+    parser.add_argument("--stages", type=int, default=1, help="hybrid topology: pipeline stages per replica")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--model", help="HF id or local path of a LLaMA/Qwen3 checkpoint")
     source.add_argument("--random", help="random LLaMA checkpoint: layers,hidden,vocab")
@@ -349,6 +384,8 @@ def main():
     parser.add_argument("--boundary-compression", dest="boundary_compression", default="none",
                         help="opt-in lossy activation codec: none, int8, hadamard-int8")
     parser.add_argument("--adapter-wire", dest="adapter_wire", default="float32", choices=("float32", "bfloat16"))
+    parser.add_argument("--replica-sync", dest="replica_sync", default=None, choices=("peer", "client"),
+                        help="replicated spans: peer (default) or client-mediated adapter/gradient exchange")
     parser.add_argument("--sim-link", default="", help="'<latency_ms>,<mbit>' simulated client link")
     parser.add_argument("--reference", action="store_true", help="also train HF+PEFT and compare (accuracy gate)")
     parser.add_argument("--worker-env", nargs="*", default=[], help="extra KEY=VALUE env for workers")
@@ -403,10 +440,58 @@ def main():
             extra["boundary_compression"] = args.boundary_compression
         if args.adapter_wire != "float32":
             extra["adapter_wire"] = args.adapter_wire
+        if args.replica_sync:
+            extra["replica_sync"] = args.replica_sync
         lora = DistributedLoRA(client, config, **extra).cuda().train()
         adapter_dir = args.output / "initial-adapter"
         lora.save_pretrained(adapter_dir)
         params = [p for p in lora.parameters() if p.requires_grad]
+        route_log = []
+        sequence = lora.remote_layers
+        if hasattr(sequence, "acquire_route"):
+            original_acquire = sequence.acquire_route
+
+            def logged_acquire(*a, **k):
+                route = original_acquire(*a, **k)
+                route_log.append((time.perf_counter(), [f"{str(s.peer_id)[-6:]}:{s.start}-{s.end}" for s in route]))
+                return route
+
+            sequence.acquire_route = logged_acquire
+        phases = {}
+
+        def timed_method(obj, name):
+            inner = getattr(obj, name)
+
+            def wrapper(*a, **k):
+                t = time.perf_counter()
+                try:
+                    return inner(*a, **k)
+                finally:
+                    phases[name] = phases.get(name, 0.0) + time.perf_counter() - t
+
+            setattr(obj, name, wrapper)
+
+        if hasattr(sequence, "collect_gradients"):
+            timed_method(sequence, "collect_gradients")
+        import bloombee.client.lora as client_lora
+
+        misses = {}
+        calls = []  # (op, start, end, n_tensors) of every LoRA RPC, to see overlap vs serial phases
+        inner_call = client_lora._call_lora
+
+        async def logged_call(manager, span, inputs, metadata):
+            t0 = time.perf_counter()
+            result = None
+            try:
+                result = await inner_call(manager, span, inputs, metadata)
+                return result
+            finally:
+                miss = result[1].get("cache_miss") if result else "error"
+                if miss:
+                    misses[miss] = misses.get(miss, 0) + 1
+                calls.append((metadata.get("op"), t0, time.perf_counter(), len(inputs)))
+
+        client_lora._call_lora = logged_call
         sampler = GpuSampler(sorted(set(_GPUS + [_CLIENT_GPU])))
         sampler.start()
         losses, times, transfer = run_training(lora, params, train, args, timed=True)
@@ -428,6 +513,11 @@ def main():
             losses=[round(x, 5) for x in losses],
             eval_loss=round(eval_loss, 5),
             trainable_parameters=sum(p.numel() for p in params),
+            routes_last_step=[r for t, r in route_log if STEP_WINDOWS and t >= STEP_WINDOWS[-1][0]],
+            call_log_last_step=_last_step_calls(calls, times),
+            cache_misses=misses,
+            phase_total_s={k: round(v, 3) for k, v in phases.items()},
+            span_load=_span_load(route_log, args.warmup),
         )
         lora.remote_layers.sequence_manager.shutdown()
     except BaseException as error:

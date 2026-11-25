@@ -84,6 +84,12 @@ class _SpanCall:
         self.adapter_wire = sequence.adapter_wire
         # Inside train_step: workers sum dA/dB over the step and the client collects them once.
         self.accumulate = getattr(sequence._local, "accumulate", None)
+        # Data parallelism: one replica per span (the seed) gets the adapters from the client,
+        # the others pull them from it, so client uploads do not grow with the replica count.
+        self.sequence = sequence
+        self.group = (span.start, span.end)
+        self.seed = sequence._seed_for(span) if sequence.peer_sync else None
+        self.pull_from = None
 
     def _meta(self, op, **extra):
         meta = {
@@ -92,6 +98,7 @@ class _SpanCall:
             "adapter_version": self.version,
             "cache_id": self.cache_id,
             "accumulate": self.accumulate,
+            **({"pull_from": self.pull_from} if self.pull_from else {}),
             **extra,
         }
         if self.codec != "none":
@@ -124,6 +131,9 @@ class _SpanCall:
                 break
             if miss == "adapter" and not send:
                 send = True
+            elif miss == "pull":
+                send, self.pull_from = True, None  # seed unreachable or lost the adapters: upload directly
+                self.sequence._drop_seed(self.group, self.span)
             elif miss == "budget" and self.cache_id is not None:
                 self.cache_id = None  # worker has no room: backward will be stateless
             else:
@@ -136,12 +146,37 @@ class _SpanCall:
             raise RuntimeError("Invalid remote LoRA forward response")
         return result[0]
 
+    async def _seed_adapters(self, parameters):
+        """Make sure the seed replica holds this adapter version; True if workers can pull it."""
+        seed_span = self.seed
+        seed_key = (str(seed_span.peer_id), seed_span.start, seed_span.end)
+        lock = self.sequence._upload_locks.setdefault(seed_key, asyncio.Lock())
+        async with lock:
+            if self.adapters.get(seed_key) == self.version:
+                return True
+            try:
+                _, response = await _call_lora(
+                    self.manager, seed_span, tuple(self._wire_params(parameters)),
+                    self._meta("upload", cache_id=None, pull_from=None),
+                )  # fmt: skip
+            except Exception:
+                response = {"cache_miss": "error"}
+            if response.get("cache_miss"):
+                self.sequence._drop_seed(self.group, seed_span)
+                return False
+            self.adapters[seed_key] = self.version
+            return True
+
     async def forward(self, inputs, parameters):
         if self.adapters.get(self.key) == self.version:
             return await self._forward(inputs, parameters, send=False)
         async with self.lock:  # concurrent microbatches upload a changed adapter only once
             send = self.adapters.get(self.key) != self.version
             if send:
+                seed = self.seed
+                if seed is not None and str(seed.peer_id) != self.key[0] and await self._seed_adapters(parameters):
+                    self.pull_from = str(seed.peer_id)
+                    return await self._forward(inputs, parameters, send=False)
                 return await self._forward(inputs, parameters, send=True)
         return await self._forward(inputs, parameters, send=False)
 
@@ -203,6 +238,10 @@ class LoRARemoteSequential(RemoteSequential):
         self._adapter_acks = {}  # (peer, start, end) -> adapter version that worker holds
         self._local = threading.local()  # per-microbatch route / seed / step token (train_step)
         self._upload_locks = {}
+        self.peer_sync = True  # replicas pull adapters from a seed / reduce gradients; see DistributedLoRA
+        self._seeds = {}  # (start, end) -> span of the replica that receives adapters from the client
+        self._route_lock = threading.Lock()
+        self._outstanding = {}  # peer id -> microbatches currently routed through it
         self.boundary_codec = "none"  # see bloombee.utils.lora_codec; set via DistributedLoRA
         self.adapter_wire = "float32"  # "bfloat16" halves adapter/gradient traffic; set via DistributedLoRA
         shapes = projection_shapes(original.config)
@@ -240,6 +279,14 @@ class LoRARemoteSequential(RemoteSequential):
             for p in (layer[name].lora_A, layer[name].lora_B)
         )
 
+    def _seed_for(self, span):
+        return self._seeds.setdefault((span.start, span.end), span)
+
+    def _drop_seed(self, group, span):
+        """The seed failed: the next call becomes the seed (and uploads directly)."""
+        if self._seeds.get(group) is not None and self._seeds[group].peer_id == span.peer_id:
+            self._seeds.pop(group, None)
+
     def make_calls(self, route, needs_grad):
         calls = []
         seed_base = getattr(self._local, "seed", None)
@@ -273,6 +320,32 @@ class LoRARemoteSequential(RemoteSequential):
             routes.append(best)
         return routes
 
+    def acquire_route(self, candidates=16):
+        """Route for the next microbatch, chosen when it starts: the candidate (a throughput-weighted
+        random draw of the sequence manager) whose busiest span has the fewest microbatches in
+        flight. Replicas that finish sooner are asked again sooner, so work follows speed."""
+        with self._route_lock:
+            best, best_cost = None, None
+            for _ in range(candidates):
+                route = self.sequence_manager.make_sequence(mode="max_throughput")
+                cost = max((self._outstanding.get(s.peer_id, 0) + 1) * (s.end - s.start) for s in route)
+                if best is None or cost < best_cost:
+                    best, best_cost = route, cost
+            for span in best:
+                self._outstanding[span.peer_id] = self._outstanding.get(span.peer_id, 0) + 1
+            return best
+
+    def release_route(self, route):
+        with self._route_lock:
+            for span in route:
+                self._outstanding[span.peer_id] = max(0, self._outstanding.get(span.peer_id, 0) - 1)
+
+    def replica_count(self, candidates=16):
+        """Distinct workers seen over a few sampled routes (more than one span group's replicas
+        means data parallelism is available)."""
+        peers = {s.peer_id for _ in range(candidates) for s in self.sequence_manager.make_sequence(mode="max_throughput")}
+        return len(peers)
+
     @contextmanager
     def microbatch(self, *, route=None, seed=None, accumulate=None):
         names = ("route", "seed", "accumulate")
@@ -297,14 +370,25 @@ class LoRARemoteSequential(RemoteSequential):
         )
         if self.adapter_wire != "float32":
             metadata["adapter_wire"] = self.adapter_wire
-        jobs = [(span, self.span_parameters(span)) for span in spans.values()]
+        groups = {}
+        for span in spans.values():
+            groups.setdefault((span.start, span.end), []).append(span)
+        jobs = []
+        for members in groups.values():
+            leader, others = members[0], members[1:]
+            job_meta = metadata
+            if others and self.peer_sync:  # the leader sums the replicas' gradients: one download per span
+                job_meta = {**metadata, "reduce_from": [str(sp.peer_id) for sp in others]}
+                jobs.append((leader, self.span_parameters(leader), job_meta))
+            else:
+                jobs.extend((span, self.span_parameters(span), metadata) for span in members)
 
         async def gather():
             return await asyncio.gather(
-                *(_collect_gradients(self.sequence_manager, span, metadata, params) for span, params in jobs)
+                *(_collect_gradients(self.sequence_manager, span, m, params) for span, params, m in jobs)
             )
 
-        for (_, parameters), gradients in zip(jobs, RemoteExpertWorker.run_coroutine(gather())):
+        for (_, parameters, _), gradients in zip(jobs, RemoteExpertWorker.run_coroutine(gather())):
             for p, g in zip(parameters, gradients):
                 g = g.to(p)
                 if p.grad is None:
@@ -343,12 +427,16 @@ class DistributedLoRA(nn.Module):
     weights are sent again at backward; there is no worker-side optimizer step.
     """
 
-    def __init__(self, model, config=None, *, boundary_compression="none", adapter_wire="float32"):
+    def __init__(self, model, config=None, *, boundary_compression="none", adapter_wire="float32", replica_sync="peer"):
         """``boundary_compression`` ("none", "int8", "hadamard-int8") is an opt-in, lossy
         codec for activations and activation gradients on the network (see
         bloombee.utils.lora_codec). ``adapter_wire="bfloat16"`` is a second opt-in: adapters
         are uploaded and their gradients returned as bf16 (fp32 masters, optimizer state and
-        gradient sums stay fp32), halving the adapter traffic. Both default to exact."""
+        gradient sums stay fp32), halving the adapter traffic. Both default to exact.
+        ``replica_sync`` ("peer" or "client") only matters when spans are replicated (data
+        parallelism): "peer" uploads each adapter version to one replica per span, the other
+        replicas pull it from there, and one replica sums the replicas' gradients before the
+        client downloads them; "client" exchanges adapters and gradients with every replica."""
         super().__init__()
         if adapter_wire not in ("float32", "bfloat16"):
             raise ValueError("adapter_wire must be 'float32' or 'bfloat16'")
@@ -373,6 +461,9 @@ class DistributedLoRA(nn.Module):
         sequence = LoRARemoteSequential(original, self.lora_config)
         sequence.boundary_codec = boundary_compression
         sequence.adapter_wire = adapter_wire
+        if replica_sync not in ("peer", "client"):
+            raise ValueError("replica_sync must be 'peer' or 'client'")
+        sequence.peer_sync = replica_sync == "peer"
         setattr(model.get_submodule(parent_path), attribute, sequence)
         self.model = model
         self._sequence_path = name
@@ -421,27 +512,38 @@ class DistributedLoRA(nn.Module):
         if total == 0:
             raise ValueError("No target tokens in this batch")
         sequence = self.remote_layers
+        sequence_spans = len(sequence.sequence_manager.make_sequence(mode="max_throughput"))
         seeds = torch.randint(0, 2**31, (len(id_chunks),), device="cpu").tolist()
-        routes = sequence.balanced_routes(len(id_chunks))
         token = uuid.uuid4().hex if accumulate_on_workers else None
+        used, used_lock = [], threading.Lock()
 
         def run(i):
             if counts[i] == 0:
                 return 0.0
-            with sequence.microbatch(route=routes[i], seed=seeds[i], accumulate=token):
-                loss = self(input_ids=id_chunks[i], labels=label_chunks[i], use_cache=False).loss
-                weight = counts[i] / total
-                (loss * (weight * loss_scale)).backward()
-                return float(loss.detach()) * weight
+            route = sequence.acquire_route()  # chosen now, not up front: work follows replica speed
+            try:
+                with used_lock:
+                    used.append(route)
+                with sequence.microbatch(route=route, seed=seeds[i], accumulate=token):
+                    loss = self(input_ids=id_chunks[i], labels=label_chunks[i], use_cache=False).loss
+                    weight = counts[i] / total
+                    (loss * (weight * loss_scale)).backward()
+                    return float(loss.detach()) * weight
+            finally:
+                sequence.release_route(route)
 
         if len(id_chunks) == 1:
             loss = run(0)
         else:
-            workers = min(max_in_flight or len(id_chunks), len(id_chunks))
+            workers = len(id_chunks)
+            if max_in_flight is not None:
+                workers = min(max_in_flight, workers)
+            elif sequence.replica_count() > sequence_spans:
+                workers = min(workers, 2 * sequence.replica_count())  # keep enough queued to pipeline, not all
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lora-microbatch") as pool:
                 loss = sum(pool.map(run, range(len(id_chunks))))
         if token is not None:
-            sequence.collect_gradients([r for r, c in zip(routes, counts) if c], token)
+            sequence.collect_gradients(used, token)
         return loss
 
     @torch.inference_mode()

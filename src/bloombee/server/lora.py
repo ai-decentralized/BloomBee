@@ -13,6 +13,15 @@ Protocol v2 (v1 requests are still served, statelessly):
                         step's microbatches. Backward/stateless requests carrying the token
                         add their dA/dB there and return only dX, so adapter gradients cross
                         the network once per optimizer step instead of once per microbatch.
+  upload    [*A/B]       store adapters without computing (the client's "seed" replica).
+  probe     []           1 if this (client, span, version) adapter is cached (no exception on a miss).
+  export    []           return the cached adapters of a (client, span, version) to a peer
+                        worker; collect with `client` set does the same for gradient sums.
+Data parallelism over replicas of a span: the client uploads each adapter version to one seed
+replica; the others pull it from the seed (worker-to-worker, authorised by knowing the
+unguessable version), and one leader replica sums the replicas' gradients before the client
+downloads them, so client traffic does not grow with the number of replicas. Any pull failure
+falls back to a direct client upload.
 Adapters are cached per (client, span, adapter version): the client only uploads A/B when
 they changed since that worker last saw them (normally once per optimizer step). Workers
 never keep optimizer state or mutate adapters, so retries cannot double-apply an update.
@@ -35,17 +44,18 @@ import torch
 from async_timeout import timeout
 from hivemind.p2p.p2p_daemon_bindings.control import DEFAULT_MAX_MSG_SIZE
 from hivemind.proto import runtime_pb2
+from hivemind.utils.asyncio import iter_as_aiter
 from hivemind.utils.streaming import split_for_streaming
 
 from bloombee.utils import lora_codec
-from bloombee.utils.hivemind_compat import MSGPackSerializer, P2PContext, ServicerBase, get_logger
+from bloombee.utils.hivemind_compat import MSGPackSerializer, P2PContext, PeerID, ServicerBase, get_logger
 from bloombee.utils.lora import LORA_NAMESPACE, LORA_PROTOCOL_VERSION, LoRAConfig, lora_context, projection_shapes
-from bloombee.utils.lossless_transport import serialize_torch_tensor
+from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
 
 logger = get_logger(__name__)
 
 _WIRE_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
-OPS = ("forward", "backward", "stateless", "release", "collect")
+OPS = ("forward", "backward", "stateless", "release", "collect", "upload", "export", "probe")
 
 
 def lora_enabled():
@@ -85,6 +95,7 @@ class _Layer:
     params: tuple  # the adapter leaves used for this layer
     seed: int
     y: torch.Tensor = None  # graph-carrying output, or None (recompute in backward)
+    graph_bytes: int = 0  # memory held by y's autograd graph
 
 
 @dataclass
@@ -136,6 +147,29 @@ def _drop_activation(key):
     if entry is not None:
         _usage["activation_bytes"] -= entry.nbytes
         entry.layers.clear()
+
+
+def _downgrade(needed, entry=None):
+    """Free `needed` accounted bytes by turning kept autograd graphs into inputs-only layers
+    (they are recomputed in backward). Newest entries go first: their backward runs last.
+    Cheaper than a cache miss, which makes the client redo the span statelessly."""
+    freed = 0
+    victims = [e for e in reversed(_ACTIVATIONS.values())]
+    if entry is not None:
+        victims.insert(0, entry)
+    for victim in victims:
+        for layer in reversed(victim.layers):
+            if freed >= needed:
+                return freed
+            if layer is None or layer.y is None:
+                continue
+            layer.y = None
+            victim.nbytes -= layer.graph_bytes
+            if victim is not entry:
+                _usage["activation_bytes"] -= layer.graph_bytes
+            freed += layer.graph_bytes
+            layer.graph_bytes = 0
+    return freed
 
 
 def _prune():
@@ -266,7 +300,10 @@ def _run_forward(backends, x, meta, layer_params, *, cache):
         used = _usage["activation_bytes"] + entry.nbytes
         keep = keep_graph_allowed and fast and used + input_bytes + estimate <= budget
         if used + input_bytes > budget:
-            raise LoRACacheMiss("budget")  # client retries statelessly; never evict live entries
+            _downgrade(used + input_bytes - budget, entry)
+            used = _usage["activation_bytes"] + entry.nbytes
+            if used + input_bytes > budget:
+                raise LoRACacheMiss("budget")  # even inputs alone do not fit: client goes stateless
         if keep:
             leaf_x = hidden.detach().requires_grad_(True)
             leaf_p = tuple(p.detach().requires_grad_(True) for p in layer_params[j])
@@ -275,7 +312,7 @@ def _run_forward(backends, x, meta, layer_params, *, cache):
                 y = layer(leaf_x)
             graph_bytes = max(0, _allocated(device) - before)
             _GRAPH_BYTES_PER_TOKEN[id(backend)] = graph_bytes / max(tokens, 1)
-            entry.layers.append(_Layer(leaf_x, leaf_p, seed, y))
+            entry.layers.append(_Layer(leaf_x, leaf_p, seed, y, graph_bytes))
             entry.nbytes += input_bytes + graph_bytes
             hidden = y.detach()
         else:
@@ -309,10 +346,76 @@ def _run_backward(backends, entry, grad):
     return (grad.to(entry.input_dtype), *(g for layer in grads_per_layer for g in layer))
 
 
+def _parse_sim_compute(value):
+    """BLOOMBEE_SIM_COMPUTE="<fwd_s>,<bwd_s>[,<fixed_s>]": seconds per (layer x token) of forward and
+    backward (backward includes the recompute of kept-input layers), plus a fixed cost per task."""
+    if not value:
+        return None
+    parts = [float(x) for x in value.split(",")]
+    if len(parts) not in (2, 3) or min(parts) < 0:
+        raise ValueError("BLOOMBEE_SIM_COMPUTE must be '<fwd_s>,<bwd_s>[,<fixed_s>]' per layer-token")
+    return parts[0], parts[1], parts[2] if len(parts) == 3 else 0.0
+
+
+_SIM_COMPUTE = _parse_sim_compute(os.getenv("BLOOMBEE_SIM_COMPUTE", ""))
+_TIMING_LOG = os.getenv("BLOOMBEE_LORA_TIMING_LOG")
+
+
+def _simulate(backends, first, meta, tensors):
+    """Benchmark-only worker: no model math, just the calibrated time the task would take on a
+    dedicated GPU, with the same protocol state (adapters, cache entries, gradient sums) so that a
+    swarm of many workers can be emulated on few GPUs. Outputs are zeros of the right shapes."""
+    op, forward_s, backward_s, fixed_s = meta["op"], *_SIM_COMPUTE
+    config = LoRAConfig(**meta["config"])
+    key = (meta["owner"], meta.get("cache_id"))
+    work = len(backends) * first.shape[0] * first.shape[1]
+    if op == "release":
+        _drop_activation(key)
+        return (torch.empty(0),)
+    if op == "collect":
+        found = _GRADIENTS.pop((meta["owner"], meta["uid"], meta.get("accumulate")), None)
+        if found is None:
+            raise LoRACacheMiss("gradients")
+        return tuple(found[0])
+    if op in ("upload", "export", "probe"):
+        return _adapter_op(op, meta, backends, first.device, tensors)
+    if op == "backward":
+        entry = _ACTIVATIONS.pop(key, None)
+        if entry is None or entry.uid != meta["uid"]:
+            raise LoRACacheMiss("activations")
+        shapes, seconds = entry.shapes, fixed_s + work * backward_s
+    else:
+        layer_params = _resolve_adapters(meta, backends, config, tensors[1:] if op == "stateless" else tensors, first.device)
+        shapes = [tuple(p.shape) for layer in layer_params for p in layer]
+        seconds = fixed_s + work * (forward_s if op == "forward" else forward_s + backward_s)
+        if op == "forward" and meta.get("cache_id") is not None:
+            entry = _Entry(meta["uid"], config, meta["training"], first.dtype, time.monotonic() + _ttl())
+            entry.shapes = shapes
+            _ACTIVATIONS[key] = entry
+    time.sleep(seconds)
+    if op == "forward":
+        return (torch.zeros_like(first),)
+    grads = [torch.zeros(shape, device=first.device) for shape in shapes]
+    return _finish_gradients(meta, (torch.zeros_like(first), *grads))
+
+
 def run_lora_task(backend, first, meta, *tensors):
     """Executed by the Runtime. `first` is x (forward/stateless), dY (backward) or a dummy."""
     _prune()
-    return _execute([_BACKENDS[name] for name in meta["uid"].split(" ")], first, meta, tensors)
+    backends = [_BACKENDS[name] for name in meta["uid"].split(" ")]
+    if _SIM_COMPUTE is not None:
+        return _simulate(backends, first, meta, tensors)
+    if _TIMING_LOG is None:
+        return _execute(backends, first, meta, tensors)
+    if first.is_cuda:
+        torch.cuda.synchronize(first.device)
+    start = time.perf_counter()
+    result = _execute(backends, first, meta, tensors)
+    if first.is_cuda:
+        torch.cuda.synchronize(first.device)
+    with open(_TIMING_LOG, "a") as log:  # op, layers, tokens, seconds
+        log.write(f"{meta['op']} {len(backends)} {first.shape[0] * first.shape[1]} {time.perf_counter() - start:.6f}\n")
+    return result
 
 
 def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
@@ -326,6 +429,18 @@ def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
     return _execute([backend], inputs, meta, rest)
 
 
+def _adapter_op(op, meta, backends, device, tensors):
+    if op == "upload":
+        _resolve_adapters(meta, backends, LoRAConfig(**meta["config"]), tensors, device)
+        return (torch.empty(0),)
+    cached = _ADAPTERS.get((meta["owner"], meta["uid"], meta["adapter_version"]))
+    if op == "probe":
+        return (torch.tensor([cached is not None]),)
+    if cached is None:
+        raise LoRACacheMiss("adapter")
+    return tuple(t.detach().cpu() for t in cached[0])
+
+
 def _execute(backends, first, meta, tensors):
     op = meta["op"]
     key = (meta["owner"], meta.get("cache_id"))
@@ -337,6 +452,8 @@ def _execute(backends, first, meta, tensors):
         if found is None:
             raise LoRACacheMiss("gradients")
         return tuple(found[0])
+    if op in ("upload", "export", "probe"):
+        return _adapter_op(op, meta, backends, first.device, tensors)
     if op == "backward":
         entry = _ACTIVATIONS.pop(key, None)
         if entry is None or entry.uid != meta["uid"]:
@@ -402,9 +519,99 @@ def _parse_v1(metadata, tensors, width, n_layers):
     return "forward", x, list(params), None
 
 
+def _miss_kind(error):
+    if isinstance(error, LoRACacheMiss):
+        return error.what
+    found = re.search(r"LORA_CACHE_MISS:(\w+)", str(error))
+    return found.group(1) if found else None
+
+
+async def _peer_request(p2p, peer, uid, metadata, tensors, request_timeout):
+    """One worker-to-worker rpc_lora_stream call; returns (tensors, response metadata)."""
+    stub = LoRAService.get_stub(p2p, PeerID.from_base58(peer), namespace=LORA_NAMESPACE)
+    packed = MSGPackSerializer.dumps(metadata)
+    parts = []
+    for tensor in tensors:
+        wire = serialize_torch_tensor(tensor.detach().cpu().contiguous(), runtime_pb2.CompressionType.NONE)
+        parts.extend(
+            runtime_pb2.ExpertRequest(uid=uid, tensors=[part], metadata=packed)
+            for part in split_for_streaming(wire, DEFAULT_MAX_MSG_SIZE)
+        )
+    parts = parts or [runtime_pb2.ExpertRequest(uid=uid, metadata=packed)]
+    response_meta = {}
+
+    async def stream():
+        nonlocal response_meta
+        async for response in await stub.rpc_lora_stream(iter_as_aiter(parts)):
+            response_meta = MSGPackSerializer.loads(response.metadata)
+            if response.tensors:
+                yield response.tensors
+
+    async with timeout(request_timeout):
+        result = await deserialize_tensor_stream(stream())
+    if response_meta.get("cache_miss"):
+        raise LoRACacheMiss(response_meta["cache_miss"])
+    return result, response_meta
+
+
 class LoRAService(ServicerBase):
     def __init__(self, handler):
         self.handler = handler
+
+    def _peer_metadata(self, metadata, op, owner, **extra):
+        keep = ("version", "config", "training", "seed", "adapter_version", "accumulate")
+        return {**{k: metadata[k] for k in keep if k in metadata}, "op": op, "client": owner, **extra}
+
+    async def _run(self, backends, uid, first, meta, rest, metadata, context):
+        """Submit to the Runtime; for data parallelism also pull adapters from a seed peer
+        and reduce replica gradient sums (both optional, set by the client)."""
+        pool, op = backends[0].lora_pool, meta["op"]
+        p2p, request_timeout = self.handler._p2p, self.handler.request_timeout
+        owner = meta["owner"]
+        if op == "forward" and not rest and metadata.get("pull_from"):
+            (have,) = await pool.submit_task(first, {**meta, "op": "probe"}, priority=2.0)
+            if not bool(have.item()):
+                began = time.perf_counter()
+                try:
+                    adapters, _ = await _peer_request(
+                        p2p, metadata["pull_from"], uid,
+                        self._peer_metadata(metadata, "export", owner), (), request_timeout,
+                    )  # fmt: skip
+                except Exception as error:
+                    logger.warning(f"LoRA adapter pull from {metadata['pull_from']} failed: {error!r}")
+                    raise LoRACacheMiss("pull") from None
+                logger.info(f"[LORA_PEER] pulled adapters in {time.perf_counter() - began:.3f}s")
+                return await pool.submit_task(first, meta, *adapters, priority=2.0)
+        if op == "collect" and metadata.get("reduce_from"):
+            totals = None
+            try:
+                totals = [t.float() for t in await pool.submit_task(first, meta, priority=2.0)]
+            except Exception as error:
+                if _miss_kind(error) != "gradients":
+                    raise
+            # One peer at a time: fetching all concurrently made the leader slower (its handler
+            # process, not the link, is the bottleneck), measured with 7 peers.
+            began = time.perf_counter()
+            for peer in metadata["reduce_from"]:
+                try:
+                    other, _ = await _peer_request(
+                        p2p, peer, uid, self._peer_metadata(metadata, "collect", owner), (), request_timeout
+                    )
+                except LoRACacheMiss:
+                    continue  # that replica served no microbatch this step
+                if totals is None:
+                    totals = [t.float() for t in other]
+                else:
+                    for total, g in zip(totals, other):
+                        total.add_(g.float())
+            logger.info(
+                f"[LORA_PEER] reduced gradients from {len(metadata['reduce_from'])} peers in "
+                f"{time.perf_counter() - began:.3f}s"
+            )
+            if totals is None:
+                raise LoRACacheMiss("gradients")
+            return tuple(totals)
+        return await pool.submit_task(first, meta, *rest, priority=2.0)
 
     async def rpc_lora_stream(
         self, requests: AsyncIterator[runtime_pb2.ExpertRequest], context: P2PContext
@@ -476,15 +683,26 @@ class LoRAService(ServicerBase):
                 adapter_wire = metadata.get("adapter_wire", "float32")
                 if adapter_wire not in ("float32", "bfloat16"):
                     raise ValueError("Invalid LoRA adapter wire dtype")
-                if adapter_wire != "float32" and op in ("forward", "stateless"):
-                    n_act = 1 + int(op == "stateless")
+                if adapter_wire != "float32" and op in ("forward", "stateless", "upload"):
+                    n_act = {"forward": 1, "stateless": 2, "upload": 0}[op]
                     if any(t.dtype != torch.bfloat16 for t in tensors[n_act:]):
                         raise ValueError("Adapters must arrive in the announced wire dtype")
                     tensors = [*tensors[:n_act], *(t.float() for t in tensors[n_act:])]
-                if op in ("release", "collect"):
+                client = metadata.get("client")
+                if client is not None:
+                    # A peer worker acting for the client (export / reduce): the adapter version or
+                    # gradient token, unguessable and known only to the client's workers, authorises it.
+                    if op not in ("export", "collect", "probe") or not isinstance(client, str):
+                        raise ValueError("Invalid LoRA peer request")
+                    meta["owner"] = client
+                if op in ("release", "collect", "export", "probe"):
                     if tensors:
-                        raise ValueError("LoRA release/collect take no tensors")
+                        raise ValueError("LoRA release/collect/export take no tensors")
                     first, rest = torch.empty(1, 1, 1), []
+                elif op == "upload":
+                    if len(tensors) != width * len(names):
+                        raise ValueError("LoRA parameter count mismatch")
+                    first, rest = torch.empty(1, 1, 1), tensors
                 elif op == "backward":
                     if len(tensors) != 1:
                         raise ValueError("Cached LoRA backward accepts only the output gradient")
@@ -501,15 +719,13 @@ class LoRAService(ServicerBase):
             meta["op"] = op
             response_meta = {"version": version}
             try:
-                outputs = await backends[0].lora_pool.submit_task(first, meta, *rest, priority=2.0)
-            except LoRACacheMiss as miss:
-                outputs, response_meta = (), {"version": version, "cache_miss": miss.what}
+                outputs = await self._run(backends, uid, first, meta, rest, metadata, context)
             except Exception as error:  # the exception class may not survive every pickling path
-                if "LORA_CACHE_MISS:" not in str(error):
+                what = _miss_kind(error)
+                if what is None:
                     raise
-                what = re.search(r"LORA_CACHE_MISS:(\w+)", str(error)).group(1)
                 outputs, response_meta = (), {"version": version, "cache_miss": what}
-            if op == "release" and not response_meta.get("cache_miss"):
+            if op in ("release", "upload") and not response_meta.get("cache_miss"):
                 outputs = ()
             if outputs and op in ("backward", "stateless", "collect") and metadata.get("adapter_wire") == "bfloat16":
                 lead = 0 if op == "collect" else 1  # dX is not an adapter gradient

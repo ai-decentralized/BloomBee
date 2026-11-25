@@ -172,6 +172,78 @@ def test_cached_backward_matches_stateless(fresh_caches, monkeypatch, keep_graph
     assert not worker._ACTIVATIONS
 
 
+def test_full_budget_downgrades_kept_graphs_instead_of_missing(fresh_caches, monkeypatch):
+    """Kept autograd graphs must never starve later microbatches of their (small) input cache."""
+    torch.manual_seed(5)
+    counter = iter(range(0, 10**12, 100000))
+    monkeypatch.setattr(worker, "_allocated", lambda device: next(counter))  # graph_bytes = 100000 per layer
+    monkeypatch.setenv("BLOOMBEE_LORA_CACHE_BYTES", str(1 << 30))
+    backends = _span()
+    config = LoRAConfig(r=2, lora_alpha=4, lora_dropout=0.0, target_modules=PROJECTIONS)
+    params = tuple(p for b in backends for p in _adapters(config, projection_shapes(b.config)))
+    xs, gs = [torch.randn(2, 6, 32) for _ in range(3)], [torch.randn(2, 6, 32) for _ in range(3)]
+    ids = ["a" * 32, "b" * 32, "c" * 32]
+    worker.run_lora_task(None, xs[0], _meta(backends, config, "forward", cache_id=ids[0]), *params)
+    first = worker._ACTIVATIONS[("peer", ids[0])]
+    assert all(layer.y is not None for layer in first.layers)
+    # Budget: exactly what the first entry (with graphs) holds. Later entries only fit once graphs are dropped.
+    budget = first.nbytes
+    monkeypatch.setenv("BLOOMBEE_LORA_CACHE_BYTES", str(budget))
+    for x, cid in zip(xs[1:], ids[1:]):
+        worker.run_lora_task(None, x, _meta(backends, config, "forward", cache_id=cid))  # no miss
+    entries = [worker._ACTIVATIONS[("peer", cid)] for cid in ids]
+    assert any(layer.y is None for e in entries for layer in e.layers)  # something was downgraded
+    assert worker._usage["activation_bytes"] == sum(e.nbytes for e in entries)
+    assert worker._usage["activation_bytes"] <= budget
+    for x, g, cid in zip(xs, gs, ids):
+        cached = worker.run_lora_task(None, g, _meta(backends, config, "backward", cache_id=cid))
+        stateless = worker.run_lora_task(None, x, _meta(backends, config, "stateless"), g, *params)
+        for a, b in zip(cached, stateless):
+            torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+    assert not worker._ACTIVATIONS and worker._usage["activation_bytes"] == 0
+
+
+def test_upload_probe_export_roundtrip(fresh_caches):
+    backends = _span(2)
+    config = LoRAConfig(r=2, target_modules=("q_proj", "v_proj"))
+    params = tuple(p for b in backends for p in _adapters(config, projection_shapes(b.config)))
+    x = torch.randn(1, 4, 32)
+    probe = _meta(backends, config, "probe", adapter_version="v9")
+    assert not bool(worker.run_lora_task(None, x, probe)[0].item())
+    with pytest.raises(worker.LoRACacheMiss, match="adapter"):
+        worker.run_lora_task(None, x, _meta(backends, config, "export", adapter_version="v9"))
+    worker.run_lora_task(None, x, _meta(backends, config, "upload", adapter_version="v9"), *params)
+    assert bool(worker.run_lora_task(None, x, probe)[0].item())
+    exported = worker.run_lora_task(None, x, _meta(backends, config, "export", adapter_version="v9"))
+    assert len(exported) == len(params)
+    for a, b in zip(exported, params):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    # A different client (owner) must not see this adapter, even with the right version string.
+    assert not bool(worker.run_lora_task(None, x, {**probe, "owner": "someone-else"})[0].item())
+    # The exported tensors are exactly what a forward from the cache uses.
+    (y_cached,) = worker.run_lora_task(None, x, _meta(backends, config, "forward", adapter_version="v9"))
+    (y_direct,) = worker.run_lora_task(None, x, _meta(backends, config, "forward", adapter_version="v10"), *exported)
+    torch.testing.assert_close(y_cached, y_direct, rtol=0, atol=0)
+
+
+def test_simulated_compute_worker_keeps_protocol_state(fresh_caches, monkeypatch):
+    monkeypatch.setattr(worker, "_SIM_COMPUTE", (1e-9, 2e-9, 0.0))
+    backends = _span(2)
+    config = LoRAConfig(r=2, target_modules=("q_proj", "v_proj"))
+    params = tuple(p for b in backends for p in _adapters(config, projection_shapes(b.config)))
+    x, g = torch.randn(2, 5, 32), torch.randn(2, 5, 32)
+    token = "t" * 32
+    for cid in ("a" * 32, "b" * 32):
+        (y,) = worker.run_lora_task(None, x, _meta(backends, config, "forward", cache_id=cid), *params)
+        assert y.shape == x.shape
+        (dx,) = worker.run_lora_task(None, g, _meta(backends, config, "backward", cache_id=cid, accumulate=token))
+        assert dx.shape == x.shape
+    with pytest.raises(worker.LoRACacheMiss, match="activations"):
+        worker.run_lora_task(None, g, _meta(backends, config, "backward", cache_id="a" * 32, accumulate=token))
+    summed = worker.run_lora_task(None, x, _meta(backends, config, "collect", accumulate=token))
+    assert [tuple(t.shape) for t in summed] == [tuple(p.shape) for p in params]
+
+
 def test_cache_misses_are_reported(fresh_caches, monkeypatch):
     backends = _span(1)
     config = LoRAConfig(r=2, target_modules=("q_proj",))
